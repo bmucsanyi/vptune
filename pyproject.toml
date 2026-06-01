@@ -1,0 +1,189 @@
+# See https://packaging.python.org/en/latest/specifications/pyproject-toml/
+
+# PEP 621 Project Metadata
+# See https://peps.python.org/pep-0621/
+
+[project]
+name = "vptune"
+authors = [{ name = "Bálint Mucsányi" }]
+urls = { Repository = "https://github.com/bmucsanyi/vptune" }
+description = "Autotuning for matrix-free derivative-vector products in PyTorch."
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Natural Language :: English",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "autobatch @ git+https://github.com/bmucsanyi/autobatch.git@a0663ac586c61c4593e9b9c6031f43f464f61139",
+    "torch",
+]
+version = "0.0.1"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12,<3.15"
+
+[project.optional-dependencies]
+dev = ["ruff", "pre-commit", "pytest", "ty", "pytest-cov"]
+transformers = ["transformers"]
+curvlinops = [
+    "curvlinops-for-pytorch @ git+https://github.com/f-dangel/curvlinops.git@479a09e468a67eb60db448b643f28269371e798b",
+]
+
+# PEP 518 Build System Configuration
+# See https://peps.python.org/pep-0518/
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vptune"]
+
+# Testing Configuration
+# See https://docs.pytest.org/en/stable/reference/customize.html
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+# torch emits this when numpy is absent; vptune neither imports nor depends on numpy
+filterwarnings = ["ignore:Failed to initialize NumPy:UserWarning"]
+
+# Linting Configuration
+# See https://docs.astral.sh/ruff/rules/#legend
+
+[tool.ruff]
+preview = true
+extend-include = ["*.ipynb"]
+exclude = [".git", "__pycache__"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "ARG",   # flake8-unused-arguments
+    "ASYNC", # flake8-async
+    "ANN",   # flake8-annotations
+    "B",     # flake8-bugbear
+    "BLE",   # flake8-blind-except
+    "C4",    # flake8-comprehensions
+    "C90",   # mccabe
+    "COM",   # flake8-commas
+    "D",     # pydocstyle
+    "DOC",   # pydoclint
+    "DTZ",   # flake8-datetimez
+    "E",     # pycodestyle error
+    "EM",    # flake8-errmsg
+    "ERA",   # eradicate
+    "F",     # Pyflakes
+    "FA",    # flake8-future-annotations
+    "FBT",   # flake8-boolean-trap
+    "FLY",   # flynt
+    "FURB",  # refurb
+    "G",     # flake8-logging-format
+    "I",     # isort
+    "ICN",   # flake8-import-conventions
+    "INP",   # flake8-no-pep420
+    "INT",   # flake8-gettext
+    "ISC",   # flake8-implicit-str-concat
+    "LOG",   # flake8-logging
+    "N",     # pep8-naming
+    "NPY",   # NumPy
+    "PD",    # pandas-vet
+    "PERF",  # Perflint
+    "PGH",   # pygrep-hooks
+    "PIE",   # flake8-pie
+    "PL",    # Pylint
+    "PT",    # flake8-pytest-style
+    "PTH",   # flake8-use-pathlib
+    "PYI",   # flake8-pyi
+    "Q",     # flake8-quotes
+    "RET",   # flake8-return
+    "RSE",   # flake8-raise
+    "RUF",   # Ruff
+    "S",     # flake8-bandit
+    "SLOT",  # flake8-slots
+    "T10",   # flake8-debugger
+    "T20",   # flake8-print
+    "TC",    # flake8-type-checking
+    "TD",    # flake8-todos
+    "TID",   # flake8-tidy-imports
+    "TRY",   # tryceratops
+    "SIM",   # flake8-simplify
+    "SLF",   # flake8-self
+    "UP",    # pyupgrade
+    "W",     # pycodestyle warning
+    "YTT",   # flake8-2020
+]
+ignore = [
+    # Prints are OK
+    "T201",
+    # Conflicting lint rules with Ruff's formatter
+    "W191",
+    "E111",
+    "E114",
+    "E117",
+    "D206",
+    "D300",
+    "Q000",
+    "Q001",
+    "Q002",
+    "Q003",
+    "COM812",
+    "COM819",
+    "ISC001",
+    "ISC002",
+    "FBT001",
+    "FBT003",
+    "TD003",
+    # An `Any` type hint is often the best type hint one can give for an argument. That
+    # being said, it is important to only use `Any` when all other possibilities have
+    # been exhausted
+    "ANN401",
+    # __init__ docstrings usually repeat the class docstring
+    "D107",
+    # In-place assignments are not always possible in torch or jax
+    "PLR6104",
+    # Assignments before return can emphasize the code's semantic structure
+    "RET504",
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"tests/*.py" = [
+    "PLC2701", # Tests monkeypatch private scheduling helpers
+    "S101",    # Use of assert is allowed in test files
+    "INP001",  # The tests folder is not an implicit namespace package
+    "D100",    # Docstrings are not required in tests
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "PLR0915", # Tests can contain many statements and many local variables
+    "PLR2004",
+    "PLR0912",
+    "PLR0914",
+    "PLR0913",
+    "PLR0917",
+    "SLF001",  # Tests may exercise internal helpers directly
+]
+"*.ipynb" = ["T201"] # Print statements are fine in notebooks
+
+[tool.ruff.lint.mccabe]
+max-complexity = 18
+
+[tool.ruff.lint.pylint]
+max-args = 25
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

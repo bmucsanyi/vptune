@@ -1,0 +1,21 @@
+# Extensions
+*.egg-info
+*.pyc
+*.pt
+*.zip
+*.json
+*.npz
+*.pdf
+*.npy
+*.out
+*.arrow
+*.sh
+
+# Files
+.coverage
+
+# Folders
+.ruff_cache
+.venv
+.pytest_cache
+__pycache__
