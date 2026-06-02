@@ -38,29 +38,6 @@ DTYPE_FLOOR_FIELDS = ("max_abs_diff", "directional_abs_diff")
 DTYPE_FLOOR_SETTINGS = ("model_dtype", "compute_dtype", "accumulation_dtype")
 
 
-def thresholds_for_measurements(
-    measurements: Mapping[str, Any],
-    settings: Mapping[str, Any],
-) -> dict[str, float]:
-    """Return active thresholds for present measurement fields.
-
-    Raises:
-        ReferenceFailedError: If no thresholded measurement field is present.
-    """
-    thresholds = {
-        name: threshold
-        for name, threshold in STANDARD_THRESHOLDS.items()
-        if name in measurements
-    }
-    apply_dtype_floors(thresholds, settings)
-
-    if not thresholds:
-        message = "reference check has no thresholded measurements"
-        raise ReferenceFailedError(message)
-
-    return thresholds
-
-
 def apply_dtype_floors(
     thresholds: dict[str, float],
     settings: Mapping[str, Any],
@@ -179,24 +156,3 @@ def tree_error_measurements(
         "max_abs_diff": float(absolute.detach().cpu()),
         "max_rel_diff": float(relative.detach().cpu()),
     }
-
-
-def assert_tree_close(
-    observed: TensorTree,
-    reference: TensorTree,
-    *,
-    settings: Mapping[str, Any] | None = None,
-    thresholds: Mapping[str, float],
-) -> dict[str, float]:
-    """Validate tree agreement and return measurements.
-
-    Returns:
-        Error measurements.
-    """
-    safe_settings = {} if settings is None else settings
-    measurements = tree_error_measurements(observed, reference)
-    active_thresholds = dict(thresholds)
-    apply_dtype_floors(active_thresholds, safe_settings)
-    validate_thresholds(measurements, active_thresholds)
-
-    return measurements

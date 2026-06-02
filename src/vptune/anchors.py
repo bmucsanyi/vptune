@@ -97,6 +97,27 @@ def jvp_anchor(
     return result
 
 
+def forward_ad_jvp_anchor(
+    function: TensorFn,
+    params: TensorTree,
+    vector: TensorTree,
+) -> Any:
+    """Return JVP through PyTorch forward AD dual tensors."""
+    with torch.autograd.forward_ad.dual_level():
+        dual_params = tree_map2(torch.autograd.forward_ad.make_dual, params, vector)
+        dual_output = function(dual_params)
+
+        def tangent_leaf(output: torch.Tensor) -> torch.Tensor:
+            primal, tangent = torch.autograd.forward_ad.unpack_dual(output)
+
+            if tangent is None:
+                return torch.zeros_like(primal)
+
+            return tangent
+
+        return tree_map(tangent_leaf, dual_output)
+
+
 def vjp_anchor(
     function: TensorFn,
     params: TensorTree,
@@ -150,6 +171,33 @@ def hvp_jvp_grad_anchor(
 ) -> Any:
     """Return HVP by JVP of grad."""
     return jvp_anchor(grad(function), params, vector)
+
+
+def hvp_anchor(
+    function: ScalarTensorFn,
+    params: TensorTree,
+    vector: TensorTree,
+) -> Any:
+    """Return HVP with PyTorch functional API."""
+    if isinstance(params, torch.Tensor):
+        _, result = torch.autograd.functional.hvp(function, params, vector)
+
+        return result
+
+    vector_in_param_order = tree_map2(lambda _, tangent: tangent, params, vector)
+    parameter_leaves = tree_leaves(params)
+    vector_leaves = tree_leaves(vector_in_param_order)
+
+    def leaf_function(*active_leaves: torch.Tensor) -> torch.Tensor:
+        return function(tree_from_leaves(params, active_leaves))
+
+    _, result_leaves = torch.autograd.functional.hvp(
+        leaf_function,
+        parameter_leaves,
+        vector_leaves,
+    )
+
+    return tree_from_leaves(params, result_leaves)
 
 
 def vhp_anchor(
@@ -246,7 +294,7 @@ def dense_metric_inverse_residual(
     residual = dense_metric_multiply(matrix, inverse_product) - vector
     denominator = vector.reshape(-1).norm()
 
-    if bool(torch.equal(denominator, torch.zeros_like(denominator))):
+    if torch.equal(denominator, torch.zeros_like(denominator)):
         return residual.reshape(-1).norm()
 
     return residual.reshape(-1).norm() / denominator

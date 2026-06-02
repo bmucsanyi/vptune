@@ -1,6 +1,7 @@
 import pytest
 
 import vptune as vp
+import vptune.ext as vpx
 
 
 def torch_func_settings(**overrides: object) -> dict[str, object]:
@@ -29,7 +30,7 @@ def torch_func_settings(**overrides: object) -> dict[str, object]:
 def test_torch_func_admission_accepts_declared_vmap_randomness(
     randomness: str,
 ) -> None:
-    vp.admit_torch_func(torch_func_settings(vmap_randomness=randomness))
+    vpx.admit_torch_func(torch_func_settings(vmap_randomness=randomness))
 
 
 @pytest.mark.parametrize(
@@ -45,12 +46,12 @@ def test_torch_func_admission_accepts_declared_vmap_randomness(
 )
 def test_torch_func_admission_rejects_transform_limitations(field: str) -> None:
     with pytest.raises(vp.AdmissionError, match=field):
-        vp.admit_torch_func(torch_func_settings(**{field: True}))
+        vpx.admit_torch_func(torch_func_settings(**{field: True}))
 
 
 def test_torch_func_admission_rejects_forward_ad_coverage_failure() -> None:
     with pytest.raises(vp.AdmissionError, match="forward AD"):
-        vp.admit_torch_func(
+        vpx.admit_torch_func(
             torch_func_settings(
                 requires_forward_ad=True,
                 forward_ad_supported=False,
@@ -60,9 +61,9 @@ def test_torch_func_admission_rejects_forward_ad_coverage_failure() -> None:
 
 def test_torch_func_admission_rejects_invalid_vmap_randomness() -> None:
     with pytest.raises(vp.AdmissionError, match="vmap_randomness"):
-        vp.admit_torch_func(torch_func_settings(vmap_randomness="random"))
+        vpx.admit_torch_func(torch_func_settings(vmap_randomness="random"))
 
 
 def test_torch_func_admission_requires_boolean_flags() -> None:
     with pytest.raises(vp.AdmissionError, match="uses_item must be a bool"):
-        vp.admit_torch_func(torch_func_settings(uses_item="false"))
+        vpx.admit_torch_func(torch_func_settings(uses_item="false"))

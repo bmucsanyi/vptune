@@ -1,13 +1,5 @@
-"""Optional adapter helpers."""
+"""Adapter helpers."""
 
-from vptune.adapters.curvlinops import (
-    CurvLinOpsAdmitter,
-    CurvLinOpsFisherMCSemantics,
-    curvlinops_axis,
-    curvlinops_operation_factory,
-    curvlinops_operator_axis,
-    curvlinops_runtime_config,
-)
 from vptune.adapters.distributed import (
     DistributedAdmissionPolicy,
     RankSelectedSettings,
@@ -51,15 +43,15 @@ from vptune.adapters.transformers import (
     admit_transformers_cache,
     check_patched_attention_reference,
     check_patched_attention_vjp_reference,
+    load_transformers_model,
     transformers_attention_axis,
+    transformers_attn_implementation,
     transformers_cache_axis,
     transformers_model_identity,
 )
 
 __all__ = [
     "PILOT_ACCEPTANCE_FAMILIES",
-    "CurvLinOpsAdmitter",
-    "CurvLinOpsFisherMCSemantics",
     "DistributedAdmissionPolicy",
     "PilotReadiness",
     "RankSelectedSettings",
@@ -71,13 +63,10 @@ __all__ = [
     "admit_transformers_cache",
     "check_patched_attention_reference",
     "check_patched_attention_vjp_reference",
-    "curvlinops_axis",
-    "curvlinops_operation_factory",
-    "curvlinops_operator_axis",
-    "curvlinops_runtime_config",
     "distributed_identity",
     "distributed_record",
     "distributed_sharding_axis",
+    "load_transformers_model",
     "pilot_acceptance_family_names",
     "pilot_acceptance_readiness",
     "pilot_lower",
@@ -88,6 +77,7 @@ __all__ = [
     "reduce_rank_statuses",
     "require_rank_selected_settings_agree",
     "transformers_attention_axis",
+    "transformers_attn_implementation",
     "transformers_cache_axis",
     "transformers_model_identity",
 ]

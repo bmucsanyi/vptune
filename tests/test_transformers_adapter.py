@@ -3,6 +3,7 @@ import torch
 
 import vptune as vp
 import vptune.adapters as vpa
+import vptune.ext as vpx
 from vptune.data import PACKAGE_VERSION
 from vptune.errors import AdmissionError, ReferenceFailedError
 
@@ -28,6 +29,75 @@ class TinyTiedModule(torch.nn.Module):
         self.embedding = shared
         self.lm_head = shared
         self.register_buffer("scale", torch.tensor([0.5]))
+
+
+class FakeModelLoader:
+    def __init__(self, calls: list[dict[str, object]]) -> None:
+        self.calls = calls
+
+    def from_pretrained(
+        self,
+        model_name_or_path: str,
+        *,
+        revision: str,
+        torch_dtype: torch.dtype,
+        attn_implementation: str,
+        use_cache: bool,
+    ) -> torch.nn.Module:
+        self.calls.append({
+            "model_name_or_path": model_name_or_path,
+            "revision": revision,
+            "torch_dtype": torch_dtype,
+            "attn_implementation": attn_implementation,
+            "use_cache": use_cache,
+        })
+
+        return TinyTiedModule()
+
+
+def test_load_transformers_model_calls_from_pretrained_with_explicit_settings() -> None:
+    calls = []
+
+    model = vpa.load_transformers_model(
+        FakeModelLoader(calls),
+        model_name_or_path="org/model",
+        revision="abc123",
+        torch_dtype=torch.bfloat16,
+        attention_frontend="transformers_flash_attention_4",
+        use_cache=False,
+    )
+
+    assert isinstance(model, TinyTiedModule)
+    assert calls == [
+        {
+            "model_name_or_path": "org/model",
+            "revision": "abc123",
+            "torch_dtype": torch.bfloat16,
+            "attn_implementation": "flash_attention_4",
+            "use_cache": False,
+        }
+    ]
+
+
+def test_transformers_attn_implementation_maps_load_time_frontends() -> None:
+    assert vpa.transformers_attn_implementation("transformers_sdpa") == "sdpa"
+    assert (
+        vpa.transformers_attn_implementation("paged|flash_attention_3")
+        == "paged|flash_attention_3"
+    )
+    assert (
+        vpa.transformers_attn_implementation(
+            "registered_transformers_attention",
+            attention_custom_kernel_id="custom_attention",
+        )
+        == "custom_attention"
+    )
+
+    with pytest.raises(vp.AdmissionError):
+        vpa.transformers_attn_implementation("pytorch_sdpa_direct")
+
+    with pytest.raises(vp.AdmissionError):
+        vpa.transformers_attn_implementation("registered_transformers_attention")
 
 
 def test_transformers_model_identity_records_module_and_adapter_fields() -> None:
@@ -111,10 +181,10 @@ def test_transformers_cache_axis_admission_and_identity() -> None:
 
 def test_transformers_cache_axis_composes_with_attention_axis() -> None:
     policy = transformers_policy(use_cache=True)
-    registry = vp.AxisRegistry()
+    registry = vpx.AxisRegistry()
     registry.register(
         vpa.transformers_attention_axis(
-            ("sdpa_math",),
+            ("pytorch_sdpa_direct",),
             policy=policy,
         )
     )
@@ -125,7 +195,10 @@ def test_transformers_cache_axis_composes_with_attention_axis() -> None:
             "family",
             "row",
             {
-                "attention_impl": "sdpa_math",
+                "attention.frontend": "pytorch_sdpa_direct",
+                "attention.sdpa_kernel": "math",
+                "module_mode": "eval",
+                "dropout_p": 0.0,
                 "use_cache": True,
             },
         )
@@ -135,7 +208,10 @@ def test_transformers_cache_axis_composes_with_attention_axis() -> None:
             "family",
             "row",
             {
-                "attention_impl": "sdpa_math",
+                "attention.frontend": "pytorch_sdpa_direct",
+                "attention.sdpa_kernel": "math",
+                "module_mode": "eval",
+                "dropout_p": 0.0,
                 "use_cache": False,
             },
         )
@@ -145,21 +221,148 @@ def test_transformers_cache_axis_composes_with_attention_axis() -> None:
     assert rejected.admission_status == "failed"
 
 
+def test_transformers_attention_replaces_core_attention_axis() -> None:
+    policy = transformers_policy()
+    registry = vpx.standard_axis_registry(
+        exclude=("attention_frontend", "functional_call_admission")
+    )
+    registry.register(
+        vpa.transformers_attention_axis(
+            ("transformers_eager",),
+            policy=policy,
+        )
+    )
+    admitted = registry.admit(
+        vp.Candidate(
+            "family",
+            "row",
+            {
+                "attention.frontend": "transformers_eager",
+                "module_mode": "eval",
+                "dropout_p": 0.0,
+            },
+        )
+    )
+
+    assert admitted.admission_status == "passed"
+
+
+def test_transformers_attention_requires_mode_and_effective_flash_dtype() -> None:
+    policy = transformers_policy()
+    axis = vpa.transformers_attention_axis(
+        ("transformers_flash_attention_2",),
+        policy=policy,
+    )
+    missing_mode = vp.Candidate(
+        "family",
+        "missing-mode",
+        {
+            "attention.frontend": "transformers_flash_attention_2",
+            "model_dtype": "bfloat16",
+            "dropout_p": 0.0,
+            "output_attentions": False,
+        },
+    )
+    float32_compute = vp.Candidate(
+        "family",
+        "float32-compute",
+        {
+            "attention.frontend": "transformers_flash_attention_2",
+            "model_dtype": "bfloat16",
+            "compute_dtype": "float32",
+            "module_mode": "eval",
+            "dropout_p": 0.0,
+            "output_attentions": False,
+        },
+    )
+    bf16_compute = vp.Candidate(
+        "family",
+        "bf16-compute",
+        {
+            "attention.frontend": "transformers_flash_attention_2",
+            "model_dtype": "float32",
+            "compute_dtype": "bfloat16",
+            "module_mode": "eval",
+            "dropout_p": 0.0,
+            "output_attentions": False,
+        },
+    )
+
+    assert axis.admit(missing_mode)[0] is False
+    assert axis.admit(float32_compute)[0] is False
+    assert axis.admit(bf16_compute) == (True, None)
+
+
+def test_transformers_attention_axis_owns_optional_admission_fields() -> None:
+    policy = transformers_policy()
+    registry = vpx.AxisRegistry()
+    registry.register(
+        vpa.transformers_attention_axis(
+            ("transformers_flash_attention_2", "blockwise_exact"),
+            policy=policy,
+        )
+    )
+    flash = vp.Candidate(
+        "family",
+        "flash",
+        {
+            "attention.frontend": "transformers_flash_attention_2",
+            "model_dtype": "bfloat16",
+            "module_mode": "eval",
+            "dropout_p": 0.0,
+            "output_attentions": False,
+        },
+    )
+    blockwise = vp.Candidate(
+        "family",
+        "blockwise",
+        {
+            "attention.frontend": "blockwise_exact",
+            "module_mode": "eval",
+            "dropout_p": 0.0,
+            "blockwise_attention_id": "blockwise-gemma-hvp",
+            "blockwise_attention_semantics": {"mask": "causal", "softcap": 30.0},
+            "attention_block_size": 16,
+            "blockwise_preserves_softcap": True,
+            "blockwise_preserves_mask": True,
+        },
+    )
+    missing_dropout = vp.Candidate(
+        "family",
+        "missing-dropout",
+        {
+            "attention.frontend": "transformers_flash_attention_2",
+            "model_dtype": "bfloat16",
+            "module_mode": "eval",
+        },
+    )
+
+    assert registry.admit(flash).admission_status == "passed"
+    assert registry.admit(blockwise).admission_status == "passed"
+    assert registry.admit(missing_dropout).admission_status == "failed"
+
+
 def test_transformers_attention_admits_packed_and_blockwise_rows() -> None:
     policy = transformers_policy()
     axis = vpa.transformers_attention_axis(
-        ("packed_target_rows", "blockwise_second_derivative"),
+        ("packed_exact", "blockwise_exact"),
         policy=policy,
     )
     packed = vp.Candidate(
         "family",
         "packed",
         {
-            "attention_impl": "packed_target_rows",
+            "attention.frontend": "packed_exact",
+            "module_mode": "eval",
+            "dropout_p": 0.0,
             "packed_attention_id": "packed-gemma-target-rows",
             "packed_attention_semantics": {"mask": "causal", "softcap": 30.0},
             "packed_target_row_axis": "target_tokens",
             "packed_target_row_count": 4,
+            "packed_preserves_softcap": True,
+            "packed_preserves_mask": True,
+            "packed_mask_semantics": "boolean_keep_mask",
+            "packed_causal_policy": "causal",
         },
     )
     missing_packed_semantics = vp.Candidate(
@@ -167,11 +370,28 @@ def test_transformers_attention_admits_packed_and_blockwise_rows() -> None:
         "missing-packed-semantics",
         {**packed.settings, "packed_attention_semantics": {}},
     )
+    missing_packed_mask = vp.Candidate(
+        "family",
+        "missing-packed-mask",
+        {**packed.settings, "packed_preserves_mask": None},
+    )
+    false_packed_softcap = vp.Candidate(
+        "family",
+        "false-packed-softcap",
+        {**packed.settings, "packed_preserves_softcap": False},
+    )
+    wrong_packed_causal_policy = vp.Candidate(
+        "family",
+        "wrong-packed-causal-policy",
+        {**packed.settings, "packed_causal_policy": "bidirectional"},
+    )
     blockwise = vp.Candidate(
         "family",
         "blockwise",
         {
-            "attention_impl": "blockwise_second_derivative",
+            "attention.frontend": "blockwise_exact",
+            "module_mode": "eval",
+            "dropout_p": 0.0,
             "blockwise_attention_id": "blockwise-gemma-hvp",
             "blockwise_attention_semantics": {"mask": "causal", "softcap": 30.0},
             "attention_block_size": 16,
@@ -189,12 +409,27 @@ def test_transformers_attention_admits_packed_and_blockwise_rows() -> None:
         "missing-blockwise-mask",
         {**blockwise.settings, "blockwise_preserves_mask": None},
     )
+    false_softcap = vp.Candidate(
+        "family",
+        "false-softcap",
+        {**blockwise.settings, "blockwise_preserves_softcap": False},
+    )
+    false_mask = vp.Candidate(
+        "family",
+        "false-mask",
+        {**blockwise.settings, "blockwise_preserves_mask": False},
+    )
 
     assert axis.admit(packed) == (True, None)
     assert axis.admit(missing_packed_semantics)[0] is False
+    assert axis.admit(missing_packed_mask)[0] is False
+    assert axis.admit(false_packed_softcap)[0] is False
+    assert axis.admit(wrong_packed_causal_policy)[0] is False
     assert axis.admit(blockwise) == (True, None)
     assert axis.admit(invalid_block_size)[0] is False
     assert axis.admit(missing_blockwise_mask)[0] is False
+    assert axis.admit(false_softcap)[0] is False
+    assert axis.admit(false_mask)[0] is False
 
 
 def test_patched_attention_reference_check_accepts_matching_outputs() -> None:

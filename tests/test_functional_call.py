@@ -5,6 +5,7 @@ import torch
 from torch.nn.utils import parametrize
 
 import vptune as vp
+import vptune.ext as vpx
 
 
 def functional_call_settings(**overrides: object) -> dict[str, object]:
@@ -22,7 +23,7 @@ def functional_call_settings(**overrides: object) -> dict[str, object]:
 
 
 def test_functional_call_admission_validates_declared_fields() -> None:
-    vp.admit_functional_call(functional_call_settings())
+    vpx.admit_functional_call(functional_call_settings())
 
     rejected = (
         {"parameter_keys": ["weight"]},
@@ -41,7 +42,14 @@ def test_functional_call_admission_validates_declared_fields() -> None:
 
     for settings_override in rejected:
         with pytest.raises(vp.AdmissionError):
-            vp.admit_functional_call(functional_call_settings(**settings_override))
+            vpx.admit_functional_call(functional_call_settings(**settings_override))
+
+
+def test_functional_call_admission_rejects_disabled_parametrizations() -> None:
+    with pytest.raises(vp.AdmissionError, match="parametrization_policy"):
+        vpx.admit_functional_call(
+            functional_call_settings(parametrization_policy="disabled")
+        )
 
 
 def test_module_functional_call_handles_buffers_and_restores_mode() -> None:
@@ -58,7 +66,7 @@ def test_module_functional_call_handles_buffers_and_restores_mode() -> None:
 
     module = BufferModule()
     module.train()
-    output = vp.module_functional_call(
+    output = vpx.module_functional_call(
         module,
         {"weight": torch.tensor([3.0])},
         {"scale": torch.tensor([4.0])},
@@ -91,7 +99,7 @@ def test_module_functional_call_respects_tied_weight_policy() -> None:
             return self.left * value + self.right * value
 
     module = TiedModule()
-    tied = vp.module_functional_call(
+    tied = vpx.module_functional_call(
         module,
         {"left": torch.tensor([2.0])},
         {},
@@ -104,7 +112,7 @@ def test_module_functional_call_respects_tied_weight_policy() -> None:
         mutated_parameter_keys=(),
         mutated_buffer_keys=(),
     )
-    untied = vp.module_functional_call(
+    untied = vpx.module_functional_call(
         module,
         {"left": torch.tensor([2.0])},
         {},
@@ -136,7 +144,7 @@ def test_module_functional_call_preserves_active_parametrization() -> None:
         "weight",
         ExpParametrization(),
     )
-    output = vp.module_functional_call(
+    output = vpx.module_functional_call(
         module,
         {"parametrizations.weight.original": torch.zeros(1, 1, dtype=torch.float64)},
         {},
@@ -168,7 +176,7 @@ def test_module_functional_call_resets_declared_buffer_mutation() -> None:
 
     module = MutatingBufferModule()
     buffers = {"count": torch.tensor([5.0])}
-    output = vp.module_functional_call(
+    output = vpx.module_functional_call(
         module,
         {},
         buffers,
@@ -204,7 +212,7 @@ def test_module_functional_call_resets_declared_mutation_after_error() -> None:
     buffers = {"count": torch.tensor([5.0])}
 
     with pytest.raises(RuntimeError, match="boom"):
-        vp.module_functional_call(
+        vpx.module_functional_call(
             module,
             {},
             buffers,

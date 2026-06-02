@@ -1,6 +1,6 @@
 """Checkpoint execution helpers for adapter runtimes."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from torch.utils.checkpoint import checkpoint, noop_context_fn
@@ -11,8 +11,8 @@ from vptune.errors import AdmissionError
 
 ACTIVE_CHECKPOINT_SETTINGS = (
     "non_reentrant",
-    "non_reentrant_preserve_rng",
     "non_reentrant_deterministic",
+    "non_reentrant_no_rng_preservation",
 )
 
 
@@ -38,6 +38,7 @@ def checkpoint_operation(
         raise AdmissionError(message)
 
     admit_checkpoint(candidate.settings)
+    _admit_checkpoint_policy(setting, candidate.settings)
     context_fn = _checkpoint_context_fn(candidate)
 
     def operation() -> TensorTree:
@@ -66,6 +67,15 @@ def _checkpoint_setting(candidate: Candidate, policy_key: str) -> str:
         raise AdmissionError(message)
 
     return setting
+
+
+def _admit_checkpoint_policy(setting: str, settings: Mapping[str, Any]) -> None:
+    if setting != "non_reentrant_no_rng_preservation":
+        return
+
+    if settings["preserve_rng_state"]:
+        message = "non_reentrant_no_rng_preservation requires preserve_rng_state=False"
+        raise AdmissionError(message)
 
 
 def _direct_operation(

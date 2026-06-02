@@ -1,6 +1,12 @@
 import pytest
 
-from vptune import AdmissionError, Candidate, MaterializationError, Measurement
+import vptune.ext as vpx
+from vptune import (
+    AdmissionError,
+    Candidate,
+    MaterializationError,
+    Measurement,
+)
 from vptune.adapters.distributed import (
     DistributedAdmissionPolicy,
     RankSelectedSettings,
@@ -39,10 +45,12 @@ def distributed_policy(
             "allowed_fsdp_offload": (offload,),
         },
         dtensor={
+            "allowed_dtensor_module_class": ("torch.nn.Linear",),
             "allowed_to_local_grad_placement": ("redistribute",),
             "allowed_from_local_check": ("strict",),
             "allowed_uneven_shard_handling": ("reject",),
             "allowed_async_local_tensor_handling": ("sync",),
+            "allowed_higher_order_diff_status": ("supported",),
         },
         tensor_parallel={"allowed_tp_output_layout": (output_layout,)},
         sequence_parallel={
@@ -79,10 +87,15 @@ def valid_layout_settings() -> dict[str, object]:
         "sharding": "tensor_parallel",
         "input_placements": ("shard(0)",),
         "output_placements": ("replicate",),
+        "dtensor_module_class": "torch.nn.Linear",
         "to_local_grad_placement": "redistribute",
         "from_local_check": "strict",
         "uneven_shard_handling": "reject",
         "async_local_tensor_handling": "sync",
+        "higher_order_diff_status": {
+            "input_placements[0]": "supported",
+            "output_placements[0]": "supported",
+        },
         "tp_output_layout": "rowwise",
     }
 
@@ -103,6 +116,14 @@ def valid_context_parallel_settings() -> dict[str, object]:
         "cp_context_axis": "tokens",
         "cp_output_layout": "context",
     }
+
+
+def valid_distributed_identity() -> dict[str, object]:
+    return distributed_identity(
+        device_mesh={"shape": (2,), "names": ("data",)},
+        placements=({"parameter": "weight", "placement": "shard0"},),
+        communication={"backend": "nccl"},
+    )
 
 
 def test_distributed_sharding_axis_validates_modes() -> None:
@@ -126,6 +147,21 @@ def test_distributed_sharding_axis_records_admission_identity() -> None:
 
     assert first.signature()["identity"]["adapter_id"] == "vptune.distributed"
     assert first.signature()["identity"] != second.signature()["identity"]
+
+
+def test_distributed_sharding_axis_owns_optional_admission_fields() -> None:
+    registry = vpx.AxisRegistry()
+    registry.register(
+        distributed_sharding_axis(
+            ("fsdp2", "tensor_parallel"),
+            policy=distributed_policy(),
+        )
+    )
+    fsdp = Candidate("family", "fsdp", valid_fsdp_settings())
+    tensor_parallel = Candidate("family", "tensor-parallel", valid_layout_settings())
+
+    assert registry.admit(fsdp).admission_status == "passed"
+    assert registry.admit(tensor_parallel).admission_status == "passed"
 
 
 def test_fsdp2_admission_requires_hook_entry_and_rejects_bypass() -> None:
@@ -187,6 +223,69 @@ def test_dtensor_admission_requires_gradient_placement_policy() -> None:
 
     assert admit_distributed_candidate(valid, policy=policy) == (True, None)
     assert admit_distributed_candidate(invalid, policy=policy)[0] is False
+
+
+def test_dtensor_admission_records_module_class_and_higher_order_diff() -> None:
+    policy = distributed_policy()
+    valid = Candidate("family", "valid", valid_layout_settings())
+    missing_status = dict(valid_layout_settings())
+    missing_status["higher_order_diff_status"] = {"input_placements[0]": "supported"}
+    unsupported_status = dict(valid_layout_settings())
+    unsupported_status["higher_order_diff_status"] = {
+        "input_placements[0]": "supported",
+        "output_placements[0]": "unsupported",
+    }
+    unsupported_module = Candidate(
+        "family",
+        "unsupported-module",
+        {**valid_layout_settings(), "dtensor_module_class": "torch.nn.Conv2d"},
+    )
+
+    assert admit_distributed_candidate(valid, policy=policy) == (True, None)
+    assert (
+        admit_distributed_candidate(
+            Candidate("family", "missing-status", missing_status),
+            policy=policy,
+        )[0]
+        is False
+    )
+    assert (
+        admit_distributed_candidate(
+            Candidate("family", "unsupported-status", unsupported_status),
+            policy=policy,
+        )[0]
+        is False
+    )
+    assert admit_distributed_candidate(unsupported_module, policy=policy)[0] is False
+
+
+def test_dtensor_admission_requires_higher_order_diff_status_per_slot() -> None:
+    settings = {
+        **valid_layout_settings(),
+        "input_placements": ("shard(0)", "shard(0)"),
+        "output_placements": ("shard(0)",),
+        "higher_order_diff_status": {
+            "input_placements[0]": "supported",
+            "input_placements[1]": "supported",
+            "output_placements[0]": "supported",
+        },
+    }
+    collapsed_status = {
+        **settings,
+        "higher_order_diff_status": {"shard(0)": "supported"},
+    }
+
+    assert admit_distributed_candidate(
+        Candidate("family", "slots", settings),
+        policy=distributed_policy(),
+    ) == (True, None)
+    assert (
+        admit_distributed_candidate(
+            Candidate("family", "collapsed", collapsed_status),
+            policy=distributed_policy(),
+        )[0]
+        is False
+    )
 
 
 def test_tensor_parallel_admission_requires_output_layout_propagation() -> None:
@@ -296,11 +395,7 @@ def test_distributed_selected_settings_must_match_across_ranks() -> None:
 
 def test_distributed_record_contains_memory_surface_and_settings() -> None:
     record = distributed_record(
-        identity=distributed_identity(
-            device_mesh={"shape": (2,), "names": ("data",)},
-            placements=({"parameter": "weight", "placement": "shard0"},),
-            communication={"backend": "nccl"},
-        ),
+        identity=valid_distributed_identity(),
         expected_rank_count=2,
         rank_statuses=(
             RankStatus(rank=0, status="passed", device="cuda:0"),
@@ -351,7 +446,7 @@ def test_distributed_record_contains_memory_surface_and_settings() -> None:
 def test_distributed_record_requires_matching_rank_sets() -> None:
     with pytest.raises(MaterializationError):
         distributed_record(
-            identity={},
+            identity=valid_distributed_identity(),
             expected_rank_count=1,
             rank_statuses=(RankStatus(rank=0, status="passed", device="cuda:0"),),
             rank_memory_samples=(
@@ -373,7 +468,7 @@ def test_distributed_record_requires_matching_rank_sets() -> None:
 
     with pytest.raises(MaterializationError):
         distributed_record(
-            identity={},
+            identity=valid_distributed_identity(),
             expected_rank_count=1,
             rank_statuses=(RankStatus(rank=0, status="passed", device="cuda:0"),),
             rank_memory_samples=(),
@@ -387,7 +482,7 @@ def test_distributed_record_requires_matching_rank_sets() -> None:
 def test_distributed_record_requires_expected_rank_count() -> None:
     with pytest.raises(MaterializationError, match="expected rank count"):
         distributed_record(
-            identity={},
+            identity=valid_distributed_identity(),
             expected_rank_count=2,
             rank_statuses=(RankStatus(rank=0, status="passed", device="cuda:0"),),
             rank_memory_samples=(
@@ -407,9 +502,70 @@ def test_distributed_record_requires_expected_rank_count() -> None:
             global_parameter_surface={},
         )
 
-    with pytest.raises(MaterializationError, match="positive expected rank count"):
+
+def test_distributed_record_requires_identity_fields() -> None:
+    with pytest.raises(MaterializationError, match="identity missing fields"):
         distributed_record(
             identity={},
+            expected_rank_count=1,
+            rank_statuses=(RankStatus(rank=0, status="passed", device="cuda:0"),),
+            rank_memory_samples=(
+                Measurement(
+                    elapsed_seconds=1.0,
+                    peak_allocated_mib=1.0,
+                    peak_reserved_mib=1.0,
+                    post_allocated_mib=0.0,
+                    post_reserved_mib=0.0,
+                    rank=0,
+                    device="cuda:0",
+                ),
+            ),
+            rank_selected_settings=(
+                RankSelectedSettings(rank=0, settings={"sharding": "fsdp2"}),
+            ),
+            global_parameter_surface={},
+        )
+
+
+def test_distributed_record_requires_zero_based_rank_set() -> None:
+    with pytest.raises(MaterializationError, match="contiguous from zero"):
+        distributed_record(
+            identity=valid_distributed_identity(),
+            expected_rank_count=2,
+            rank_statuses=(
+                RankStatus(rank=1, status="passed", device="cuda:1"),
+                RankStatus(rank=2, status="passed", device="cuda:2"),
+            ),
+            rank_memory_samples=(
+                Measurement(
+                    elapsed_seconds=1.0,
+                    peak_allocated_mib=1.0,
+                    peak_reserved_mib=1.0,
+                    post_allocated_mib=0.0,
+                    post_reserved_mib=0.0,
+                    rank=1,
+                    device="cuda:1",
+                ),
+                Measurement(
+                    elapsed_seconds=1.0,
+                    peak_allocated_mib=1.0,
+                    peak_reserved_mib=1.0,
+                    post_allocated_mib=0.0,
+                    post_reserved_mib=0.0,
+                    rank=2,
+                    device="cuda:2",
+                ),
+            ),
+            rank_selected_settings=(
+                RankSelectedSettings(rank=1, settings={"sharding": "fsdp2"}),
+                RankSelectedSettings(rank=2, settings={"sharding": "fsdp2"}),
+            ),
+            global_parameter_surface={},
+        )
+
+    with pytest.raises(MaterializationError, match="positive expected rank count"):
+        distributed_record(
+            identity=valid_distributed_identity(),
             expected_rank_count=0,
             rank_statuses=(RankStatus(rank=0, status="passed", device="cuda:0"),),
             rank_memory_samples=(

@@ -10,6 +10,8 @@ import torch
 from vptune.admission import (
     FUNCTIONAL_CALL_FIELDS,
     TORCH_FUNC_FIELDS,
+    admit_forward_ad,
+    admit_functional_call,
     admit_torch_func,
 )
 from vptune.anchors import (
@@ -20,37 +22,46 @@ from vptune.anchors import (
     finite_difference_hvp,
     finite_difference_jvp,
     fisher_vp_dense_anchor,
+    forward_ad_jvp_anchor,
     gradient_anchor,
+    hvp_anchor,
     hvp_jvp_grad_anchor,
     hvp_reverse_over_reverse_anchor,
     jvp_anchor,
     vjp_anchor,
     vjp_dot_identity_error,
 )
+from vptune.candidates import standard_axis_registry
 from vptune.checks import (
     apply_dtype_floors,
     tree_error_measurements,
     validate_thresholds,
 )
 from vptune.data import (
+    PACKAGE_VERSION,
     Batch,
     BufferTree,
     CallableMaterializer,
     Candidate,
     CandidateAdmitter,
     CandidateOperation,
+    DataProvider,
     FullSizeRecord,
     FunctionObjective,
     Materializer,
     ObjectiveContext,
     OperationFactory,
     OperatorSpec,
+    ParameterSurface,
     ParameterTree,
+    Problem,
     ReferenceCheck,
     ReferenceChildResult,
     ReferenceResult,
     RuntimeConfig,
     ScalarObjective,
+    Target,
+    VectorProvider,
 )
 from vptune.errors import AdmissionError, MaterializationError, ReferenceFailedError
 from vptune.tensor_tree import (
@@ -65,14 +76,17 @@ from vptune.tensor_tree import (
 
 GRADIENT_PATH = "autograd_grad"
 JVP_PATH = "torch_func_jvp"
+JVP_FORWARD_AD_PATH = "forward_ad_jvp"
 VJP_PATH = "torch_func_vjp"
 HVP_REFERENCE_PATH = "reverse_over_reverse"
+HVP_FUNCTIONAL_PATH = "functional_hvp"
 HVP_JVP_GRAD_PATH = "jvp_grad"
 VHP_PATH = "vhp"
 GGN_DENSE_PATH = "dense_ggn"
 GGN_JVP_HESSIAN_VJP_PATH = "jvp_hessian_vjp"
 FISHER_DENSE_PATH = "dense_score_outer"
 FISHER_CATEGORICAL_EXACT_PATH = "categorical_exact"
+FISHER_CATEGORICAL_MC_PATH = "categorical_monte_carlo"
 FISHER_SCORE_GRADIENT_LOOP_PATH = "score_gradient_loop"
 EMPIRICAL_FISHER_DENSE_PATH = "dense_empirical_fisher"
 EMPIRICAL_FISHER_GRADIENT_LOOP_PATH = "per_example_gradient_loop"
@@ -95,14 +109,6 @@ SUPPORTED_STANDARD_SETTINGS = (
     "vmap_chunk_size",
     "vmap_batch_in_dims",
 )
-ANCHOR_RUNTIME_SETTINGS = (
-    *RUNTIME_DTYPE_SETTINGS,
-    *BACKEND_SETTINGS,
-    *TORCH_FUNC_FIELDS,
-    *FUNCTIONAL_CALL_FIELDS,
-    "vmap_chunk_size",
-    "vmap_batch_in_dims",
-)
 MATRIX_DIMS = 2
 STANDARD_ANCHOR_PATHS = {
     "gradient": GRADIENT_PATH,
@@ -112,6 +118,12 @@ STANDARD_ANCHOR_PATHS = {
     "ggnvp": GGN_JVP_HESSIAN_VJP_PATH,
     "fisher_vp": FISHER_SCORE_GRADIENT_LOOP_PATH,
     "empirical_fisher_vp": EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+    "metric": METRIC_DENSE_PATH,
+    "inverse_metric": INVERSE_METRIC_DENSE_PATH,
+}
+SINGLE_OPERATOR_PATHS = {
+    "gradient": GRADIENT_PATH,
+    "vjp": VJP_PATH,
     "metric": METRIC_DENSE_PATH,
     "inverse_metric": INVERSE_METRIC_DENSE_PATH,
 }
@@ -148,8 +160,12 @@ def composition_operation_factory(
         _require_candidate_family(operator, candidate)
 
         def operation() -> TensorTree:
-            _require_supported_standard_settings(candidate)
-            _require_path(operator.kind, _operator_path(candidate), (COMPOSITION_PATH,))
+            _require_supported_standard_settings(operator, candidate)
+            _require_path(
+                operator.kind,
+                _required_candidate_operator_path(candidate),
+                (COMPOSITION_PATH,),
+            )
             runtime_batch = _runtime_batch(batch, candidate.settings)
             result = _runtime_vector(vector, candidate.settings)
 
@@ -260,10 +276,18 @@ def _composition_reference_outputs(
 ]:
     _require_candidate_family(operator, candidate)
     _require_candidate_family(operator, anchor_candidate)
-    _require_supported_standard_settings(candidate)
-    _require_supported_standard_settings(anchor_candidate)
-    _require_path(operator.kind, _operator_path(candidate), (COMPOSITION_PATH,))
-    _require_path(operator.kind, _operator_path(anchor_candidate), (COMPOSITION_PATH,))
+    _require_supported_standard_settings(operator, candidate)
+    _require_supported_standard_settings(operator, anchor_candidate)
+    _require_path(
+        operator.kind,
+        _required_candidate_operator_path(candidate),
+        (COMPOSITION_PATH,),
+    )
+    _require_path(
+        operator.kind,
+        _required_candidate_operator_path(anchor_candidate),
+        (COMPOSITION_PATH,),
+    )
     candidate_batch = _runtime_batch(batch, candidate.settings)
     anchor_batch = _runtime_batch(batch, anchor_candidate.settings)
     candidate_result = _runtime_vector(vector, candidate.settings)
@@ -397,6 +421,9 @@ def _semantic_measurements(
     output: TensorTree,
 ) -> dict[str, float]:
     if operator.kind == "ggnvp":
+        if _ggn_loss_geometry(operator) != "psd_metric":
+            return {}
+
         loss_hessian = _batch_tensor(batch, "loss_hessian")
 
         return {
@@ -441,7 +468,6 @@ def _first_order_reference_measurements(
     buffers: BufferTree,
     scalar_objectives: Mapping[str, ScalarObjective],
     function_objectives: Mapping[str, FunctionObjective],
-    thresholds: Mapping[str, float],
 ) -> dict[str, float]:
     if operator.kind == "gradient":
         scalar = _scalar_objective(operator, scalar_objectives)
@@ -482,7 +508,7 @@ def _first_order_reference_measurements(
             "directional_rel_diff": errors["max_rel_diff"],
         }
 
-    if operator.kind == "vjp" and "inner_abs_diff" in thresholds:
+    if operator.kind == "vjp":
         function = _function_objective(operator, function_objectives)
         tangent = _batch_tree(batch, "tangent_vector")
         context = ObjectiveContext(
@@ -515,7 +541,6 @@ def _hvp_finite_difference_measurements(
     scalar_objectives: Mapping[str, ScalarObjective],
     anchor_candidate: Candidate,
     candidate_factory: OperationFactory,
-    thresholds: Mapping[str, float],
 ) -> dict[str, float]:
     if operator.kind != "hvp":
         return {}
@@ -542,21 +567,47 @@ def _hvp_finite_difference_measurements(
         "directional_rel_diff": errors["max_rel_diff"],
     }
 
-    if "symmetry_max_abs_diff" in thresholds:
-        symmetry_vector = _batch_tree(batch, "symmetry_vector")
-        anchor_symmetry = candidate_factory(
-            anchor_candidate,
-            batch,
-            symmetry_vector,
-        )()
-        left = tree_dot(
-            _runtime_vector(symmetry_vector, candidate.settings),
-            candidate_output,
-        )
-        right = tree_dot(vector, anchor_symmetry)
-        measurements["symmetry_max_abs_diff"] = float((left - right).abs().item())
+    symmetry_vector = _batch_tree(batch, "symmetry_vector")
+    anchor_symmetry = candidate_factory(
+        anchor_candidate,
+        batch,
+        symmetry_vector,
+    )()
+    left = tree_dot(
+        _runtime_vector(symmetry_vector, candidate.settings),
+        candidate_output,
+    )
+    right = tree_dot(vector, anchor_symmetry)
+    measurements["symmetry_max_abs_diff"] = float((left - right).abs().item())
 
     return measurements
+
+
+def _ggn_inner_product_measurements(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    batch: Batch,
+    vector: TensorTree,
+    candidate_output: TensorTree,
+    anchor_candidate: Candidate,
+    candidate_factory: OperationFactory,
+) -> dict[str, float]:
+    if operator.kind != "ggnvp" or _ggn_loss_geometry(operator) != "psd_metric":
+        return {}
+
+    symmetry_vector = _batch_tree(batch, "symmetry_vector")
+    anchor_symmetry = candidate_factory(
+        anchor_candidate,
+        batch,
+        symmetry_vector,
+    )()
+    left = tree_dot(
+        _runtime_vector(symmetry_vector, candidate.settings),
+        candidate_output,
+    )
+    right = tree_dot(vector, anchor_symmetry)
+
+    return {"inner_abs_diff": float((left - right).abs().item())}
 
 
 def _matrix_symmetry_error(matrix: torch.Tensor) -> float:
@@ -600,7 +651,7 @@ def _inverse_residual(
 
 
 def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
-    if not bool(torch.isfinite(tensor).all().item()):
+    if not torch.isfinite(tensor).all().item():
         message = f"{name} contains nonfinite values"
         raise MaterializationError(message)
 
@@ -692,32 +743,32 @@ def standard_operation_factory(
         vector: TensorTree,
     ) -> CandidateOperation:
         _require_candidate_family(operator, candidate)
+        _require_supported_standard_settings(operator, candidate)
+        path = _operator_path(operator, candidate)
+        _require_batch_inputs(operator, candidate, batch, phase="operation")
+        runtime_params = _runtime_params(params, candidate.settings)
+        runtime_buffers = _runtime_buffers(buffers, candidate.settings)
+        runtime_batch = _runtime_batch(batch, candidate.settings)
+        runtime_vector = _runtime_vector(vector, candidate.settings)
         context = ObjectiveContext(
             family=operator.family,
             candidate_id=candidate.candidate_id,
             settings=dict(candidate.settings),
         )
+        execution = StandardExecution(
+            operator=operator,
+            candidate=candidate,
+            path=path,
+            batch=runtime_batch,
+            vector=runtime_vector,
+            params=runtime_params,
+            buffers=runtime_buffers,
+            context=context,
+            scalar_objectives=scalar_map,
+            function_objectives=function_map,
+        )
 
         def operation() -> TensorTree:
-            _require_supported_standard_settings(candidate)
-            path = _operator_path(candidate)
-            runtime_params = _runtime_params(params, candidate.settings)
-            runtime_buffers = _runtime_buffers(buffers, candidate.settings)
-            runtime_batch = _runtime_batch(batch, candidate.settings)
-            runtime_vector = _runtime_vector(vector, candidate.settings)
-            execution = StandardExecution(
-                operator=operator,
-                candidate=candidate,
-                path=path,
-                batch=runtime_batch,
-                vector=runtime_vector,
-                params=runtime_params,
-                buffers=runtime_buffers,
-                context=context,
-                scalar_objectives=scalar_map,
-                function_objectives=function_map,
-            )
-
             return _run_with_backend_settings(
                 candidate.settings,
                 lambda: _run_standard_operation(execution),
@@ -762,57 +813,35 @@ def standard_reference_check(
         vector: TensorTree,
     ) -> ReferenceResult:
         try:
-            _require_vhp_reference_policy(candidate, batch, thresholds)
-            anchor_candidate = _anchor_candidate(operator, candidate)
-            candidate_output = candidate_factory(candidate, batch, vector)()
-            anchor_output = candidate_factory(anchor_candidate, batch, vector)()
+            anchor_candidate, candidate_output, anchor_output = (
+                _standard_reference_outputs(
+                    operator,
+                    candidate,
+                    batch,
+                    vector,
+                    thresholds,
+                    candidate_factory,
+                )
+            )
         except ReferenceFailedError:
             raise
         except RuntimeError as error:
             raise ReferenceFailedError(str(error)) from error
 
         try:
-            measurements = tree_error_measurements(candidate_output, anchor_output)
-            _augment_ggn_dense_cross_check(
+            measurements = _standard_reference_measurements(
                 operator,
                 candidate,
+                anchor_candidate,
                 batch,
                 vector,
                 candidate_output,
+                anchor_output,
                 candidate_factory,
-                measurements,
-            )
-            measurements.update(
-                _semantic_measurements(operator, batch, vector, candidate_output)
-            )
-            measurements.update(
-                _first_order_reference_measurements(
-                    operator,
-                    candidate,
-                    batch,
-                    vector,
-                    candidate_output,
-                    params=params,
-                    buffers=buffers,
-                    scalar_objectives=scalar_map,
-                    function_objectives=function_map,
-                    thresholds=thresholds,
-                )
-            )
-            measurements.update(
-                _hvp_finite_difference_measurements(
-                    operator,
-                    candidate,
-                    batch,
-                    vector,
-                    candidate_output,
-                    params=params,
-                    buffers=buffers,
-                    scalar_objectives=scalar_map,
-                    anchor_candidate=anchor_candidate,
-                    candidate_factory=candidate_factory,
-                    thresholds=thresholds,
-                )
+                params=params,
+                buffers=buffers,
+                scalar_objectives=scalar_map,
+                function_objectives=function_map,
             )
         except ReferenceFailedError:
             raise
@@ -831,6 +860,200 @@ def standard_reference_check(
         )
 
     return check
+
+
+def _standard_reference_outputs(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    batch: Batch,
+    vector: TensorTree,
+    thresholds: Mapping[str, float],
+    candidate_factory: OperationFactory,
+) -> tuple[Candidate, TensorTree, TensorTree]:
+    anchor_candidate = _anchor_candidate(operator, candidate)
+    _require_batch_inputs(operator, candidate, batch, phase="reference")
+    _require_batch_inputs(operator, anchor_candidate, batch, phase="reference")
+    _require_vhp_reference_policy(candidate, batch, thresholds)
+    candidate_output = candidate_factory(candidate, batch, vector)()
+    anchor_output = candidate_factory(anchor_candidate, batch, vector)()
+
+    return anchor_candidate, candidate_output, anchor_output
+
+
+def _require_batch_inputs(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    batch: Batch,
+    *,
+    phase: str,
+) -> None:
+    required = _required_batch_inputs(operator, candidate, phase)
+    missing = tuple(key for key in required if key not in batch)
+
+    if missing:
+        message = (
+            f"batch inputs missing for {operator.family}/{candidate.candidate_id}/"
+            f"{phase}: {missing}"
+        )
+        raise MaterializationError(message)
+
+
+def _required_batch_inputs(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    phase: str,
+) -> tuple[str, ...]:
+    declared = operator.batch_inputs.get(phase)
+
+    if declared is None:
+        message = f"operator batch_inputs must declare {phase}"
+        raise MaterializationError(message)
+
+    path_inputs = _candidate_batch_inputs(operator, candidate)
+
+    return tuple(dict.fromkeys((*declared, *path_inputs)))
+
+
+def _candidate_batch_inputs(
+    operator: OperatorSpec,
+    candidate: Candidate,
+) -> tuple[str, ...]:
+    path = _operator_path(operator, candidate)
+
+    if operator.kind == "fisher_vp":
+        return _fisher_batch_inputs(operator, path)
+
+    if operator.kind == "empirical_fisher_vp":
+        return _empirical_fisher_batch_inputs(operator, path)
+
+    return ()
+
+
+def _fisher_batch_inputs(operator: OperatorSpec, path: str) -> tuple[str, ...]:
+    if path not in {
+        FISHER_DENSE_PATH,
+        FISHER_CATEGORICAL_EXACT_PATH,
+        FISHER_CATEGORICAL_MC_PATH,
+        FISHER_SCORE_GRADIENT_LOOP_PATH,
+    }:
+        return ()
+
+    inputs = ()
+
+    if path == FISHER_DENSE_PATH:
+        inputs = ("score_gradients",)
+
+    return (*inputs, *_fisher_denominator_batch_inputs(operator, path))
+
+
+def _fisher_denominator_batch_inputs(
+    operator: OperatorSpec,
+    path: str,
+) -> tuple[str, ...]:
+    denominator = _operator_semantic(operator, "denominator")
+
+    if denominator == "batch_normalization":
+        return ("normalization",)
+
+    if denominator == "num_examples" and path not in {
+        FISHER_CATEGORICAL_EXACT_PATH,
+        FISHER_CATEGORICAL_MC_PATH,
+    }:
+        return ("num_examples",)
+
+    return ()
+
+
+def _empirical_fisher_batch_inputs(
+    operator: OperatorSpec,
+    path: str,
+) -> tuple[str, ...]:
+    if path not in {
+        EMPIRICAL_FISHER_DENSE_PATH,
+        EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+        EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+    }:
+        return ()
+
+    inputs = ()
+
+    if path == EMPIRICAL_FISHER_DENSE_PATH:
+        inputs = ("per_example_gradients",)
+
+    if _operator_semantic(operator, "denominator") == "batch_normalization":
+        return (*inputs, "normalization")
+
+    return inputs
+
+
+def _standard_reference_measurements(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    anchor_candidate: Candidate,
+    batch: Batch,
+    vector: TensorTree,
+    candidate_output: TensorTree,
+    anchor_output: TensorTree,
+    candidate_factory: OperationFactory,
+    *,
+    params: ParameterTree,
+    buffers: BufferTree,
+    scalar_objectives: Mapping[str, ScalarObjective],
+    function_objectives: Mapping[str, FunctionObjective],
+) -> dict[str, Any]:
+    measurements = tree_error_measurements(candidate_output, anchor_output)
+    _augment_ggn_dense_cross_check(
+        operator,
+        candidate,
+        batch,
+        vector,
+        candidate_output,
+        candidate_factory,
+        measurements,
+    )
+    measurements.update(
+        _semantic_measurements(operator, batch, vector, candidate_output)
+    )
+    measurements.update(
+        _ggn_inner_product_measurements(
+            operator,
+            candidate,
+            batch,
+            vector,
+            candidate_output,
+            anchor_candidate,
+            candidate_factory,
+        )
+    )
+    measurements.update(
+        _first_order_reference_measurements(
+            operator,
+            candidate,
+            batch,
+            vector,
+            candidate_output,
+            params=params,
+            buffers=buffers,
+            scalar_objectives=scalar_objectives,
+            function_objectives=function_objectives,
+        )
+    )
+    measurements.update(
+        _hvp_finite_difference_measurements(
+            operator,
+            candidate,
+            batch,
+            vector,
+            candidate_output,
+            params=params,
+            buffers=buffers,
+            scalar_objectives=scalar_objectives,
+            anchor_candidate=anchor_candidate,
+            candidate_factory=candidate_factory,
+        )
+    )
+
+    return measurements
 
 
 def _augment_ggn_dense_cross_check(
@@ -909,6 +1132,71 @@ def standard_runtime_config(
     )
 
 
+def standard_problem(
+    *,
+    model: torch.nn.Module,
+    parameter_surface: ParameterSurface,
+    parameter_values: ParameterTree,
+    buffers: BufferTree,
+    operator: OperatorSpec,
+    data: DataProvider,
+    vectors: VectorProvider,
+    target: Target,
+    candidates: Mapping[str, Mapping[str, Any]],
+    thresholds: Mapping[str, float],
+    objective_signature: Mapping[str, Any],
+    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
+    function_objectives: Mapping[str, FunctionObjective] | None = None,
+) -> Problem:
+    """Return a standard PyTorch tuning problem from explicit settings.
+
+    Raises:
+        MaterializationError: If candidate settings are empty.
+    """
+    if not candidates:
+        message = "problem candidate_settings are required"
+        raise MaterializationError(message)
+
+    candidate_rows = tuple(
+        Candidate(
+            family=operator.family,
+            candidate_id=candidate_id,
+            settings=dict(settings),
+            changed_axes=tuple(settings),
+            generator_id="vptune.problem",
+            generator_version=PACKAGE_VERSION,
+        )
+        for candidate_id, settings in candidates.items()
+    )
+    runtime = standard_runtime_config(
+        operator,
+        params=parameter_values,
+        buffers=buffers,
+        candidates=candidate_rows,
+        thresholds=thresholds,
+        objective_signature=objective_signature,
+        axis_registry=standard_axis_registry(),
+        scalar_objectives=scalar_objectives,
+        function_objectives=function_objectives,
+    )
+
+    return Problem(
+        model=model,
+        params=parameter_surface,
+        data=data,
+        operator=operator,
+        vectors=vectors,
+        target=target,
+        runtime=runtime,
+        anchor_policy={},
+        replay_policy={},
+        adapter_identity={
+            "adapter_id": "vptune.core",
+            "adapter_version": PACKAGE_VERSION,
+        },
+    )
+
+
 def _run_standard_operation(execution: StandardExecution) -> TensorTree:
     runner = STANDARD_RUNNERS.get(execution.operator.kind)
 
@@ -951,7 +1239,7 @@ def _require_composition_components(
 
 
 def _run_gradient(execution: StandardExecution) -> TensorTree:
-    _require_path(execution.operator.kind, execution.path, (GRADIENT_PATH,))
+    _require_single_operator_path(execution)
     scalar = _scalar_objective(execution.operator, execution.scalar_objectives)
 
     def scalar_function(active_params: ParameterTree) -> torch.Tensor:
@@ -966,7 +1254,11 @@ def _run_gradient(execution: StandardExecution) -> TensorTree:
 
 
 def _run_jvp(execution: StandardExecution) -> TensorTree:
-    _require_path(execution.operator.kind, execution.path, (JVP_PATH,))
+    _require_path(
+        execution.operator.kind,
+        execution.path,
+        (JVP_PATH, JVP_FORWARD_AD_PATH),
+    )
     function = _function_objective(execution.operator, execution.function_objectives)
 
     def tensor_function(active_params: ParameterTree) -> TensorTree:
@@ -977,11 +1269,18 @@ def _run_jvp(execution: StandardExecution) -> TensorTree:
             execution.context,
         )
 
+    if execution.path == JVP_FORWARD_AD_PATH:
+        return forward_ad_jvp_anchor(
+            tensor_function,
+            execution.params,
+            execution.vector,
+        )
+
     return jvp_anchor(tensor_function, execution.params, execution.vector)
 
 
 def _run_vjp(execution: StandardExecution) -> TensorTree:
-    _require_path(execution.operator.kind, execution.path, (VJP_PATH,))
+    _require_single_operator_path(execution)
     function = _function_objective(execution.operator, execution.function_objectives)
 
     def tensor_function(active_params: ParameterTree) -> TensorTree:
@@ -999,7 +1298,7 @@ def _run_hvp(execution: StandardExecution) -> TensorTree:
     _require_path(
         execution.operator.kind,
         execution.path,
-        (HVP_REFERENCE_PATH, HVP_JVP_GRAD_PATH, VHP_PATH),
+        (HVP_REFERENCE_PATH, HVP_FUNCTIONAL_PATH, HVP_JVP_GRAD_PATH, VHP_PATH),
     )
     scalar = _scalar_objective(execution.operator, execution.scalar_objectives)
 
@@ -1017,6 +1316,9 @@ def _run_hvp(execution: StandardExecution) -> TensorTree:
             execution.params,
             execution.vector,
         )
+
+    if execution.path == HVP_FUNCTIONAL_PATH:
+        return hvp_anchor(scalar_function, execution.params, execution.vector)
 
     if execution.path == VHP_PATH:
         return _run_hvp_vhp_path(execution, scalar)
@@ -1051,7 +1353,7 @@ def _run_hvp_vhp_path(
         vector_leaves,
     )
 
-    return tree_from_leaves(execution.vector, result_leaves)
+    return tree_from_leaves(execution.params, result_leaves)
 
 
 def _run_ggnvp(execution: StandardExecution) -> TensorTree:
@@ -1060,6 +1362,7 @@ def _run_ggnvp(execution: StandardExecution) -> TensorTree:
         execution.path,
         (GGN_DENSE_PATH, GGN_JVP_HESSIAN_VJP_PATH),
     )
+    _ggn_loss_geometry(execution.operator)
 
     if execution.path == GGN_JVP_HESSIAN_VJP_PATH:
         return _run_ggnvp_jvp_hessian_vjp(execution)
@@ -1102,7 +1405,7 @@ def _run_ggnvp(execution: StandardExecution) -> TensorTree:
     result = jacobian.T @ (loss_hessian @ (jacobian @ vector_tensor.reshape(-1)))
     _require_finite_tensor(result, "GGN result")
 
-    return _wrap_flat_vector(execution.vector, result)
+    return _wrap_flat_vector(execution.params, result)
 
 
 def _run_ggnvp_jvp_hessian_vjp(execution: StandardExecution) -> TensorTree:
@@ -1166,21 +1469,24 @@ def _run_fisher_vp(execution: StandardExecution) -> TensorTree:
         (
             FISHER_DENSE_PATH,
             FISHER_CATEGORICAL_EXACT_PATH,
+            FISHER_CATEGORICAL_MC_PATH,
             FISHER_SCORE_GRADIENT_LOOP_PATH,
-            EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
         ),
     )
 
     if execution.path == FISHER_CATEGORICAL_EXACT_PATH:
         score_gradients = _categorical_fisher_gradient_matrix(execution)
+    elif execution.path == FISHER_CATEGORICAL_MC_PATH:
+        score_gradients = _categorical_monte_carlo_fisher_gradient_matrix(execution)
     elif execution.path == FISHER_SCORE_GRADIENT_LOOP_PATH:
+        _require_explicit_score_fisher_semantics(execution.operator)
         score_gradients = _per_example_gradient_matrix(execution)
-    elif execution.path == EMPIRICAL_FISHER_GRADIENT_VMAP_PATH:
-        score_gradients = _per_example_gradient_matrix_vmap(execution)
     else:
+        _require_valid_fisher_semantics(execution.operator)
         score_gradients = _batch_tensor(execution.batch, "score_gradients")
 
-    vector_tensor = _flatten_vector(execution.vector)
+    vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
+    vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
     _require_finite_tensor(score_gradients, "score_gradients")
     _require_finite_tensor(vector_tensor, "Fisher vector")
     result = fisher_vp_dense_anchor(
@@ -1190,7 +1496,7 @@ def _run_fisher_vp(execution: StandardExecution) -> TensorTree:
     )
     _require_finite_tensor(result, "Fisher result")
 
-    return _wrap_flat_vector(execution.vector, result)
+    return _wrap_flat_vector(execution.params, result)
 
 
 def _categorical_fisher_gradient_matrix(execution: StandardExecution) -> torch.Tensor:
@@ -1201,6 +1507,7 @@ def _categorical_fisher_gradient_matrix(execution: StandardExecution) -> torch.T
             "label_policy": "model_distribution",
             "expectation": "exact",
             "sample_space": "classes",
+            "loss_reduction": "log_prob",
         },
     )
     function = _function_objective(execution.operator, execution.function_objectives)
@@ -1255,6 +1562,90 @@ def _categorical_fisher_gradient_matrix(execution: StandardExecution) -> torch.T
     return torch.stack(gradient_rows)
 
 
+def _categorical_monte_carlo_fisher_gradient_matrix(
+    execution: StandardExecution,
+) -> torch.Tensor:
+    _require_fisher_semantics(
+        execution.operator,
+        {
+            "distribution": "categorical",
+            "label_policy": "model_distribution",
+            "expectation": "monte_carlo",
+            "sample_space": "classes",
+            "loss_reduction": "log_prob",
+        },
+    )
+    sample_count = _operator_semantic_positive_int(execution.operator, "sample_count")
+    seed = _operator_semantic_int(execution.operator, "seed")
+    function = _function_objective(execution.operator, execution.function_objectives)
+    parameter_items = tuple(execution.params.items())
+    active_leaves = tuple(
+        tensor.detach().clone().requires_grad_(True) for _, tensor in parameter_items
+    )
+
+    def logits_function(*leaves: torch.Tensor) -> torch.Tensor:
+        active_params = {
+            name: leaf for (name, _), leaf in zip(parameter_items, leaves, strict=True)
+        }
+        logits = function(
+            active_params,
+            execution.buffers,
+            execution.batch,
+            execution.context,
+        )
+
+        return _categorical_logits_matrix(execution.operator, logits)
+
+    logits_matrix = logits_function(*active_leaves)
+    _require_finite_tensor(logits_matrix, "Monte Carlo Fisher logits")
+    log_probs = torch.log_softmax(logits_matrix, dim=-1)
+    probabilities = log_probs.exp().detach()
+    generator = torch.Generator(device=probabilities.device)
+    generator.manual_seed(seed)
+    labels = torch.multinomial(
+        probabilities,
+        sample_count,
+        replacement=True,
+        generator=generator,
+    )
+
+    return _monte_carlo_fisher_rows(log_probs, labels, active_leaves, sample_count)
+
+
+def _monte_carlo_fisher_rows(
+    log_probs: torch.Tensor,
+    labels: torch.Tensor,
+    active_leaves: tuple[torch.Tensor, ...],
+    sample_count: int,
+) -> torch.Tensor:
+    gradient_rows = []
+
+    for row in range(labels.shape[0]):
+        for sample_index in range(sample_count):
+            term = log_probs[row, int(labels[row, sample_index])]
+            gradient_result = torch.autograd.grad(
+                term,
+                active_leaves,
+                retain_graph=row < labels.shape[0] - 1
+                or sample_index < sample_count - 1,
+                allow_unused=True,
+            )
+            gradients = tuple(
+                torch.zeros_like(leaf) if gradient is None else gradient.detach()
+                for leaf, gradient in zip(
+                    active_leaves,
+                    gradient_result,
+                    strict=True,
+                )
+            )
+            gradient_rows.append(
+                torch.cat(tuple(gradient.reshape(-1) for gradient in gradients))
+                / math.sqrt(float(sample_count))
+            )
+
+    return torch.stack(gradient_rows)
+
+
 def _categorical_logits_matrix(
     operator: OperatorSpec,
     logits: TensorTree,
@@ -1299,17 +1690,22 @@ def _run_empirical_fisher_vp(execution: StandardExecution) -> TensorTree:
     else:
         per_example_gradients = _batch_tensor(execution.batch, "per_example_gradients")
 
-    vector_tensor = _flatten_vector(execution.vector)
+    vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
+    vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
     _require_finite_tensor(per_example_gradients, "per_example_gradients")
     _require_finite_tensor(vector_tensor, "empirical Fisher vector")
     result = empirical_fisher_vp_dense_anchor(
         per_example_gradients,
         vector_tensor,
-        normalization=_normalization(execution.batch, execution.operator),
+        normalization=_empirical_fisher_normalization(
+            execution.batch,
+            execution.operator,
+            per_example_gradients,
+        ),
     )
     _require_finite_tensor(result, "empirical Fisher result")
 
-    return _wrap_flat_vector(execution.vector, result)
+    return _wrap_flat_vector(execution.params, result)
 
 
 def _per_example_gradient_matrix(execution: StandardExecution) -> torch.Tensor:
@@ -1525,7 +1921,7 @@ def _torch_func_vmap(function: Callable[..., Any], **kwargs: Any) -> Callable[..
 
 
 def _run_metric(execution: StandardExecution) -> TensorTree:
-    _require_path(execution.operator.kind, execution.path, (METRIC_DENSE_PATH,))
+    _require_single_operator_path(execution)
     matrix = _batch_tensor(execution.batch, "metric")
     vector_tensor = _flatten_vector(execution.vector)
     _require_finite_tensor(matrix, "metric matrix")
@@ -1537,11 +1933,7 @@ def _run_metric(execution: StandardExecution) -> TensorTree:
 
 
 def _run_inverse_metric(execution: StandardExecution) -> TensorTree:
-    _require_path(
-        execution.operator.kind,
-        execution.path,
-        (INVERSE_METRIC_DENSE_PATH,),
-    )
+    _require_single_operator_path(execution)
     matrix = _batch_tensor(execution.batch, "metric")
     vector_tensor = _flatten_vector(execution.vector)
     _require_finite_tensor(matrix, "metric matrix")
@@ -1558,10 +1950,22 @@ class StandardMetricOperator:
 
     candidate: Candidate
     record: FullSizeRecord
+    default_operation: str = "multiply"
 
     def __call__(self, batch: Batch, vector: TensorTree) -> TensorTree:
-        """Return metric-vector product."""
-        return self.multiply(batch, vector)
+        """Return the selected metric-vector product.
+
+        Raises:
+            MaterializationError: If the default metric operation is unsupported.
+        """
+        if self.default_operation == "multiply":
+            return self.multiply(batch, vector)
+
+        if self.default_operation == "inverse_multiply":
+            return self.inverse_multiply(batch, vector)
+
+        message = f"unsupported metric default operation: {self.default_operation}"
+        raise MaterializationError(message)
 
     def multiply(self, batch: Batch, vector: TensorTree) -> TensorTree:
         """Return metric-vector product."""
@@ -1781,8 +2185,15 @@ def _standard_materializer(
             message = "selected record does not match selected candidate"
             raise MaterializationError(message)
 
-        if operator is not None and operator.kind in {"metric", "inverse_metric"}:
+        if operator is not None and operator.kind == "metric":
             return StandardMetricOperator(candidate, record)
+
+        if operator is not None and operator.kind == "inverse_metric":
+            return StandardMetricOperator(
+                candidate,
+                record,
+                default_operation="inverse_multiply",
+            )
 
         def selected(batch: Batch, vector: TensorTree) -> TensorTree:
             return operation_factory(candidate, batch, vector)()
@@ -1797,7 +2208,21 @@ def _standard_materializer(
     )
 
 
-def _operator_path(candidate: Candidate) -> str:
+def _operator_path(operator: OperatorSpec, candidate: Candidate) -> str:
+    path = candidate.settings.get("operator_path")
+    singleton_path = SINGLE_OPERATOR_PATHS.get(operator.kind)
+
+    if singleton_path is None:
+        return _required_candidate_operator_path(candidate)
+
+    if path is not None:
+        message = f"operator_path is not a setting for {operator.kind}"
+        raise MaterializationError(message)
+
+    return singleton_path
+
+
+def _required_candidate_operator_path(candidate: Candidate) -> str:
     path = candidate.settings.get("operator_path")
 
     if not isinstance(path, str):
@@ -1807,7 +2232,10 @@ def _operator_path(candidate: Candidate) -> str:
     return path
 
 
-def _require_supported_standard_settings(candidate: Candidate) -> None:
+def _require_supported_standard_settings(
+    operator: OperatorSpec,
+    candidate: Candidate,
+) -> None:
     unsupported = tuple(
         key for key in candidate.settings if key not in SUPPORTED_STANDARD_SETTINGS
     )
@@ -1816,14 +2244,35 @@ def _require_supported_standard_settings(candidate: Candidate) -> None:
         message = f"standard runtime settings are unsupported: {unsupported}"
         raise MaterializationError(message)
 
+    path = _operator_path(operator, candidate)
+
     for key in ("vmap_chunk_size", "vmap_batch_in_dims"):
-        if (
-            key in candidate.settings
-            and candidate.settings.get("operator_path")
-            != EMPIRICAL_FISHER_GRADIENT_VMAP_PATH
-        ):
+        if key in candidate.settings and path != EMPIRICAL_FISHER_GRADIENT_VMAP_PATH:
             message = f"{key} is only supported by per_example_gradient_vmap"
             raise MaterializationError(message)
+
+    if path in {
+        JVP_PATH,
+        VJP_PATH,
+        HVP_JVP_GRAD_PATH,
+        EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+    }:
+        try:
+            admit_torch_func(candidate.settings)
+        except AdmissionError as error:
+            raise MaterializationError(str(error)) from error
+
+    if path in {JVP_PATH, JVP_FORWARD_AD_PATH, HVP_JVP_GRAD_PATH}:
+        try:
+            admit_forward_ad(candidate.settings)
+        except AdmissionError as error:
+            raise MaterializationError(str(error)) from error
+
+    if any(field in candidate.settings for field in FUNCTIONAL_CALL_FIELDS):
+        try:
+            admit_functional_call(candidate.settings)
+        except AdmissionError as error:
+            raise MaterializationError(str(error)) from error
 
 
 def _runtime_params(
@@ -1985,22 +2434,61 @@ def _bool_setting(settings: Mapping[str, Any], key: str) -> bool | None:
 
 def _anchor_candidate(operator: OperatorSpec, candidate: Candidate) -> Candidate:
     path = _anchor_path(operator)
+    settings = _anchor_settings(candidate, path)
+
+    if operator.kind in SINGLE_OPERATOR_PATHS:
+        settings.pop("operator_path", None)
 
     return dataclasses.replace(
         candidate,
-        settings=_anchor_settings(candidate, path),
+        settings=settings,
     )
 
 
 def _anchor_settings(candidate: Candidate, path: str) -> dict[str, Any]:
     settings = dict(candidate.settings)
 
-    for key in ANCHOR_RUNTIME_SETTINGS:
+    for key in (
+        *RUNTIME_DTYPE_SETTINGS,
+        *BACKEND_SETTINGS,
+        *TORCH_FUNC_FIELDS,
+        *FUNCTIONAL_CALL_FIELDS,
+        "vmap_chunk_size",
+        "vmap_batch_in_dims",
+    ):
         settings.pop(key, None)
 
     settings["operator_path"] = path
+    settings.update(_anchor_admission_settings(path))
 
     return settings
+
+
+def _anchor_admission_settings(path: str) -> dict[str, Any]:
+    if path == JVP_PATH:
+        return _torch_func_anchor_settings(requires_forward_ad=True)
+
+    if path == VJP_PATH:
+        return _torch_func_anchor_settings(requires_forward_ad=False)
+
+    if path == HVP_JVP_GRAD_PATH:
+        return _torch_func_anchor_settings(requires_forward_ad=True)
+
+    return {}
+
+
+def _torch_func_anchor_settings(*, requires_forward_ad: bool) -> dict[str, Any]:
+    return {
+        "contains_autograd_call": False,
+        "contains_backward_call": False,
+        "uses_out_variant": False,
+        "uses_data_dependent_control_flow": False,
+        "uses_item": False,
+        "has_dynamic_shape_output": False,
+        "vmap_randomness": "error",
+        "requires_forward_ad": requires_forward_ad,
+        "forward_ad_supported": True,
+    }
 
 
 def _anchor_path(operator: OperatorSpec) -> str:
@@ -2021,12 +2509,12 @@ def _fisher_anchor_path(operator: OperatorSpec) -> str:
     expectation = _operator_semantic(operator, "expectation")
     label_policy = _operator_semantic(operator, "label_policy")
 
-    if (
-        distribution == "categorical"
-        and expectation == "exact"
-        and label_policy == "model_distribution"
-    ):
-        return FISHER_CATEGORICAL_EXACT_PATH
+    if distribution == "categorical" and label_policy == "model_distribution":
+        if expectation == "exact":
+            return FISHER_CATEGORICAL_EXACT_PATH
+
+        if expectation == "monte_carlo":
+            return FISHER_CATEGORICAL_MC_PATH
 
     if distribution == "explicit_score_gradients" and expectation == "explicit_rows":
         return FISHER_SCORE_GRADIENT_LOOP_PATH
@@ -2054,6 +2542,12 @@ def _require_path(
 
     message = f"operator path {path} does not support {operator_kind}"
     raise MaterializationError(message)
+
+
+def _require_single_operator_path(execution: StandardExecution) -> None:
+    path = SINGLE_OPERATOR_PATHS[execution.operator.kind]
+
+    _require_path(execution.operator.kind, execution.path, (path,))
 
 
 def _scalar_objective(
@@ -2173,11 +2667,52 @@ def _normalization(batch: Batch, operator: OperatorSpec) -> float:
     return normalization
 
 
+def _empirical_fisher_normalization(
+    batch: Batch,
+    operator: OperatorSpec,
+    per_example_gradients: torch.Tensor,
+) -> float:
+    _require_empirical_fisher_semantics(operator)
+    denominator = _operator_semantic(operator, "denominator")
+
+    if denominator == "num_examples":
+        normalization = float(per_example_gradients.shape[0])
+    elif denominator == "one":
+        normalization = 1.0
+    elif denominator == "batch_normalization":
+        normalization = _normalization(batch, operator)
+    else:
+        message = f"empirical Fisher denominator is unsupported: {denominator}"
+        raise MaterializationError(message)
+
+    if operator.aggregation == "sum" and not math.isclose(
+        normalization,
+        1.0,
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        message = "sum aggregation requires empirical Fisher denominator one"
+        raise MaterializationError(message)
+
+    return normalization
+
+
+def _require_empirical_fisher_semantics(operator: OperatorSpec) -> None:
+    loss_reduction = _operator_semantic(operator, "loss_reduction")
+
+    if loss_reduction != "per_example":
+        message = f"empirical Fisher loss_reduction is unsupported: {loss_reduction}"
+        raise MaterializationError(message)
+
+
 def _fisher_normalization(execution: StandardExecution) -> float:
     denominator = _operator_semantic(execution.operator, "denominator")
 
     if denominator == "num_examples":
-        if execution.path == FISHER_CATEGORICAL_EXACT_PATH:
+        if execution.path in {
+            FISHER_CATEGORICAL_EXACT_PATH,
+            FISHER_CATEGORICAL_MC_PATH,
+        }:
             logits = _function_objective(
                 execution.operator,
                 execution.function_objectives,
@@ -2225,6 +2760,70 @@ def _require_fisher_semantics(
             raise MaterializationError(message)
 
 
+def _require_valid_fisher_semantics(operator: OperatorSpec) -> None:
+    distribution = _operator_semantic(operator, "distribution")
+    expectation = _operator_semantic(operator, "expectation")
+
+    if distribution == "categorical" and expectation == "exact":
+        _require_fisher_semantics(
+            operator,
+            {
+                "distribution": "categorical",
+                "label_policy": "model_distribution",
+                "expectation": "exact",
+                "sample_space": "classes",
+                "loss_reduction": "log_prob",
+            },
+        )
+
+        return
+
+    if distribution == "categorical" and expectation == "monte_carlo":
+        _require_fisher_semantics(
+            operator,
+            {
+                "distribution": "categorical",
+                "label_policy": "model_distribution",
+                "expectation": "monte_carlo",
+                "sample_space": "classes",
+                "loss_reduction": "log_prob",
+            },
+        )
+
+        return
+
+    if distribution == "explicit_score_gradients":
+        _require_explicit_score_fisher_semantics(operator)
+
+        return
+
+    message = f"Fisher distribution is unsupported: {distribution}"
+    raise MaterializationError(message)
+
+
+def _require_explicit_score_fisher_semantics(operator: OperatorSpec) -> None:
+    _require_fisher_semantics(
+        operator,
+        {
+            "distribution": "explicit_score_gradients",
+            "label_policy": "explicit_scores",
+            "expectation": "explicit_rows",
+            "sample_space": "terms",
+            "loss_reduction": "none",
+        },
+    )
+
+
+def _ggn_loss_geometry(operator: OperatorSpec) -> str:
+    value = _operator_semantic(operator, "loss_geometry")
+
+    if value not in {"psd_metric", "linear_map"}:
+        message = f"GGNVP loss_geometry is unsupported: {value}"
+        raise MaterializationError(message)
+
+    return value
+
+
 def _operator_semantic(operator: OperatorSpec, key: str) -> str:
     value = operator.semantics.get(key)
 
@@ -2240,6 +2839,16 @@ def _operator_semantic_int(operator: OperatorSpec, key: str) -> int:
 
     if not isinstance(value, int) or isinstance(value, bool):
         message = f"operator semantic field is missing: {key}"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _operator_semantic_positive_int(operator: OperatorSpec, key: str) -> int:
+    value = _operator_semantic_int(operator, key)
+
+    if value < 1:
+        message = f"operator semantic field must be positive: {key}"
         raise MaterializationError(message)
 
     return value

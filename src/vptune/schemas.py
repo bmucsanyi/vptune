@@ -1,11 +1,11 @@
 """Schema validation for saved records."""
 
 import dataclasses
-import itertools
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from vptune.cohorts import candidate_matches_assignment, cohort_assignments
 from vptune.data import (
     PACKAGE_VERSION,
     SCHEMA_VERSION,
@@ -22,22 +22,85 @@ from vptune.data import (
 )
 from vptune.errors import StaleRecordError, VPTuneError
 from vptune.identities import (
-    owner_hash,
-    record_content_hash,
-    stable_hash,
+    canonical_json,
     to_json_value,
+)
+from vptune.selection_core import (
+    memory_stable,
+    select_accepted_family,
+    select_complete_cohort,
 )
 
 REQUIRED_COMMON_FIELDS = (
     "record_type",
     "schema_version",
     "package_version",
-    "owner_hash",
     "input_signature",
     "candidate_settings",
     "status",
     "generator_id",
     "generator_version",
+)
+REQUIRED_TYPE_FIELDS = {
+    "candidate": (
+        "family",
+        "candidate_id",
+        "changed_axes",
+        "admission_error",
+        "migration_source_id",
+        "dependency_identities",
+        "cohort_assignment",
+    ),
+    "reference": (
+        "family",
+        "candidate_id",
+        "name",
+        "thresholds",
+        "measurements",
+        "error_type",
+        "error",
+        "dependency_identities",
+        "cohort_assignment",
+    ),
+    "full_size": (
+        "family",
+        "candidate_id",
+        "timing_samples",
+        "memory_samples",
+        "output_signature",
+        "error_type",
+        "error",
+        "reference_passed",
+        "dependency_identities",
+        "cohort_assignment",
+    ),
+}
+REQUIRED_PLAN_SUMMARY_FIELDS = (
+    "selected",
+    "records",
+    "full_size_records",
+    "check_records",
+    "validation_records",
+    "validation_required",
+    "validation_order",
+    "validator_identities",
+    "dependencies_by_family",
+    "cohort_assignment",
+    "cohort_constraints",
+    "selected_dependency_identities",
+    "materializer_identities",
+    "target_identity",
+    "runtime_identities",
+    "adapter_identities",
+    "policy",
+)
+REQUIRED_VALIDATION_SUMMARY_FIELDS = ("records",)
+JSON_MATCH_FIELDS = (
+    "changed_axes",
+    "input_signature",
+    "candidate_settings",
+    "dependency_identities",
+    "cohort_assignment",
 )
 
 
@@ -45,6 +108,14 @@ REQUIRED_COMMON_FIELDS = (
 class _ValidationReplayIdentity:
     required: bool
     validator_identities: Mapping[str, Mapping[str, Any]]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ReplayRows:
+    full_size_by_key: Mapping[str, FullSizeRecord]
+    ordered_full_size: tuple[FullSizeRecord, ...]
+    ordered_checks: tuple[CheckRecord, ...]
+    ordered_validation: tuple[CheckRecord, ...]
 
 
 def validate_json_record(record: Mapping[str, Any]) -> None:
@@ -71,71 +142,187 @@ def validate_json_record(record: Mapping[str, Any]) -> None:
         message = f"record type is invalid: {record['record_type']}"
         raise VPTuneError(message)
 
-
-def check_owner_payload(
-    *,
-    record_type: str,
-    family: str,
-    candidate_id: str,
-    check_name: str = "",
-    input_signature: Mapping[str, Any],
-    candidate_settings: Mapping[str, Any],
-    candidate_spec_hash: str = "",
-    thresholds: Mapping[str, Any] | None = None,
-    dependency_identities: Mapping[str, Mapping[str, Any]] | None = None,
-    changed_axes: Sequence[str] = (),
-    generator_id: str,
-    generator_version: str,
-) -> dict[str, Any]:
-    """Return the owner-hash payload shared by check and full-size rows."""
-    return {
-        "record_type": record_type,
-        "family": family,
-        "candidate_id": candidate_id,
-        "check_name": check_name,
-        "input_signature": dict(input_signature),
-        "candidate_settings": dict(candidate_settings),
-        "candidate_spec_hash": candidate_spec_hash,
-        "thresholds": {} if thresholds is None else dict(thresholds),
-        "dependency_identities": _dependency_identity_record(dependency_identities),
-        "changed_axes": tuple(changed_axes),
-        "generator_id": generator_id,
-        "generator_version": generator_version,
-    }
+    _validate_record_type_fields(record)
 
 
-def compute_record_owner_hash(
-    *,
-    record_type: str,
-    family: str,
-    candidate_id: str,
-    check_name: str = "",
-    input_signature: Mapping[str, Any],
-    candidate_settings: Mapping[str, Any],
-    candidate_spec_hash: str = "",
-    thresholds: Mapping[str, Any] | None = None,
-    dependency_identities: Mapping[str, Mapping[str, Any]] | None = None,
-    changed_axes: Sequence[str] = (),
-    generator_id: str,
-    generator_version: str,
-) -> str:
-    """Return the owner hash for a saved row."""
-    payload = check_owner_payload(
-        record_type=record_type,
-        family=family,
-        candidate_id=candidate_id,
-        check_name=check_name,
-        input_signature=input_signature,
-        candidate_settings=candidate_settings,
-        candidate_spec_hash=candidate_spec_hash,
-        thresholds=thresholds,
-        dependency_identities=dependency_identities,
-        changed_axes=changed_axes,
-        generator_id=generator_id,
-        generator_version=generator_version,
+def _validate_record_type_fields(record: Mapping[str, Any]) -> None:
+    record_type = str(record["record_type"])
+    fields = REQUIRED_TYPE_FIELDS.get(record_type, ())
+
+    if record_type == "summary":
+        if record["generator_id"] == "selected_plan_validation":
+            fields = REQUIRED_VALIDATION_SUMMARY_FIELDS
+        else:
+            fields = REQUIRED_PLAN_SUMMARY_FIELDS
+
+    for field in fields:
+        if field not in record:
+            message = f"{record_type} record field is missing: {field}"
+            raise VPTuneError(message)
+
+    if record_type in {"candidate", "reference", "full_size"}:
+        _validate_row_input_signature(record)
+
+    if record_type == "summary":
+        _validate_summary_identity_fields(record)
+
+
+def _validate_row_input_signature(record: Mapping[str, Any]) -> None:
+    signature = _effective_row_input_signature(record)
+
+    _validate_tuning_input_signature(signature)
+
+
+def _effective_row_input_signature(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    input_signature = record["input_signature"]
+
+    if not isinstance(input_signature, Mapping):
+        message = "record input_signature must be a mapping"
+        raise VPTuneError(message)
+
+    if (
+        record["record_type"] == "reference"
+        and record.get("name") == "selected_plan_validation"
+    ):
+        nested = input_signature.get("input_signature")
+
+        if not isinstance(nested, Mapping):
+            message = "selected-plan validation input signature is missing"
+            raise VPTuneError(message)
+
+        return nested
+
+    parent = input_signature.get("parent_input_signature")
+
+    if isinstance(parent, Mapping):
+        return parent
+
+    return input_signature
+
+
+def _validate_tuning_input_signature(signature: Mapping[str, Any]) -> None:
+    if "run_id" in signature:
+        family_signatures = tuple(
+            value
+            for key, value in signature.items()
+            if key not in {"run_id", "cohort_assignment"}
+        )
+
+        if not family_signatures:
+            message = "run input signature has no family signatures"
+            raise VPTuneError(message)
+
+        for family_signature in family_signatures:
+            if not isinstance(family_signature, Mapping):
+                message = "run family input signature must be a mapping"
+                raise VPTuneError(message)
+
+            _validate_problem_input_signature(family_signature)
+
+        return
+
+    _validate_problem_input_signature(signature)
+
+
+def _validate_problem_input_signature(signature: Mapping[str, Any]) -> None:
+    operator = signature.get("operator")
+    target = signature.get("target")
+    adapter = signature.get("adapter")
+
+    if not isinstance(operator, Mapping):
+        message = "input signature operator is missing"
+        raise VPTuneError(message)
+
+    if not isinstance(target, Mapping) or not target:
+        message = "input signature target is missing"
+        raise VPTuneError(message)
+
+    if not isinstance(target.get("environment"), Mapping):
+        message = "input signature target environment is missing"
+        raise VPTuneError(message)
+
+    if not isinstance(adapter, Mapping):
+        message = "input signature adapter identity is missing"
+        raise VPTuneError(message)
+
+    _validate_adapter_identity(adapter, "input signature adapter")
+
+
+def _validate_adapter_identity(identity: Mapping[str, Any], label: str) -> None:
+    if not identity.get("adapter_id") or not identity.get("adapter_version"):
+        message = f"{label} id and version are required"
+        raise VPTuneError(message)
+
+
+def _validate_summary_identity_fields(record: Mapping[str, Any]) -> None:
+    if record["generator_id"] == "selected_plan_validation":
+        nested = record["input_signature"].get("input_signature")
+
+        if not isinstance(nested, Mapping):
+            message = "selected-plan validation summary input signature is missing"
+            raise VPTuneError(message)
+
+        _validate_tuning_input_signature(nested)
+
+        return
+
+    target_identity = record["target_identity"]
+
+    if not isinstance(target_identity, Mapping) or not target_identity:
+        message = "plan summary target_identity is missing"
+        raise VPTuneError(message)
+
+    if not isinstance(target_identity.get("environment"), Mapping):
+        message = "plan summary target environment is missing"
+        raise VPTuneError(message)
+
+    selected = set(dict(record["selected"]))
+    _validate_summary_family_identities(
+        "adapter",
+        record["adapter_identities"],
+        selected,
+    )
+    _validate_summary_family_identities(
+        "materializer",
+        record["materializer_identities"],
+        selected,
     )
 
-    return owner_hash(record_type, payload)
+
+def _validate_summary_family_identities(
+    label: str,
+    identities: Any,
+    selected: set[str],
+) -> None:
+    if not isinstance(identities, Mapping) or set(identities) != selected:
+        message = f"plan summary {label} identities are missing"
+        raise VPTuneError(message)
+
+    for family, identity in identities.items():
+        if not isinstance(identity, Mapping) or not identity:
+            message = f"plan summary {label} identity is missing: {family}"
+            raise VPTuneError(message)
+
+        if label == "adapter":
+            _validate_adapter_identity(identity, f"plan summary adapter {family}")
+
+
+def _validate_replay_selection_policy(policy: SelectionPolicy) -> None:
+    if policy.speed_statistic != "median_elapsed_seconds":
+        message = f"unsupported speed statistic: {policy.speed_statistic}"
+        raise VPTuneError(message)
+
+    if policy.tie_breaker != "min_peak_reserved_mib":
+        message = f"unsupported tie breaker: {policy.tie_breaker}"
+        raise VPTuneError(message)
+
+    if policy.cohort_speed_statistic != "sum_median_elapsed_seconds":
+        message = f"unsupported cohort speed statistic: {policy.cohort_speed_statistic}"
+        raise VPTuneError(message)
+
+    if policy.cohort_tie_breaker != "sum_peak_reserved_mib":
+        message = f"unsupported cohort tie breaker: {policy.cohort_tie_breaker}"
+        raise VPTuneError(message)
 
 
 def record_current(
@@ -147,9 +334,8 @@ def record_current(
     check_name: str = "",
     input_signature: Mapping[str, Any],
     candidate_settings: Mapping[str, Any],
-    candidate_spec_hash: str = "",
-    thresholds: Mapping[str, Any] | None = None,
     dependency_identities: Mapping[str, Mapping[str, Any]] | None = None,
+    cohort_assignment: Mapping[str, Any] | None = None,
     changed_axes: Sequence[str] = (),
     generator_id: str,
     generator_version: str,
@@ -160,42 +346,103 @@ def record_current(
     except VPTuneError:
         return False
 
-    expected = compute_record_owner_hash(
+    expected = _expected_record_fields(
         record_type=record_type,
         family=family,
         candidate_id=candidate_id,
         check_name=check_name,
         input_signature=input_signature,
         candidate_settings=candidate_settings,
-        candidate_spec_hash=candidate_spec_hash,
-        thresholds=thresholds,
         dependency_identities=dependency_identities,
+        cohort_assignment=cohort_assignment,
         changed_axes=changed_axes,
         generator_id=generator_id,
         generator_version=generator_version,
     )
 
-    return (
-        record.get("record_type") == record_type
-        and record.get("family") == family
-        and record.get("candidate_id") == candidate_id
-        and (record_type != "reference" or record.get("name") == check_name)
-        and (
-            record_type != "candidate"
-            or to_json_value(record.get("changed_axes"))
-            == to_json_value(tuple(changed_axes))
-        )
-        and to_json_value(record.get("input_signature"))
-        == to_json_value(dict(input_signature))
-        and to_json_value(record.get("candidate_settings"))
-        == to_json_value(dict(candidate_settings))
-        and str(record.get("candidate_spec_hash", "")) == candidate_spec_hash
-        and to_json_value(record.get("dependency_identities"))
-        == to_json_value(_dependency_identity_record(dependency_identities))
-        and record.get("generator_id") == generator_id
-        and record.get("generator_version") == generator_version
-        and record.get("owner_hash") == expected
+    return _record_fields_current(record, expected)
+
+
+def _expected_record_fields(
+    *,
+    record_type: str,
+    family: str,
+    candidate_id: str,
+    check_name: str,
+    input_signature: Mapping[str, Any],
+    candidate_settings: Mapping[str, Any],
+    dependency_identities: Mapping[str, Mapping[str, Any]] | None,
+    cohort_assignment: Mapping[str, Any] | None,
+    changed_axes: Sequence[str],
+    generator_id: str,
+    generator_version: str,
+) -> dict[str, Any]:
+    expected = _common_expected_record_fields(
+        record_type=record_type,
+        family=family,
+        candidate_id=candidate_id,
+        input_signature=input_signature,
+        candidate_settings=candidate_settings,
+        dependency_identities=dependency_identities,
+        cohort_assignment=cohort_assignment,
+        generator_id=generator_id,
+        generator_version=generator_version,
     )
+
+    if record_type == "reference":
+        return {**expected, "name": check_name}
+
+    if record_type == "candidate":
+        return {**expected, "changed_axes": tuple(changed_axes)}
+
+    return expected
+
+
+def _common_expected_record_fields(
+    *,
+    record_type: str,
+    family: str,
+    candidate_id: str,
+    input_signature: Mapping[str, Any],
+    candidate_settings: Mapping[str, Any],
+    dependency_identities: Mapping[str, Mapping[str, Any]] | None,
+    cohort_assignment: Mapping[str, Any] | None,
+    generator_id: str,
+    generator_version: str,
+) -> dict[str, Any]:
+    return {
+        "record_type": record_type,
+        "family": family,
+        "candidate_id": candidate_id,
+        "input_signature": dict(input_signature),
+        "candidate_settings": dict(candidate_settings),
+        "dependency_identities": _dependency_identity_record(dependency_identities),
+        "cohort_assignment": {}
+        if cohort_assignment is None
+        else dict(cohort_assignment),
+        "generator_id": generator_id,
+        "generator_version": generator_version,
+    }
+
+
+def _record_fields_current(
+    record: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    return all(
+        _record_field_current(record, key, value) for key, value in expected.items()
+    )
+
+
+def _record_field_current(
+    record: Mapping[str, Any],
+    key: str,
+    expected: Any,
+) -> bool:
+    if key in JSON_MATCH_FIELDS:
+        return to_json_value(record.get(key)) == to_json_value(expected)
+
+    return record.get(key) == expected
 
 
 def _dependency_identity_record(
@@ -215,24 +462,10 @@ def candidate_record_to_json(
     input_signature: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return a JSON row for a candidate."""
-    row_hash = compute_record_owner_hash(
-        record_type="candidate",
-        family=candidate.family,
-        candidate_id=candidate.candidate_id,
-        input_signature=input_signature,
-        candidate_settings=candidate.settings,
-        candidate_spec_hash=candidate.candidate_spec_hash(),
-        dependency_identities=candidate.dependency_identities,
-        changed_axes=candidate.changed_axes,
-        generator_id=candidate.generator_id,
-        generator_version=candidate.generator_version,
-    )
-
-    payload = {
+    return {
         "record_type": "candidate",
         "schema_version": SCHEMA_VERSION,
         "package_version": PACKAGE_VERSION,
-        "owner_hash": row_hash,
         "input_signature": dict(input_signature),
         "candidate_settings": dict(candidate.settings),
         "dependency_identities": _dependency_identity_record(
@@ -247,19 +480,11 @@ def candidate_record_to_json(
         "changed_axes": candidate.changed_axes,
         "admission_error": candidate.admission_error,
         "migration_source_id": candidate.migration_source_id,
-        "candidate_spec_hash": candidate.candidate_spec_hash(),
     }
-    payload["content_hash"] = record_content_hash(payload)
-
-    return payload
 
 
 def candidate_from_signature(record: Mapping[str, Any]) -> Candidate:
-    """Return a candidate from a saved candidate signature.
-
-    Raises:
-        StaleRecordError: If the selected candidate spec hash differs.
-    """
+    """Return a candidate from a saved candidate signature."""
     candidate = Candidate(
         family=str(record["family"]),
         candidate_id=str(record["candidate_id"]),
@@ -285,10 +510,6 @@ def candidate_from_signature(record: Mapping[str, Any]) -> Candidate:
         ),
     )
 
-    if str(record["candidate_spec_hash"]) != candidate.candidate_spec_hash():
-        message = "selected candidate spec hash is stale"
-        raise StaleRecordError(message)
-
     return candidate
 
 
@@ -296,7 +517,7 @@ def candidate_record_from_json(record: Mapping[str, Any]) -> Candidate:
     """Return a candidate from a saved candidate row.
 
     Raises:
-        StaleRecordError: If the saved candidate owner hash is stale.
+        StaleRecordError: If the saved candidate row differs from its fields.
         VPTuneError: If the row is not a candidate record.
     """
     validate_json_record(record)
@@ -304,8 +525,6 @@ def candidate_record_from_json(record: Mapping[str, Any]) -> Candidate:
     if record["record_type"] != "candidate":
         message = "candidate replay requires a candidate record"
         raise VPTuneError(message)
-
-    _require_content_hash(record, "candidate")
 
     candidate = Candidate(
         family=str(record["family"]),
@@ -332,10 +551,6 @@ def candidate_record_from_json(record: Mapping[str, Any]) -> Candidate:
         ),
     )
 
-    if str(record["candidate_spec_hash"]) != candidate.candidate_spec_hash():
-        message = "candidate spec hash is stale"
-        raise StaleRecordError(message)
-
     if not record_current(
         record,
         record_type="candidate",
@@ -343,20 +558,13 @@ def candidate_record_from_json(record: Mapping[str, Any]) -> Candidate:
         candidate_id=candidate.candidate_id,
         input_signature=record["input_signature"],
         candidate_settings=candidate.settings,
-        candidate_spec_hash=candidate.candidate_spec_hash(),
         dependency_identities=candidate.dependency_identities,
+        cohort_assignment=candidate.cohort_assignment,
         changed_axes=candidate.changed_axes,
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
     ):
-        message = "candidate record owner hash is stale"
-        raise StaleRecordError(message)
-
-    payload = dict(record)
-    content_hash = str(payload.pop("content_hash"))
-
-    if content_hash != record_content_hash(payload):
-        message = "candidate record content hash is stale"
+        message = "candidate record fields differ"
         raise StaleRecordError(message)
 
     return candidate
@@ -366,7 +574,6 @@ def check_record_to_json(record: CheckRecord) -> dict[str, Any]:
     """Return a JSON row for a reference check."""
     payload = dataclasses.asdict(record)
     payload["record_type"] = "reference"
-    payload["content_hash"] = record_content_hash(payload)
 
     return payload
 
@@ -375,7 +582,7 @@ def check_record_from_json(record: Mapping[str, Any]) -> CheckRecord:
     """Return a check record from a JSON row.
 
     Raises:
-        StaleRecordError: If the owner hash does not match the row.
+        StaleRecordError: If the reference row differs from its fields.
         VPTuneError: If the row is not a reference record.
     """
     validate_json_record(record)
@@ -386,50 +593,39 @@ def check_record_from_json(record: Mapping[str, Any]) -> CheckRecord:
 
     payload = dict(record)
     payload.pop("record_type")
-    _require_content_hash(payload, "reference")
-
     check_record = CheckRecord(**payload)
 
     if not check_record_current(check_record):
-        message = "reference record owner hash is stale"
-        raise StaleRecordError(message)
-
-    if not check_record_content_current(check_record):
-        message = "reference record content hash is stale"
+        message = "reference record fields differ"
         raise StaleRecordError(message)
 
     return check_record
 
 
 def check_record_current(record: CheckRecord) -> bool:
-    """Return whether a reference row owner hash matches its row identity."""
-    expected = compute_record_owner_hash(
+    """Return whether a reference row stores matching direct fields."""
+    return record_current(
+        {
+            **dataclasses.asdict(record),
+            "record_type": "reference",
+        },
         record_type="reference",
         family=record.family,
         candidate_id=record.candidate_id,
         check_name=record.name,
         input_signature=record.input_signature,
         candidate_settings=record.candidate_settings,
-        candidate_spec_hash=record.candidate_spec_hash,
-        thresholds=record.thresholds,
         dependency_identities=record.dependency_identities,
+        cohort_assignment=record.cohort_assignment,
         generator_id=record.generator_id,
         generator_version=record.generator_version,
     )
-
-    return record.owner_hash == expected
-
-
-def check_record_content_current(record: CheckRecord) -> bool:
-    """Return whether a reference row content hash matches its content."""
-    return record.content_hash == record.computed_content_hash()
 
 
 def full_size_record_to_json(record: FullSizeRecord) -> dict[str, Any]:
     """Return a JSON row for a full-size result."""
     payload = dataclasses.asdict(record)
     payload["record_type"] = "full_size"
-    payload["content_hash"] = record_content_hash(payload)
 
     return payload
 
@@ -443,12 +639,11 @@ def full_size_record_from_json(record: Mapping[str, Any]) -> FullSizeRecord:
     """Return a full-size record from a JSON row.
 
     Raises:
-        StaleRecordError: If the owner hash does not match the row.
+        StaleRecordError: If the full-size row differs from its fields.
     """
     validate_json_record(record)
     payload = dict(record)
     payload.pop("record_type")
-    _require_content_hash(payload, "full-size")
     payload["timing_samples"] = tuple(
         measurement_from_json(sample) for sample in payload["timing_samples"]
     )
@@ -459,36 +654,29 @@ def full_size_record_from_json(record: Mapping[str, Any]) -> FullSizeRecord:
     full_size_record = FullSizeRecord(**payload)
 
     if not full_size_record_current(full_size_record):
-        message = "full-size record owner hash is stale"
-        raise StaleRecordError(message)
-
-    if not full_size_record_content_current(full_size_record):
-        message = "full-size record content hash is stale"
+        message = "full-size record fields differ"
         raise StaleRecordError(message)
 
     return full_size_record
 
 
 def full_size_record_current(record: FullSizeRecord) -> bool:
-    """Return whether a full-size row owner hash matches its row identity."""
-    expected = compute_record_owner_hash(
+    """Return whether a full-size row stores matching direct fields."""
+    return record_current(
+        {
+            **dataclasses.asdict(record),
+            "record_type": "full_size",
+        },
         record_type="full_size",
         family=record.family,
         candidate_id=record.candidate_id,
         input_signature=record.input_signature,
         candidate_settings=record.candidate_settings,
-        candidate_spec_hash=record.candidate_spec_hash,
         dependency_identities=record.dependency_identities,
+        cohort_assignment=record.cohort_assignment,
         generator_id=record.generator_id,
         generator_version=record.generator_version,
     )
-
-    return record.owner_hash == expected
-
-
-def full_size_record_content_current(record: FullSizeRecord) -> bool:
-    """Return whether a full-size row content hash matches its content."""
-    return record.content_hash == record.computed_content_hash()
 
 
 def plan_to_json(plan: Plan) -> dict[str, Any]:
@@ -501,13 +689,11 @@ def selected_plan_validation_summary_record(
     records: Sequence[CheckRecord],
 ) -> dict[str, Any]:
     """Return the selected-plan validation summary row."""
-    input_signature = {
-        "plan": plan.owner_hash(),
-        "input_signature": dict(plan.input_signature),
-    }
+    input_signature = selected_plan_validation_input_signature(plan)
+    record_keys = tuple(record.row_key() for record in records)
     candidate_settings = {
         "validation_order": plan.validation_order,
-        "records": tuple(record.owner_hash for record in records),
+        "records": record_keys,
     }
     status = (
         "passed" if all(record.status == "passed" for record in records) else "failed"
@@ -517,21 +703,27 @@ def selected_plan_validation_summary_record(
         "record_type": "summary",
         "schema_version": SCHEMA_VERSION,
         "package_version": PACKAGE_VERSION,
-        "owner_hash": compute_record_owner_hash(
-            record_type="summary",
-            family="selected_plan_validation",
-            candidate_id=plan.owner_hash(),
-            input_signature=input_signature,
-            candidate_settings=candidate_settings,
-            generator_id="selected_plan_validation",
-            generator_version=PACKAGE_VERSION,
-        ),
         "input_signature": input_signature,
         "candidate_settings": candidate_settings,
         "status": status,
         "generator_id": "selected_plan_validation",
         "generator_version": PACKAGE_VERSION,
-        "records": tuple(record.owner_hash for record in records),
+        "records": record_keys,
+    }
+
+
+def selected_plan_validation_input_signature(plan: Plan) -> dict[str, Any]:
+    """Return direct fields that selected-plan validation checks."""
+    return {
+        "input_signature": dict(plan.input_signature),
+        "selected": {
+            family: candidate.signature()
+            for family, candidate in sorted(plan.selected.items())
+        },
+        "records": {
+            family: record.row_key() for family, record in sorted(plan.records.items())
+        },
+        "validation_order": plan.validation_order,
     }
 
 
@@ -555,7 +747,6 @@ def selected_plan_validation_summary_current(
         "record_type",
         "schema_version",
         "package_version",
-        "owner_hash",
         "input_signature",
         "candidate_settings",
         "status",
@@ -575,10 +766,7 @@ def _validate_selected_plan_validation_rows(
     records: Sequence[CheckRecord],
 ) -> None:
     validation_order = plan.validation_order or tuple(plan.selected)
-    expected_input_signature = {
-        "plan": plan.owner_hash(),
-        "input_signature": dict(plan.input_signature),
-    }
+    expected_input_signature = selected_plan_validation_input_signature(plan)
 
     if tuple(record.family for record in records) != tuple(validation_order):
         message = "plan replay selected-plan validation order differs"
@@ -594,14 +782,6 @@ def _validate_selected_plan_validation_rows(
             expected_input_signature,
             record,
         )
-
-    if any(not check_record_current(record) for record in records):
-        message = "plan replay has stale selected-plan validation rows"
-        raise StaleRecordError(message)
-
-    if any(not check_record_content_current(record) for record in records):
-        message = "plan replay has changed selected-plan validation rows"
-        raise StaleRecordError(message)
 
     if summary.get("status") != "passed" or any(
         record.status != "passed" for record in records
@@ -627,10 +807,6 @@ def _validate_selected_plan_validation_row(
         message = "plan replay validation row candidate differs"
         raise StaleRecordError(message)
 
-    if record.candidate_spec_hash != candidate.candidate_spec_hash():
-        message = "plan replay validation row candidate spec differs"
-        raise StaleRecordError(message)
-
     if to_json_value(record.candidate_settings) != to_json_value(candidate.settings):
         message = "plan replay validation row settings differ"
         raise StaleRecordError(message)
@@ -639,6 +815,12 @@ def _validate_selected_plan_validation_row(
         candidate.dependency_identities
     ):
         message = "plan replay validation row dependencies differ"
+        raise StaleRecordError(message)
+
+    if to_json_value(record.cohort_assignment) != to_json_value(
+        candidate.cohort_assignment
+    ):
+        message = "plan replay validation row cohort assignment differs"
         raise StaleRecordError(message)
 
     if record.generator_id != candidate.generator_id:
@@ -661,15 +843,13 @@ def plan_record_current(record: Mapping[str, Any], plan: Plan) -> bool:
 
     for field in (
         "record_type",
-        "owner_hash",
         "input_signature",
         "candidate_settings",
         "selected",
         "records",
         "full_size_records",
-        "full_size_record_content_hashes",
         "check_records",
-        "check_record_content_hashes",
+        "validation_records",
         "validation_required",
         "validation_order",
         "validator_identities",
@@ -694,59 +874,38 @@ def plan_record_current(record: Mapping[str, Any], plan: Plan) -> bool:
     return True
 
 
-def _record_by_owner_hash(records: Sequence[Any], label: str) -> dict[str, Any]:
-    by_hash = {record.owner_hash: record for record in records}
+def _record_by_row_key(records: Sequence[Any], label: str) -> dict[str, Any]:
+    by_key = {canonical_json(record.row_key()): record for record in records}
 
-    if len(by_hash) != len(records):
-        message = f"plan replay has duplicate {label} owner hashes"
+    if len(by_key) != len(records):
+        message = f"plan replay has duplicate {label} rows"
         raise VPTuneError(message)
 
-    return by_hash
+    return by_key
 
 
 def _records_in_saved_order(
-    owner_hashes: Sequence[Any],
-    records_by_hash: Mapping[str, Any],
+    row_keys: Sequence[Any],
+    records_by_key: Mapping[str, Any],
     label: str,
 ) -> tuple[Any, ...]:
     ordered = []
 
-    for value in owner_hashes:
-        record_hash = str(value)
-        record = records_by_hash.get(record_hash)
+    for value in row_keys:
+        row_key = canonical_json(value)
+        record = records_by_key.get(row_key)
 
         if record is None:
-            message = f"plan replay missing {label} row: {record_hash}"
+            message = f"plan replay missing {label} row: {value}"
             raise VPTuneError(message)
 
         ordered.append(record)
 
-    if set(records_by_hash) != {str(value) for value in owner_hashes}:
+    if set(records_by_key) != {canonical_json(value) for value in row_keys}:
         message = f"plan replay received extra {label} rows"
         raise VPTuneError(message)
 
     return tuple(ordered)
-
-
-def _content_hashes_in_saved_order(
-    content_hashes: Sequence[Any],
-    records: Sequence[Any],
-    label: str,
-) -> None:
-    if len(content_hashes) != len(records):
-        message = f"plan replay {label} content-hash count differs"
-        raise VPTuneError(message)
-
-    for expected, row in zip(content_hashes, records, strict=True):
-        if str(expected) != row.computed_content_hash():
-            message = f"plan replay {label} row content changed: {row.owner_hash}"
-            raise StaleRecordError(message)
-
-
-def _require_content_hash(payload: Mapping[str, Any], label: str) -> None:
-    if "content_hash" not in payload:
-        message = f"{label} record content hash is missing"
-        raise StaleRecordError(message)
 
 
 def _selection_policy_from_json(record: Mapping[str, Any]) -> SelectionPolicy:
@@ -796,8 +955,14 @@ def _validation_replay_identity(
     record: Mapping[str, Any],
     replay_context: ReplayContext,
 ) -> _ValidationReplayIdentity:
+    saved_required = record["validation_required"]
+
+    if saved_required is not True and saved_required is not False:
+        message = "plan validation_required must be a bool"
+        raise VPTuneError(message)
+
     return _ValidationReplayIdentity(
-        required=bool(record["validation_required"]),
+        required=saved_required or replay_context.validation_required,
         validator_identities={
             str(family): dict(identity)
             for family, identity in replay_context.validator_identities.items()
@@ -806,43 +971,16 @@ def _validation_replay_identity(
 
 
 def _validate_ordered_replay_rows(
-    record: Mapping[str, Any],
     ordered_full_size: Sequence[FullSizeRecord],
     ordered_checks: Sequence[CheckRecord],
 ) -> None:
-    if any(not full_size_record_current(row) for row in ordered_full_size):
-        message = "plan replay has stale full-size rows"
-        raise StaleRecordError(message)
-
-    if any(not full_size_record_content_current(row) for row in ordered_full_size):
-        message = "plan replay has changed full-size row content"
-        raise StaleRecordError(message)
-
-    if any(not check_record_current(row) for row in ordered_checks):
-        message = "plan replay has stale reference rows"
-        raise StaleRecordError(message)
-
-    if any(not check_record_content_current(row) for row in ordered_checks):
-        message = "plan replay has changed reference row content"
-        raise StaleRecordError(message)
-
-    _content_hashes_in_saved_order(
-        tuple(record["full_size_record_content_hashes"]),
-        ordered_full_size,
-        "full-size",
-    )
-    _content_hashes_in_saved_order(
-        tuple(record["check_record_content_hashes"]),
-        ordered_checks,
-        "reference",
-    )
     _validate_reference_linkage(ordered_full_size, ordered_checks)
 
 
 def _row_candidate_key(
     row: FullSizeRecord | CheckRecord,
-) -> tuple[str, str, str]:
-    return row.family, row.candidate_id, row.candidate_spec_hash
+) -> str:
+    return _result_candidate_key(row)
 
 
 def _reference_matches_full_size(
@@ -886,31 +1024,31 @@ def _validate_reference_linkage(
             raise VPTuneError(message)
 
 
-def _selected_record_hashes(
+def _selected_record_keys(
     record: Mapping[str, Any],
     selected: Mapping[str, Candidate],
-    full_size_by_hash: Mapping[str, FullSizeRecord],
+    full_size_by_key: Mapping[str, FullSizeRecord],
 ) -> dict[str, str]:
-    selected_record_hashes = {
-        str(family): str(row_hash)
-        for family, row_hash in dict(record["records"]).items()
+    selected_record_keys = {
+        str(family): canonical_json(row_key)
+        for family, row_key in dict(record["records"]).items()
     }
 
-    if set(selected_record_hashes) != set(selected):
+    if set(selected_record_keys) != set(selected):
         message = "plan replay selected families differ from record families"
         raise VPTuneError(message)
 
     missing_records = tuple(
         family
-        for family, row_hash in selected_record_hashes.items()
-        if row_hash not in full_size_by_hash
+        for family, row_key in selected_record_keys.items()
+        if row_key not in full_size_by_key
     )
 
     if missing_records:
         message = f"plan replay missing full-size records: {missing_records}"
         raise VPTuneError(message)
 
-    return selected_record_hashes
+    return selected_record_keys
 
 
 def _validate_materializers(
@@ -940,8 +1078,12 @@ def _validate_replay_context(
     replay_context: ReplayContext,
     materializers: Mapping[str, Materializer],
     ordered_full_size: Sequence[FullSizeRecord],
+    ordered_checks: Sequence[CheckRecord],
 ) -> None:
     selected_families = tuple(str(family) for family in dict(record["selected"]))
+    selected_record_keys = {
+        canonical_json(row_key) for row_key in dict(record["records"]).values()
+    }
 
     _validate_replay_run_identity(record, replay_context)
     _validate_replay_materializers(record, replay_context, materializers)
@@ -966,11 +1108,36 @@ def _validate_replay_context(
             message = f"plan replay missing family input signature: {row.family}"
             raise VPTuneError(message)
 
-        if to_json_value(row.input_signature) != to_json_value(
-            dict(expected_signature)
+        if canonical_json(
+            row.row_key()
+        ) not in selected_record_keys and not _row_matches_signature(
+            row, expected_signature
         ):
+            continue
+
+        if not _row_matches_signature(row, expected_signature):
             message = f"plan replay family input signature is stale: {row.family}"
             raise StaleRecordError(message)
+
+    for row in ordered_checks:
+        expected_signature = replay_context.family_input_signatures.get(row.family)
+
+        if expected_signature is None:
+            if row.family not in selected_families:
+                continue
+
+            message = f"plan replay missing reference input signature: {row.family}"
+            raise VPTuneError(message)
+
+        if not _row_matches_signature(row, expected_signature):
+            continue
+
+
+def _row_matches_signature(
+    row: FullSizeRecord | CheckRecord,
+    expected_signature: Mapping[str, Any],
+) -> bool:
+    return to_json_value(row.input_signature) == to_json_value(dict(expected_signature))
 
 
 def _validate_replay_run_identity(
@@ -983,7 +1150,9 @@ def _validate_replay_run_identity(
         message = "plan replay input signature is stale"
         raise StaleRecordError(message)
 
-    if to_json_value(record["policy"]) != to_json_value(
+    saved_policy = _selection_policy_from_json(record["policy"])
+
+    if to_json_value(dataclasses.asdict(saved_policy)) != to_json_value(
         dataclasses.asdict(replay_context.selection_policy)
     ):
         message = "plan replay selection policy is stale"
@@ -1051,100 +1220,75 @@ def _validate_replay_family_identities(
         raise VPTuneError(message)
 
 
-def _validate_recomputed_selection(
-    selected: Mapping[str, Candidate],
-    selected_records: Mapping[str, FullSizeRecord],
-    ordered_full_size: Sequence[FullSizeRecord],
-    replay_context: ReplayContext,
-) -> None:
-    for family in selected:
-        records = tuple(
-            record for record in ordered_full_size if record.family == family
-        )
-
-        if not records:
-            message = f"plan replay has no full-size rows for family: {family}"
-            raise VPTuneError(message)
-
-        expected_signature = replay_context.family_input_signatures.get(family)
-
-        if expected_signature is None:
-            message = f"plan replay missing family input signature: {family}"
-            raise VPTuneError(message)
-
-        recomputed_record = _replay_select_family(
-            records,
-            input_signature=expected_signature,
-            policy=replay_context.selection_policy,
-        )
-
-        if recomputed_record.owner_hash != selected_records[family].owner_hash:
-            message = f"plan replay selected row is stale: {family}"
-            raise StaleRecordError(message)
-
-
 def _replay_select_family(
-    records: Sequence[FullSizeRecord],
+    records: Sequence[tuple[Candidate, FullSizeRecord]],
     *,
     input_signature: Mapping[str, Any],
     policy: SelectionPolicy,
-) -> FullSizeRecord:
+) -> tuple[Candidate, FullSizeRecord]:
     accepted = tuple(
-        record
-        for record in records
+        (candidate, record)
+        for candidate, record in records
         if record.status == "passed"
         and record.reference_passed
         and to_json_value(record.input_signature) == to_json_value(input_signature)
-        and _replay_memory_stable(record)
+        and memory_stable(record)
     )
 
     if not accepted:
         message = "plan replay family has no accepted rows"
         raise VPTuneError(message)
 
-    fastest = min(record.median_elapsed_seconds() for record in accepted)
-    near_fastest = tuple(
-        record
-        for record in accepted
-        if record.median_elapsed_seconds() <= fastest * policy.near_fastest_multiplier
+    autobatch_selected = _replay_autobatch_selected(
+        tuple(record for _, record in records),
+        tuple(record for _, record in accepted),
     )
 
-    return min(near_fastest, key=lambda record: record.peak_reserved_mib())
+    if autobatch_selected is not None:
+        for candidate, record in accepted:
+            if to_json_value(record.row_key()) == to_json_value(
+                autobatch_selected.row_key()
+            ):
+                return candidate, record
+
+    return select_accepted_family(accepted, policy=policy)
 
 
-def _replay_memory_stable(record: FullSizeRecord) -> bool:
-    samples_by_device: dict[tuple[int, str], list[Measurement]] = {}
+def _replay_autobatch_selected(
+    records: Sequence[FullSizeRecord],
+    accepted: Sequence[FullSizeRecord],
+) -> FullSizeRecord | None:
+    selected = tuple(record for record in records if _is_autobatch_selected(record))
 
-    for sample in record.memory_samples:
-        key = (sample.rank, sample.device)
-        samples_by_device.setdefault(key, []).append(sample)
+    if not selected:
+        return None
 
-    return all(
-        _replay_memory_samples_stable(tuple(samples))
-        for samples in samples_by_device.values()
-    )
+    if len(selected) != 1:
+        message = "plan replay has multiple Autobatch-selected rows"
+        raise VPTuneError(message)
+
+    accepted_keys = {canonical_json(record.row_key()) for record in accepted}
+
+    if canonical_json(selected[0].row_key()) not in accepted_keys:
+        message = "plan replay Autobatch-selected row is stale"
+        raise StaleRecordError(message)
+
+    return selected[0]
 
 
-def _replay_memory_samples_stable(samples: tuple[Measurement, ...]) -> bool:
-    if len(samples) <= 1:
-        return True
+def _is_autobatch_selected(record: FullSizeRecord) -> bool:
+    metadata = dict(record.selection_metadata)
 
-    first = samples[0]
-
-    return all(
-        sample.post_allocated_mib <= first.post_allocated_mib
-        and sample.post_reserved_mib <= first.post_reserved_mib
-        for sample in samples[1:]
-    )
+    return metadata.get("source") == "autobatch" and metadata.get("selected") is True
 
 
 def _selected_records(
     selected: Mapping[str, Candidate],
-    selected_record_hashes: Mapping[str, str],
-    full_size_by_hash: Mapping[str, FullSizeRecord],
+    selected_record_keys: Mapping[str, str],
+    full_size_by_key: Mapping[str, FullSizeRecord],
 ) -> dict[str, FullSizeRecord]:
     records = {
-        family: full_size_by_hash[selected_record_hashes[family]] for family in selected
+        family: full_size_by_key[selected_record_keys[family]] for family in selected
     }
 
     for family, candidate in selected.items():
@@ -1165,10 +1309,6 @@ def _validate_selected_record(
     if selected_record.candidate_id != candidate.candidate_id:
         message = f"plan replay selected record candidate differs: {family}"
         raise VPTuneError(message)
-
-    if selected_record.candidate_spec_hash != candidate.candidate_spec_hash():
-        message = f"plan replay selected record candidate spec differs: {family}"
-        raise StaleRecordError(message)
 
     if selected_record.generator_id != candidate.generator_id:
         message = f"plan replay selected record generator differs: {family}"
@@ -1194,6 +1334,12 @@ def _validate_selected_record(
         message = f"plan replay selected record dependencies differ: {family}"
         raise StaleRecordError(message)
 
+    if to_json_value(selected_record.cohort_assignment) != to_json_value(
+        candidate.cohort_assignment
+    ):
+        message = f"plan replay selected record cohort differs: {family}"
+        raise StaleRecordError(message)
+
 
 def _dependency_identity(
     family: str,
@@ -1204,10 +1350,8 @@ def _dependency_identity(
     return {
         "family": family,
         "candidate_id": candidate.candidate_id,
-        "candidate_spec_hash": candidate.candidate_spec_hash(),
-        "full_size_owner_hash": record.owner_hash,
-        "full_size_content_hash": record.computed_content_hash(),
-        "full_size_input_signature": dict(record.input_signature),
+        "candidate_settings": dict(candidate.settings),
+        "full_size_row": record.row_key(),
         "materializer_identity": dict(materializer_identity),
     }
 
@@ -1258,17 +1402,39 @@ def _validate_dependency_identities(
                 raise StaleRecordError(message)
 
 
-def _candidate_record_key(candidate: Candidate) -> tuple[str, str, str]:
-    return (
-        candidate.family,
-        candidate.candidate_id,
-        candidate.candidate_spec_hash(),
-    )
+def _candidate_record_key(candidate: Candidate) -> str:
+    return canonical_json({
+        "family": candidate.family,
+        "candidate_id": candidate.candidate_id,
+        "settings": dict(candidate.settings),
+        "dependency_identities": {
+            family: dict(identity)
+            for family, identity in sorted(candidate.dependency_identities.items())
+        },
+        "cohort_assignment": dict(candidate.cohort_assignment),
+        "generator_id": candidate.generator_id,
+        "generator_version": candidate.generator_version,
+    })
+
+
+def _result_candidate_key(record: FullSizeRecord | CheckRecord) -> str:
+    return canonical_json({
+        "family": record.family,
+        "candidate_id": record.candidate_id,
+        "settings": dict(record.candidate_settings),
+        "dependency_identities": {
+            family: dict(identity)
+            for family, identity in sorted(record.dependency_identities.items())
+        },
+        "cohort_assignment": dict(record.cohort_assignment),
+        "generator_id": record.generator_id,
+        "generator_version": record.generator_version,
+    })
 
 
 def _candidate_records_by_key(
     candidate_records: Sequence[Mapping[str, Any]],
-) -> dict[tuple[str, str, str], tuple[Candidate, Mapping[str, Any]]]:
+) -> dict[str, tuple[Candidate, Mapping[str, Any]]]:
     records = {}
 
     for record in candidate_records:
@@ -1290,24 +1456,17 @@ def _validate_candidate_records(
     full_size_records: Sequence[FullSizeRecord],
     check_records: Sequence[CheckRecord],
     candidate_records: Sequence[Mapping[str, Any]],
-) -> dict[tuple[str, str, str], Candidate]:
+) -> dict[str, Candidate]:
     by_key = _candidate_records_by_key(candidate_records)
     full_size_by_key = {
-        (record.family, record.candidate_id, record.candidate_spec_hash): record
-        for record in full_size_records
+        _result_candidate_key(record): record for record in full_size_records
     }
     checks_by_key = {}
 
     for record in check_records:
-        checks_by_key.setdefault(
-            (record.family, record.candidate_id, record.candidate_spec_hash),
-            [],
-        ).append(record)
+        checks_by_key.setdefault(_result_candidate_key(record), []).append(record)
 
-    check_keys = {
-        (record.family, record.candidate_id, record.candidate_spec_hash)
-        for record in check_records
-    }
+    check_keys = {_result_candidate_key(record) for record in check_records}
 
     if len(full_size_by_key) != len(full_size_records):
         message = "plan replay has duplicate full-size candidate identities"
@@ -1339,10 +1498,8 @@ def _validate_candidate_records(
             message = f"plan replay candidate row differs: {family}"
             raise StaleRecordError(message)
 
-        if _candidate_record_key(row_candidate) != (
-            selected_records[family].family,
-            selected_records[family].candidate_id,
-            selected_records[family].candidate_spec_hash,
+        if _candidate_record_key(row_candidate) != _result_candidate_key(
+            selected_records[family]
         ):
             message = f"plan replay selected candidate row is stale: {family}"
             raise StaleRecordError(message)
@@ -1370,10 +1527,14 @@ def _candidate_matches_check(
     check: CheckRecord,
 ) -> bool:
     return (
-        to_json_value(row["input_signature"]) == to_json_value(check.input_signature)
+        check.status == "passed"
+        and to_json_value(row["input_signature"])
+        == to_json_value(check.input_signature)
         and to_json_value(candidate.settings) == to_json_value(check.candidate_settings)
         and to_json_value(candidate.dependency_identities)
         == to_json_value(check.dependency_identities)
+        and to_json_value(candidate.cohort_assignment)
+        == to_json_value(check.cohort_assignment)
         and candidate.generator_id == check.generator_id
         and candidate.generator_version == check.generator_version
     )
@@ -1404,6 +1565,12 @@ def _validate_candidate_against_full_size(
         message = f"plan replay candidate generator version differs: {candidate.family}"
         raise StaleRecordError(message)
 
+    if to_json_value(candidate.cohort_assignment) != to_json_value(
+        full_size_record.cohort_assignment
+    ):
+        message = f"plan replay candidate cohort differs: {candidate.family}"
+        raise StaleRecordError(message)
+
     if to_json_value(row["input_signature"]) != to_json_value(
         full_size_record.input_signature
     ):
@@ -1411,109 +1578,12 @@ def _validate_candidate_against_full_size(
         raise StaleRecordError(message)
 
 
-def _constraint_families(
-    constraint: CohortConstraint,
-    family_names: tuple[str, ...],
-) -> tuple[str, ...]:
-    if constraint.families:
-        return constraint.families
-
-    return family_names
-
-
-def _candidate_matches_assignment(
-    candidate: Candidate,
-    assignment: CohortAssignment,
-    constraints: tuple[CohortConstraint, ...],
-    family_names: tuple[str, ...],
-) -> bool:
-    matched_constraint = False
-
-    for constraint in constraints:
-        if candidate.family not in _constraint_families(constraint, family_names):
-            continue
-
-        matched_constraint = True
-
-        for key in constraint.settings_keys:
-            if candidate.settings.get(key) != assignment.values[key]:
-                return False
-
-    if candidate.cohort_assignment and to_json_value(
-        candidate.cohort_assignment
-    ) != to_json_value(assignment.signature()):
-        return False
-
-    if not matched_constraint and candidate.cohort_assignment:
-        return to_json_value(candidate.cohort_assignment) == to_json_value(
-            assignment.signature()
-        )
-
-    return True
-
-
-def _cohort_assignments(
-    constraints: tuple[CohortConstraint, ...],
-    family_names: tuple[str, ...],
-) -> tuple[CohortAssignment, ...]:
-    if not constraints:
-        return (
-            CohortAssignment(
-                assignment_id="default",
-                values={},
-                constraints=(),
-                covered_families=(),
-            ),
-        )
-
-    assignments = []
-
-    for entries in itertools.product(
-        *(constraint.assignments for constraint in constraints)
-    ):
-        values = {}
-        covered_families = set()
-        valid = True
-
-        for constraint, entry in zip(constraints, entries, strict=True):
-            covered_families.update(_constraint_families(constraint, family_names))
-
-            for key, value in entry.items():
-                if key in values and values[key] != value:
-                    valid = False
-                    break
-
-                values[key] = value
-
-            if not valid:
-                break
-
-        if not valid:
-            continue
-
-        signature = {
-            "constraints": tuple(constraint.name for constraint in constraints),
-            "values": dict(values),
-            "covered_families": tuple(sorted(covered_families)),
-        }
-        assignments.append(
-            CohortAssignment(
-                assignment_id=stable_hash(signature),
-                values=dict(values),
-                constraints=tuple(constraint.name for constraint in constraints),
-                covered_families=tuple(sorted(covered_families)),
-            )
-        )
-
-    return tuple(assignments)
-
-
 def _assignment_records(
     assignment: CohortAssignment | None,
     constraints: tuple[CohortConstraint, ...],
     family_names: tuple[str, ...],
     ordered_full_size: Sequence[FullSizeRecord],
-    candidates_by_key: Mapping[tuple[str, str, str], Candidate],
+    candidates_by_key: Mapping[str, Candidate],
     replay_context: ReplayContext,
 ) -> tuple[tuple[Candidate, FullSizeRecord], ...]:
     pairs = []
@@ -1524,11 +1594,9 @@ def _assignment_records(
         if to_json_value(record.input_signature) != to_json_value(expected_signature):
             continue
 
-        candidate = candidates_by_key[
-            record.family, record.candidate_id, record.candidate_spec_hash
-        ]
+        candidate = candidates_by_key[_result_candidate_key(record)]
 
-        if assignment is not None and not _candidate_matches_assignment(
+        if assignment is not None and not candidate_matches_assignment(
             candidate,
             assignment,
             constraints,
@@ -1539,7 +1607,7 @@ def _assignment_records(
         if (
             record.status == "passed"
             and record.reference_passed
-            and _replay_memory_stable(record)
+            and memory_stable(record)
         ):
             pairs.append((candidate, record))
 
@@ -1586,31 +1654,74 @@ def _replay_cohort_dependency_identities_match(
     return True
 
 
-def _replay_select_cohort(
-    cohorts: Sequence[Mapping[str, tuple[Candidate, FullSizeRecord]]],
-    policy: SelectionPolicy,
-) -> Mapping[str, tuple[Candidate, FullSizeRecord]]:
-    if not cohorts:
-        message = "plan replay has no complete cohorts"
-        raise VPTuneError(message)
+def _replay_family_order(
+    family_names: tuple[str, ...],
+    dependencies_by_family: Mapping[str, tuple[str, ...]],
+) -> tuple[str, ...]:
+    remaining = list(family_names)
+    ordered = []
 
-    fastest = min(
-        sum(record.median_elapsed_seconds() for _, record in cohort.values())
-        for cohort in cohorts
-    )
-    near_fastest = tuple(
-        cohort
-        for cohort in cohorts
-        if sum(record.median_elapsed_seconds() for _, record in cohort.values())
-        <= fastest * policy.near_fastest_multiplier
-    )
+    while remaining:
+        progressed = False
 
-    return min(
-        near_fastest,
-        key=lambda cohort: sum(
-            record.peak_reserved_mib() for _, record in cohort.values()
-        ),
-    )
+        for family in tuple(remaining):
+            dependencies = dependencies_by_family.get(family)
+
+            if dependencies is None:
+                message = f"plan replay dependency record missing: {family}"
+                raise VPTuneError(message)
+
+            if all(dependency in ordered for dependency in dependencies):
+                ordered.append(family)
+                remaining.remove(family)
+                progressed = True
+
+        if not progressed:
+            message = "plan replay dependency graph has a cycle or missing dependency"
+            raise VPTuneError(message)
+
+    return tuple(ordered)
+
+
+def _replay_row_matches_selected_dependencies(
+    candidate: Candidate,
+    record: FullSizeRecord,
+    cohort: Mapping[str, tuple[Candidate, FullSizeRecord]],
+    dependencies_by_family: Mapping[str, tuple[str, ...]],
+    materializers: Mapping[str, Materializer],
+) -> bool:
+    dependencies = dependencies_by_family[candidate.family]
+
+    if set(candidate.dependency_identities) != set(dependencies):
+        return False
+
+    if set(record.dependency_identities) != set(dependencies):
+        return False
+
+    for dependency in dependencies:
+        selected_dependency = cohort.get(dependency)
+
+        if selected_dependency is None:
+            return False
+
+        expected_identity = _dependency_identity(
+            dependency,
+            selected_dependency[0],
+            selected_dependency[1],
+            materializers[dependency].identity(),
+        )
+
+        if to_json_value(candidate.dependency_identities[dependency]) != to_json_value(
+            expected_identity
+        ):
+            return False
+
+        if to_json_value(record.dependency_identities[dependency]) != to_json_value(
+            expected_identity
+        ):
+            return False
+
+    return True
 
 
 def _validate_recomputed_cohort_selection(
@@ -1619,15 +1730,16 @@ def _validate_recomputed_cohort_selection(
     replay_context: ReplayContext,
     dependencies_by_family: Mapping[str, tuple[str, ...]],
     materializers: Mapping[str, Materializer],
-    candidates_by_key: Mapping[tuple[str, str, str], Candidate],
+    candidates_by_key: Mapping[str, Candidate],
     cohort_assignment: CohortAssignment | None,
     cohort_constraints: tuple[CohortConstraint, ...],
 ) -> None:
     family_names = tuple(selected_records)
+    ordered_families = _replay_family_order(family_names, dependencies_by_family)
     cohorts = []
     state_by_cohort = {}
 
-    for assignment in _cohort_assignments(cohort_constraints, family_names):
+    for assignment in cohort_assignments(cohort_constraints, family_names):
         pairs = _assignment_records(
             assignment,
             cohort_constraints,
@@ -1638,24 +1750,28 @@ def _validate_recomputed_cohort_selection(
         )
         cohort = {}
 
-        for family in family_names:
+        for family in ordered_families:
             records = tuple(
-                record for candidate, record in pairs if candidate.family == family
+                (candidate, record)
+                for candidate, record in pairs
+                if candidate.family == family
+                and _replay_row_matches_selected_dependencies(
+                    candidate,
+                    record,
+                    cohort,
+                    dependencies_by_family,
+                    materializers,
+                )
             )
 
             if not records:
                 break
 
-            selected_record = _replay_select_family(
+            candidate, selected_record = _replay_select_family(
                 records,
                 input_signature=replay_context.family_input_signatures[family],
                 policy=replay_context.selection_policy,
             )
-            candidate = candidates_by_key[
-                selected_record.family,
-                selected_record.candidate_id,
-                selected_record.candidate_spec_hash,
-            ]
             cohort[family] = (candidate, selected_record)
 
         if set(cohort) == set(
@@ -1668,7 +1784,11 @@ def _validate_recomputed_cohort_selection(
             cohorts.append(cohort)
             state_by_cohort[id(cohort)] = assignment
 
-    selected_cohort = _replay_select_cohort(cohorts, replay_context.selection_policy)
+    selected_cohort = select_complete_cohort(
+        cohorts,
+        families=family_names,
+        policy=replay_context.selection_policy,
+    )
     selected_assignment = state_by_cohort[id(selected_cohort)]
 
     if cohort_constraints and cohort_assignment is None:
@@ -1682,9 +1802,152 @@ def _validate_recomputed_cohort_selection(
         raise StaleRecordError(message)
 
     for family, (_, record) in selected_cohort.items():
-        if record.owner_hash != selected_records[family].owner_hash:
+        if to_json_value(record.row_key()) != to_json_value(
+            selected_records[family].row_key()
+        ):
             message = f"plan replay selected cohort row is stale: {family}"
             raise StaleRecordError(message)
+
+
+def _selected_candidates_from_record(record: Mapping[str, Any]) -> dict[str, Candidate]:
+    return {
+        str(family): candidate_from_signature(dict(candidate_record))
+        for family, candidate_record in dict(record["selected"]).items()
+    }
+
+
+def _replay_rows(
+    record: Mapping[str, Any],
+    full_size_records: Sequence[FullSizeRecord],
+    check_records: Sequence[CheckRecord],
+    validation_records: Sequence[CheckRecord],
+) -> _ReplayRows:
+    full_size_by_key = _record_by_row_key(full_size_records, "full-size")
+    check_by_key = _record_by_row_key(check_records, "reference")
+    ordered_full_size = _records_in_saved_order(
+        tuple(record["full_size_records"]),
+        full_size_by_key,
+        "full-size",
+    )
+    ordered_checks = _records_in_saved_order(
+        tuple(record["check_records"]),
+        check_by_key,
+        "reference",
+    )
+    ordered_validation = _plan_validation_records(record, validation_records)
+
+    _validate_ordered_replay_rows(
+        ordered_full_size,
+        ordered_checks,
+    )
+
+    return _ReplayRows(
+        full_size_by_key=full_size_by_key,
+        ordered_full_size=ordered_full_size,
+        ordered_checks=ordered_checks,
+        ordered_validation=ordered_validation,
+    )
+
+
+def _dependencies_from_record(record: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+    return {
+        str(family): tuple(str(dependency) for dependency in dependencies)
+        for family, dependencies in dict(record["dependencies_by_family"]).items()
+    }
+
+
+def _replayed_plan(
+    record: Mapping[str, Any],
+    replay_context: ReplayContext,
+    selected: Mapping[str, Candidate],
+    selected_records: Mapping[str, FullSizeRecord],
+    rows: _ReplayRows,
+    materializers: Mapping[str, Materializer],
+    validation_identity: _ValidationReplayIdentity,
+    dependencies_by_family: Mapping[str, tuple[str, ...]],
+    cohort_assignment: CohortAssignment | None,
+    cohort_constraints: tuple[CohortConstraint, ...],
+    run_dir: Path | None,
+) -> Plan:
+    return Plan(
+        selected=dict(selected),
+        records=dict(selected_records),
+        input_signature=dict(replay_context.input_signature),
+        policy=replay_context.selection_policy,
+        full_size_records=rows.ordered_full_size,
+        check_records=rows.ordered_checks,
+        validation_records=rows.ordered_validation,
+        materializers={family: materializers[family] for family in selected},
+        validation_order=tuple(str(family) for family in record["validation_order"]),
+        dependencies_by_family=dict(dependencies_by_family),
+        cohort_assignment=cohort_assignment,
+        cohort_constraints=cohort_constraints,
+        target_identity=dict(replay_context.target_identity),
+        runtime_identities={
+            family: dict(identity)
+            for family, identity in replay_context.runtime_identities.items()
+        },
+        adapter_identities={
+            family: dict(identity)
+            for family, identity in replay_context.adapter_identities.items()
+        },
+        validation_required=validation_identity.required,
+        validator_identities=dict(validation_identity.validator_identities),
+        run_dir=run_dir,
+    )
+
+
+def _validate_replay_validation_summary(
+    plan: Plan,
+    replay_context: ReplayContext,
+    validation_summary: Mapping[str, Any] | None,
+    validation_records: Sequence[CheckRecord],
+) -> None:
+    if validation_records and validation_summary is None:
+        message = "plan replay validation records require a validation summary"
+        raise VPTuneError(message)
+
+    if (replay_context.validation_required or plan.validation_required) and (
+        validation_summary is None
+    ):
+        message = "plan replay requires selected-plan validation"
+        raise VPTuneError(message)
+
+    if validation_summary is not None and not validation_records:
+        message = "plan replay validation summary requires validation records"
+        raise VPTuneError(message)
+
+    if validation_summary is None:
+        return
+
+    if not selected_plan_validation_summary_current(
+        validation_summary,
+        plan,
+        validation_records,
+    ):
+        message = "plan replay selected-plan validation summary is stale"
+        raise StaleRecordError(message)
+
+    ordered_validation = _summary_validation_records(
+        validation_summary,
+        validation_records,
+    )
+    _validate_selected_plan_validation_rows(
+        plan,
+        validation_summary,
+        ordered_validation,
+    )
+
+
+def _validate_replay_validation_order(
+    record: Mapping[str, Any],
+    replay_context: ReplayContext,
+) -> None:
+    if replay_context.validation_order and tuple(record["validation_order"]) != tuple(
+        replay_context.validation_order
+    ):
+        message = "plan replay validation order is stale"
+        raise StaleRecordError(message)
 
 
 def plan_from_json(
@@ -1706,62 +1969,39 @@ def plan_from_json(
         VPTuneError: If the record is not a summary or required rows are missing.
     """
     validate_json_record(record)
+    _validate_replay_selection_policy(replay_context.selection_policy)
 
     if record["record_type"] != "summary":
         message = "plan replay requires a summary record"
         raise VPTuneError(message)
 
-    selected_rows = dict(record["selected"])
-    selected = {
-        str(family): candidate_from_signature(dict(candidate_record))
-        for family, candidate_record in selected_rows.items()
-    }
-    full_size_by_hash = _record_by_owner_hash(full_size_records, "full-size")
-    check_by_hash = _record_by_owner_hash(check_records, "reference")
-    ordered_full_size = _records_in_saved_order(
-        tuple(record["full_size_records"]),
-        full_size_by_hash,
-        "full-size",
-    )
-    ordered_checks = _records_in_saved_order(
-        tuple(record["check_records"]),
-        check_by_hash,
-        "reference",
-    )
-
-    _validate_ordered_replay_rows(
-        record,
-        ordered_full_size,
-        ordered_checks,
-    )
+    selected = _selected_candidates_from_record(record)
+    rows = _replay_rows(record, full_size_records, check_records, validation_records)
     _validate_replay_context(
         record,
         replay_context,
         materializers,
-        ordered_full_size,
-    )
-    selected_record_hashes = _selected_record_hashes(
-        record,
-        selected,
-        full_size_by_hash,
+        rows.ordered_full_size,
+        rows.ordered_checks,
     )
     _validate_materializers(selected, materializers)
     selected_records = _selected_records(
         selected,
-        selected_record_hashes,
-        full_size_by_hash,
+        _selected_record_keys(
+            record,
+            selected,
+            rows.full_size_by_key,
+        ),
+        rows.full_size_by_key,
     )
     candidates_by_key = _validate_candidate_records(
         selected,
         selected_records,
-        ordered_full_size,
-        ordered_checks,
+        rows.ordered_full_size,
+        rows.ordered_checks,
         candidate_records,
     )
-    dependencies_by_family = {
-        str(family): tuple(str(dependency) for dependency in dependencies)
-        for family, dependencies in dict(record["dependencies_by_family"]).items()
-    }
+    dependencies_by_family = _dependencies_from_record(record)
     validation_identity = _validation_replay_identity(record, replay_context)
     cohort_assignment = _cohort_assignment_from_json(record["cohort_assignment"])
     cohort_constraints = _cohort_constraints_from_json(
@@ -1773,16 +2013,9 @@ def plan_from_json(
         dependencies_by_family,
         materializers,
     )
-    if not cohort_constraints:
-        _validate_recomputed_selection(
-            selected,
-            selected_records,
-            ordered_full_size,
-            replay_context,
-        )
     _validate_recomputed_cohort_selection(
         selected_records,
-        ordered_full_size,
+        rows.ordered_full_size,
         replay_context,
         dependencies_by_family,
         materializers,
@@ -1791,69 +2024,57 @@ def plan_from_json(
         cohort_constraints,
     )
 
-    plan = Plan(
-        selected=selected,
-        records=selected_records,
-        input_signature=dict(replay_context.input_signature),
-        policy=replay_context.selection_policy,
-        full_size_records=ordered_full_size,
-        check_records=ordered_checks,
-        materializers={family: materializers[family] for family in selected},
-        validation_order=tuple(str(family) for family in record["validation_order"]),
-        dependencies_by_family=dependencies_by_family,
-        cohort_assignment=cohort_assignment,
-        cohort_constraints=cohort_constraints,
-        target_identity=dict(replay_context.target_identity),
-        runtime_identities={
-            family: dict(identity)
-            for family, identity in replay_context.runtime_identities.items()
-        },
-        adapter_identities={
-            family: dict(identity)
-            for family, identity in replay_context.adapter_identities.items()
-        },
-        validation_required=validation_identity.required,
-        validator_identities=dict(validation_identity.validator_identities),
-        run_dir=run_dir,
+    plan = _replayed_plan(
+        record,
+        replay_context,
+        selected,
+        selected_records,
+        rows,
+        materializers,
+        validation_identity,
+        dependencies_by_family,
+        cohort_assignment,
+        cohort_constraints,
+        run_dir,
     )
 
     if not plan_record_current(record, plan):
         message = "plan replay summary is stale"
         raise StaleRecordError(message)
 
-    if validation_records and validation_summary is None:
-        message = "plan replay validation records require a validation summary"
-        raise VPTuneError(message)
-
-    if (replay_context.validation_required or plan.validation_required) and (
-        validation_summary is None
-    ):
-        message = "plan replay requires selected-plan validation"
-        raise VPTuneError(message)
-
-    if replay_context.validation_order and tuple(record["validation_order"]) != tuple(
-        replay_context.validation_order
-    ):
-        message = "plan replay validation order is stale"
-        raise StaleRecordError(message)
-
-    if validation_summary is not None and not validation_records:
-        message = "plan replay validation summary requires validation records"
-        raise VPTuneError(message)
-
-    if validation_summary is not None and not selected_plan_validation_summary_current(
-        validation_summary,
+    _validate_replay_validation_order(record, replay_context)
+    _validate_replay_validation_summary(
         plan,
+        replay_context,
+        validation_summary,
         validation_records,
-    ):
-        message = "plan replay selected-plan validation summary is stale"
-        raise StaleRecordError(message)
-
-    if validation_summary is not None:
-        _validate_selected_plan_validation_rows(
-            plan,
-            validation_summary,
-            validation_records,
-        )
+    )
 
     return plan
+
+
+def _plan_validation_records(
+    record: Mapping[str, Any],
+    validation_records: Sequence[CheckRecord],
+) -> tuple[CheckRecord, ...]:
+    row_keys = tuple(record["validation_records"])
+
+    if not row_keys:
+        return ()
+
+    return _records_in_saved_order(
+        row_keys,
+        _record_by_row_key(validation_records, "selected-plan validation"),
+        "selected-plan validation",
+    )
+
+
+def _summary_validation_records(
+    summary: Mapping[str, Any],
+    validation_records: Sequence[CheckRecord],
+) -> tuple[CheckRecord, ...]:
+    return _records_in_saved_order(
+        tuple(summary["records"]),
+        _record_by_row_key(validation_records, "selected-plan validation"),
+        "selected-plan validation",
+    )

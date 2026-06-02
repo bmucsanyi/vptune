@@ -106,6 +106,33 @@ def distributed_sharding_axis(
         name="distributed_sharding",
         settings_keys=("sharding",),
         allowed_values=tuple(modes),
+        optional_settings_keys=(
+            "fsdp_hook_entry_points",
+            "fsdp_hook_entry_policy",
+            "fsdp_sharding_granularity",
+            "fsdp_forward_prefetch",
+            "fsdp_backward_prefetch",
+            "fsdp_reshard_after_forward",
+            "fsdp_mixed_precision",
+            "fsdp_offload",
+            "fsdp_bypasses_hooks",
+            "fsdp_bottom_up_order",
+            "fsdp_mutated_modules",
+            "fsdp_collectives",
+            "input_placements",
+            "output_placements",
+            "dtensor_module_class",
+            "to_local_grad_placement",
+            "from_local_check",
+            "uneven_shard_handling",
+            "async_local_tensor_handling",
+            "higher_order_diff_status",
+            "tp_output_layout",
+            "sp_sequence_axis",
+            "sp_output_layout",
+            "cp_context_axis",
+            "cp_output_layout",
+        ),
         adapter_id="vptune.distributed",
         adapter_version=PACKAGE_VERSION,
         admission_rule=lambda candidate: admit_distributed_candidate(
@@ -238,15 +265,60 @@ def _layout_common_error(
     if placement_error is not None:
         return placement_error
 
-    return _policy_fields_error(
+    policy_error = _policy_fields_error(
         settings,
         policy.dtensor,
         (
+            "dtensor_module_class",
             "to_local_grad_placement",
             "from_local_check",
             "uneven_shard_handling",
             "async_local_tensor_handling",
         ),
+    )
+
+    if policy_error is not None:
+        return policy_error
+
+    return _higher_order_diff_status_error(settings, policy)
+
+
+def _higher_order_diff_status_error(
+    settings: Mapping[str, Any],
+    policy: DistributedAdmissionPolicy,
+) -> str | None:
+    status = settings.get("higher_order_diff_status")
+
+    if not isinstance(status, Mapping):
+        return "higher_order_diff_status must be a mapping"
+
+    expected = _higher_order_diff_status_keys(settings)
+
+    if set(status) != set(expected):
+        return (
+            "higher_order_diff_status must cover every input and output placement slot"
+        )
+
+    allowed = policy.dtensor.get("allowed_higher_order_diff_status")
+
+    if not isinstance(allowed, tuple):
+        return "higher_order_diff_status policy must declare allowed values"
+
+    for slot, value in status.items():
+        if not isinstance(value, str) or value not in allowed:
+            return f"higher_order_diff_status is not allowed for {slot}: {value}"
+
+    return None
+
+
+def _higher_order_diff_status_keys(settings: Mapping[str, Any]) -> tuple[str, ...]:
+    input_placements = tuple(settings["input_placements"])
+    output_placements = tuple(settings["output_placements"])
+
+    return tuple(
+        f"input_placements[{index}]" for index, _ in enumerate(input_placements)
+    ) + tuple(
+        f"output_placements[{index}]" for index, _ in enumerate(output_placements)
     )
 
 
@@ -408,6 +480,7 @@ def distributed_record(
     global_parameter_surface: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return a distributed row record payload."""
+    _require_distributed_identity(identity)
     _require_matching_rank_sets(
         expected_rank_count,
         rank_statuses,
@@ -474,6 +547,12 @@ def _require_matching_rank_sets(
         message = "distributed rank set differs from expected rank count"
         raise MaterializationError(message)
 
+    expected_ranks = set(range(expected_rank_count))
+
+    if status_ranks != expected_ranks:
+        message = "distributed rank set must be contiguous from zero"
+        raise MaterializationError(message)
+
 
 def _rank_set(ranks: Sequence[int], label: str) -> set[int]:
     if not ranks:
@@ -487,6 +566,36 @@ def _rank_set(ranks: Sequence[int], label: str) -> set[int]:
         raise MaterializationError(message)
 
     return rank_set
+
+
+def _require_distributed_identity(identity: Mapping[str, Any]) -> None:
+    required = (
+        "adapter_id",
+        "adapter_version",
+        "device_mesh",
+        "placements",
+        "communication",
+    )
+    missing = tuple(key for key in required if key not in identity)
+
+    if missing:
+        message = f"distributed identity missing fields: {missing}"
+        raise MaterializationError(message)
+
+    if identity["adapter_id"] != "vptune.distributed":
+        message = "distributed identity adapter_id differs"
+        raise MaterializationError(message)
+
+    for key in ("device_mesh", "communication"):
+        if not isinstance(identity[key], Mapping) or not identity[key]:
+            message = f"distributed identity {key} must be a non-empty mapping"
+            raise MaterializationError(message)
+
+    placements = identity["placements"]
+
+    if not isinstance(placements, tuple) or not placements:
+        message = "distributed identity placements must be a non-empty tuple"
+        raise MaterializationError(message)
 
 
 def distributed_identity(

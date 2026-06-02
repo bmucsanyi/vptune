@@ -3,37 +3,47 @@
 import dataclasses
 import itertools
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
 from vptune.autobatch_bridge import find_autobatch_value
 from vptune.candidates import topological_families
+from vptune.cohorts import candidate_matches_assignment, cohort_assignments
 from vptune.data import (
     AutobatchDomain,
     Batch,
+    BufferTree,
     Candidate,
     CandidateOperation,
     CheckRecord,
     CohortAssignment,
     CohortConstraint,
+    DataProvider,
     Family,
     FullSizeRecord,
+    FunctionObjective,
     Materializer,
     Measurement,
+    OperatorSpec,
+    ParameterSurface,
+    ParameterTree,
     Plan,
     PlanValidationContext,
     PlanValidator,
     Problem,
     ReferenceResult,
+    ReplayContext,
     RuntimeConfig,
+    ScalarObjective,
     SelectionPolicy,
     Target,
     TuningRun,
+    VectorProvider,
 )
 from vptune.errors import MaterializationError, NoPassedCandidateError
-from vptune.identities import stable_hash, to_json_value
-from vptune.io import write_record
+from vptune.identities import canonical_json, stable_hash
+from vptune.io import read_record, write_record
 from vptune.measure import (
     MemoryBackend,
     OperationMeasurementError,
@@ -42,12 +52,17 @@ from vptune.measure import (
     measure_once,
     run_candidate,
 )
+from vptune.runtime import standard_problem
 from vptune.schemas import (
+    candidate_from_signature,
     candidate_record_to_json,
+    check_record_from_json,
     check_record_to_json,
-    compute_record_owner_hash,
+    full_size_record_from_json,
     full_size_record_to_json,
+    plan_from_json,
     plan_to_json,
+    selected_plan_validation_input_signature,
     selected_plan_validation_summary_record,
 )
 from vptune.select import record_accepted, select_cohort, select_family
@@ -67,6 +82,13 @@ class _RunCohortState:
     cohort: Mapping[str, tuple[Candidate, FullSizeRecord]]
     input_signature: Mapping[str, Any]
     materializers: Mapping[str, Any]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _RunProblemIndex:
+    ordered_families: tuple[Family, ...]
+    problems_by_family: Mapping[str, Problem]
+    family_names: tuple[str, ...]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -97,7 +119,7 @@ class _AutobatchProbeState:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class _AutobatchReferenceOutcome:
+class _ReferenceOutcome:
     check_records: tuple[CheckRecord, ...]
     full_size_record: FullSizeRecord | None
     passed: bool
@@ -139,7 +161,37 @@ def _probe_inputs(problem: Problem) -> tuple[tuple[Batch, TensorTree], ...]:
 
 
 def _runtime(problem: Problem) -> RuntimeConfig:
+    identity = problem.runtime.identity()
+    adapter_id = identity.get("adapter_id")
+
+    if adapter_id is None:
+        return problem.runtime
+
+    for key in ("adapter_id", "adapter_version"):
+        if problem.adapter_identity.get(key) != identity.get(key):
+            message = f"problem adapter identity does not match runtime identity: {key}"
+            raise MaterializationError(message)
+
     return problem.runtime
+
+
+def _memory_backend(
+    devices: tuple[str, ...],
+    memory_backend: MemoryBackend | None,
+) -> MemoryBackend:
+    if memory_backend is None:
+        return default_memory_backend(devices)
+
+    return memory_backend
+
+
+def _input_signature(problem: Problem, memory_backend: MemoryBackend) -> dict[str, Any]:
+    signature = problem.input_signature()
+    signature["measurement"] = {
+        "memory_backend": dict(memory_backend.identity()),
+    }
+
+    return signature
 
 
 def _domain_settings_product(
@@ -243,36 +295,57 @@ def _target_admission_error(candidate: Candidate, target: Target) -> str | None:
     errors = []
 
     for key in DTYPE_SETTING_KEYS:
-        if key not in candidate.settings:
-            continue
+        error = _allowed_target_string_error(
+            candidate.settings,
+            key,
+            target.allowed_dtypes,
+            "dtype",
+        )
 
-        value = candidate.settings[key]
+        if error is not None:
+            errors.append(error)
 
-        if not isinstance(value, str):
-            errors.append(f"candidate setting must be a string: {key}")
-        elif value not in target.allowed_dtypes:
-            errors.append(f"candidate dtype is not allowed by target: {key}={value}")
+    for key, allowed_values, label in (
+        (
+            "attention.frontend",
+            target.allowed_attention_frontends,
+            "attention frontend",
+        ),
+        ("attention.sdpa_kernel", target.allowed_sdpa_kernels, "SDPA kernel"),
+        ("sharding", target.allowed_sharding_modes, "sharding mode"),
+    ):
+        error = _allowed_target_string_error(
+            candidate.settings,
+            key,
+            allowed_values,
+            label,
+        )
 
-    attention_impl = candidate.settings.get("attention_impl")
-
-    if attention_impl is not None:
-        if not isinstance(attention_impl, str):
-            errors.append("candidate setting must be a string: attention_impl")
-        elif attention_impl not in target.allowed_attention_impls:
-            errors.append(
-                f"candidate attention implementation is not allowed: {attention_impl}"
-            )
-
-    sharding = candidate.settings.get("sharding")
-
-    if sharding is not None:
-        if not isinstance(sharding, str):
-            errors.append("candidate setting must be a string: sharding")
-        elif sharding not in target.allowed_sharding_modes:
-            errors.append(f"candidate sharding mode is not allowed: {sharding}")
+        if error is not None:
+            errors.append(error)
 
     if errors:
         return "; ".join(errors)
+
+    return None
+
+
+def _allowed_target_string_error(
+    settings: Mapping[str, Any],
+    key: str,
+    allowed_values: tuple[str, ...],
+    label: str,
+) -> str | None:
+    value = settings.get(key)
+
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        return f"candidate setting must be a string: {key}"
+
+    if value not in allowed_values:
+        return f"candidate {label} is not allowed by target: {key}={value}"
 
     return None
 
@@ -347,11 +420,12 @@ def _measured_operation(
     candidate: Candidate,
     inputs: tuple[tuple[Batch, TensorTree], ...],
 ) -> CandidateOperation:
+    operations = tuple(
+        runtime.operation_factory(candidate, batch, vector) for batch, vector in inputs
+    )
+
     def operation() -> TensorTree:
-        return tuple(
-            runtime.operation_factory(candidate, batch, vector)()
-            for batch, vector in inputs
-        )
+        return tuple(candidate_operation() for candidate_operation in operations)
 
     return operation
 
@@ -372,20 +446,6 @@ def _check_record(
         measurements=dict(result.measurements),
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
-        owner_hash=compute_record_owner_hash(
-            record_type="reference",
-            family=candidate.family,
-            candidate_id=candidate.candidate_id,
-            check_name=result.name,
-            input_signature=input_signature,
-            candidate_settings=candidate.settings,
-            candidate_spec_hash=candidate.candidate_spec_hash(),
-            thresholds=result.thresholds,
-            dependency_identities=candidate.dependency_identities,
-            generator_id=candidate.generator_id,
-            generator_version=candidate.generator_version,
-        ),
-        candidate_spec_hash=candidate.candidate_spec_hash(),
         dependency_identities=dict(candidate.dependency_identities),
         cohort_assignment=dict(candidate.cohort_assignment),
     )
@@ -406,14 +466,14 @@ def _check_records(
         )
         records.extend(child_records)
 
-    child_owner_hashes = tuple(record.owner_hash for record in records)
+    child_rows = tuple(record.row_key() for record in records)
 
-    if child_owner_hashes:
+    if child_rows:
         result = dataclasses.replace(
             result,
             measurements={
                 **dict(result.measurements),
-                "child_reference_owner_hashes": child_owner_hashes,
+                "child_reference_rows": child_rows,
             },
             child_results=(),
         )
@@ -421,6 +481,25 @@ def _check_records(
     records.append(_check_record(candidate, input_signature, result))
 
     return tuple(records)
+
+
+def _with_parent_input_signature(
+    result: ReferenceResult,
+    input_signature: Mapping[str, Any],
+) -> ReferenceResult:
+    child_results = tuple(
+        dataclasses.replace(
+            child,
+            input_signature={
+                **dict(child.input_signature),
+                "parent_input_signature": dict(input_signature),
+            },
+            result=_with_parent_input_signature(child.result, input_signature),
+        )
+        for child in result.child_results
+    )
+
+    return dataclasses.replace(result, child_results=child_results)
 
 
 def _child_reference_candidates(
@@ -464,20 +543,6 @@ def _failed_check_record(
         measurements={},
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
-        owner_hash=compute_record_owner_hash(
-            record_type="reference",
-            family=candidate.family,
-            candidate_id=candidate.candidate_id,
-            check_name="tree_close",
-            input_signature=input_signature,
-            candidate_settings=candidate.settings,
-            candidate_spec_hash=candidate.candidate_spec_hash(),
-            thresholds={},
-            dependency_identities=candidate.dependency_identities,
-            generator_id=candidate.generator_id,
-            generator_version=candidate.generator_version,
-        ),
-        candidate_spec_hash=candidate.candidate_spec_hash(),
         dependency_identities=dict(candidate.dependency_identities),
         cohort_assignment=dict(candidate.cohort_assignment),
         error_type=error_type,
@@ -498,7 +563,7 @@ def _passed_full_size_record_from_samples(
 
     samples = tuple(state.samples)
 
-    return FullSizeRecord(
+    record = FullSizeRecord(
         family=candidate.family,
         candidate_id=candidate.candidate_id,
         status="passed",
@@ -506,18 +571,6 @@ def _passed_full_size_record_from_samples(
         candidate_settings=dict(candidate.settings),
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
-        owner_hash=compute_record_owner_hash(
-            record_type="full_size",
-            family=candidate.family,
-            candidate_id=candidate.candidate_id,
-            input_signature=input_signature,
-            candidate_settings=candidate.settings,
-            candidate_spec_hash=candidate.candidate_spec_hash(),
-            dependency_identities=candidate.dependency_identities,
-            generator_id=candidate.generator_id,
-            generator_version=candidate.generator_version,
-        ),
-        candidate_spec_hash=candidate.candidate_spec_hash(),
         timing_samples=samples,
         memory_samples=samples,
         output_signature=dict(state.output_signature),
@@ -525,6 +578,7 @@ def _passed_full_size_record_from_samples(
         cohort_assignment=dict(candidate.cohort_assignment),
         reference_passed=True,
     )
+    return record
 
 
 def _record_from_autobatch_state(
@@ -551,45 +605,51 @@ def _record_from_autobatch_state(
 def _write_candidate(
     run_dir: Path, input_signature: dict[str, Any], candidate: Candidate
 ) -> None:
-    write_record(
+    _write_unique_record(
         run_dir
         / "candidates"
         / candidate.family
         / candidate.candidate_id
-        / f"{candidate.candidate_spec_hash()}.json",
+        / "candidate.json",
         candidate_record_to_json(candidate, input_signature),
     )
 
 
 def _write_check(run_dir: Path, record: CheckRecord) -> None:
-    write_record(
+    _write_unique_record(
         run_dir
         / "references"
         / record.family
         / record.candidate_id
-        / _record_candidate_spec_hash(record)
         / f"{record.name}.json",
         check_record_to_json(record),
     )
 
 
 def _write_full_size(run_dir: Path, record: FullSizeRecord) -> None:
-    write_record(
-        run_dir
-        / "full_size"
-        / record.family
-        / record.candidate_id
-        / f"{_record_candidate_spec_hash(record)}.json",
+    _write_unique_record(
+        run_dir / "full_size" / record.family / record.candidate_id / "result.json",
         full_size_record_to_json(record),
     )
 
 
+def _write_unique_record(path: Path, payload: dict[str, Any]) -> None:
+    if not path.exists():
+        write_record(path, payload)
+
+        return
+
+    for index in itertools.count(1):
+        candidate_path = path.with_name(f"{path.stem}-{index:06d}{path.suffix}")
+
+        if not candidate_path.exists():
+            write_record(candidate_path, payload)
+
+            return
+
+
 def _write_summary(run_dir: Path, plan: Plan) -> None:
     write_record(run_dir / "summaries" / "tuning.json", plan_to_json(plan))
-
-
-def _record_candidate_spec_hash(record: CheckRecord | FullSizeRecord) -> str:
-    return record.candidate_spec_hash
 
 
 def _dependency_identity(
@@ -601,10 +661,8 @@ def _dependency_identity(
     return {
         "family": family,
         "candidate_id": candidate.candidate_id,
-        "candidate_spec_hash": candidate.candidate_spec_hash(),
-        "full_size_owner_hash": record.owner_hash,
-        "full_size_content_hash": record.computed_content_hash(),
-        "full_size_input_signature": dict(record.input_signature),
+        "candidate_settings": dict(candidate.settings),
+        "full_size_row": record.row_key(),
         "materializer_identity": dict(materializer_identity),
     }
 
@@ -692,6 +750,54 @@ def tune(
     return plan
 
 
+def autotune(
+    *,
+    model: Any,
+    parameter_surface: ParameterSurface,
+    parameter_values: ParameterTree,
+    buffers: BufferTree,
+    data: DataProvider,
+    operator: OperatorSpec,
+    vectors: VectorProvider,
+    target: Target,
+    candidates: Mapping[str, Mapping[str, Any]],
+    thresholds: Mapping[str, float],
+    objective_signature: Mapping[str, Any],
+    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
+    function_objectives: Mapping[str, FunctionObjective] | None = None,
+    run_dir: Path | None = None,
+    memory_backend: MemoryBackend | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+) -> Plan:
+    """Build and tune a standard PyTorch problem.
+
+    Returns:
+        Selected plan.
+    """
+    tuning_problem = standard_problem(
+        model=model,
+        parameter_surface=parameter_surface,
+        parameter_values=parameter_values,
+        buffers=buffers,
+        data=data,
+        operator=operator,
+        vectors=vectors,
+        target=target,
+        candidates=candidates,
+        thresholds=thresholds,
+        objective_signature=objective_signature,
+        scalar_objectives=scalar_objectives,
+        function_objectives=function_objectives,
+    )
+
+    return tune(
+        tuning_problem,
+        run_dir=run_dir,
+        memory_backend=memory_backend,
+        clock=clock,
+    )
+
+
 def _select_probe_result(
     probe: _ProbeResult,
     *,
@@ -756,12 +862,8 @@ def _probe_problem(
     reference_batch, reference_vector = _reference_input(problem)
     probe_inputs = _probe_inputs(problem)
 
-    input_signature = problem.input_signature()
-    backend = (
-        default_memory_backend(problem.target.devices)
-        if memory_backend is None
-        else memory_backend
-    )
+    backend = _memory_backend(problem.target.devices, memory_backend)
+    input_signature = _input_signature(problem, backend)
     records = []
     check_records = []
 
@@ -769,74 +871,25 @@ def _probe_problem(
         if run_dir is not None:
             _write_candidate(run_dir, input_signature, candidate)
 
-        if candidate.admission_status == "failed":
-            check_record = _failed_check_record(
-                candidate,
-                input_signature,
-                error_type="AdmissionError",
-                error=candidate.admission_error
-                or f"candidate admission failed: {candidate.candidate_id}",
-            )
-            check_records.append(check_record)
-            if run_dir is not None:
-                _write_check(run_dir, check_record)
-
-            records.append(
-                failed_record(
-                    candidate,
-                    input_signature,
-                    error_type="AdmissionError",
-                    error=candidate.admission_error
-                    or f"candidate admission failed: {candidate.candidate_id}",
-                    reference_passed=False,
-                )
-            )
-            if run_dir is not None:
-                _write_full_size(run_dir, records[-1])
-
-            continue
-
-        try:
-            reference_result = runtime.reference_check(
-                candidate,
-                reference_batch,
-                reference_vector,
-            )
-        except RuntimeError as error:
-            check_record = _failed_check_record(
-                candidate,
-                input_signature,
-                error_type=type(error).__name__,
-                error=str(error),
-            )
-            check_records.append(check_record)
-            if run_dir is not None:
-                _write_check(run_dir, check_record)
-
-            records.append(
-                failed_record(
-                    candidate,
-                    input_signature,
-                    error_type=type(error).__name__,
-                    error=str(error),
-                    reference_passed=False,
-                )
-            )
-            if run_dir is not None:
-                _write_full_size(run_dir, records[-1])
-
-            continue
-
-        candidate_check_records = _check_records(
+        outcome = _reference_outcome(
+            runtime,
             candidate,
+            reference_batch,
+            reference_vector,
             input_signature,
-            reference_result,
+            run_dir,
         )
-        check_records.extend(candidate_check_records)
-        _write_child_reference_candidates(run_dir, reference_result)
+        check_records.extend(outcome.check_records)
         if run_dir is not None:
-            for check_record in candidate_check_records:
+            for check_record in outcome.check_records:
                 _write_check(run_dir, check_record)
+
+        if outcome.full_size_record is not None:
+            records.append(outcome.full_size_record)
+            if run_dir is not None:
+                _write_full_size(run_dir, records[-1])
+
+            continue
 
         operation = _measured_operation(runtime, candidate, probe_inputs)
         records.append(
@@ -877,12 +930,8 @@ def _probe_problem_with_autobatch(
         for candidate in _candidate_rows(runtime)
     )
     probe_inputs = _probe_inputs(problem)
-    input_signature = problem.input_signature()
-    backend = (
-        default_memory_backend(problem.target.devices)
-        if memory_backend is None
-        else memory_backend
-    )
+    backend = _memory_backend(problem.target.devices, memory_backend)
+    input_signature = _input_signature(problem, backend)
     check_records = []
     records = []
     value_to_candidate = {
@@ -937,6 +986,18 @@ def _probe_problem_with_autobatch(
         if record is None:
             continue
 
+        if candidate.candidate_id == selected_candidate_id:
+            record = dataclasses.replace(
+                record,
+                selection_metadata={
+                    "source": "autobatch",
+                    "selected": True,
+                    "axis_name": domain.axis_name,
+                    "value": value,
+                    "goal": domain.goal,
+                },
+            )
+
         records.append(record)
         if run_dir is not None:
             _write_full_size(run_dir, record)
@@ -971,7 +1032,7 @@ def _autobatch_reference_rows(
         if run_dir is not None:
             _write_candidate(run_dir, input_signature, candidate)
 
-        outcome = _autobatch_reference_outcome(
+        outcome = _reference_outcome(
             runtime,
             candidate,
             reference_batch,
@@ -999,20 +1060,20 @@ def _autobatch_reference_rows(
     )
 
 
-def _autobatch_reference_outcome(
+def _reference_outcome(
     runtime: RuntimeConfig,
     candidate: Candidate,
     reference_batch: Batch,
     reference_vector: TensorTree,
     input_signature: dict[str, Any],
     run_dir: Path | None,
-) -> _AutobatchReferenceOutcome:
+) -> _ReferenceOutcome:
     if candidate.admission_status == "failed":
         error = candidate.admission_error or (
             f"candidate admission failed: {candidate.candidate_id}"
         )
 
-        return _AutobatchReferenceOutcome(
+        return _ReferenceOutcome(
             check_records=(
                 _failed_check_record(
                     candidate,
@@ -1038,7 +1099,7 @@ def _autobatch_reference_outcome(
             reference_vector,
         )
     except RuntimeError as error:
-        return _AutobatchReferenceOutcome(
+        return _ReferenceOutcome(
             check_records=(
                 _failed_check_record(
                     candidate,
@@ -1057,9 +1118,10 @@ def _autobatch_reference_outcome(
             passed=False,
         )
 
+    reference_result = _with_parent_input_signature(reference_result, input_signature)
     _write_child_reference_candidates(run_dir, reference_result)
 
-    return _AutobatchReferenceOutcome(
+    return _ReferenceOutcome(
         check_records=_check_records(candidate, input_signature, reference_result),
         full_size_record=None,
         passed=True,
@@ -1102,138 +1164,6 @@ def _probe_autobatch_value(
     state.output_signature = tree_signature(output)
 
 
-def _constraint_families(
-    constraint: CohortConstraint,
-    family_names: tuple[str, ...],
-) -> tuple[str, ...]:
-    if constraint.families:
-        missing = tuple(
-            family for family in constraint.families if family not in family_names
-        )
-
-        if missing:
-            message = f"cohort constraint names unknown families: {missing}"
-            raise MaterializationError(message)
-
-        return constraint.families
-
-    return family_names
-
-
-def _validate_cohort_constraints(
-    constraints: tuple[CohortConstraint, ...],
-    family_names: tuple[str, ...],
-) -> None:
-    names = tuple(constraint.name for constraint in constraints)
-
-    if len(set(names)) != len(names):
-        message = "cohort constraint names must be unique"
-        raise MaterializationError(message)
-
-    for constraint in constraints:
-        if not constraint.settings_keys:
-            message = f"cohort constraint has no settings keys: {constraint.name}"
-            raise MaterializationError(message)
-
-        if not constraint.assignments:
-            message = f"cohort constraint has no assignments: {constraint.name}"
-            raise MaterializationError(message)
-
-        if constraint.dependency_inheritance != "covered_families":
-            message = f"unsupported dependency inheritance: {constraint.name}"
-            raise MaterializationError(message)
-
-        if constraint.selection_aggregation != "sum_median_elapsed_seconds":
-            message = f"unsupported cohort selection aggregation: {constraint.name}"
-            raise MaterializationError(message)
-
-        _constraint_families(constraint, family_names)
-
-        for assignment in constraint.assignments:
-            if set(assignment) != set(constraint.settings_keys):
-                message = f"cohort assignment keys differ: {constraint.name}"
-                raise MaterializationError(message)
-
-
-def _cohort_assignments(
-    constraints: tuple[CohortConstraint, ...],
-    family_names: tuple[str, ...],
-) -> tuple[CohortAssignment, ...]:
-    _validate_cohort_constraints(constraints, family_names)
-
-    if not constraints:
-        return (
-            CohortAssignment(
-                assignment_id="default",
-                values={},
-                constraints=(),
-                covered_families=(),
-            ),
-        )
-
-    assignments = []
-
-    for entries in itertools.product(
-        *(constraint.assignments for constraint in constraints)
-    ):
-        values = {}
-        covered_families = set()
-        valid = True
-
-        for constraint, entry in zip(constraints, entries, strict=True):
-            covered_families.update(_constraint_families(constraint, family_names))
-
-            for key, value in entry.items():
-                if key in values and values[key] != value:
-                    valid = False
-                    break
-
-                values[key] = value
-
-            if not valid:
-                break
-
-        if not valid:
-            continue
-
-        signature = {
-            "constraints": tuple(constraint.name for constraint in constraints),
-            "values": dict(values),
-            "covered_families": tuple(sorted(covered_families)),
-        }
-        assignments.append(
-            CohortAssignment(
-                assignment_id=stable_hash(signature),
-                values=dict(values),
-                constraints=tuple(constraint.name for constraint in constraints),
-                covered_families=tuple(sorted(covered_families)),
-            )
-        )
-
-    if not assignments:
-        message = "cohort constraints have no compatible assignments"
-        raise MaterializationError(message)
-
-    return tuple(assignments)
-
-
-def _candidate_matches_assignment(
-    candidate: Candidate,
-    assignment: CohortAssignment,
-    constraints: tuple[CohortConstraint, ...],
-    family_names: tuple[str, ...],
-) -> bool:
-    for constraint in constraints:
-        if candidate.family not in _constraint_families(constraint, family_names):
-            continue
-
-        for key in constraint.settings_keys:
-            if candidate.settings.get(key) != assignment.values[key]:
-                return False
-
-    return True
-
-
 def _problem_for_assignment(
     problem: Problem,
     assignment: CohortAssignment,
@@ -1242,9 +1172,9 @@ def _problem_for_assignment(
 ) -> Problem:
     runtime = _runtime(problem)
     candidates = tuple(
-        dataclasses.replace(candidate, cohort_assignment=assignment.signature())
+        _candidate_for_assignment(candidate, assignment)
         for candidate in runtime.candidates
-        if _candidate_matches_assignment(
+        if candidate_matches_assignment(
             candidate, assignment, constraints, family_names
         )
     )
@@ -1253,6 +1183,16 @@ def _problem_for_assignment(
         problem,
         runtime=dataclasses.replace(runtime, candidates=candidates),
     )
+
+
+def _candidate_for_assignment(
+    candidate: Candidate,
+    assignment: CohortAssignment,
+) -> Candidate:
+    if candidate.family in assignment.covered_families:
+        return dataclasses.replace(candidate, cohort_assignment=assignment.signature())
+
+    return candidate
 
 
 def _prerequisite_failed_records(
@@ -1320,22 +1260,35 @@ def _tune_cohort_assignment(
     run_dir: Path,
     memory_backend: MemoryBackend | None,
     clock: Callable[[], float],
+    probe_cache: MutableMapping[str, _ProbeResult],
 ) -> _AssignmentResult:
     selected = {}
     records = {}
     materializers = {}
     full_size_records = ()
     check_records = ()
-    blocked_families = ()
     input_signature: dict[str, Any] = {
         "run_id": run.run_id,
         "cohort_assignment": assignment.signature(),
     }
 
-    for index, family in enumerate(ordered_families):
+    for family in ordered_families:
         if any(dependency not in selected for dependency in family.dependencies):
-            blocked_families = ordered_families[index:]
-            break
+            full_size_records = (
+                *full_size_records,
+                *_prerequisite_failed_records(
+                    problem=problems_by_family[family.name],
+                    family=family,
+                    assignment=assignment,
+                    selected=selected,
+                    records=records,
+                    materializers=materializers,
+                    constraints=run.cohort_constraints,
+                    family_names=family_names,
+                    run_dir=run_dir,
+                ),
+            )
+            continue
 
         problem = problems_by_family[family.name]
 
@@ -1357,19 +1310,23 @@ def _tune_cohort_assignment(
             family_names,
         )
 
-        try:
+        if not _runtime(problem_for_assignment).candidates:
+            continue
+
+        probe_key = _probe_cache_key(problem_for_assignment, memory_backend)
+        probe = probe_cache.get(probe_key)
+
+        if probe is None:
             probe = _probe_problem(
                 problem_for_assignment,
                 run_dir=run_dir,
                 memory_backend=memory_backend,
                 clock=clock,
             )
-        except MaterializationError:
-            blocked_families = ordered_families[index + 1 :]
-            break
+            probe_cache[probe_key] = probe
+            full_size_records = (*full_size_records, *probe.full_size_records)
+            check_records = (*check_records, *probe.check_records)
 
-        full_size_records = (*full_size_records, *probe.full_size_records)
-        check_records = (*check_records, *probe.check_records)
         input_signature[problem_for_assignment.operator.family] = dict(
             probe.input_signature
         )
@@ -1381,28 +1338,11 @@ def _tune_cohort_assignment(
                 policy=problem_for_assignment.target.selection_policy,
             )
         except NoPassedCandidateError:
-            blocked_families = ordered_families[index + 1 :]
-            break
+            continue
 
         selected[family.name] = selected_candidate
         records[family.name] = selected_record
         materializers[family.name] = probe.materializer
-
-    for family in blocked_families:
-        full_size_records = (
-            *full_size_records,
-            *_prerequisite_failed_records(
-                problem=problems_by_family[family.name],
-                family=family,
-                assignment=assignment,
-                selected=selected,
-                records=records,
-                materializers=materializers,
-                constraints=run.cohort_constraints,
-                family_names=family_names,
-                run_dir=run_dir,
-            ),
-        )
 
     if set(selected) != set(family_names):
         return _AssignmentResult(
@@ -1429,6 +1369,20 @@ def _tune_cohort_assignment(
     )
 
 
+def _probe_cache_key(
+    problem: Problem,
+    memory_backend: MemoryBackend | None,
+) -> str:
+    backend = _memory_backend(problem.target.devices, memory_backend)
+
+    return canonical_json({
+        "input_signature": _input_signature(problem, backend),
+        "candidates": tuple(
+            candidate.signature() for candidate in _runtime(problem).candidates
+        ),
+    })
+
+
 def tune_run(
     run: TuningRun,
     *,
@@ -1445,9 +1399,96 @@ def tune_run(
         Selected plan.
 
     Raises:
-        MaterializationError: If the run has no lowered problems.
-        NoPassedCandidateError: If no complete cohort has accepted rows.
+        NoPassedCandidateError: If no measured rows are produced.
     """
+    index = _run_problem_index(run, run_dir)
+    _validate_run_validators(run, index.family_names)
+
+    cohort_states = []
+    full_size_records = ()
+    check_records = ()
+    probe_cache = {}
+
+    for assignment in cohort_assignments(run.cohort_constraints, index.family_names):
+        result = _tune_cohort_assignment(
+            run=run,
+            assignment=assignment,
+            ordered_families=index.ordered_families,
+            family_names=index.family_names,
+            problems_by_family=index.problems_by_family,
+            run_dir=run_dir,
+            memory_backend=memory_backend,
+            clock=clock,
+            probe_cache=probe_cache,
+        )
+        full_size_records = (*full_size_records, *result.full_size_records)
+        check_records = (*check_records, *result.check_records)
+
+        if result.state is not None:
+            cohort_states.append(result.state)
+
+    selected_cohort = select_cohort(
+        tuple(state.cohort for state in cohort_states),
+        families=index.family_names,
+        policy=run.target.selection_policy,
+    )
+    selected_state = next(
+        state for state in cohort_states if state.cohort == selected_cohort
+    )
+    selected = {family: selected_cohort[family][0] for family in index.family_names}
+    records = {family: selected_cohort[family][1] for family in index.family_names}
+    materializers = {
+        family: selected_state.materializers[family] for family in index.family_names
+    }
+    input_signature = dict(selected_state.input_signature)
+
+    if not full_size_records:
+        message = "run has no measured candidate rows"
+        raise NoPassedCandidateError(message)
+
+    plan = Plan(
+        selected=selected,
+        records=records,
+        input_signature=input_signature,
+        policy=run.target.selection_policy,
+        full_size_records=full_size_records,
+        check_records=check_records,
+        materializers=materializers,
+        validation_order=index.family_names,
+        dependencies_by_family={
+            family.name: family.dependencies for family in index.ordered_families
+        },
+        cohort_assignment=selected_state.assignment,
+        cohort_constraints=run.cohort_constraints,
+        target_identity=run.target.signature(),
+        runtime_identities={
+            family: index.problems_by_family[family].runtime.identity()
+            for family in index.family_names
+        },
+        adapter_identities={
+            family: dict(index.problems_by_family[family].adapter_identity)
+            for family in index.family_names
+        },
+        validation_required=len(run.validators) > 0,
+        validator_identities={
+            family: dict(run.validator_identities[family]) for family in run.validators
+        },
+        run_dir=run_dir,
+    )
+
+    _write_summary(run_dir, plan)
+
+    if run.validators:
+        plan = dataclasses.replace(
+            plan,
+            validation_records=validate_plan(plan, run.validators, run_dir=run_dir),
+        )
+        _write_summary(run_dir, plan)
+
+    return plan
+
+
+def _run_problem_index(run: TuningRun, run_dir: Path) -> _RunProblemIndex:
     if not run.problems:
         message = f"run adapter is required for TuningRun: {run.run_id} at {run_dir}"
         raise MaterializationError(message)
@@ -1464,84 +1505,11 @@ def tune_run(
         message = "run families must match lowered problem families"
         raise MaterializationError(message)
 
-    _validate_run_validators(run, family_names)
-
-    cohort_states = []
-    full_size_records = ()
-    check_records = ()
-
-    for assignment in _cohort_assignments(run.cohort_constraints, family_names):
-        result = _tune_cohort_assignment(
-            run=run,
-            assignment=assignment,
-            ordered_families=ordered_families,
-            family_names=family_names,
-            problems_by_family=problems_by_family,
-            run_dir=run_dir,
-            memory_backend=memory_backend,
-            clock=clock,
-        )
-        full_size_records = (*full_size_records, *result.full_size_records)
-        check_records = (*check_records, *result.check_records)
-
-        if result.state is not None:
-            cohort_states.append(result.state)
-
-    selected_cohort = select_cohort(
-        tuple(state.cohort for state in cohort_states),
-        families=family_names,
-        policy=run.target.selection_policy,
+    return _RunProblemIndex(
+        ordered_families=ordered_families,
+        problems_by_family=problems_by_family,
+        family_names=family_names,
     )
-    selected_state = next(
-        state for state in cohort_states if state.cohort == selected_cohort
-    )
-    selected = {family: selected_cohort[family][0] for family in family_names}
-    records = {family: selected_cohort[family][1] for family in family_names}
-    materializers = {
-        family: selected_state.materializers[family] for family in family_names
-    }
-    input_signature = dict(selected_state.input_signature)
-
-    if not full_size_records:
-        message = "run has no measured candidate rows"
-        raise NoPassedCandidateError(message)
-
-    plan = Plan(
-        selected=selected,
-        records=records,
-        input_signature=input_signature,
-        policy=run.target.selection_policy,
-        full_size_records=full_size_records,
-        check_records=check_records,
-        materializers=materializers,
-        validation_order=family_names,
-        dependencies_by_family={
-            family.name: family.dependencies for family in ordered_families
-        },
-        cohort_assignment=selected_state.assignment,
-        cohort_constraints=run.cohort_constraints,
-        target_identity=run.target.signature(),
-        runtime_identities={
-            family: problems_by_family[family].runtime.identity()
-            for family in family_names
-        },
-        adapter_identities={
-            family: dict(problems_by_family[family].adapter_identity)
-            for family in family_names
-        },
-        validation_required=bool(run.validators),
-        validator_identities={
-            family: dict(run.validator_identities[family]) for family in run.validators
-        },
-        run_dir=run_dir,
-    )
-
-    _write_summary(run_dir, plan)
-
-    if run.validators:
-        validate_plan(plan, run.validators, run_dir=run_dir)
-
-    return plan
 
 
 def _validate_run_validators(run: TuningRun, family_names: tuple[str, ...]) -> None:
@@ -1570,87 +1538,253 @@ def _validate_run_validators(run: TuningRun, family_names: tuple[str, ...]) -> N
 
 
 def materialize(plan: Plan, *, family: str | None = None) -> Any:
-    """Return selected materialization data for a plan.
+    """Return selected materialization data for a plan."""
+    return plan.materialize(family)
 
-    Raises:
-        MaterializationError: If the requested family cannot be materialized.
+
+def load_tuned_plan(
+    run_dir: Path,
+    problem: Problem,
+    *,
+    memory_backend: MemoryBackend | None = None,
+) -> Plan:
+    """Load and replay a saved single-family plan for a problem.
+
+    Returns:
+        Replayed selected plan.
+
     """
-    if family is None:
-        if len(plan.selected) != 1:
-            message = "family is required for multi-family plans"
+    runtime = _runtime(problem)
+    family = problem.operator.family
+
+    return load_plan(
+        run_dir,
+        replay_context=_replay_context_for_problem(
+            problem,
+            runtime=runtime,
+            memory_backend=memory_backend,
+        ),
+        materializers={family: runtime.materializer},
+    )
+
+
+def load_tuned_run(
+    run_dir: Path,
+    run: TuningRun,
+    *,
+    memory_backend: MemoryBackend | None = None,
+) -> Plan:
+    """Load and replay a saved multi-family run.
+
+    Returns:
+        Replayed selected plan.
+    """
+    index = _run_problem_index(run, run_dir)
+    _validate_run_validators(run, index.family_names)
+    summary = read_record(run_dir / "summaries" / "tuning.json")
+    selected = {
+        str(family): candidate_from_signature(dict(candidate_record))
+        for family, candidate_record in dict(summary["selected"]).items()
+    }
+    selected_records = _selected_records_for_summary(run_dir, summary)
+    materializers = {
+        family: _runtime(index.problems_by_family[family]).materializer
+        for family in index.family_names
+    }
+
+    return load_plan(
+        run_dir,
+        replay_context=_replay_context_for_run(
+            run,
+            ordered_families=index.ordered_families,
+            problems_by_family=index.problems_by_family,
+            family_names=index.family_names,
+            selected=selected,
+            selected_records=selected_records,
+            materializers=materializers,
+            summary=summary,
+            memory_backend=memory_backend,
+        ),
+        materializers=materializers,
+    )
+
+
+def _selected_records_for_summary(
+    run_dir: Path,
+    summary: Mapping[str, Any],
+) -> dict[str, FullSizeRecord]:
+    full_size_records = tuple(
+        full_size_record_from_json(read_record(path))
+        for path in sorted((run_dir / "full_size").rglob("*.json"))
+    )
+    full_size_by_key = {
+        canonical_json(record.row_key()): record for record in full_size_records
+    }
+    selected_records = {}
+
+    for family, row_key in dict(summary["records"]).items():
+        record = full_size_by_key.get(canonical_json(row_key))
+
+        if record is None:
+            message = f"run replay selected full-size row is missing: {family}"
             raise MaterializationError(message)
 
-        family = next(iter(plan.selected))
+        selected_records[str(family)] = record
 
-    candidate = plan.selected.get(family)
-
-    if candidate is None:
-        message = f"selected family is missing: {family}"
-        raise MaterializationError(message)
-
-    record = plan.records.get(family)
-
-    if record is None:
-        message = f"selected record is missing: {family}"
-        raise MaterializationError(message)
-
-    selected_materializer = plan.materializers.get(family)
-
-    if selected_materializer is None:
-        message = f"selected family has no materializer: {family}"
-        raise MaterializationError(message)
-
-    return selected_materializer(candidate, record)
+    return selected_records
 
 
-def _validate_plan_dependency_identities(plan: Plan) -> None:
-    dependencies_by_family = plan.selected_dependencies_by_family()
+def _replay_context_for_run(
+    run: TuningRun,
+    *,
+    ordered_families: tuple[Family, ...],
+    problems_by_family: Mapping[str, Problem],
+    family_names: tuple[str, ...],
+    selected: Mapping[str, Candidate],
+    selected_records: Mapping[str, FullSizeRecord],
+    materializers: Mapping[str, Materializer],
+    summary: Mapping[str, Any],
+    memory_backend: MemoryBackend | None,
+) -> ReplayContext:
+    selected_so_far = {}
+    records_so_far = {}
+    family_input_signatures = {}
+    assignment = _cohort_assignment_from_record(summary["cohort_assignment"])
 
-    if set(dependencies_by_family) != set(plan.selected):
-        message = "selected-plan dependencies must name every selected family"
-        raise MaterializationError(message)
+    for family in ordered_families:
+        problem = problems_by_family[family.name]
 
-    for family, candidate in plan.selected.items():
-        dependencies = dependencies_by_family[family]
-        record = plan.records[family]
-
-        if set(candidate.dependency_identities) != set(dependencies):
-            message = f"selected candidate dependencies differ: {family}"
+        if problem.operator != family.operator:
+            message = f"family operator differs from problem operator: {family.name}"
             raise MaterializationError(message)
 
-        if set(record.dependency_identities) != set(dependencies):
-            message = f"selected record dependencies differ: {family}"
-            raise MaterializationError(message)
+        problem_with_dependencies = _with_dependency_identities(
+            problem,
+            family.dependencies,
+            selected_so_far,
+            records_so_far,
+            dict(materializers),
+        )
+        problem_for_assignment = _problem_for_assignment(
+            problem_with_dependencies,
+            assignment,
+            run.cohort_constraints,
+            family_names,
+        )
+        backend = _memory_backend(problem_for_assignment.target.devices, memory_backend)
+        family_input_signatures[family.name] = _input_signature(
+            problem_for_assignment,
+            backend,
+        )
+        selected_so_far[family.name] = selected[family.name]
+        records_so_far[family.name] = selected_records[family.name]
 
-        for dependency in dependencies:
-            if dependency not in plan.selected:
-                message = f"selected dependency is missing: {dependency}"
-                raise MaterializationError(message)
+    return ReplayContext(
+        input_signature={
+            "run_id": run.run_id,
+            "cohort_assignment": assignment.signature(),
+            **family_input_signatures,
+        },
+        family_input_signatures=family_input_signatures,
+        materializer_identities={
+            family: dict(materializers[family].identity()) for family in family_names
+        },
+        selection_policy=run.target.selection_policy,
+        target_identity=run.target.signature(),
+        runtime_identities={
+            family: _runtime(problems_by_family[family]).identity()
+            for family in family_names
+        },
+        adapter_identities={
+            family: dict(problems_by_family[family].adapter_identity)
+            for family in family_names
+        },
+        validator_identities={
+            family: dict(run.validator_identities[family]) for family in run.validators
+        },
+        validation_required=len(run.validators) > 0,
+        validation_order=family_names,
+    )
 
-            dependency_materializer = plan.materializers.get(dependency)
 
-            if dependency_materializer is None:
-                message = f"selected dependency has no materializer: {dependency}"
-                raise MaterializationError(message)
+def _cohort_assignment_from_record(record: Mapping[str, Any]) -> CohortAssignment:
+    return CohortAssignment(
+        assignment_id=str(record["assignment_id"]),
+        values=dict(record["values"]),
+        constraints=tuple(str(name) for name in record["constraints"]),
+        covered_families=tuple(str(family) for family in record["covered_families"]),
+    )
 
-            expected_identity = _dependency_identity(
-                dependency,
-                plan.selected[dependency],
-                plan.records[dependency],
-                dependency_materializer.identity(),
-            )
 
-            if to_json_value(candidate.dependency_identities[dependency]) != (
-                to_json_value(expected_identity)
-            ):
-                message = f"selected candidate dependency identity differs: {family}"
-                raise MaterializationError(message)
+def _replay_context_for_problem(
+    problem: Problem,
+    *,
+    runtime: RuntimeConfig,
+    memory_backend: MemoryBackend | None,
+) -> ReplayContext:
+    backend = _memory_backend(problem.target.devices, memory_backend)
+    input_signature = _input_signature(problem, backend)
+    family = problem.operator.family
 
-            if to_json_value(record.dependency_identities[dependency]) != (
-                to_json_value(expected_identity)
-            ):
-                message = f"selected record dependency identity differs: {family}"
-                raise MaterializationError(message)
+    return ReplayContext(
+        input_signature=input_signature,
+        family_input_signatures={family: input_signature},
+        materializer_identities={family: dict(runtime.materializer.identity())},
+        selection_policy=problem.target.selection_policy,
+        target_identity=problem.target.signature(),
+        runtime_identities={family: runtime.identity()},
+        adapter_identities={family: dict(problem.adapter_identity)},
+        validation_order=(family,),
+    )
+
+
+def load_plan(
+    run_dir: Path,
+    *,
+    replay_context: ReplayContext,
+    materializers: Mapping[str, Materializer],
+) -> Plan:
+    """Load and replay a saved plan from a run directory.
+
+    Returns:
+        Replayed selected plan.
+    """
+    summary = read_record(run_dir / "summaries" / "tuning.json")
+    full_size_records = tuple(
+        full_size_record_from_json(read_record(path))
+        for path in sorted((run_dir / "full_size").rglob("*.json"))
+    )
+    reference_rows = tuple(
+        check_record_from_json(read_record(path))
+        for path in sorted((run_dir / "references").rglob("*.json"))
+    )
+    check_records = tuple(
+        record for record in reference_rows if record.name != "selected_plan_validation"
+    )
+    validation_records = tuple(
+        record for record in reference_rows if record.name == "selected_plan_validation"
+    )
+    candidate_records = tuple(
+        read_record(path) for path in sorted((run_dir / "candidates").rglob("*.json"))
+    )
+    validation_summary_path = run_dir / "summaries" / "selected_plan_validation.json"
+    validation_summary = (
+        read_record(validation_summary_path)
+        if validation_summary_path.exists()
+        else None
+    )
+
+    return plan_from_json(
+        summary,
+        replay_context=replay_context,
+        full_size_records=full_size_records,
+        check_records=check_records,
+        candidate_records=candidate_records,
+        materializers=materializers,
+        validation_summary=validation_summary,
+        validation_records=validation_records,
+        run_dir=run_dir,
+    )
 
 
 def _validation_record(
@@ -1669,25 +1803,10 @@ def _validation_record(
         measurements=dict(result.measurements),
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
-        owner_hash=compute_record_owner_hash(
-            record_type="reference",
-            family=candidate.family,
-            candidate_id=candidate.candidate_id,
-            check_name="selected_plan_validation",
-            input_signature=input_signature,
-            candidate_settings=candidate.settings,
-            candidate_spec_hash=candidate.candidate_spec_hash(),
-            thresholds=result.thresholds,
-            dependency_identities=candidate.dependency_identities,
-            generator_id=candidate.generator_id,
-            generator_version=candidate.generator_version,
-        ),
-        candidate_spec_hash=candidate.candidate_spec_hash(),
         dependency_identities=dict(candidate.dependency_identities),
         cohort_assignment=dict(candidate.cohort_assignment),
     )
-
-    return dataclasses.replace(record, content_hash=record.computed_content_hash())
+    return record
 
 
 def _failed_validation_record(
@@ -1708,27 +1827,12 @@ def _failed_validation_record(
         measurements={},
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
-        owner_hash=compute_record_owner_hash(
-            record_type="reference",
-            family=candidate.family,
-            candidate_id=candidate.candidate_id,
-            check_name="selected_plan_validation",
-            input_signature=input_signature,
-            candidate_settings=candidate.settings,
-            candidate_spec_hash=candidate.candidate_spec_hash(),
-            thresholds={},
-            dependency_identities=candidate.dependency_identities,
-            generator_id=candidate.generator_id,
-            generator_version=candidate.generator_version,
-        ),
-        candidate_spec_hash=candidate.candidate_spec_hash(),
         dependency_identities=dict(candidate.dependency_identities),
         cohort_assignment=dict(candidate.cohort_assignment),
         error_type=error_type,
         error=error,
     )
-
-    return dataclasses.replace(record, content_hash=record.computed_content_hash())
+    return record
 
 
 def _write_validation(run_dir: Path, record: CheckRecord) -> None:
@@ -1737,7 +1841,6 @@ def _write_validation(run_dir: Path, record: CheckRecord) -> None:
         / "references"
         / record.family
         / record.candidate_id
-        / _record_candidate_spec_hash(record)
         / f"{record.name}.json",
         check_record_to_json(record),
     )
@@ -1775,12 +1878,9 @@ def validate_plan(
         message = "selected-plan validators must match selected families"
         raise MaterializationError(message)
 
-    _validate_plan_dependency_identities(plan)
+    plan.validate_dependency_identities()
 
-    input_signature = {
-        "plan": plan.owner_hash(),
-        "input_signature": dict(plan.input_signature),
-    }
+    input_signature = selected_plan_validation_input_signature(plan)
     records = []
 
     validation_order = plan.validation_order or tuple(plan.selected)
@@ -1789,18 +1889,30 @@ def validate_plan(
         message = "selected-plan validation order must match selected families"
         raise MaterializationError(message)
 
-    materialized = {
-        family: materialize(plan, family=family) for family in validation_order
-    }
+    materialized = {}
 
     for family in validation_order:
         candidate = plan.selected[family]
         selected_record = plan.records[family]
-        selected_impl = materialized[family]
         dependency_names = plan.dependencies_by_family.get(
             family,
             tuple(candidate.dependency_identities),
         )
+        missing_dependencies = tuple(
+            dependency
+            for dependency in dependency_names
+            if dependency not in materialized
+        )
+
+        if missing_dependencies:
+            message = (
+                "selected-plan validation order must place dependencies first: "
+                f"{family}"
+            )
+            raise MaterializationError(message)
+
+        selected_impl = materialize(plan, family=family)
+        materialized[family] = selected_impl
         dependencies = {
             dependency: materialized[dependency] for dependency in dependency_names
         }
@@ -1808,7 +1920,7 @@ def validate_plan(
             family=family,
             selected=selected_impl,
             dependencies=dependencies,
-            materialized=materialized,
+            materialized=dict(materialized),
         )
 
         try:

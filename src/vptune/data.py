@@ -7,7 +7,12 @@ from typing import Any, Protocol
 
 import torch
 
-from vptune.identities import module_identity, record_content_hash, stable_hash
+from vptune.errors import MaterializationError
+from vptune.identities import (
+    device_signature,
+    module_identity,
+    to_json_value,
+)
 from vptune.tensor_tree import TensorTree
 
 SCHEMA_VERSION = 1
@@ -313,6 +318,26 @@ class CohortConstraint:
     dependency_inheritance: str = "covered_families"
     selection_aggregation: str = "sum_median_elapsed_seconds"
 
+    def __post_init__(self) -> None:
+        """Validate supported cohort constraint modes.
+
+        Raises:
+            RuntimeError: If a cohort mode is unsupported.
+        """
+        if self.dependency_inheritance != "covered_families":
+            message = (
+                "unsupported cohort dependency inheritance: "
+                f"{self.dependency_inheritance}"
+            )
+            raise RuntimeError(message)
+
+        if self.selection_aggregation != "sum_median_elapsed_seconds":
+            message = (
+                "unsupported cohort selection aggregation: "
+                f"{self.selection_aggregation}"
+            )
+            raise RuntimeError(message)
+
     def signature(self) -> dict[str, Any]:
         """Return stable cohort-constraint identity."""
         return {
@@ -351,7 +376,8 @@ class Target:
     devices: tuple[str, ...]
     accelerator: str
     allowed_dtypes: tuple[str, ...]
-    allowed_attention_impls: tuple[str, ...]
+    allowed_attention_frontends: tuple[str, ...]
+    allowed_sdpa_kernels: tuple[str, ...]
     allowed_sharding_modes: tuple[str, ...]
     timing_policy: TimingPolicy
     selection_policy: SelectionPolicy
@@ -362,9 +388,13 @@ class Target:
         """Return a stable target identity."""
         return {
             "devices": self.devices,
+            "device_signatures": tuple(
+                device_signature(device) for device in self.devices
+            ),
             "accelerator": self.accelerator,
             "allowed_dtypes": self.allowed_dtypes,
-            "allowed_attention_impls": self.allowed_attention_impls,
+            "allowed_attention_frontends": self.allowed_attention_frontends,
+            "allowed_sdpa_kernels": self.allowed_sdpa_kernels,
             "allowed_sharding_modes": self.allowed_sharding_modes,
             "timing_policy": dataclasses.asdict(self.timing_policy),
             "selection_policy": dataclasses.asdict(self.selection_policy),
@@ -415,7 +445,7 @@ def parameter_surface(
     return ParameterSurface(
         names=tuple(name for name, _ in pairs),
         shapes=tuple(tuple(parameter.shape) for _, parameter in pairs),
-        trainable=tuple(bool(parameter.requires_grad) for _, parameter in pairs),
+        trainable=tuple(parameter.requires_grad for _, parameter in pairs),
         buffer_policy=buffers,
         tied_weights_policy=tied_weights,
     )
@@ -434,13 +464,23 @@ class OperatorSpec:
     data_axis: str = "batch"
     output_shape: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     dtype_policy: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    batch_inputs: Mapping[str, tuple[str, ...]] = dataclasses.field(
+        default_factory=lambda: {"reference": (), "operation": ()}
+    )
     anchor_family: str = "builtin"
     randomness: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     thresholds: Mapping[str, float] = dataclasses.field(default_factory=dict)
 
     def signature(self) -> dict[str, Any]:
         """Return a stable operator identity."""
-        return dataclasses.asdict(self)
+        values = dataclasses.asdict(self)
+        batch_inputs = values.pop("batch_inputs")
+        signature = {key: to_json_value(value) for key, value in values.items()}
+        signature["batch_inputs"] = {
+            phase: list(keys) for phase, keys in sorted(batch_inputs.items())
+        }
+
+        return signature
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -472,25 +512,6 @@ class Candidate:
     generator_version: str = PACKAGE_VERSION
     migration_source_id: str | None = None
 
-    def candidate_spec_hash(self) -> str:
-        """Return stable candidate spec hash."""
-        return stable_hash({
-            "family": self.family,
-            "candidate_id": self.candidate_id,
-            "settings": dict(self.settings),
-            "changed_axes": self.changed_axes,
-            "dependency_identities": {
-                family: dict(identity)
-                for family, identity in sorted(self.dependency_identities.items())
-            },
-            "cohort_assignment": dict(self.cohort_assignment),
-            "admission_status": self.admission_status,
-            "admission_error": self.admission_error,
-            "generator_id": self.generator_id,
-            "generator_version": self.generator_version,
-            "migration_source_id": self.migration_source_id,
-        })
-
     def signature(self) -> dict[str, Any]:
         """Return candidate identity fields."""
         return {
@@ -508,7 +529,6 @@ class Candidate:
             "generator_id": self.generator_id,
             "generator_version": self.generator_version,
             "migration_source_id": self.migration_source_id,
-            "candidate_spec_hash": self.candidate_spec_hash(),
         }
 
 
@@ -544,8 +564,6 @@ class CheckRecord:
     measurements: Mapping[str, Any]
     generator_id: str
     generator_version: str
-    owner_hash: str
-    candidate_spec_hash: str
     dependency_identities: Mapping[str, Mapping[str, Any]] = dataclasses.field(
         default_factory=dict
     )
@@ -554,14 +572,24 @@ class CheckRecord:
     error: str | None = None
     schema_version: int = SCHEMA_VERSION
     package_version: str = PACKAGE_VERSION
-    content_hash: str = ""
 
-    def computed_content_hash(self) -> str:
-        """Return the current saved-content hash."""
-        payload = dataclasses.asdict(self)
-        payload["record_type"] = "reference"
-
-        return record_content_hash(payload)
+    def row_key(self) -> dict[str, Any]:
+        """Return direct fields that identify this reference row."""
+        return {
+            "family": self.family,
+            "candidate_id": self.candidate_id,
+            "name": self.name,
+            "input_signature": dict(self.input_signature),
+            "candidate_settings": dict(self.candidate_settings),
+            "thresholds": dict(self.thresholds),
+            "dependency_identities": {
+                family: dict(identity)
+                for family, identity in sorted(self.dependency_identities.items())
+            },
+            "cohort_assignment": dict(self.cohort_assignment),
+            "generator_id": self.generator_id,
+            "generator_version": self.generator_version,
+        }
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -594,11 +622,10 @@ class FullSizeRecord:
     candidate_settings: Mapping[str, Any]
     generator_id: str
     generator_version: str
-    owner_hash: str
-    candidate_spec_hash: str
     timing_samples: tuple[Measurement, ...] = ()
     memory_samples: tuple[Measurement, ...] = ()
     output_signature: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    selection_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     dependency_identities: Mapping[str, Mapping[str, Any]] = dataclasses.field(
         default_factory=dict
     )
@@ -608,14 +635,22 @@ class FullSizeRecord:
     error: str | None = None
     schema_version: int = SCHEMA_VERSION
     package_version: str = PACKAGE_VERSION
-    content_hash: str = ""
 
-    def computed_content_hash(self) -> str:
-        """Return the current saved-content hash."""
-        payload = dataclasses.asdict(self)
-        payload["record_type"] = "full_size"
-
-        return record_content_hash(payload)
+    def row_key(self) -> dict[str, Any]:
+        """Return direct fields that identify this full-size row."""
+        return {
+            "family": self.family,
+            "candidate_id": self.candidate_id,
+            "input_signature": dict(self.input_signature),
+            "candidate_settings": dict(self.candidate_settings),
+            "dependency_identities": {
+                family: dict(identity)
+                for family, identity in sorted(self.dependency_identities.items())
+            },
+            "cohort_assignment": dict(self.cohort_assignment),
+            "generator_id": self.generator_id,
+            "generator_version": self.generator_version,
+        }
 
     def median_elapsed_seconds(self) -> float:
         """Return median elapsed seconds.
@@ -762,6 +797,7 @@ class Plan:
     policy: SelectionPolicy
     full_size_records: tuple[FullSizeRecord, ...] = ()
     check_records: tuple[CheckRecord, ...] = ()
+    validation_records: tuple[CheckRecord, ...] = ()
     materializers: Mapping[str, Materializer] = dataclasses.field(default_factory=dict)
     validation_order: tuple[str, ...] = ()
     dependencies_by_family: Mapping[str, tuple[str, ...]] = dataclasses.field(
@@ -783,6 +819,128 @@ class Plan:
     run_dir: Path | None = None
     schema_version: int = SCHEMA_VERSION
     package_version: str = PACKAGE_VERSION
+
+    def selected_candidate(self, family: str | None = None) -> Candidate:
+        """Return the selected candidate for one family."""
+        selected_family = self._selected_family(family)
+
+        return self.selected[selected_family]
+
+    def materialize(self, family: str | None = None) -> Any:
+        """Return the materialized selected implementation.
+
+        Raises:
+            MaterializationError: If the family or materializer is missing.
+        """
+        self.validate_dependency_identities()
+        selected_family = self._selected_family(family)
+        candidate = self.selected[selected_family]
+        record = self.records.get(selected_family)
+
+        if record is None:
+            message = f"selected record is missing: {selected_family}"
+            raise MaterializationError(message)
+
+        materializer = self.materializers.get(selected_family)
+
+        if materializer is None:
+            message = f"selected materializer is missing: {selected_family}"
+            raise MaterializationError(message)
+
+        return materializer(candidate, record)
+
+    def validate_dependency_identities(self) -> None:
+        """Validate selected dependency identity records.
+
+        Raises:
+            MaterializationError: If selected dependency identities are stale.
+        """
+        dependencies_by_family = self.selected_dependencies_by_family()
+
+        if set(dependencies_by_family) != set(self.selected):
+            message = "selected-plan dependencies must name every selected family"
+            raise MaterializationError(message)
+
+        for family, candidate in self.selected.items():
+            dependencies = dependencies_by_family[family]
+            record = self.records.get(family)
+
+            if record is None:
+                message = f"selected record is missing: {family}"
+                raise MaterializationError(message)
+
+            if set(candidate.dependency_identities) != set(dependencies):
+                message = f"selected candidate dependencies differ: {family}"
+                raise MaterializationError(message)
+
+            if set(record.dependency_identities) != set(dependencies):
+                message = f"selected record dependencies differ: {family}"
+                raise MaterializationError(message)
+
+            for dependency in dependencies:
+                self._validate_dependency_identity(
+                    family,
+                    dependency,
+                    candidate,
+                    record,
+                )
+
+    def _validate_dependency_identity(
+        self,
+        family: str,
+        dependency: str,
+        candidate: Candidate,
+        record: FullSizeRecord,
+    ) -> None:
+        if dependency not in self.selected:
+            message = f"selected dependency is missing: {dependency}"
+            raise MaterializationError(message)
+
+        dependency_materializer = self.materializers.get(dependency)
+
+        if dependency_materializer is None:
+            message = f"selected dependency has no materializer: {dependency}"
+            raise MaterializationError(message)
+
+        dependency_record = self.records.get(dependency)
+
+        if dependency_record is None:
+            message = f"selected dependency has no record: {dependency}"
+            raise MaterializationError(message)
+
+        expected_identity = {
+            "family": dependency,
+            "candidate_id": self.selected[dependency].candidate_id,
+            "candidate_settings": dict(self.selected[dependency].settings),
+            "full_size_row": dependency_record.row_key(),
+            "materializer_identity": dict(dependency_materializer.identity()),
+        }
+
+        if to_json_value(candidate.dependency_identities[dependency]) != (
+            to_json_value(expected_identity)
+        ):
+            message = f"selected candidate dependency identity differs: {family}"
+            raise MaterializationError(message)
+
+        if to_json_value(record.dependency_identities[dependency]) != (
+            to_json_value(expected_identity)
+        ):
+            message = f"selected record dependency identity differs: {family}"
+            raise MaterializationError(message)
+
+    def _selected_family(self, family: str | None) -> str:
+        if family is not None:
+            if family not in self.selected:
+                message = f"selected family is missing: {family}"
+                raise MaterializationError(message)
+
+            return family
+
+        if len(self.selected) != 1:
+            message = "family is required for multi-family plans"
+            raise MaterializationError(message)
+
+        return next(iter(self.selected))
 
     def materializer_identities(self) -> dict[str, dict[str, Any]]:
         """Return selected materializer identities by family.
@@ -843,57 +1001,12 @@ class Plan:
             for family in sorted(self.validator_identities)
         }
 
-    def owner_hash(self) -> str:
-        """Return owner hash for the selected plan."""
-        payload = {
-            "selected": {
-                family: candidate.signature()
-                for family, candidate in sorted(self.selected.items())
-            },
-            "records": {
-                family: record.owner_hash
-                for family, record in sorted(self.records.items())
-            },
-            "full_size_records": tuple(
-                record.owner_hash for record in self.full_size_records
-            ),
-            "full_size_record_content_hashes": tuple(
-                record.computed_content_hash() for record in self.full_size_records
-            ),
-            "check_records": tuple(record.owner_hash for record in self.check_records),
-            "check_record_content_hashes": tuple(
-                record.computed_content_hash() for record in self.check_records
-            ),
-            "validation_required": self.validation_required,
-            "validation_order": self.validation_order,
-            "validator_identities": self.selected_validator_identities(),
-            "dependencies_by_family": self.selected_dependencies_by_family(),
-            "cohort_assignment": None
-            if self.cohort_assignment is None
-            else self.cohort_assignment.signature(),
-            "cohort_constraints": tuple(
-                constraint.signature() for constraint in self.cohort_constraints
-            ),
-            "selected_dependency_identities": self.selected_dependency_identities(),
-            "materializer_identities": self.materializer_identities(),
-            "target_identity": dict(self.target_identity),
-            "runtime_identities": self.selected_runtime_identities(),
-            "adapter_identities": self.selected_adapter_identities(),
-            "input_signature": dict(self.input_signature),
-            "policy": dataclasses.asdict(self.policy),
-            "schema_version": self.schema_version,
-            "package_version": self.package_version,
-        }
-
-        return stable_hash(payload)
-
     def to_record(self) -> dict[str, Any]:
         """Return the saved plan record."""
         return {
             "record_type": "summary",
             "schema_version": self.schema_version,
             "package_version": self.package_version,
-            "owner_hash": self.owner_hash(),
             "input_signature": dict(self.input_signature),
             "candidate_settings": {
                 family: dict(candidate.settings)
@@ -907,18 +1020,15 @@ class Plan:
                 for family, candidate in sorted(self.selected.items())
             },
             "records": {
-                family: record.owner_hash
+                family: record.row_key()
                 for family, record in sorted(self.records.items())
             },
             "full_size_records": tuple(
-                record.owner_hash for record in self.full_size_records
+                record.row_key() for record in self.full_size_records
             ),
-            "full_size_record_content_hashes": tuple(
-                record.computed_content_hash() for record in self.full_size_records
-            ),
-            "check_records": tuple(record.owner_hash for record in self.check_records),
-            "check_record_content_hashes": tuple(
-                record.computed_content_hash() for record in self.check_records
+            "check_records": tuple(record.row_key() for record in self.check_records),
+            "validation_records": tuple(
+                record.row_key() for record in self.validation_records
             ),
             "validation_required": self.validation_required,
             "validation_order": self.validation_order,

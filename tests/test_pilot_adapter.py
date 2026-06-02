@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import vptune as vp
+import vptune.ext as vpx
 from vptune.adapters.pilot import (
     acceptance_family_names,
     acceptance_readiness,
@@ -14,7 +15,6 @@ from vptune.adapters.pilot import (
     selected_settings,
     validators,
 )
-from vptune.schemas import compute_record_owner_hash
 
 
 class OneBatchData:
@@ -57,7 +57,8 @@ def cpu_target() -> vp.Target:
         devices=("cpu",),
         accelerator="cpu",
         allowed_dtypes=("float32",),
-        allowed_attention_impls=(),
+        allowed_attention_frontends=(),
+        allowed_sdpa_kernels=(),
         allowed_sharding_modes=("single_device",),
         timing_policy=vp.TimingPolicy(),
         selection_policy=vp.SelectionPolicy(),
@@ -77,13 +78,13 @@ def reference_passed() -> vp.ReferenceResult:
 def materialize_candidate_impl(
     candidate: vp.Candidate,
     record: vp.FullSizeRecord,
-) -> vp.CandidateOperation:
+) -> vpx.CandidateOperation:
     assert record.candidate_id == candidate.candidate_id
 
-    return vp.constant_operation(torch.tensor([1.0]))
+    return vpx.constant_operation(torch.tensor([1.0]))
 
 
-materialize_candidate = vp.CallableMaterializer(
+materialize_candidate = vpx.CallableMaterializer(
     "tests.pilot.materialize_candidate",
     "1",
     {},
@@ -115,11 +116,11 @@ def problem_for(name: str, operator: vp.OperatorSpec) -> vp.Problem:
         candidate: vp.Candidate,
         batch: Mapping[str, object],
         vector: vp.TensorTree,
-    ) -> vp.CandidateOperation:
+    ) -> vpx.CandidateOperation:
         assert candidate.family == name
         assert batch["family"] == name
 
-        return vp.constant_operation(vector)
+        return vpx.constant_operation(vector)
 
     return vp.Problem(
         model=model,
@@ -128,7 +129,7 @@ def problem_for(name: str, operator: vp.OperatorSpec) -> vp.Problem:
         operator=operator,
         vectors=OneVectorProvider(),
         target=cpu_target(),
-        runtime=vp.RuntimeConfig(
+        runtime=vpx.RuntimeConfig(
             (candidate,),
             operation_factory,
             reference_check,
@@ -156,24 +157,29 @@ def full_size_record(candidate: vp.Candidate) -> vp.FullSizeRecord:
         candidate_settings=candidate.settings,
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
-        owner_hash=compute_record_owner_hash(
-            record_type="full_size",
-            family=candidate.family,
-            candidate_id=candidate.candidate_id,
-            input_signature={"case": "pilot"},
-            candidate_settings=candidate.settings,
-            candidate_spec_hash=candidate.candidate_spec_hash(),
-            dependency_identities=candidate.dependency_identities,
-            generator_id=candidate.generator_id,
-            generator_version=candidate.generator_version,
-        ),
-        candidate_spec_hash=candidate.candidate_spec_hash(),
         timing_samples=(sample,),
         memory_samples=(sample,),
         dependency_identities=dict(candidate.dependency_identities),
     )
 
-    return dataclasses.replace(record, content_hash=record.computed_content_hash())
+    return record
+
+
+def dependency_identity(
+    candidate: vp.Candidate,
+    record: vp.FullSizeRecord,
+) -> dict[str, object]:
+    return {
+        "family": candidate.family,
+        "candidate_id": candidate.candidate_id,
+        "candidate_settings": dict(candidate.settings),
+        "full_size_row": record.row_key(),
+        "materializer_identity": dict(materialize_candidate.identity()),
+    }
+
+
+def refresh_check_record(record: vp.CheckRecord) -> vp.CheckRecord:
+    return record
 
 
 def plan_for(candidate: vp.Candidate) -> vp.Plan:
@@ -194,6 +200,23 @@ def test_pilot_lower_validates_family_problem_match() -> None:
     target = cpu_target()
     first_operator = vp.gradient("first", "loss", aggregation="sum")
     second_operator = vp.hvp("second", "loss", aggregation="sum")
+    constraint = vp.CohortConstraint(
+        name="dtype",
+        settings_keys=("model_dtype",),
+        assignments=({"model_dtype": "float32"},),
+        families=("first", "second"),
+    )
+
+    def validator(
+        candidate: vp.Candidate,
+        record: vp.FullSizeRecord,
+        context: vp.PlanValidationContext,
+    ) -> vp.ReferenceResult:
+        assert candidate.family == record.family
+        assert context.family in {"first", "second"}
+
+        return reference_passed()
+
     run = lower(
         target=target,
         families=(
@@ -205,9 +228,21 @@ def test_pilot_lower_validates_family_problem_match() -> None:
             problem_for("second", second_operator),
         ),
         run_id="pilot",
+        cohort_constraints=(constraint,),
+        plan_validators={"first": validator, "second": validator},
+        validator_identities={
+            "first": {"validator": "pilot"},
+            "second": {"validator": "pilot"},
+        },
     )
 
     assert tuple(family.name for family in run.families) == ("first", "second")
+    assert run.cohort_constraints == (constraint,)
+    assert set(run.validators) == {"first", "second"}
+    assert run.validator_identities == {
+        "first": {"validator": "pilot"},
+        "second": {"validator": "pilot"},
+    }
 
     with pytest.raises(vp.MaterializationError):
         lower(
@@ -215,6 +250,16 @@ def test_pilot_lower_validates_family_problem_match() -> None:
             families=(vp.Family("first", first_operator),),
             problems=(problem_for("second", second_operator),),
             run_id="bad",
+        )
+
+    with pytest.raises(vp.MaterializationError, match="validator identities"):
+        lower(
+            target=target,
+            families=(vp.Family("first", first_operator),),
+            problems=(problem_for("first", first_operator),),
+            run_id="bad-validators",
+            plan_validators={"first": validator},
+            validator_identities={},
         )
 
 
@@ -247,6 +292,144 @@ def test_pilot_readiness_and_selected_settings() -> None:
         selected_settings(stale, ("family",))
 
 
+def test_pilot_readiness_rejects_stale_selected_candidate_metadata() -> None:
+    candidate = vp.Candidate(
+        "family",
+        "row",
+        {"axis": "value"},
+        admission_status="passed",
+        generator_version="1",
+    )
+    plan = plan_for(candidate)
+    changed_generator = dataclasses.replace(
+        plan,
+        selected={
+            "family": dataclasses.replace(candidate, generator_version="2"),
+        },
+    )
+    failed_admission = dataclasses.replace(
+        plan,
+        selected={
+            "family": dataclasses.replace(
+                candidate,
+                admission_status="failed",
+                admission_error="rejected",
+            ),
+        },
+    )
+
+    assert not readiness(changed_generator, ("family",)).passed()
+    assert not readiness(failed_admission, ("family",)).passed()
+
+
+def test_pilot_readiness_rejects_stale_selected_dependencies() -> None:
+    dependency = vp.Candidate(
+        "dependency",
+        "dependency-row",
+        {"axis": "dependency"},
+        admission_status="passed",
+    )
+    dependency_record = full_size_record(dependency)
+    dependent = vp.Candidate(
+        "dependent",
+        "dependent-row",
+        {"axis": "dependent"},
+        dependency_identities={
+            "dependency": dependency_identity(dependency, dependency_record)
+        },
+        admission_status="passed",
+    )
+    plan = vp.Plan(
+        selected={
+            "dependency": dependency,
+            "dependent": dependent,
+        },
+        records={
+            "dependency": dependency_record,
+            "dependent": full_size_record(dependent),
+        },
+        input_signature={"case": "pilot"},
+        policy=vp.SelectionPolicy(),
+        full_size_records=(dependency_record, full_size_record(dependent)),
+        materializers={
+            "dependency": materialize_candidate,
+            "dependent": materialize_candidate,
+        },
+        validation_order=("dependency", "dependent"),
+    )
+    changed_dependent = dataclasses.replace(
+        dependent,
+        dependency_identities={
+            "dependency": {
+                **dependent.dependency_identities["dependency"],
+                "candidate_id": "changed",
+            }
+        },
+    )
+    stale = dataclasses.replace(
+        plan,
+        selected={
+            "dependency": dependency,
+            "dependent": changed_dependent,
+        },
+    )
+
+    assert not readiness(stale, ("dependent",)).passed()
+
+
+def test_pilot_readiness_requires_selected_dependencies() -> None:
+    dependency = vp.Candidate(
+        "dependency",
+        "dependency-row",
+        {"axis": "dependency"},
+        admission_status="passed",
+    )
+    dependency_record = full_size_record(dependency)
+    dependent = vp.Candidate(
+        "dependent",
+        "dependent-row",
+        {"axis": "dependent"},
+        dependency_identities={
+            "dependency": dependency_identity(dependency, dependency_record)
+        },
+        admission_status="passed",
+    )
+    dependent_record = full_size_record(dependent)
+    missing_dependency_plan = vp.Plan(
+        selected={"dependent": dependent},
+        records={"dependent": dependent_record},
+        input_signature={"case": "pilot"},
+        policy=vp.SelectionPolicy(),
+        full_size_records=(dependent_record,),
+        materializers={"dependent": materialize_candidate},
+        validation_order=("dependent",),
+    )
+    ready_plan = vp.Plan(
+        selected={"dependency": dependency, "dependent": dependent},
+        records={
+            "dependency": dependency_record,
+            "dependent": dependent_record,
+        },
+        input_signature={"case": "pilot"},
+        policy=vp.SelectionPolicy(),
+        full_size_records=(dependency_record, dependent_record),
+        materializers={
+            "dependency": materialize_candidate,
+            "dependent": materialize_candidate,
+        },
+        validation_order=("dependency", "dependent"),
+        dependencies_by_family={"dependent": ("dependency",)},
+    )
+
+    missing_state = readiness(missing_dependency_plan, ("dependent",))
+    ready_state = readiness(ready_plan, ("dependent",))
+
+    assert not missing_state.passed()
+    assert missing_state.required_families == ("dependent", "dependency")
+    assert missing_state.missing_families == ("dependency",)
+    assert ready_state.passed()
+
+
 def test_pilot_selected_settings_require_validation_rows_when_plan_requires_them() -> (
     None
 ):
@@ -275,14 +458,20 @@ def test_pilot_selected_settings_require_validation_rows_when_plan_requires_them
         return reference_passed()
 
     validation_records = vp.validate_plan(plan, {"family": validator})
+    plan_with_records = dataclasses.replace(
+        plan,
+        validation_records=validation_records,
+    )
     settings = selected_settings(
         plan,
         ("family",),
         validation_records=validation_records,
     )
+    attached_settings = selected_settings(plan_with_records, ("family",))
     failed_record = dataclasses.replace(validation_records[0], status="failed")
 
     assert settings["family"]["candidate_id"] == "row"
+    assert attached_settings["family"]["candidate_id"] == "row"
 
     with pytest.raises(vp.MaterializationError, match="validation rows"):
         selected_settings(plan, ("family",))
@@ -292,6 +481,90 @@ def test_pilot_selected_settings_require_validation_rows_when_plan_requires_them
             plan,
             ("family",),
             validation_records=(failed_record,),
+        )
+
+
+def test_pilot_selected_settings_rejects_validation_dependency_mismatch() -> None:
+    dependency = vp.Candidate(
+        "dependency",
+        "dependency-row",
+        {"axis": "dependency"},
+        admission_status="passed",
+    )
+    dependency_record = full_size_record(dependency)
+    dependent = vp.Candidate(
+        "dependent",
+        "dependent-row",
+        {"axis": "dependent"},
+        dependency_identities={
+            "dependency": dependency_identity(dependency, dependency_record)
+        },
+        admission_status="passed",
+    )
+    dependent_record = full_size_record(dependent)
+    plan = vp.Plan(
+        selected={"dependency": dependency, "dependent": dependent},
+        records={
+            "dependency": dependency_record,
+            "dependent": dependent_record,
+        },
+        input_signature={"case": "pilot"},
+        policy=vp.SelectionPolicy(),
+        full_size_records=(dependency_record, dependent_record),
+        materializers={
+            "dependency": materialize_candidate,
+            "dependent": materialize_candidate,
+        },
+        validation_order=("dependency", "dependent"),
+        dependencies_by_family={"dependent": ("dependency",)},
+        validation_required=True,
+        validator_identities={
+            "dependency": {"validator": "test"},
+            "dependent": {"validator": "test"},
+        },
+    )
+
+    def validator(
+        candidate: vp.Candidate,
+        record: vp.FullSizeRecord,
+        context: vp.PlanValidationContext,
+    ) -> vp.ReferenceResult:
+        assert candidate.family == record.family
+        assert context.family == candidate.family
+
+        return reference_passed()
+
+    validation_records = vp.validate_plan(
+        plan,
+        {
+            "dependency": validator,
+            "dependent": validator,
+        },
+    )
+    bad_dependent_record = refresh_check_record(
+        dataclasses.replace(
+            validation_records[1],
+            dependency_identities={
+                "dependency": {
+                    **dict(dependent.dependency_identities["dependency"]),
+                    "full_size_row": {
+                        **dict(
+                            dependent.dependency_identities["dependency"][
+                                "full_size_row"
+                            ]
+                        ),
+                        "candidate_id": "different",
+                    },
+                }
+            },
+        )
+    )
+
+    with pytest.raises(vp.MaterializationError, match="dependencies"):
+        selected_settings(
+            plan,
+            ("dependent",),
+            validation_records=(validation_records[0], bad_dependent_record),
         )
 
 

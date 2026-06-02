@@ -1,18 +1,20 @@
 """Candidate measurement."""
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
 import torch
 
 from vptune.data import Candidate, FullSizeRecord, Measurement, TimingPolicy
-from vptune.schemas import compute_record_owner_hash
 from vptune.tensor_tree import TensorTree, tree_detach, tree_signature
 
 
 class MemoryBackend(Protocol):
     """Memory sampling backend."""
+
+    def identity(self) -> Mapping[str, Any]:
+        """Return stable memory measurement identity."""
 
     def prepare(self) -> None:
         """Reset memory state before a call."""
@@ -29,6 +31,18 @@ class MemoryBackend(Protocol):
 
 class CPUMemoryBackend:
     """Zero-valued memory backend for CPU tests and CPU candidates."""
+
+    @staticmethod
+    def identity() -> Mapping[str, Any]:
+        """Return stable CPU memory measurement identity."""
+        return {
+            "backend_id": "vptune.cpu_memory",
+            "backend_version": "0.0.1",
+            "devices": ("cpu",),
+            "prepare": "none",
+            "synchronize": "none",
+            "cleanup": "none",
+        }
 
     @staticmethod
     def prepare() -> None:
@@ -69,6 +83,18 @@ class CUDAMemoryBackend:
             )
         else:
             self.devices = tuple(devices)
+
+    def identity(self) -> Mapping[str, Any]:
+        """Return stable CUDA memory measurement identity."""
+        return {
+            "backend_id": "vptune.cuda_memory",
+            "backend_version": "0.0.1",
+            "devices": self.devices,
+            "prepare": "empty_cache_reset_peak_synchronize",
+            "synchronize": "cuda_synchronize_all_devices",
+            "cleanup": "empty_cache",
+            "device_memory_used": hasattr(torch.cuda, "device_memory_used"),
+        }
 
     def prepare(self) -> None:
         """Reset CUDA peak memory on every device."""
@@ -334,18 +360,6 @@ def run_candidate(
         candidate_settings=dict(candidate.settings),
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
-        owner_hash=compute_record_owner_hash(
-            record_type="full_size",
-            family=candidate.family,
-            candidate_id=candidate.candidate_id,
-            input_signature=input_signature,
-            candidate_settings=candidate.settings,
-            candidate_spec_hash=candidate.candidate_spec_hash(),
-            dependency_identities=candidate.dependency_identities,
-            generator_id=candidate.generator_id,
-            generator_version=candidate.generator_version,
-        ),
-        candidate_spec_hash=candidate.candidate_spec_hash(),
         timing_samples=samples,
         memory_samples=samples,
         output_signature=tree_signature(output),
@@ -373,18 +387,6 @@ def failed_record(
         candidate_settings=dict(candidate.settings),
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
-        owner_hash=compute_record_owner_hash(
-            record_type="full_size",
-            family=candidate.family,
-            candidate_id=candidate.candidate_id,
-            input_signature=input_signature,
-            candidate_settings=candidate.settings,
-            candidate_spec_hash=candidate.candidate_spec_hash(),
-            dependency_identities=candidate.dependency_identities,
-            generator_id=candidate.generator_id,
-            generator_version=candidate.generator_version,
-        ),
-        candidate_spec_hash=candidate.candidate_spec_hash(),
         dependency_identities=dict(candidate.dependency_identities),
         cohort_assignment=dict(candidate.cohort_assignment),
         reference_passed=reference_passed,

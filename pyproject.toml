@@ -34,9 +34,6 @@ requires-python = ">=3.12,<3.15"
 [project.optional-dependencies]
 dev = ["ruff", "pre-commit", "pytest", "ty", "pytest-cov"]
 transformers = ["transformers"]
-curvlinops = [
-    "curvlinops-for-pytorch @ git+https://github.com/f-dangel/curvlinops.git@479a09e468a67eb60db448b643f28269371e798b",
-]
 
 # PEP 518 Build System Configuration
 # See https://peps.python.org/pep-0518/

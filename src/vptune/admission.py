@@ -37,6 +37,7 @@ TORCH_FUNC_BOOL_FIELDS = (
     "requires_forward_ad",
     "forward_ad_supported",
 )
+FORWARD_AD_FIELDS = ("requires_forward_ad", "forward_ad_supported")
 CHECKPOINT_FIELDS = (
     "use_reentrant",
     "preserve_rng_state",
@@ -76,8 +77,8 @@ def admit_functional_call(settings: Mapping[str, Any]) -> None:
     _require_string_tuple(settings["mutated_parameter_keys"], "mutated_parameter_keys")
     _require_string_tuple(settings["mutated_buffer_keys"], "mutated_buffer_keys")
 
-    if settings["parametrization_policy"] not in {"active", "disabled"}:
-        message = "parametrization_policy must be active or disabled"
+    if settings["parametrization_policy"] != "active":
+        message = "parametrization_policy must be active"
         raise AdmissionError(message)
 
     if settings["module_mode"] not in {"train", "eval"}:
@@ -164,6 +165,25 @@ def admit_torch_func(settings: Mapping[str, Any]) -> None:
         raise AdmissionError(message)
 
     if settings["requires_forward_ad"] and not settings["forward_ad_supported"]:
+        message = "forward AD is required but unsupported"
+        raise AdmissionError(message)
+
+
+def admit_forward_ad(settings: Mapping[str, Any]) -> None:
+    """Validate forward AD admission fields.
+
+    Raises:
+        AdmissionError: If the candidate cannot use forward AD.
+    """
+    require_fields(settings, FORWARD_AD_FIELDS)
+    _require_bool(settings["requires_forward_ad"], "requires_forward_ad")
+    _require_bool(settings["forward_ad_supported"], "forward_ad_supported")
+
+    if settings["requires_forward_ad"] is not True:
+        message = "candidate must declare requires_forward_ad=True"
+        raise AdmissionError(message)
+
+    if settings["forward_ad_supported"] is not True:
         message = "forward AD is required but unsupported"
         raise AdmissionError(message)
 

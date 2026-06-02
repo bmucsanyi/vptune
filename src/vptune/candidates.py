@@ -6,9 +6,11 @@ from typing import Any
 
 from vptune.admission import (
     CHECKPOINT_FIELDS,
+    FORWARD_AD_FIELDS,
     FUNCTIONAL_CALL_FIELDS,
     TORCH_FUNC_FIELDS,
     admit_checkpoint,
+    admit_forward_ad,
     admit_functional_call,
     admit_torch_func,
 )
@@ -18,26 +20,45 @@ from vptune.errors import AdmissionError
 AdmissionRule = Callable[[Candidate], tuple[bool, str | None]]
 
 DTYPE_VALUES = ("bfloat16", "float16", "float32")
-ATTENTION_IMPL_VALUES = (
-    "eager",
-    "sdpa_math",
-    "sdpa_flash",
-    "sdpa_memory_efficient",
+ATTENTION_FRONTEND_VALUES = (
     "transformers_eager",
     "transformers_sdpa",
     "transformers_flash_attention_2",
+    "transformers_flash_attention_3",
+    "transformers_flash_attention_4",
+    "transformers_flex_attention",
+    "paged|eager",
+    "paged|sdpa",
+    "paged|flash_attention_2",
+    "paged|flash_attention_3",
+    "paged|flash_attention_4",
+    "registered_transformers_attention",
+    "pytorch_sdpa_direct",
     "patched_eager",
+    "packed_exact",
+    "blockwise_exact",
+)
+SDPA_KERNEL_VALUES = (
+    "math",
+    "flash_attention",
+    "efficient_attention",
+    "cudnn_attention",
+    "overrideable",
+    "priority_list",
 )
 OPERATOR_PATH_VALUES = (
     "autograd_grad",
     "torch_func_jvp",
+    "forward_ad_jvp",
     "torch_func_vjp",
     "reverse_over_reverse",
+    "functional_hvp",
     "jvp_grad",
     "dense_ggn",
     "jvp_hessian_vjp",
     "dense_score_outer",
     "categorical_exact",
+    "categorical_monte_carlo",
     "score_gradient_loop",
     "dense_empirical_fisher",
     "per_example_gradient_loop",
@@ -53,7 +74,10 @@ TORCH_FUNC_OPERATOR_PATHS = (
     "jvp_grad",
     "per_example_gradient_vmap",
 )
-FORWARD_AD_OPERATOR_PATHS = ("torch_func_jvp", "jvp_grad")
+FORWARD_AD_OPERATOR_PATHS = ("torch_func_jvp", "forward_ad_jvp", "jvp_grad")
+TORCH_FUNC_AXIS_FIELDS = tuple(
+    field for field in TORCH_FUNC_FIELDS if field not in FORWARD_AD_FIELDS
+)
 VMAP_OPERATOR_PATHS = ("per_example_gradient_vmap",)
 PARAMETER_LAYOUT_VALUES = ("flat_cpu", "flat_cuda", "tensor_tree", "dtensor")
 SHARDING_VALUES = (
@@ -85,6 +109,7 @@ class AxisDescriptor:
     name: str
     settings_keys: tuple[str, ...]
     allowed_values: tuple[Any, ...]
+    optional_settings_keys: tuple[str, ...] = ()
     adapter_id: str = "core"
     adapter_version: str = "0.0.1"
     admission_rule: AdmissionRule | None = None
@@ -111,6 +136,7 @@ class AxisDescriptor:
         return {
             "name": self.name,
             "settings_keys": self.settings_keys,
+            "optional_settings_keys": self.optional_settings_keys,
             "allowed_values": self.allowed_values,
             "adapter_id": self.adapter_id,
             "adapter_version": self.adapter_version,
@@ -125,6 +151,9 @@ class AxisRegistry:
 
     axes: dict[str, AxisDescriptor] = dataclasses.field(default_factory=dict)
     owners: dict[str, str] = dataclasses.field(default_factory=dict)
+    optional_owners: dict[str, tuple[str, ...]] = dataclasses.field(
+        default_factory=dict
+    )
 
     def register(self, axis: AxisDescriptor) -> None:
         """Register an axis descriptor.
@@ -143,6 +172,12 @@ class AxisRegistry:
             message = f"axis is already registered: {axis.name}"
             raise AdmissionError(message)
 
+        all_setting_keys = (*axis.settings_keys, *axis.optional_settings_keys)
+
+        if len(set(all_setting_keys)) != len(all_setting_keys):
+            message = f"axis setting keys are duplicated: {axis.name}"
+            raise AdmissionError(message)
+
         for key in axis.settings_keys:
             owner = self.owners.get(key)
 
@@ -154,6 +189,12 @@ class AxisRegistry:
 
         for key in axis.settings_keys:
             self.owners[key] = axis.name
+
+        for key in axis.optional_settings_keys:
+            owners = self.optional_owners.get(key, ())
+
+            if axis.name not in owners:
+                self.optional_owners[key] = (*owners, axis.name)
 
     def admit(self, candidate: Candidate) -> Candidate:
         """Return candidate with admission status set.
@@ -169,11 +210,17 @@ class AxisRegistry:
         for key in candidate.settings:
             owner = self.owners.get(key)
 
-            if owner is None:
+            if owner is not None:
+                axis_names.add(owner)
+                continue
+
+            optional_owners = self.optional_owners.get(key)
+
+            if optional_owners is None:
                 message = f"candidate setting key has no axis owner: {key}"
                 raise AdmissionError(message)
 
-            axis_names.add(owner)
+            axis_names.update(optional_owners)
 
         for axis_name in sorted(axis_names):
             axis = self.axes.get(axis_name)
@@ -200,6 +247,9 @@ class AxisRegistry:
                 name: axis.signature() for name, axis in sorted(self.axes.items())
             },
             "owners": dict(sorted(self.owners.items())),
+            "optional_owners": {
+                key: tuple(value) for key, value in sorted(self.optional_owners.items())
+            },
         }
 
 
@@ -295,36 +345,50 @@ def _operator_path_axis() -> AdmissionRule:
     def admit(candidate: Candidate) -> tuple[bool, str | None]:
         value = candidate.settings["operator_path"]
 
+        if value == "forward_ad_jvp":
+            return _admit_forward_ad_path(candidate.settings)
+
         if value not in TORCH_FUNC_OPERATOR_PATHS:
             return True, None
 
-        missing = tuple(
-            field for field in TORCH_FUNC_FIELDS if field not in candidate.settings
-        )
-
-        if missing:
-            return False, f"torch.func admission fields missing: {missing}"
-
-        if (
-            value in FORWARD_AD_OPERATOR_PATHS
-            and candidate.settings["requires_forward_ad"] is not True
-        ):
-            return False, f"operator path requires forward AD: {value}"
-
-        if value in VMAP_OPERATOR_PATHS:
-            vmap_error = _vmap_path_error(candidate.settings)
-
-            if vmap_error is not None:
-                return False, vmap_error
-
-        try:
-            admit_torch_func(candidate.settings)
-        except AdmissionError as error:
-            return False, str(error)
-
-        return True, None
+        return _admit_torch_func_path(value, candidate.settings)
 
     return admit
+
+
+def _admit_forward_ad_path(settings: Mapping[str, Any]) -> tuple[bool, str | None]:
+    try:
+        admit_forward_ad(settings)
+    except AdmissionError as error:
+        return False, str(error)
+
+    return True, None
+
+
+def _admit_torch_func_path(
+    value: str,
+    settings: Mapping[str, Any],
+) -> tuple[bool, str | None]:
+    missing = tuple(field for field in TORCH_FUNC_FIELDS if field not in settings)
+
+    if missing:
+        return False, f"torch.func admission fields missing: {missing}"
+
+    if value in VMAP_OPERATOR_PATHS:
+        vmap_error = _vmap_path_error(settings)
+
+        if vmap_error is not None:
+            return False, vmap_error
+
+    try:
+        admit_torch_func(settings)
+
+        if value in FORWARD_AD_OPERATOR_PATHS:
+            admit_forward_ad(settings)
+    except AdmissionError as error:
+        return False, str(error)
+
+    return True, None
 
 
 def _vmap_path_error(settings: Mapping[str, Any]) -> str | None:
@@ -422,7 +486,21 @@ def _checkpoint_axis(
         if value not in active_values:
             return True, None
 
-        return _admit_checkpoint_fields(candidate)
+        passed, error = _admit_checkpoint_fields(candidate)
+
+        if not passed:
+            return passed, error
+
+        if (
+            value == "non_reentrant_no_rng_preservation"
+            and candidate.settings["preserve_rng_state"]
+        ):
+            return (
+                False,
+                "non_reentrant_no_rng_preservation requires preserve_rng_state=False",
+            )
+
+        return True, None
 
     return admit
 
@@ -499,11 +577,12 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             "operator_path",
             ("operator_path",),
             OPERATOR_PATH_VALUES,
+            optional_settings_keys=FORWARD_AD_FIELDS,
             admission_rule=_operator_path_axis(),
         ),
         AxisDescriptor(
             "torch_func_admission",
-            TORCH_FUNC_FIELDS,
+            TORCH_FUNC_AXIS_FIELDS,
             (),
             admission_rule=_torch_func_axis(),
         ),
@@ -537,7 +616,16 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             PARAMETER_LAYOUT_VALUES,
         ),
         AxisDescriptor("sharding", ("sharding",), SHARDING_VALUES),
-        AxisDescriptor("attention_impl", ("attention_impl",), ATTENTION_IMPL_VALUES),
+        AxisDescriptor(
+            "attention_frontend",
+            ("attention.frontend",),
+            ATTENTION_FRONTEND_VALUES,
+        ),
+        AxisDescriptor(
+            "attention_sdpa_kernel",
+            ("attention.sdpa_kernel",),
+            SDPA_KERNEL_VALUES,
+        ),
         AxisDescriptor("storage_dtype", ("storage_dtype",), DTYPE_VALUES),
         AxisDescriptor(
             "metric_residency", ("metric_residency",), METRIC_RESIDENCY_VALUES
@@ -566,11 +654,15 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
     )
 
 
-def standard_axis_registry() -> AxisRegistry:
+def standard_axis_registry(*, exclude: Sequence[str] = ()) -> AxisRegistry:
     """Return a registry populated with standard core axes."""
     registry = AxisRegistry()
+    excluded = set(exclude)
 
     for axis in standard_axis_descriptors():
+        if axis.name in excluded:
+            continue
+
         registry.register(axis)
 
     return registry

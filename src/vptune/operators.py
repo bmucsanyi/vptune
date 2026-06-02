@@ -39,6 +39,7 @@ def jvp(
         "jvp",
         objective_id,
         aggregation=aggregation,
+        batch_inputs={"reference": (), "operation": ()},
         randomness={} if randomness is None else dict(randomness),
         thresholds={} if thresholds is None else dict(thresholds),
     )
@@ -58,6 +59,7 @@ def vjp(
         "vjp",
         objective_id,
         aggregation=aggregation,
+        batch_inputs={"reference": ("tangent_vector",), "operation": ()},
         randomness={} if randomness is None else dict(randomness),
         thresholds={} if thresholds is None else dict(thresholds),
     )
@@ -77,6 +79,7 @@ def hvp(
         "hvp",
         objective_id,
         aggregation=aggregation,
+        batch_inputs={"reference": ("symmetry_vector",), "operation": ()},
         randomness={} if randomness is None else dict(randomness),
         thresholds={} if thresholds is None else dict(thresholds),
     )
@@ -87,15 +90,29 @@ def ggnvp(
     objective_id: str,
     *,
     aggregation: str,
+    loss_geometry: str,
     randomness: Mapping[str, Any] | None = None,
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
     """Return a GGNVP operator spec."""
+    if loss_geometry == "psd_metric":
+        batch_inputs = {
+            "reference": ("loss_hessian", "symmetry_vector"),
+            "operation": ("loss_hessian",),
+        }
+    else:
+        batch_inputs = {
+            "reference": ("loss_hessian",),
+            "operation": ("loss_hessian",),
+        }
+
     return OperatorSpec(
         family,
         "ggnvp",
         objective_id,
         aggregation=aggregation,
+        semantics={"loss_geometry": loss_geometry},
+        batch_inputs=batch_inputs,
         randomness={} if randomness is None else dict(randomness),
         thresholds={} if thresholds is None else dict(thresholds),
     )
@@ -140,6 +157,7 @@ def fisher_vp(
         objective_id,
         aggregation=aggregation,
         semantics=semantics,
+        batch_inputs={"reference": (), "operation": ()},
         randomness={} if randomness is None else dict(randomness),
         thresholds={} if thresholds is None else dict(thresholds),
     )
@@ -150,15 +168,24 @@ def empirical_fisher_vp(
     objective_id: str,
     *,
     aggregation: str,
+    loss_reduction: str,
+    denominator: str,
     randomness: Mapping[str, Any] | None = None,
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
     """Return an empirical FisherVP operator spec."""
+    semantics = {
+        "loss_reduction": loss_reduction,
+        "denominator": denominator,
+    }
+
     return OperatorSpec(
         family,
         "empirical_fisher_vp",
         objective_id,
         aggregation=aggregation,
+        semantics=semantics,
+        batch_inputs={"reference": (), "operation": ()},
         randomness={} if randomness is None else dict(randomness),
         thresholds={} if thresholds is None else dict(thresholds),
     )
@@ -178,6 +205,7 @@ def metric(
         "metric",
         objective_id,
         aggregation=aggregation,
+        batch_inputs={"reference": ("metric",), "operation": ("metric",)},
         randomness={} if randomness is None else dict(randomness),
         thresholds={} if thresholds is None else dict(thresholds),
     )
@@ -197,6 +225,7 @@ def inverse_metric(
         "inverse_metric",
         objective_id,
         aggregation=aggregation,
+        batch_inputs={"reference": ("metric",), "operation": ("metric",)},
         randomness={} if randomness is None else dict(randomness),
         thresholds={} if thresholds is None else dict(thresholds),
     )

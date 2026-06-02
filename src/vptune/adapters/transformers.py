@@ -3,7 +3,7 @@
 import dataclasses
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -14,31 +14,61 @@ from vptune.errors import AdmissionError
 from vptune.identities import module_identity
 from vptune.tensor_tree import TensorTree
 
-EAGER_ATTENTION_IMPLS = (
-    "eager",
+EAGER_ATTENTION_FRONTENDS = (
     "transformers_eager",
     "patched_eager",
+    "paged|eager",
 )
-SDPA_ATTENTION_IMPLS = (
-    "sdpa_math",
-    "sdpa_flash",
-    "sdpa_memory_efficient",
+SDPA_ATTENTION_FRONTENDS = (
     "transformers_sdpa",
+    "paged|sdpa",
+    "pytorch_sdpa_direct",
 )
-FLASH_ATTENTION_IMPLS = (
-    "sdpa_flash",
+FLASH_ATTENTION_FRONTENDS = (
     "transformers_flash_attention_2",
+    "transformers_flash_attention_3",
+    "transformers_flash_attention_4",
+    "paged|flash_attention_2",
+    "paged|flash_attention_3",
+    "paged|flash_attention_4",
 )
-PACKED_ATTENTION_IMPLS = ("packed_target_rows",)
-BLOCKWISE_ATTENTION_IMPLS = ("blockwise_second_derivative",)
-TRANSFORMERS_ATTENTION_IMPLS = (
-    *EAGER_ATTENTION_IMPLS,
-    *SDPA_ATTENTION_IMPLS,
-    "transformers_flash_attention_2",
-    *PACKED_ATTENTION_IMPLS,
-    *BLOCKWISE_ATTENTION_IMPLS,
+CUSTOM_ATTENTION_FRONTENDS = (
+    "transformers_flex_attention",
+    "registered_transformers_attention",
 )
+PACKED_ATTENTION_FRONTENDS = ("packed_exact",)
+BLOCKWISE_ATTENTION_FRONTENDS = ("blockwise_exact",)
+TRANSFORMERS_ATTENTION_FRONTENDS = (
+    *EAGER_ATTENTION_FRONTENDS,
+    *SDPA_ATTENTION_FRONTENDS,
+    *FLASH_ATTENTION_FRONTENDS,
+    *CUSTOM_ATTENTION_FRONTENDS,
+    *PACKED_ATTENTION_FRONTENDS,
+    *BLOCKWISE_ATTENTION_FRONTENDS,
+)
+SDPA_KERNELS = (
+    "math",
+    "flash_attention",
+    "efficient_attention",
+    "cudnn_attention",
+    "overrideable",
+    "priority_list",
+)
+NON_MATH_SDPA_KERNELS = tuple(kernel for kernel in SDPA_KERNELS if kernel != "math")
 FLASH_ATTENTION_DTYPES = ("float16", "bfloat16")
+LOAD_TIME_ATTENTION_FRONTENDS = {
+    "transformers_eager": "eager",
+    "transformers_sdpa": "sdpa",
+    "transformers_flash_attention_2": "flash_attention_2",
+    "transformers_flash_attention_3": "flash_attention_3",
+    "transformers_flash_attention_4": "flash_attention_4",
+    "transformers_flex_attention": "flex_attention",
+    "paged|eager": "paged|eager",
+    "paged|sdpa": "paged|sdpa",
+    "paged|flash_attention_2": "paged|flash_attention_2",
+    "paged|flash_attention_3": "paged|flash_attention_3",
+    "paged|flash_attention_4": "paged|flash_attention_4",
+}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -99,6 +129,81 @@ class TransformersModelIdentity:
         }
 
 
+class TransformersModelLoader(Protocol):
+    """Object with a Transformers-style loader."""
+
+    def from_pretrained(
+        self,
+        model_name_or_path: str,
+        *,
+        revision: str,
+        torch_dtype: torch.dtype,
+        attn_implementation: str,
+        use_cache: bool,
+    ) -> torch.nn.Module:
+        """Return a loaded model."""
+
+
+def load_transformers_model(
+    model_cls: TransformersModelLoader,
+    *,
+    model_name_or_path: str,
+    revision: str,
+    torch_dtype: torch.dtype,
+    attention_frontend: str,
+    attention_custom_kernel_id: str | None = None,
+    use_cache: bool,
+) -> torch.nn.Module:
+    """Load a Transformers model with explicit execution settings.
+
+    Returns:
+        Loaded model.
+    """
+    return model_cls.from_pretrained(
+        model_name_or_path,
+        revision=revision,
+        torch_dtype=torch_dtype,
+        attn_implementation=transformers_attn_implementation(
+            attention_frontend,
+            attention_custom_kernel_id=attention_custom_kernel_id,
+        ),
+        use_cache=use_cache,
+    )
+
+
+def transformers_attn_implementation(
+    attention_frontend: str,
+    *,
+    attention_custom_kernel_id: str | None = None,
+) -> str:
+    """Return the Transformers loader value for an attention frontend.
+
+    Returns:
+        `from_pretrained(attn_implementation=...)` value.
+
+    Raises:
+        AdmissionError: If the frontend is not a load-time Transformers frontend.
+    """
+    if attention_frontend == "registered_transformers_attention":
+        if not attention_custom_kernel_id:
+            message = (
+                "registered_transformers_attention requires attention_custom_kernel_id"
+            )
+            raise AdmissionError(message)
+
+        return attention_custom_kernel_id
+
+    attn_implementation = LOAD_TIME_ATTENTION_FRONTENDS.get(attention_frontend)
+
+    if attn_implementation is None:
+        message = (
+            f"attention frontend is not load-time selectable: {attention_frontend}"
+        )
+        raise AdmissionError(message)
+
+    return attn_implementation
+
+
 def transformers_model_identity(
     model: torch.nn.Module,
     *,
@@ -147,29 +252,55 @@ def transformers_model_identity(
 
 
 def transformers_attention_axis(
-    implementations: Sequence[str],
+    frontends: Sequence[str],
     *,
     policy: TransformersAttentionPolicy,
 ) -> AxisDescriptor:
-    """Return an attention-implementation axis for Transformers models.
+    """Return an attention frontend axis for Transformers models.
 
     Raises:
-        AdmissionError: If an implementation name is unsupported.
+        AdmissionError: If a frontend name is unsupported.
     """
     unsupported = tuple(
-        implementation
-        for implementation in implementations
-        if implementation not in TRANSFORMERS_ATTENTION_IMPLS
+        frontend
+        for frontend in frontends
+        if frontend not in TRANSFORMERS_ATTENTION_FRONTENDS
     )
 
     if unsupported:
-        message = f"unsupported Transformers attention implementations: {unsupported}"
+        message = f"unsupported Transformers attention frontends: {unsupported}"
         raise AdmissionError(message)
 
     return AxisDescriptor(
-        name="transformers_attention",
-        settings_keys=("attention_impl",),
-        allowed_values=tuple(implementations),
+        name="transformers_attention_frontend",
+        settings_keys=("attention.frontend",),
+        allowed_values=tuple(frontends),
+        optional_settings_keys=(
+            "attention.sdpa_kernel",
+            "attention.sdpa_priority_list",
+            "attention.custom_kernel_id",
+            "attention.mask_formatter_id",
+            "model_dtype",
+            "compute_dtype",
+            "output_attentions",
+            "module_mode",
+            "dropout_p",
+            "enable_gqa",
+            "query_heads",
+            "key_heads",
+            "value_heads",
+            "patched_attention_id",
+            "patched_attention_semantics",
+            "packed_attention_id",
+            "packed_attention_semantics",
+            "packed_target_row_axis",
+            "packed_target_row_count",
+            "blockwise_attention_id",
+            "blockwise_attention_semantics",
+            "attention_block_size",
+            "blockwise_preserves_softcap",
+            "blockwise_preserves_mask",
+        ),
         adapter_id="vptune.transformers",
         adapter_version=PACKAGE_VERSION,
         admission_rule=lambda candidate: admit_transformers_attention(
@@ -205,18 +336,18 @@ def admit_transformers_attention(
     policy: TransformersAttentionPolicy,
 ) -> tuple[bool, str | None]:
     """Return whether a Transformers attention candidate is admitted."""
-    attention_impl = candidate.settings.get("attention_impl")
+    attention_frontend = candidate.settings.get("attention.frontend")
 
-    if not isinstance(attention_impl, str):
-        return False, "attention_impl must be a string"
+    if not isinstance(attention_frontend, str):
+        return False, "attention.frontend must be a string"
 
-    if attention_impl not in TRANSFORMERS_ATTENTION_IMPLS:
+    if attention_frontend not in TRANSFORMERS_ATTENTION_FRONTENDS:
         return (
             False,
-            f"unsupported Transformers attention implementation: {attention_impl}",
+            f"unsupported Transformers attention frontend: {attention_frontend}",
         )
 
-    error = _attention_error(candidate, policy, attention_impl)
+    error = _attention_error(candidate, policy, attention_frontend)
 
     if error is None:
         return True, None
@@ -230,11 +361,12 @@ def admit_transformers_cache(
     policy: TransformersAttentionPolicy,
 ) -> tuple[bool, str | None]:
     """Return whether a Transformers cache candidate is admitted."""
-    use_cache = candidate.settings.get("use_cache")
+    error = _required_bool_setting(candidate.settings, "use_cache")
 
-    if not isinstance(use_cache, bool):
-        return False, "use_cache must be a bool"
+    if error is not None:
+        return False, error
 
+    use_cache = candidate.settings["use_cache"]
     if use_cache != policy.use_cache:
         return (
             False,
@@ -293,19 +425,17 @@ def check_patched_attention_vjp_reference(
 def _attention_error(
     candidate: Candidate,
     policy: TransformersAttentionPolicy,
-    attention_impl: str,
+    attention_frontend: str,
 ) -> str | None:
-    error = None
+    error = _sdpa_kernel_error(candidate.settings, policy, attention_frontend)
 
-    if attention_impl == "transformers_flash_attention_2":
-        error = _flash_attention2_error(candidate, policy)
-    elif attention_impl == "sdpa_flash":
-        error = _sdpa_flash_error(candidate, policy)
+    if error is None and attention_frontend in FLASH_ATTENTION_FRONTENDS:
+        error = _flash_attention_frontend_error(candidate, policy, attention_frontend)
 
     if (
         error is None
         and candidate.settings.get("output_attentions") is True
-        and attention_impl not in EAGER_ATTENTION_IMPLS
+        and attention_frontend not in EAGER_ATTENTION_FRONTENDS
     ):
         error = "output_attentions requires eager attention"
 
@@ -316,13 +446,16 @@ def _attention_error(
         error = _gqa_error(candidate.settings)
 
     if error is None:
-        error = _patched_attention_error(candidate.settings, attention_impl)
+        error = _patched_attention_error(candidate.settings, attention_frontend)
 
     if error is None:
-        error = _packed_attention_error(candidate.settings, attention_impl)
+        error = _packed_attention_error(candidate.settings, policy, attention_frontend)
 
     if error is None:
-        error = _blockwise_attention_error(candidate.settings, attention_impl)
+        error = _blockwise_attention_error(candidate.settings, attention_frontend)
+
+    if error is None:
+        error = _registered_attention_error(candidate.settings, attention_frontend)
 
     if error is None:
         error = _policy_error(policy)
@@ -330,16 +463,17 @@ def _attention_error(
     return error
 
 
-def _flash_attention2_error(
+def _flash_attention_frontend_error(
     candidate: Candidate,
     policy: TransformersAttentionPolicy,
+    attention_frontend: str,
 ) -> str | None:
     if policy.padding_limit is None or policy.padding_limit <= 0:
-        return "FlashAttention-2 requires a positive padding limit"
+        return f"{attention_frontend} requires a positive padding limit"
 
     dtype_error = _flash_attention_dtype_error(
         candidate.settings,
-        "transformers_flash_attention_2",
+        attention_frontend,
     )
 
     if dtype_error is not None:
@@ -348,14 +482,110 @@ def _flash_attention2_error(
     return _forced_kernel_error(policy)
 
 
-def _sdpa_flash_error(
-    candidate: Candidate,
+def _sdpa_kernel_error(
+    settings: Mapping[str, Any],
+    policy: TransformersAttentionPolicy,
+    attention_frontend: str,
+) -> str | None:
+    if attention_frontend not in SDPA_ATTENTION_FRONTENDS:
+        return _unexpected_sdpa_kernel_error(settings)
+
+    value_error = _sdpa_kernel_value_error(settings)
+
+    if value_error is not None:
+        return value_error
+
+    return _admitted_sdpa_kernel_error(
+        settings,
+        policy,
+        settings["attention.sdpa_kernel"],
+    )
+
+
+def _unexpected_sdpa_kernel_error(settings: Mapping[str, Any]) -> str | None:
+    if settings.get("attention.sdpa_kernel") is not None:
+        return "attention.sdpa_kernel applies only to SDPA frontends"
+
+    return None
+
+
+def _sdpa_kernel_value_error(settings: Mapping[str, Any]) -> str | None:
+    sdpa_kernel = settings.get("attention.sdpa_kernel")
+
+    if not isinstance(sdpa_kernel, str):
+        return "attention.sdpa_kernel must be a string"
+
+    if sdpa_kernel not in SDPA_KERNELS:
+        return f"unsupported SDPA kernel: {sdpa_kernel}"
+
+    return None
+
+
+def _admitted_sdpa_kernel_error(
+    settings: Mapping[str, Any],
+    policy: TransformersAttentionPolicy,
+    sdpa_kernel: object,
+) -> str | None:
+    if sdpa_kernel == "priority_list":
+        return _sdpa_priority_list_error(settings, policy)
+
+    if sdpa_kernel == "math":
+        return None
+
+    return _non_math_sdpa_kernel_error(settings, policy, sdpa_kernel)
+
+
+def _sdpa_priority_list_error(
+    settings: Mapping[str, Any],
     policy: TransformersAttentionPolicy,
 ) -> str | None:
-    dtype_error = _flash_attention_dtype_error(candidate.settings, "sdpa_flash")
+    priority_list = settings.get("attention.sdpa_priority_list")
 
-    if dtype_error is not None:
-        return dtype_error
+    if (
+        not isinstance(priority_list, Sequence)
+        or isinstance(priority_list, str)
+        or not priority_list
+    ):
+        return "attention.sdpa_priority_list must be a non-empty sequence"
+
+    for kernel in priority_list:
+        if not isinstance(kernel, str):
+            return "attention.sdpa_priority_list entries must be strings"
+
+        if kernel not in SDPA_KERNELS or kernel == "priority_list":
+            return f"invalid SDPA priority-list entry: {kernel}"
+
+    if "flash_attention" in priority_list:
+        dtype_error = _flash_attention_dtype_error(
+            settings,
+            "attention.sdpa_kernel=priority_list",
+        )
+
+        if dtype_error is not None:
+            return dtype_error
+
+    if any(kernel != "math" for kernel in priority_list):
+        return _forced_kernel_error(policy)
+
+    return None
+
+
+def _non_math_sdpa_kernel_error(
+    settings: Mapping[str, Any],
+    policy: TransformersAttentionPolicy,
+    sdpa_kernel: object,
+) -> str | None:
+    if sdpa_kernel == "flash_attention":
+        dtype_error = _flash_attention_dtype_error(
+            settings,
+            "attention.sdpa_kernel=flash_attention",
+        )
+
+        if dtype_error is not None:
+            return dtype_error
+
+    if sdpa_kernel not in NON_MATH_SDPA_KERNELS:
+        return None
 
     return _forced_kernel_error(policy)
 
@@ -372,24 +602,29 @@ def _forced_kernel_error(policy: TransformersAttentionPolicy) -> str | None:
 
 def _flash_attention_dtype_error(
     settings: Mapping[str, Any],
-    attention_impl: str,
+    attention_frontend: str,
 ) -> str | None:
-    dtype = settings.get("model_dtype")
+    dtype = settings.get("compute_dtype", settings.get("model_dtype"))
 
     if dtype not in FLASH_ATTENTION_DTYPES:
-        return f"{attention_impl} requires float16 or bfloat16 model_dtype"
+        return f"{attention_frontend} requires float16 or bfloat16 effective dtype"
 
     return None
 
 
 def _eval_dropout_error(settings: Mapping[str, Any]) -> str | None:
-    if settings.get("module_mode") != "eval":
+    module_mode = settings.get("module_mode")
+
+    if module_mode not in {"train", "eval"}:
+        return "attention rows require module_mode train or eval"
+
+    if module_mode != "eval":
         return None
 
     dropout_p = settings.get("dropout_p")
 
     if dropout_p is None:
-        return None
+        return "eval attention references require recorded dropout_p"
 
     if not isinstance(dropout_p, int | float):
         return "dropout_p must be numeric"
@@ -429,9 +664,9 @@ def _gqa_error(settings: Mapping[str, Any]) -> str | None:
 
 def _patched_attention_error(
     settings: Mapping[str, Any],
-    attention_impl: str,
+    attention_frontend: str,
 ) -> str | None:
-    if attention_impl != "patched_eager":
+    if attention_frontend != "patched_eager":
         return None
 
     return _semantic_attention_error(
@@ -443,9 +678,10 @@ def _patched_attention_error(
 
 def _packed_attention_error(
     settings: Mapping[str, Any],
-    attention_impl: str,
+    policy: TransformersAttentionPolicy,
+    attention_frontend: str,
 ) -> str | None:
-    if attention_impl != "packed_target_rows":
+    if attention_frontend != "packed_exact":
         return None
 
     return _first_attention_error((
@@ -456,14 +692,26 @@ def _packed_attention_error(
         ),
         _required_string_setting(settings, "packed_target_row_axis"),
         _required_positive_int_setting(settings, "packed_target_row_count"),
+        _required_true_setting(settings, "packed_preserves_softcap"),
+        _required_true_setting(settings, "packed_preserves_mask"),
+        _required_string_match(
+            settings,
+            "packed_mask_semantics",
+            policy.mask_semantics,
+        ),
+        _required_string_match(
+            settings,
+            "packed_causal_policy",
+            policy.causal_policy,
+        ),
     ))
 
 
 def _blockwise_attention_error(
     settings: Mapping[str, Any],
-    attention_impl: str,
+    attention_frontend: str,
 ) -> str | None:
-    if attention_impl != "blockwise_second_derivative":
+    if attention_frontend != "blockwise_exact":
         return None
 
     return _first_attention_error((
@@ -473,8 +721,21 @@ def _blockwise_attention_error(
             semantics_key="blockwise_attention_semantics",
         ),
         _required_positive_int_setting(settings, "attention_block_size"),
-        _required_bool_setting(settings, "blockwise_preserves_softcap"),
-        _required_bool_setting(settings, "blockwise_preserves_mask"),
+        _required_true_setting(settings, "blockwise_preserves_softcap"),
+        _required_true_setting(settings, "blockwise_preserves_mask"),
+    ))
+
+
+def _registered_attention_error(
+    settings: Mapping[str, Any],
+    attention_frontend: str,
+) -> str | None:
+    if attention_frontend != "registered_transformers_attention":
+        return None
+
+    return _first_attention_error((
+        _required_string_setting(settings, "attention.custom_kernel_id"),
+        _required_string_setting(settings, "attention.mask_formatter_id"),
     ))
 
 
@@ -531,6 +792,26 @@ def _required_positive_int_setting(
 def _required_bool_setting(settings: Mapping[str, Any], key: str) -> str | None:
     if not isinstance(settings.get(key), bool):
         return f"{key} must be a bool"
+
+    return None
+
+
+def _required_true_setting(settings: Mapping[str, Any], key: str) -> str | None:
+    if settings.get(key) is not True:
+        return f"{key} must be true"
+
+    return None
+
+
+def _required_string_match(
+    settings: Mapping[str, Any],
+    key: str,
+    expected: str,
+) -> str | None:
+    value = settings.get(key)
+
+    if value != expected:
+        return f"{key} must match policy value {expected}"
 
     return None
 
