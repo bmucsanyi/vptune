@@ -116,13 +116,13 @@ Core package:
 - Saved records.
 - `autobatch` integration.
 
-Optional adapters:
+Adapter modules:
 
 - `vptune.adapters.transformers`: Hugging Face model loading, attention implementation settings, tied-weight handling, cache flags, tokenizer-aware batching, and model-specific attention variants.
 - `vptune.adapters.distributed`: DTensor, FSDP2, tensor parallel, rank-local memory, global status, and selected settings agreement.
 - `vptune.adapters.pilot`: pilot lowering, readiness, selected settings conversion, and adapter-owned validation.
 
-`import vptune as vp` exports the main tuning API: operator declarations, problem and run objects, plans, policies, objective/data/vector protocols, validation protocols, and package errors. Adapter and runtime authors import lower-level tools from `vptune.ext`. Optional adapter helpers are imported from `vptune.adapters` or the specific adapter module.
+`import vptune as vp` exports the main tuning API: operator declarations, problem and run objects, plans, policies, objective/data/vector protocols, validation protocols, and package errors. Adapter and runtime authors import lower-level tools from `vptune.ext`. Adapter helpers are imported from `vptune.adapters` or the specific adapter module.
 
 The live package spec is `SPEC.md`. The live package scratchpad is `SCRATCHPAD.md`.
 
@@ -167,7 +167,7 @@ plan = vp.autotune(
 selected = plan.materialize()
 ```
 
-`vp.standard_problem(...)` builds the same standard `Problem` without running it. `vp.tune(problem)` remains the lower-level entry point. `vp.load_tuned_plan(run_dir, problem)` replays a saved single-family problem run without requiring caller-built replay identity. `vp.load_tuned_run(run_dir, tuning)` does the same for a saved multi-family `TuningRun`. Custom operators and adapters can provide `vptune.ext.RuntimeConfig` directly with an operation factory, reference check, materializer, axis registry, and runtime identity.
+`vp.standard_problem(...)` builds the same standard `Problem` without running it. `vp.tune(problem)` remains the lower-level entry point. `vp.load_tuned_plan(run_dir, problem)` replays a saved single-family problem run without requiring caller-built replay identity. `vp.load_tuned_run(run_dir, tuning)` does the same for a saved multi-family `TuningRun`. Composition specs require `TuningRun` because their child families must be present in the same run-level dependency graph; `vp.autotune(...)` and `vp.standard_problem(...)` reject composition specs. Custom operators and adapters can provide `vptune.ext.RuntimeConfig` directly with an operation factory, reference check, materializer, axis registry, and runtime identity.
 
 Multi-family tuning:
 
@@ -192,8 +192,12 @@ tuning = vp.TuningRun(
         ),
         vp.Family(
             "preconditioned_hvp",
-            vp.composition("preconditioned_hvp", "metric_inverse_after_hvp", aggregation="sum"),
-            dependencies=("loss_gradient", "metric"),
+            vp.composition(
+                "preconditioned_hvp",
+                "metric_inverse_after_hvp",
+                aggregation="sum",
+                children=("loss_gradient", "metric"),
+            ),
         ),
     ),
     problems=adapter.lower(tuning_inputs),
@@ -328,7 +332,7 @@ def fisher_vp(
     distribution: str,
     label_policy: str,
     sample_space: str,
-    loss_reduction: str,
+    score_reduction: str,
     denominator: str,
 ) -> OperatorSpec: ...
 
@@ -342,7 +346,7 @@ def sampled_fisher_vp(
     sample_count: int,
     sample_source: str,
     sampling_bound: Mapping[str, Any],
-    loss_reduction: str,
+    score_reduction: str,
     denominator: str,
 ) -> OperatorSpec: ...
 
@@ -351,13 +355,34 @@ def empirical_fisher_vp(
     objective_id: str,
     *,
     aggregation: str,
-    loss_reduction: str,
+    example_loss_reduction: str,
     denominator: str,
 ) -> OperatorSpec: ...
 
-def metric(family: str, objective_id: str, *, aggregation: str) -> OperatorSpec: ...
-def inverse_metric(family: str, objective_id: str, *, aggregation: str) -> OperatorSpec: ...
-def composition(family: str, objective_id: str, *, aggregation: str) -> OperatorSpec: ...
+def metric(
+    family: str,
+    objective_id: str,
+    *,
+    aggregation: str,
+    representation: Mapping[str, Any],
+) -> OperatorSpec: ...
+
+def inverse_metric(
+    family: str,
+    objective_id: str,
+    *,
+    aggregation: str,
+    representation: Mapping[str, Any],
+    damping: float,
+) -> OperatorSpec: ...
+
+def composition(
+    family: str,
+    objective_id: str,
+    *,
+    aggregation: str,
+    children: Sequence[str],
+) -> OperatorSpec: ...
 ```
 
 Required callable protocols:
@@ -477,13 +502,13 @@ Error types:
 - Materializer identity.
 - Axis registry.
 - Runtime identity signature.
-- Optional Autobatch domains for monotone integer candidate axes.
+- Autobatch domains for monotone integer candidate axes.
 
 `Family` fields:
 
 - Name.
 - Operator spec.
-- Dependencies.
+- Dependencies. For composition families, dependencies are derived from the operator's ordered `children` field and are not separately declared.
 - Candidate generator.
 - Anchor checks.
 - Full-size probe inputs.
@@ -501,7 +526,7 @@ Error types:
 - Admission failure fields.
 - Candidate generator id.
 - Candidate generator version.
-- Optional source id for imported rows.
+- Source id for imported rows; package-generated rows set source id to `package`.
 
 `Check` fields:
 
@@ -520,7 +545,7 @@ Error types:
 - Peak reserved MiB.
 - Post allocated MiB.
 - Post reserved MiB.
-- Optional non-PyTorch device memory measurement.
+- Backend-specific device memory measurement fields.
 
 `Plan` fields:
 
@@ -640,10 +665,13 @@ Required replay fields:
 - Objective fields: qualified callable name, user-supplied id, reduction rule, data aggregation rule, RNG policy, module mode, and gradient target.
 - Data fields: dataset name or user id, data value version, revision, selected row ids or slice fields, and batch collation policy.
 - Vector fields: vector source id, vector value version, shape tree, dtype tree, norm summary, seed when generated, and storage id when loaded from tensors.
+- Metric representation fields: representation kind, metric value version, declared factor names, factor order, factor shape tree, block order, damping, denominator, and normalization fields.
 - Target fields: declared devices, per-device hardware signatures, GPU model, device capability, driver version when CUDA reports it, CUDA or ROCm runtime version, PyTorch version, `torch.__config__` summary, allocator config, deterministic flags, TF32 flags, cuDNN flags, BF16 reduced-reduction flags, matmul precision, MPS availability, and relevant environment variables. `vptune.ext.environment_signature()` captures the runtime fields, and `Target.signature()` binds both the declared target devices and their device signatures. The selected memory backend fields are part of the per-problem input signature because callers may supply the backend at tune time.
 - Adapter fields: adapter package version, adapter registry id, model-specific admission rules, and candidate-generator version.
 
 Every saved row is current only when its saved replay fields match the current run by direct field equality: family, row id, check name for reference rows, input signature, settings, thresholds, dependency fields, cohort assignment fields, changed axes for candidate rows, generator fields, axis descriptor fields, admission fields, migration source id, and selected dependency fields.
+
+Value-version fields are caller-declared drift signals. The package compares those fields directly and does not inspect tensor content during replay. Callers must change parameter, buffer, data, vector, or metric-representation value-version fields when value changes should invalidate saved numeric checks or selected rows.
 
 When runtime fields declare `adapter_id` and `adapter_version`, the enclosing `Problem.adapter_identity` must declare the same values. Mismatched adapter fields fail before search.
 
@@ -659,15 +687,15 @@ When runtime fields declare `adapter_id` and `adapter_version`, the enclosing `P
 
 `vp.ggnvp(family, objective_id, aggregation=..., loss_geometry=...)` declares $J^\top H_\ell Jv$ for output Jacobian $J$ and loss Hessian $H_\ell$. `loss_geometry="psd_metric"` requires symmetry, PSD, and dot-product checks on the output-space loss Hessian. `loss_geometry="linear_map"` checks candidate agreement against anchors without metric-only checks.
 
-`vp.fisher_vp(family, objective_id, aggregation=..., distribution=..., label_policy=..., sample_space=..., loss_reduction=..., denominator=...)` declares $Fv = \mathbb{E}[s_\theta s_\theta^\top v]$, where $s_\theta=\nabla_\theta \log p_\theta(y|x)$ is the declared score. FisherVP rows compute exact score-gradient outer products over the declared score source. Exact categorical NLL Fisher is represented by GGNVP with the CE/KL loss Hessian.
+`vp.fisher_vp(family, objective_id, aggregation=..., distribution=..., label_policy=..., sample_space=..., score_reduction=..., denominator=...)` declares $Fv = \mathbb{E}[s_\theta s_\theta^\top v]$, where $s_\theta=\nabla_\theta \log p_\theta(y|x)$ is the declared score. FisherVP rows compute exact score-gradient outer products over the declared score source. Exact categorical NLL Fisher is represented by GGNVP with the CE/KL loss Hessian.
 
-`vp.sampled_fisher_vp(family, objective_id, aggregation=..., distribution=..., label_policy=..., sample_count=..., sample_source=..., sampling_bound=..., loss_reduction=..., denominator=...)` declares $\hat F_S v = \frac{1}{nS}\sum_{i,s} g_{is}(g_{is}^\top v)$ for a fixed sample table or fixed seed and sample count $S$. It is a separate operator family from exact FisherVP. `sampling_bound` declares the exact-Fisher comparison formula used when a row enables exact-Fisher comparison.
+`vp.sampled_fisher_vp(family, objective_id, aggregation=..., distribution=..., label_policy=..., sample_count=..., sample_source=..., sampling_bound=..., score_reduction=..., denominator=...)` declares $\hat F_S v = \frac{1}{nS}\sum_{i,s} g_{is}(g_{is}^\top v)$ for a fixed sample table or fixed seed and sample count $S$. It is a separate operator family from exact FisherVP. `sampling_bound` declares the exact-Fisher comparison formula used when a row enables exact-Fisher comparison.
 
-`vp.empirical_fisher_vp(family, objective_id, aggregation=..., loss_reduction=..., denominator=...)` declares $\frac{1}{n}\sum_i g_i(g_i^\top v)$ for per-example gradients $g_i = \nabla_\theta \ell_i(\theta)$. The operator spec records the per-example loss reduction and denominator. The standard anchor computes those gradients from the declared loss and data axis. A supplied `per_example_gradients` matrix is a dense candidate input, not the semantic anchor.
+`vp.empirical_fisher_vp(family, objective_id, aggregation=..., example_loss_reduction=..., denominator=...)` declares $\frac{1}{n}\sum_i g_i(g_i^\top v)$ for per-example gradients $g_i = \nabla_\theta \ell_i(\theta)$. The operator spec records the within-example loss reduction and denominator. The standard anchor computes those gradients from the declared loss and data axis. A supplied `per_example_gradients` matrix is a dense candidate input, not the semantic anchor.
 
-`Metric` returns multiply, inverse multiply, inner product, and factor records when the metric spec declares factors.
+`Metric` returns multiply, inverse multiply, inner product, and factor records when the metric spec declares factors. `representation` declares one of: dense matrix, diagonal tree, block-diagonal blocks, KFAC factors, low-rank factors, or GGN-derived factors. The representation fields are fixed problem fields, not sweep axes.
 
-`vp.composition(family, objective_id, aggregation=...)` declares an ordered composition of selected operator implementations. The built-in composition runtime path is `sequential_composition`; it applies named components in declared order to the current vector.
+`vp.composition(family, objective_id, aggregation=..., children=...)` declares an ordered composition of selected operator implementations. `children` is the ordered child-family list and is the single source for the composition family's dependencies. The built-in composition runtime path is `sequential_composition`; it applies named components in declared order to the current vector.
 
 Every operator spec declares:
 
@@ -688,8 +716,9 @@ All built-in operators obey these rules:
 - `vp.vjp(...)` declares `tangent_vector` for reference checks.
 - `vp.ggnvp(..., loss_geometry="psd_metric")` declares `loss_hessian` for operation and `loss_hessian`, `symmetry_vector` for reference checks.
 - `vp.ggnvp(..., loss_geometry="linear_map")` declares `loss_hessian` for operation and reference checks.
-- `vp.metric(...)` and `vp.inverse_metric(...)` declare `metric` for operation and reference checks.
+- `vp.metric(...)` and `vp.inverse_metric(...)` declare the representation fields needed by the selected metric representation.
 - Fisher, sampled Fisher, and empirical Fisher dense candidate paths add dense matrix inputs to the declared base inputs: `score_gradients` for `dense_score_outer`, `sampled_score_gradients` for sampled Fisher dense rows, `per_example_gradients` for `dense_empirical_fisher`, and denominator inputs such as `normalization` or `num_examples` when their declared denominator needs a batch field.
+- Metric representations add their declared inputs: `metric_matrix` for dense, `metric_diagonal` for diagonal, `metric_blocks` for block diagonal, `kfac_factors` for KFAC, `low_rank_factors` for low rank, and `ggn_factors` for GGN-derived factors.
 - Flattening order is the declared parameter-surface order. The order is stored in the parameter surface identity and compared directly during replay.
 - Dense GGNVP, metric, inverse metric, FisherVP, sampled FisherVP, and empirical FisherVP flatten full vector trees for matrix multiplication and reconstruct the original tree shape on return.
 - Tree outputs preserve key order. Vectorized outputs declare whether vectors are stacked on a leading axis or returned as a sequence.
@@ -751,7 +780,7 @@ FisherVP anchors:
 
 - Exact score-gradient outer products on small references from the declared distribution.
 - Dense Fisher matrix on tiny models.
-- Explicit-score Fisher rows require `loss_reduction="none"`. Precomputed `score_gradients` matrices are admitted as dense candidate inputs with their own identity and normalization fields.
+- Explicit-score Fisher rows require `score_reduction="none"`. Precomputed `score_gradients` matrices are admitted as dense candidate inputs with their own identity and normalization fields.
 
 Sampled FisherVP anchors:
 
@@ -771,6 +800,8 @@ EmpiricalFisherVP anchors:
 Metric anchors:
 
 - Dense matrix multiply, solve, and inner product on small block references.
+- Dense references are reconstructed from the declared representation before the check: dense matrix uses $M$ directly; diagonal tree assembles $\operatorname{diag}(d)$ in parameter order; block-diagonal blocks assemble $M=\operatorname{blockdiag}(M_1,\ldots,M_b)$ in declared block order; KFAC assembles each block as $A_b \otimes G_b$; low-rank assembles $M=UU^\top + D$; GGN-derived assembles $M=J^\top H J$.
+- Metric multiply, inner product, and inverse references use the reconstructed dense $M$ plus the declared damping when present.
 - Inverse residual check: $\|(M+\lambda I)x-v\|/\|v\|$ for damped inverse rows and $\|Mx-v\|/\|v\|$ for undamped inverse rows.
 - Symmetry check.
 - PSD check by eigenvalue floor for dense references.
@@ -817,7 +848,7 @@ Every integer-valued axis must be finite before candidate generation. It has eit
 The package-owned standard runtime executes these settings:
 
 - operator paths for gradient, JVP, VJP, HVP, GGNVP, FisherVP, sampled FisherVP, empirical FisherVP, metric multiply, inverse metric multiply, and composition
-- dtype fields, autocast fields, TF32 fields, matmul precision fields, and reduced-precision-reduction fields
+- dtype fields, autocast fields, matmul precision fields, and reduced-precision-reduction fields
 - vectorization fields for vector, tangent, and cotangent batching
 - `vmap_chunk_size` for vmap-owned paths
 - compile fields when the callable boundary is package-owned
@@ -897,7 +928,6 @@ The package manifest must include these shared axes:
 - `vectorization.vmap_chunk_size`: a finite positive integer domain.
 - `vectorization.in_dims`: declared PyTorch `vmap` input dimensions.
 - `vectorization.randomness`: `error`, `same`, `different`.
-- `grad_materialization.mode`: `return_tensor_tree`, `materialize_grad_then_read`.
 - `call.path`: `functional_call`, `stateful_module`.
 - `call.params`: `explicit_params`, `module_params`.
 - `call.buffers`: `explicit_buffers`, `module_buffers`.
@@ -955,7 +985,6 @@ The package manifest must include these shared axes:
 - `dtype.output`: `fp32`, `bf16`, `fp16`.
 - `dtype.metric_factor`: `fp32`, `bf16`, `fp16`.
 - `autocast`: `off`, `cuda_fp16`, `cuda_bf16`.
-- `numeric.tf32`: `false`, `true`.
 - `numeric.float32_matmul_precision`: `highest`, `high`, `medium`.
 - `numeric.bf16_reduced_precision_reduction`: `false`, `true`.
 - `numeric.fp16_reduced_precision_reduction`: `false`, `true`.
@@ -1027,8 +1056,6 @@ The package manifest must include these shared axes:
 - `comm.overlap`: `none`, `all_gather_overlap`, `reduce_scatter_overlap`, `both`.
 - `comm.prefetch`: `none`, `forward`, `backward`, `both`.
 - `comm.collective_bucket_size`: a finite positive integer domain.
-- `comm.rank_memory_reduction`: `max_peak_allocated`, `max_peak_reserved`, `sum_peak_reserved`.
-
 These manifest rules reject contradictory rows:
 
 - `attention.sdpa_kernel` applies only when the executable calls PyTorch SDPA.
@@ -1040,13 +1067,23 @@ These manifest rules reject contradictory rows:
 - `compile.mode="max-autotune-no-cudagraphs"` is represented as `compile.mode=max-autotune` and `compile.cuda_graphs=false`.
 - Backend option maps that request max autotune are represented by `compile.mode=max-autotune`.
 - Backend option maps that request CUDA graph capture are represented by `compile.cuda_graphs=true`.
+- Rows that set any `compile.options.*` value to `true` must use `compile.mode=None`. Rows with all compile options disabled must not set `compile.mode=None`.
+- `numeric.float32_matmul_precision` owns the CUDA matmul TF32 decision.
 - `tp.loss_parallel=true` requires exact cross-shard CE or KL normalization and a multi-rank agreement check.
 - DTensor layout settings require matching `dtensor.*_placement` settings.
 - Reduction-degrading rows require derived numeric error-bound fields.
 - Sampled FisherVP rows must declare fixed sample count and fixed sample source.
 - Exact categorical NLL Fisher is represented only by GGNVP with the CE or KL loss Hessian.
-- `gradient.path=backward_materialized_grad` and `vjp.path=backward_materialized_grad` require `grad_materialization.mode=materialize_grad_then_read`.
-- `torch.func` gradient and VJP rows require `grad_materialization.mode=return_tensor_tree`.
+- Gradient materialization is derived from the AD path. `gradient.path=backward_materialized_grad` and `vjp.path=backward_materialized_grad` materialize `.grad` and read it back. All `torch.func` rows and eager `torch.autograd.grad` rows return tensor trees.
+- `gradient.value_reuse=gradient_and_primal_value` requires `gradient.path=torch_func_grad_and_value` or a runtime path that explicitly returns both the primal value and gradient.
+- `inverse_metric.iteration_budget` applies only to iterative solve rows.
+- `attention.partition=segmented_forward_ad` requires a forward-AD operator path.
+- Metric and inverse-metric rows require representation-compatible paths. `metric.multiply_path=dense_matmul` requires a dense matrix. `metric.multiply_path=factorized_multiply` requires diagonal, KFAC, low-rank, or GGN-derived factors. `metric.multiply_path=blockwise_multiply` requires block-diagonal blocks. `metric.multiply_path=streaming_multiply` requires diagonal, block-diagonal, KFAC, low-rank, or GGN-derived representation fields.
+- `metric.block_schedule` requires block-diagonal blocks or KFAC factors. `metric.accumulation` applies only to non-dense metric multiply paths.
+- Direct inverse solve paths `dense_solve`, `cholesky_solve`, `eigh_solve`, and `svd_solve` require a dense matrix; `cholesky_solve` additionally requires a PSD metric, and `eigh_solve` additionally requires a symmetric metric. `conjugate_gradient` requires an admitted metric multiply path for the same representation. `factorized_solve` requires diagonal, KFAC, low-rank, or GGN-derived factors. `blockwise_solve` requires block-diagonal blocks. `woodbury_low_rank_solve` requires low-rank factors.
+- `inverse_metric.preconditioner=block_diagonal` requires block-diagonal blocks or KFAC factors. `inverse_metric.preconditioner=factorized_metric` requires diagonal, KFAC, low-rank, or GGN-derived factors. `inverse_metric.block_schedule` requires block-diagonal blocks or KFAC factors.
+- `dtype.metric_factor` and `memory.factor_residency` are declared only by rows whose metric or inverse path uses declared or computed factors.
+- Candidate generators do not emit representation-incompatible metric or inverse-metric rows; hand-supplied incompatible rows fail admission before reference checks.
 
 ## Execution Lowering
 
@@ -1161,10 +1198,24 @@ EmpiricalFisherVP:
 
 Metric and inverse metric:
 
-- Dense rows lower to `torch.matmul`, `torch.linalg.solve`, `torch.linalg.cholesky`, `torch.linalg.eigh`, `torch.linalg.svd`, or conjugate-gradient loops.
-- Factorized and blockwise rows lower through declared metric factors or blocks.
+- `metric.multiply_path=dense_matmul` multiplies the declared `metric_matrix`.
+- `metric.multiply_path=factorized_multiply` applies KFAC, low-rank, diagonal, or GGN-derived factors in the representation's declared order.
+- `metric.multiply_path=blockwise_multiply` applies each declared metric block to the matching parameter block and writes the result back in parameter-surface order.
+- `metric.multiply_path=streaming_multiply` streams declared blocks or factors from their declared residency and accumulates the output tree.
+- `metric.block_schedule=layer_blocks`, `module_blocks`, or `custom_blocks` selects the block partition from the metric representation.
+- `metric.accumulation=streaming` accumulates block outputs without materializing the full metric. `metric.accumulation=materialized_blocks` materializes declared blocks before multiplication.
+- `inverse_metric.solve_path=dense_solve` uses `torch.linalg.solve`.
+- `inverse_metric.solve_path=cholesky_solve` uses a declared or computed Cholesky factor.
+- `inverse_metric.solve_path=eigh_solve` uses an eigendecomposition with declared eigenvalue handling.
+- `inverse_metric.solve_path=svd_solve` uses an SVD with declared singular-value handling.
+- `inverse_metric.solve_path=conjugate_gradient` runs conjugate gradient against the metric multiply operator.
+- `inverse_metric.solve_path=factorized_solve` applies an inverse through declared KFAC, low-rank, diagonal, or GGN-derived factors.
+- `inverse_metric.solve_path=blockwise_solve` solves each declared block and writes the result back in parameter-surface order.
+- `inverse_metric.solve_path=woodbury_low_rank_solve` applies the Woodbury identity using the declared low-rank factors and diagonal base.
+- `inverse_metric.preconditioner` supplies the declared preconditioner to iterative solves.
+- `inverse_metric.factor_reuse=reuse_factor_across_rhs` reuses declared or computed factors across right-hand sides with identical metric representation fields.
 - Damped inverse rows check $\|(M+\lambda I)x-v\|/\|v\|$.
-- `inverse_metric.iteration_budget` caps iterations; the row passes only when the fixed residual threshold passes.
+- `inverse_metric.iteration_budget` caps iterative solves only; direct solve rows reject it.
 
 Numeric backend:
 
@@ -1174,7 +1225,6 @@ Numeric backend:
 - `dtype.accumulation` controls reduction accumulation dtype.
 - `dtype.vector`, `dtype.intermediate`, `dtype.output`, and `dtype.metric_factor` cast the corresponding tensors at declared boundaries.
 - `autocast` enters the declared PyTorch autocast context.
-- `numeric.tf32` sets the PyTorch TF32 flags before probing.
 - `numeric.float32_matmul_precision` sets PyTorch float32 matmul precision before probing.
 - Reduced-precision reduction flags set the corresponding PyTorch backend flags before probing.
 - `numeric.deterministic_algorithms` sets PyTorch deterministic algorithms before probing.
@@ -1186,27 +1236,19 @@ Composition:
 - `composition.execution=stream_child_outputs` passes each child output directly into the next child.
 - `composition.execution=fuse_adjacent_children` builds a fused callable for adjacent compatible children and validates every child output.
 - `composition.execution=compile_whole_composition` compiles the composed callable when compile settings admit it.
+- `composition.child_evaluation=selected_child_rows` uses already selected child-family rows named in the ordered `children` list.
+- `composition.child_evaluation=inline_child_lowering` builds child lowerings inside the parent row using the ordered `children` list.
+- `composition.validation=validate_each_child` runs each child reference check at the child boundary.
+- `composition.validation=validate_composed_output` runs the full composed-output reference check after the last child.
 
-### Transformers Lowering
+### Attention Execution Lowering
 
-Transformers rows are executable through `vptune.adapters.transformers`.
+Attention execution is model-library agnostic. A model adapter supplies an attention-location descriptor that identifies Q, K, V, mask, position, dropout, scale, RoPE, softcap, cache, and output locations. The attention executor owns PyTorch SDPA contexts and package exact attention kernels.
 
-Model loading:
+Core attention frontend lowering:
 
-- `load_transformers_model` calls a Transformers-style `from_pretrained` loader with explicit model id, revision, dtype, selected attention frontend, selected custom attention id when present, and `use_cache`.
-- The adapter resolves `attention.frontend` to the exact `attn_implementation` string sent to Transformers.
-- `model.set_attn_implementation(...)` is the runtime switch when a row changes only the attention frontend on an already loaded compatible model.
-
-Attention frontend lowering:
-
-- `transformers_eager` selects `attn_implementation="eager"`.
-- `transformers_sdpa` selects `attn_implementation="sdpa"`.
-- `transformers_flash_attention_2`, `transformers_flash_attention_3`, and `transformers_flash_attention_4` select the matching Transformers backend string.
-- `transformers_flex_attention` selects `attn_implementation="flex_attention"`.
-- `paged|eager`, `paged|sdpa`, `paged|flash_attention_2`, `paged|flash_attention_3`, and `paged|flash_attention_4` select the exact paged backend string.
-- `registered_transformers_attention` registers the declared attention function through `AttentionInterface` and registers the declared mask function through `AttentionMaskInterface` before probing.
-- `pytorch_sdpa_direct` calls `torch.nn.functional.scaled_dot_product_attention` directly from the adapter attention wrapper.
-- `patched_eager` replaces the model attention module with a package-owned differentiable eager attention wrapper.
+- `pytorch_sdpa_direct` calls `torch.nn.functional.scaled_dot_product_attention` at the declared attention location.
+- `patched_eager` installs a package-owned differentiable eager attention wrapper at the declared attention location.
 - `packed_exact` executes exact packed-token attention and restores inverse token order.
 - `blockwise_exact` executes exact blockwise query attention and preserves masks, causality, RoPE, softcaps, and logit scaling.
 
@@ -1233,6 +1275,25 @@ Full-size attention checks:
 - Non-math SDPA kernels require full-size agreement checks.
 - FlashAttention, FlexAttention, paged attention, registered attention, packed attention, blockwise attention, CUDA graph capture, max-autotune compilation, fused kernels, tensor-parallel loss, and context-parallel attention require full-size agreement checks at a size that triggers the selected backend.
 - Tiny references still run, but they do not replace the full-size gate.
+
+### Transformers Lowering
+
+Transformers rows are executable through `vptune.adapters.transformers`.
+
+Model loading:
+
+- `load_transformers_model` calls a Transformers-style `from_pretrained` loader with explicit model id, revision, dtype, selected attention frontend, selected custom attention id when present, and `use_cache`.
+- The adapter resolves the Transformers-owned `attention.frontend` values to the exact `attn_implementation` string sent to Transformers.
+- `model.set_attn_implementation(...)` is the runtime switch when a row changes only the Transformers attention frontend on an already loaded compatible model.
+
+Transformers frontend lowering:
+
+- `transformers_eager` selects `attn_implementation="eager"`.
+- `transformers_sdpa` selects `attn_implementation="sdpa"`.
+- `transformers_flash_attention_2`, `transformers_flash_attention_3`, and `transformers_flash_attention_4` select the matching Transformers backend string.
+- `transformers_flex_attention` selects `attn_implementation="flex_attention"`.
+- `paged|eager`, `paged|sdpa`, `paged|flash_attention_2`, `paged|flash_attention_3`, and `paged|flash_attention_4` select the exact paged backend string.
+- `registered_transformers_attention` registers the declared attention function through `AttentionInterface` and registers the declared mask function through `AttentionMaskInterface` before probing.
 
 ### Compile Lowering
 
@@ -1350,7 +1411,6 @@ Class A keys are swept inside a fixed operator path, dtype, attention, layout, a
 
 - `layout.vector_ops`
 - `gradient.value_reuse`
-- `grad_materialization.mode`
 
 Class B keys are swept only after the row fixes operator path, attention frontend, compile state, and distributed strategy:
 
@@ -1361,7 +1421,7 @@ Class B keys are swept only after the row fixes operator path, attention fronten
 
 Class C primary groups form a partition:
 
-- `ad_lowering`: `gradient.*`, `jvp.*`, `vjp.*`, `hvp.*`, `ggn.*`, `fisher.*`, `sampled_fisher.*`, `empirical_fisher.*`, `composition.*`, `grad_materialization.mode`, `vectorization.*`, and `call.*`.
+- `ad_lowering`: `gradient.*`, `jvp.*`, `vjp.*`, `hvp.*`, `ggn.*`, `fisher.*`, `sampled_fisher.*`, `empirical_fisher.*`, `composition.*`, `vectorization.*`, and `call.*`.
 - `attention_dispatch`: `attention.frontend`, `attention.sdpa_kernel`, `attention.custom_kernel_id`, `attention.mask_formatter_id`, `attention.partition`, and `attention.padding`.
 - `input_schedule`: `batch.*`, `chunk.*`, `schedule.*`, `input.*`, and `teacher_outputs`.
 - `activation_memory`: `checkpoint.*`, `activation.*`, `memory.primal_outputs`, `memory.jvp_outputs`, `memory.output_cotangents`, `memory.vector_residency`, and `memory.intermediate_residency`.
@@ -1519,6 +1579,7 @@ Selection policy fields:
 - `speed_statistic`: `median_elapsed_seconds`.
 - `compiled_speed_statistic`: compile-amortized steady-state score.
 - `distributed_speed_statistic`: scalarized global wall time.
+- `rank_memory_reduction`: `max_peak_allocated`, `max_peak_reserved`, or `sum_peak_reserved`.
 - `near_fastest_multiplier`: `1.05`.
 - `tie_breaker`: `min_peak_reserved_mib`.
 - `cohort_speed_statistic`: sum of selected row scores.
@@ -1618,6 +1679,8 @@ Compile admission rules:
 - `compile.mode=max-autotune` and backend option maps that request max autotune are one decision; the normalized row uses `compile.mode=max-autotune`.
 - `compile.mode=default` with `compile.cuda_graphs=true` represents PyTorch reduce-overhead behavior.
 - `compile.mode=max-autotune` with `compile.cuda_graphs=false` represents PyTorch max-autotune without CUDA graph capture.
+- `compile.options.*=true` rows must set `compile.mode=None`.
+- Rows with all `compile.options.*=false` must not set `compile.mode=None`.
 
 SDPA rows must record:
 
@@ -1654,6 +1717,20 @@ Full-size agreement gates are mandatory for:
 - Context-parallel attention.
 
 The full-size gate runs at an input size that triggers the selected backend. Selection ignores rows whose tiny references pass but whose full-size gate is missing.
+
+## Attention Executor
+
+The attention executor is part of core `vptune`, not a Transformers adapter dependency. It owns:
+
+- `pytorch_sdpa_direct`
+- `patched_eager`
+- `packed_exact`
+- `blockwise_exact`
+- `attention.sdpa_kernel`
+- `attention.partition`
+- `attention.padding`
+
+Every model adapter that wants package-owned attention execution must provide an attention-location descriptor. The descriptor names the tensors, masks, positions, cache fields, layout, and model-specific semantic fields that the core attention executor needs.
 
 ## Pilot Adapter
 
@@ -1693,10 +1770,6 @@ Supported rows:
 - `paged|flash_attention_3`
 - `paged|flash_attention_4`
 - `registered_transformers_attention`
-- `pytorch_sdpa_direct`
-- `patched_eager`
-- `packed_exact`
-- `blockwise_exact`
 
 PyTorch SDPA kernel rows are `math`, `flash_attention`, `efficient_attention`, `cudnn_attention`, `overrideable`, and `priority_list`. `priority_list` records the exact backend order. Auto selection is represented only by this priority list.
 
@@ -1945,6 +2018,9 @@ Package tests:
 
 - Axis manifest contains every key and value in this spec, has one owner per key, assigns every key to one Class C group, applies merge rules deterministically, and rejects duplicate owners.
 - Axis manifest rejects contradictory rows for packing, checkpoint and activation recompute, activation offload, compile aliases, SDPA kernels, DTensor placements, sampled Fisher, and exact categorical Fisher.
+- Axis manifest rejects `compile.options.*=true` with `compile.mode` other than `None`, rejects `compile.mode=None` when all compile options are disabled, and uses `numeric.float32_matmul_precision` as the only CUDA matmul TF32 sweep key.
+- Axis manifest rejects metric and inverse-metric rows whose path, block schedule, preconditioner, factor dtype, or factor residency is incompatible with the declared metric representation.
+- Single-family `vp.autotune(...)` and `vp.standard_problem(...)` reject composition specs because composition children require sibling families in a `TuningRun`.
 - Every manifest value has one admission rule and either one lowering rule or one adapter owner that supplies lowering.
 - Gradient anchor matches direct autograd on a tiny MLP.
 - JVP anchor matches finite difference.
@@ -1952,8 +2028,8 @@ Package tests:
 - HVP anchor matches reverse-over-reverse and finite-difference gradient checks.
 - Standard runtime builder runs gradient, JVP, VJP, and HVP from declared objectives and candidates.
 - Standard runtime builder runs dense GGNVP, FisherVP, sampled FisherVP, empirical FisherVP, metric, and inverse metric candidates over full tensor trees.
-- Standard runtime applies declared `dtype.parameter_storage`, `dtype.model_compute`, `numeric.float32_matmul_precision`, `numeric.tf32`, and `numeric.bf16_reduced_precision_reduction`; it preserves integer and boolean batch tensors.
-- Grad-materialization tests cover `return_tensor_tree`, `materialize_grad_then_read`, rejection of `.grad` materialization for torch.func rows, and rejection of tensor-tree materialization for `backward_materialized_grad` rows.
+- Standard runtime applies declared `dtype.parameter_storage`, `dtype.model_compute`, `numeric.float32_matmul_precision`, and `numeric.bf16_reduced_precision_reduction`; it preserves integer and boolean batch tensors.
+- Grad-materialization tests cover tensor-tree returns for torch.func and eager `torch.autograd.grad` rows, `.grad` materialization for `backward_materialized_grad` rows, and rejection of rows that try to override the materialization derived from the AD path.
 - Teacher-output tests cover CPU, pinned CPU, GPU, and recomputed teacher outputs, including equality rejection for recomputed teacher outputs that do not match the fixed teacher-output field.
 - Numeric loss-scaling tests cover degree-one unscale, degree-two score-gradient unscale for FisherVP, sampled FisherVP, and empirical FisherVP, and rejection of rows that omit the exact unscale law.
 - Fusion tests cover every `fusion.*` axis value, verify the registered fused subpath is actually called, require exact global normalization for fused CE and KL, and run the required higher-order agreement check for HVP, GGNVP, FisherVP, sampled FisherVP, empirical FisherVP, and compositions containing them.
@@ -1969,16 +2045,20 @@ Package tests:
 - EmpiricalFisherVP anchor computes per-example-gradient outer products from the declared per-example loss objective and rejects mismatched precomputed matrices.
 - EmpiricalFisherVP standard runtime has both loop and `vmap(grad)` per-example-gradient paths, and `vmap_chunk_size` is honored only on the vmap path.
 - Standard dense metric materialization returns one object with metric multiply, inverse multiply, and metric inner product. Materialized `metric` defaults to multiply; materialized `inverse_metric` defaults to inverse multiply.
+- Metric tests cover dense, diagonal, block-diagonal, KFAC, low-rank, and GGN-derived representations; every factored representation supplies its required fields through `representation`, reconstructs a dense reference from those fields, and matches dense multiply, solve, and inner-product references.
+- Inverse-metric tests cover every solve path, every preconditioner, factor reuse, block schedules, and rejection of `inverse_metric.iteration_budget` on direct solve rows.
 - Composition reference checks run child operator anchors and write child reference rows linked by ordered child reference descriptors from the parent row.
+- Composition tests declare ordered children through `vp.composition(..., children=...)`, derive family dependencies from that ordered list, reject any separately supplied composition dependency list, and cover `selected_child_rows`, `inline_child_lowering`, `validate_each_child`, and `validate_composed_output`.
 - KFAC metric multiply, inverse, and inner product match dense references.
 - Metric and inverse-metric checks reject nonsymmetric and indefinite dense metrics.
 - Threshold logic covers over-threshold failure, abs-or-rel passing, derived numeric error bounds, zero-denominator relative error, and nonfinite values.
 - Compile tests cover disabled eager rows, callable boundaries, fullgraph graph-break rejection, compiled autograd, CUDA graph rows, max-autotune normalization, compile amortization, cold compile, warm cache, and recompile counts.
 - Attention tests cover every frontend listed in the manifest, every SDPA kernel listed in the manifest, priority ordered SDPA kernels, `sdpa_kernel` context entry, `set_attn_implementation`, registered attention and mask functions, packed exact attention, blockwise exact attention, and full-size backend-triggering checks.
+- Attention executor tests cover a non-Transformers module using `pytorch_sdpa_direct`, `patched_eager`, `packed_exact`, `blockwise_exact`, SDPA kernels, partitioning, and padding through a model-attention-location descriptor.
 - Distributed tests cover every distributed axis, process-group creation, `DeviceMesh`, DTensor placements, FSDP2 `fully_shard`, HSDP mesh dims, tensor-parallel plans, sequence parallel, context parallel, DTensor redistribution, collective overlap, global memory reduction, rank failure propagation, and multi-rank reference agreement.
 - Search tests cover `admission`, `smoke`, `fast`, `balanced`, `thorough`, and `exhaustive` strategies on bounded candidate sets.
 - Autobatch tests cover every integer-domain field, domain admission, value-to-settings mapping, reference-before-probe behavior, failure frontier termination, and replay from selected observed values.
-- JSON schema validation rejects stale direct identity fields, stale input signatures, stale thresholds, stale generator versions, and stale dependency selections.
+- JSON schema validation rejects stale direct identity fields, stale input signatures, stale thresholds, stale generator versions, stale metric-representation replay fields, and stale dependency selections.
 - Saved reference and full-size rows carry schema-valid content fields. Replay compares the saved row fields used by selection and materialization directly against the loaded rows and recomputed selected plan.
 - Saved-run replay materializes the selected plan without running search.
 - Memory stability rejects post-call reserved growth.
@@ -1994,7 +2074,7 @@ Package tests:
 - `functional_call` tests cover tied weights, parametrizations, buffers, module mode, in-place writes, and direct runtime admission.
 - `torch.func` tests cover every torch.func-transform path in the manifest, including gradient, JVP, VJP, HVP, GGNVP JVP/VJP, FisherVP, sampled FisherVP, and empirical FisherVP paths; they also cover `vmap` randomness, dynamic-shape rejection, `.item()` rejection, forward AD coverage failure, and direct runtime admission.
 - Checkpoint tests cover RNG preservation and deterministic recomputation.
-- Transformer adapter tests cover model identity, eager, SDPA, FlashAttention, FlexAttention, paged attention, admission setting ownership, `output_attentions=True` rejection, softcap signatures, mask semantics, dropout policy, packed/blockwise semantic preservation, patched-attention output agreement, patched-attention VJP agreement, and full-size agreement gates for non-math attention rows.
+- Transformer adapter tests cover model identity, eager, SDPA, FlashAttention, FlexAttention, paged attention, registered Transformers attention, admission setting ownership, `output_attentions=True` rejection, softcap signatures, mask semantics, dropout policy, and full-size agreement gates for non-math Transformers attention rows.
 - Distributed adapter tests cover rank agreement, global max memory, per-rank failure propagation, FSDP hook entry, FSDP policy axes, admission setting ownership, DTensor gradient placement, and mode-specific layout admission for tensor, sequence, and context parallel rows.
 - Selected-plan validation follows stored family order, receives materialized dependency context, writes per-family validation rows named `selected_plan_validation`, writes `summaries/selected_plan_validation.json`, records validator identities in the plan, fails the selected settings when any selected family fails, and replay rejects missing, forged, stale, or failed validation rows and summaries.
 - Root imports expose core APIs only; adapter helpers are available through `vptune.adapters`, and extension helpers are available through `vptune.ext`.
@@ -2029,6 +2109,7 @@ vptune/
       data.py
       errors.py
       identities.py
+      attention.py
       io.py
       measure.py
       operators.py
@@ -2046,6 +2127,7 @@ vptune/
         pilot.py
   tests/
     test_core.py
+    test_attention_executor.py
     test_standard_runtime.py
     test_transformers_adapter.py
     test_distributed_adapter.py
@@ -2061,11 +2143,12 @@ vptune/
 5. Measurement, memory sampling, failure rows, selection, and shared selector reuse for tuning and replay.
 6. Search strategies: `admission`, `smoke`, `fast`, `balanced`, `thorough`, and `exhaustive`.
 7. Autobatch domains for integer axes.
-8. Transformers executor: model loading, `set_attn_implementation`, SDPA kernels, FlashAttention rows, FlexAttention rows, paged rows, registered attention, patched eager attention, packed exact attention, and blockwise exact attention.
-9. Compile executor: `torch.compile`, compiled autograd, CUDA graph rows, max-autotune rows, call-horizon scoring, and recompile measurement.
-10. Activation and memory executor: checkpointing, manual recompute, saved-tensor hooks, residency movement, and output buffers.
-11. Layout executor: flat, per-layer, per-block, per-shard, DTensor, foreach vector ops, contiguity, aliasing, and parametrizations.
-12. Distributed executor: process groups, `DeviceMesh`, DTensor placement, FSDP2, HSDP, tensor parallel, sequence parallel, context parallel, communication scheduling, and rank-global measurement.
-13. Pilot adapter lowering and readiness conversion.
+8. Core attention executor: PyTorch SDPA context, direct SDPA calls, patched eager attention, packed exact attention, blockwise exact attention, partitioning, padding, and model-attention-location descriptors.
+9. Transformers executor: model loading, `set_attn_implementation`, Transformers FlashAttention rows, Transformers FlexAttention rows, paged rows, registered Transformers attention, and model-attention-location descriptors for the core attention executor.
+10. Compile executor: `torch.compile`, compiled autograd, CUDA graph rows, max-autotune rows, call-horizon scoring, and recompile measurement.
+11. Activation and memory executor: checkpointing, manual recompute, saved-tensor hooks, residency movement, and output buffers.
+12. Layout executor: flat, per-layer, per-block, per-shard, DTensor, foreach vector ops, contiguity, aliasing, and parametrizations.
+13. Distributed executor: process groups, `DeviceMesh`, DTensor placement, FSDP2, HSDP, tensor parallel, sequence parallel, context parallel, communication scheduling, and rank-global measurement.
+14. Pilot adapter lowering and readiness conversion.
 
 The package is complete when every axis value in this spec has executable lowering or adapter lowering, every required check runs, and the full test list passes.

@@ -367,13 +367,24 @@ Mandatory checks:
 
 A metric operator is declared by its mathematical representation. Dense, KFAC,
 diagonal, block diagonal, low rank, and GGN-derived metrics are different metric
-specs unless the spec declares equivalence.
+specs unless the spec declares equivalence. The representation supplies the
+required fields: dense matrix, diagonal tree, metric blocks, KFAC factors,
+low-rank factors, or GGN-derived factors.
 
 Owned axes for a fixed metric spec:
 
 - `metric.multiply_path`: `dense_matmul`, `factorized_multiply`, `blockwise_multiply`, `streaming_multiply`
 - `metric.block_schedule`: `layer_blocks`, `module_blocks`, `custom_blocks`
 - `metric.accumulation`: `streaming`, `materialized_blocks`
+
+Representation compatibility:
+
+- `dense_matmul` requires dense matrix representation
+- `factorized_multiply` requires diagonal, KFAC, low-rank, or GGN-derived factors
+- `blockwise_multiply` requires block-diagonal blocks
+- `streaming_multiply` requires diagonal, block-diagonal, KFAC, low-rank, or GGN-derived representation fields
+- `metric.block_schedule` requires block-diagonal blocks or KFAC factors
+- `metric.accumulation` applies only to non-dense metric multiply paths
 
 Shared axes that apply:
 
@@ -387,6 +398,11 @@ Shared axes that apply:
 Mandatory checks:
 
 - dense tiny metric multiply
+- dense reference reconstruction from the declared representation: dense matrix uses
+  $M$ directly, diagonal tree assembles $\operatorname{diag}(d)$, block-diagonal
+  blocks assemble $M=\operatorname{blockdiag}(M_1,\ldots,M_b)$, KFAC assembles
+  each block as $A_b \otimes G_b$, low-rank assembles $M=UU^\top + D$, and
+  GGN-derived assembles $M=J^\top H J$
 - symmetry check when the metric is declared symmetric
 - PSD check when the metric is declared PSD
 
@@ -406,6 +422,21 @@ Owned axes:
 `inverse_metric.iteration_budget` is an implementation cap. A row with too low a
 cap fails the fixed inverse residual acceptance check. Residual tolerance is not
 a sweep axis.
+`inverse_metric.iteration_budget` applies only to iterative solve rows.
+
+Representation compatibility:
+
+- `dense_solve`, `cholesky_solve`, `eigh_solve`, and `svd_solve` require dense matrix representation
+- `cholesky_solve` requires a PSD metric
+- `eigh_solve` requires a symmetric metric
+- `conjugate_gradient` requires an admitted metric multiply path for the same representation
+- `factorized_solve` requires diagonal, KFAC, low-rank, or GGN-derived factors
+- `blockwise_solve` requires block-diagonal blocks
+- `woodbury_low_rank_solve` requires low-rank factors
+- `inverse_metric.preconditioner=block_diagonal` requires block-diagonal blocks or KFAC factors
+- `inverse_metric.preconditioner=factorized_metric` requires diagonal, KFAC, low-rank, or GGN-derived factors
+- `inverse_metric.block_schedule` requires block-diagonal blocks or KFAC factors
+- `dtype.metric_factor` and `memory.factor_residency` are declared only by rows whose metric or inverse path uses declared or computed factors
 
 Shared axes that apply:
 
@@ -426,6 +457,11 @@ Mandatory checks:
 
 For declared child operators $A_1,\ldots,A_k$, compute the declared composition.
 The mathematical order is fixed by the operator spec.
+
+The operator spec contains the ordered child-family list. That list is the single
+source for the composition family's dependencies. Composition requires a
+multi-family run because child families must be present in the same run-level
+dependency graph.
 
 Owned axes:
 
@@ -466,23 +502,21 @@ microbatching.
 
 `vmap` rows require transform-compatible code and explicit randomness behavior.
 
-### Gradient Materialization
+### Derived Gradient Materialization
 
 Applies to gradient, VJP, and HVP rows that compute gradients with respect to the
 declared parameter surface.
 
-- `grad_materialization.mode`: `return_tensor_tree`, `materialize_grad_then_read`
+Gradient materialization is derived from the AD path. It is recorded on rows, but
+it is not a sweep axis.
 
-`grad_materialization.mode=materialize_grad_then_read` owns the decision to
-populate `.grad` and read it back. Clearing stale `.grad` values before probes is
-mandatory execution hygiene and is never a row.
+- `gradient.path=backward_materialized_grad` and
+  `vjp.path=backward_materialized_grad`: materialize `.grad` and read it back.
+- All `torch.func` rows and eager `torch.autograd.grad` rows: return a tensor
+  tree.
 
-Rows whose AD path uses `torch.func` must set
-`grad_materialization.mode=return_tensor_tree`.
-
-`gradient.path=backward_materialized_grad` and
-`vjp.path=backward_materialized_grad` require
-`grad_materialization.mode=materialize_grad_then_read`.
+Clearing stale `.grad` values before probes is mandatory execution hygiene and
+is never a row.
 
 ### Model Call And Functionalization
 
@@ -514,6 +548,12 @@ Attention rows distinguish frontend dispatch from kernel dispatch.
 - `attention.mask_formatter_id`: registered mask formatter id
 - `attention.partition`: `full`, `packed_tokens`, `blockwise_queries`, `segmented_forward_ad`
 - `attention.padding`: `dense_padded`, `unpadded_packed`
+
+Core attention execution owns `pytorch_sdpa_direct`, `patched_eager`,
+`packed_exact`, `blockwise_exact`, `attention.sdpa_kernel`,
+`attention.partition`, and `attention.padding`. A model adapter supplies an
+attention-location descriptor. The Transformers adapter owns
+`transformers_*`, `paged|*`, and `registered_transformers_attention` frontends.
 
 `attention.sdpa_kernel` applies only when the executable calls PyTorch SDPA.
 Auto selection is represented by `priority_list` with the exact backend order
@@ -595,6 +635,7 @@ If `schedule.per_token=packed` or `attention.partition=packed_tokens`, then
 `input.batch_layout` must be `packed_with_inverse_permutation` or
 `variable_length`. If `input.batch_layout=dense_padded`, packed token scheduling
 and packed attention are invalid.
+`attention.partition=segmented_forward_ad` requires a forward-AD operator path.
 
 ### Activation And Memory Schedule
 
@@ -651,7 +692,6 @@ metric sections.
 - `dtype.output`: `fp32`, `bf16`, `fp16`
 - `dtype.metric_factor`: `fp32`, `bf16`, `fp16`
 - `autocast`: `off`, `cuda_fp16`, `cuda_bf16`
-- `numeric.tf32`: `false`, `true`
 - `numeric.float32_matmul_precision`: `highest`, `high`, `medium`
 - `numeric.bf16_reduced_precision_reduction`: `false`, `true`
 - `numeric.fp16_reduced_precision_reduction`: `false`, `true`
@@ -672,7 +712,7 @@ These fields are reduction-degrading rows and always require derived bounds:
 
 - `dtype.accumulation=bf16`
 - `dtype.accumulation=fp16`
-- `numeric.tf32=true`
+- `numeric.float32_matmul_precision=high`
 - `numeric.float32_matmul_precision=medium`
 - `numeric.bf16_reduced_precision_reduction=true`
 - `numeric.fp16_reduced_precision_reduction=true`
@@ -717,6 +757,10 @@ Fields from the PyTorch API that are not sweep axes:
   `compile.mode=max-autotune` and `compile.cuda_graphs=false`
 - debug options such as tracing and graph diagrams: diagnostics only
 - unsafe guard filtering: excluded from default package rows
+
+Rows that set any `compile.options.*` value to `true` must use
+`compile.mode=None`. Rows with all compile options disabled must not set
+`compile.mode=None`.
 
 Compiled rows record compile time, first-call time, steady-state time, number of
 recompiles, graph-break status, CUDA graph capture status, peak memory during
@@ -821,7 +865,6 @@ Communication rows:
 - `comm.overlap`: `none`, `all_gather_overlap`, `reduce_scatter_overlap`, `both`
 - `comm.prefetch`: `none`, `forward`, `backward`, `both`
 - `comm.collective_bucket_size`
-- `comm.rank_memory_reduction`: `max_peak_allocated`, `max_peak_reserved`, `sum_peak_reserved`
 
 Distributed selection records elapsed wall time after rank barriers, rank-local
 memory, global memory reductions, and rank failure sets.
@@ -866,7 +909,6 @@ Class A, mostly independent after admission:
 
 - `layout.vector_ops`
 - `gradient.value_reuse`
-- `grad_materialization.mode`
 
 These can be swept separately inside a fixed operator path, dtype, attention,
 layout, and distributed setting.
@@ -884,7 +926,7 @@ Class C primary groups form a partition:
 
 - `ad_lowering`: `gradient.*`, `jvp.*`, `vjp.*`, `hvp.*`, `ggn.*`,
   `fisher.*`, `sampled_fisher.*`, `empirical_fisher.*`, `composition.*`,
-  `grad_materialization.mode`, `vectorization.*`, and `call.*`
+  `vectorization.*`, and `call.*`
 - `attention_dispatch`: `attention.frontend`, `attention.sdpa_kernel`,
   `attention.custom_kernel_id`, `attention.mask_formatter_id`,
   `attention.partition`, and `attention.padding`
@@ -1041,7 +1083,7 @@ Within accepted rows, selection ranks by the configured objective:
 - distributed eager rows: median rank-maximum steady-state elapsed time after barriers
 - single-rank compiled rows: $((1+R)T_{\mathrm{compile}} / N) + T_{\mathrm{steady}}$
 - distributed compiled rows: $((1+R)T_{\mathrm{compile}} / N) + T_{\mathrm{steady}}$ using rank-maximum compile time and rank-maximum steady-state time
-- distributed memory tie breaking uses the selected reduction from `comm.rank_memory_reduction`
+- distributed memory tie breaking uses the selection policy's rank-memory reduction
 - ties inside the near-fastest band: lower peak reserved memory
 - cohort comparison sums selected row scores and selected row memory scores
 
