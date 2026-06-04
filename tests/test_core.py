@@ -5476,6 +5476,45 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "memory.output_buffers": "fresh_allocation",
         },
     )
+    valid_package_runtime_axes = vp.Candidate(
+        "family",
+        "valid-package-runtime-axes",
+        {
+            "dtype.autodiff_compute": "bf16",
+            "dtype.accumulation": "fp32",
+            "gradient.graph_schedule": "build_once",
+            "memory.primal_outputs": "retain",
+            "memory.jvp_outputs": "retain",
+            "memory.output_cotangents": "retain",
+            "activation.recompute": "checkpoint_selective",
+            "activation.offload": "custom_saved_tensor_hooks",
+            "activation.pack_hook": lambda tensor: tensor,
+            "activation.unpack_hook": lambda tensor: tensor,
+            "checkpoint.use_reentrant": "false",
+            "checkpoint.early_stop": "true",
+            "checkpoint.preserve_rng_state": "false",
+            "checkpoint.determinism_check": "default",
+            "checkpoint.context_fn": "declared_context_pair",
+            "checkpoint.context_fn_callable": lambda: (
+                contextlib.nullcontext(),
+                contextlib.nullcontext(),
+            ),
+            "checkpoint.moves_to_new_device": "false",
+            "checkpoint.uses_global_state": "false",
+            "metric.block_schedule": "layer_blocks",
+            "inverse_metric.block_schedule": "module_blocks",
+            "fusion.norm": "model_default",
+            "fusion.mlp": "model_default",
+            "fusion.rope": "model_default",
+            "fusion.logits": "model_default",
+            "fusion.loss": "model_default",
+        },
+    )
+    invalid_package_runtime_axis = vp.Candidate(
+        "family",
+        "invalid-package-runtime-axis",
+        {"checkpoint.use_reentrant": "true"},
+    )
     valid_compile_boundary = vp.Candidate(
         "family",
         "valid-compile-boundary",
@@ -5545,6 +5584,8 @@ def test_standard_axis_registry_validates_core_axes() -> None:
     assert registry.admit(jvp_microbatch).admission_status == "passed"
     assert registry.admit(hvp_microbatch).admission_status == "passed"
     assert registry.admit(valid_input_memory_axes).admission_status == "passed"
+    assert registry.admit(valid_package_runtime_axes).admission_status == "passed"
+    assert registry.admit(invalid_package_runtime_axis).admission_status == "failed"
     assert registry.admit(valid_compile_boundary).admission_status == "passed"
     assert registry.admit(invalid_compile_boundary).admission_status == "failed"
     assert registry.admit(valid_chunk_axes).admission_status == "passed"

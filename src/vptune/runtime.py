@@ -167,6 +167,7 @@ SPEC_PATH_KEYS = {
 }
 SPEC_ADDITIONAL_RUNTIME_SETTINGS = (
     "gradient.value_reuse",
+    "gradient.graph_schedule",
     "jvp.linearize_reuse",
     "vjp.closure_reuse",
     "hvp.graph_schedule",
@@ -8720,6 +8721,7 @@ def _require_supported_standard_settings(
     _require_output_buffer_settings(candidate.settings)
     _require_fusion_settings(candidate.settings)
     _require_call_runtime_settings(candidate.settings)
+    _require_gradient_graph_schedule_settings(operator, candidate.settings)
     _require_ggn_loss_hessian_settings(operator, candidate.settings)
     _require_ggn_vjp_path_settings(operator, path, candidate.settings)
     _require_ggn_reuse_settings(operator, path, candidate.settings)
@@ -9308,6 +9310,23 @@ def _memory_recompute_supported(
         return settings.get("ggn.cotangent_reuse") == "recompute_output_cotangent"
 
     return False
+
+
+def _require_gradient_graph_schedule_settings(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+) -> None:
+    graph_schedule = settings.get("gradient.graph_schedule")
+
+    if graph_schedule is None:
+        return
+
+    if operator.kind != "gradient":
+        message = "gradient.graph_schedule applies only to gradient rows"
+        raise MaterializationError(message)
+
+    message = "gradient.graph_schedule requires gradient graph scheduling lowering"
+    raise MaterializationError(message)
 
 
 def _require_runtime_residency(

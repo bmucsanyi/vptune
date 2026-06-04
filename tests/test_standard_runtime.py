@@ -7142,6 +7142,27 @@ def test_standard_runtime_rejects_unlowered_chunk_axis() -> None:
         )
 
 
+def test_standard_runtime_rejects_gradient_graph_schedule_without_lowering() -> None:
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+    )
+
+    with pytest.raises(vp.MaterializationError, match="graph scheduling lowering"):
+        factory(
+            vp.Candidate(
+                "gradient",
+                "graph-schedule",
+                {**gradient_settings(), "gradient.graph_schedule": "build_once"},
+                admission_status="passed",
+            ),
+            {"scale": torch.tensor(1.0, dtype=torch.float64)},
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+        )
+
+
 @pytest.mark.parametrize(
     ("settings_override", "message"),
     [

@@ -2726,6 +2726,16 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("dtype.model_compute",),
             SPEC_DTYPE_VALUES,
         ),
+        AxisDescriptor(
+            "dtype.autodiff_compute",
+            ("dtype.autodiff_compute",),
+            SPEC_DTYPE_VALUES,
+        ),
+        AxisDescriptor(
+            "dtype.accumulation",
+            ("dtype.accumulation",),
+            SPEC_DTYPE_VALUES,
+        ),
         AxisDescriptor("dtype.vector", ("dtype.vector",), SPEC_DTYPE_VALUES),
         AxisDescriptor(
             "dtype.intermediate",
@@ -2876,6 +2886,11 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("gradient_only", "gradient_and_primal_value"),
             optional_settings_keys=("gradient.path",),
             admission_rule=_gradient_value_reuse_axis(),
+        ),
+        AxisDescriptor(
+            "gradient.graph_schedule",
+            ("gradient.graph_schedule",),
+            ("build_once", "rebuild_per_call"),
         ),
         AxisDescriptor(
             "jvp.path",
@@ -3158,6 +3173,21 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("fresh_allocation", "preallocated"),
         ),
         AxisDescriptor(
+            "memory.primal_outputs",
+            ("memory.primal_outputs",),
+            ("retain", "recompute"),
+        ),
+        AxisDescriptor(
+            "memory.jvp_outputs",
+            ("memory.jvp_outputs",),
+            ("retain", "recompute"),
+        ),
+        AxisDescriptor(
+            "memory.output_cotangents",
+            ("memory.output_cotangents",),
+            ("retain", "recompute"),
+        ),
+        AxisDescriptor(
             "chunk.class_block_size_with_exact_global_normalization",
             ("chunk.class_block_size_with_exact_global_normalization",),
             (),
@@ -3238,6 +3268,52 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("cold_compile", "warm_cache"),
         ),
         AxisDescriptor(
+            "activation.recompute",
+            ("activation.recompute",),
+            (
+                "none",
+                "checkpoint_non_reentrant_by_layer",
+                "checkpoint_selective",
+                "manual_recompute",
+            ),
+        ),
+        AxisDescriptor(
+            "activation.offload",
+            ("activation.offload",),
+            ("none", "saved_tensor_hooks_cpu", "custom_saved_tensor_hooks"),
+            optional_settings_keys=("activation.pack_hook", "activation.unpack_hook"),
+        ),
+        AxisDescriptor(
+            "checkpoint.use_reentrant",
+            ("checkpoint.use_reentrant",),
+            ("false",),
+            optional_settings_keys=(
+                "checkpoint.moves_to_new_device",
+                "checkpoint.uses_global_state",
+            ),
+        ),
+        AxisDescriptor(
+            "checkpoint.early_stop",
+            ("checkpoint.early_stop",),
+            ("false", "true"),
+        ),
+        AxisDescriptor(
+            "checkpoint.preserve_rng_state",
+            ("checkpoint.preserve_rng_state",),
+            ("false", "true"),
+        ),
+        AxisDescriptor(
+            "checkpoint.determinism_check",
+            ("checkpoint.determinism_check",),
+            ("default", "none"),
+        ),
+        AxisDescriptor(
+            "checkpoint.context_fn",
+            ("checkpoint.context_fn",),
+            ("none", "declared_context_pair"),
+            optional_settings_keys=("checkpoint.context_fn_callable",),
+        ),
+        AxisDescriptor(
             "numeric.float32_matmul_precision",
             ("numeric.float32_matmul_precision",),
             MATMUL_PRECISION_VALUES,
@@ -3262,6 +3338,11 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("metric.accumulation",),
             ("streaming", "materialized_blocks"),
             optional_settings_keys=("metric.multiply_path",),
+        ),
+        AxisDescriptor(
+            "metric.block_schedule",
+            ("metric.block_schedule",),
+            ("layer_blocks", "module_blocks", "custom_blocks"),
         ),
         AxisDescriptor(
             "inverse_metric.solve_path",
@@ -3294,6 +3375,11 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("refactor_each_rhs", "reuse_factor_across_rhs"),
         ),
         AxisDescriptor(
+            "inverse_metric.block_schedule",
+            ("inverse_metric.block_schedule",),
+            ("layer_blocks", "module_blocks", "custom_blocks"),
+        ),
+        AxisDescriptor(
             "composition.execution",
             ("composition.execution",),
             (
@@ -3323,6 +3409,31 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             "numeric.fp16_reduced_precision_reduction",
             ("numeric.fp16_reduced_precision_reduction",),
             ("false", "true"),
+        ),
+        AxisDescriptor(
+            "fusion.norm",
+            ("fusion.norm",),
+            ("model_default", "fused_rmsnorm", "fused_layernorm"),
+        ),
+        AxisDescriptor(
+            "fusion.mlp",
+            ("fusion.mlp",),
+            ("model_default", "fused_mlp"),
+        ),
+        AxisDescriptor(
+            "fusion.rope",
+            ("fusion.rope",),
+            ("model_default", "fused_rope"),
+        ),
+        AxisDescriptor(
+            "fusion.logits",
+            ("fusion.logits",),
+            ("model_default", "fused_logits_projection"),
+        ),
+        AxisDescriptor(
+            "fusion.loss",
+            ("fusion.loss",),
+            ("model_default", "fused_ce", "fused_kl"),
         ),
         AxisDescriptor(
             "numeric.deterministic_algorithms",
