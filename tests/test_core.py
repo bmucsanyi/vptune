@@ -958,6 +958,73 @@ def test_tune_balanced_strategy_halves_group_rows_by_probe_stage(
     )
 
 
+def test_tune_balanced_strategy_with_only_baseline_measures_it_once(
+    tmp_path: Path,
+) -> None:
+    calls = []
+    model = torch.nn.Linear(1, 1)
+    candidate = vp.Candidate("family", "base", {}, admission_status="passed")
+    target = dataclasses.replace(
+        cpu_target(
+            vp.TimingPolicy(
+                short_seconds=0.0,
+                medium_seconds=0.0,
+                long_measured_calls=1,
+            )
+        ),
+        search_policy=vp.SearchPolicy(strategy="balanced", retained_top_count=1),
+    )
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert batch["source"] == "probe"
+        assert isinstance(vector, torch.Tensor)
+        calls.append(("operation", candidate.candidate_id))
+
+        return vpx.constant_operation(torch.tensor([1.0]))
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert batch["source"] == "reference"
+        assert isinstance(vector, torch.Tensor)
+        calls.append(("reference", candidate.candidate_id))
+
+        return reference_passed()
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            (candidate,),
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.search-balanced-baseline"},
+        ),
+    )
+    plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0)),
+    )
+
+    assert tuple(record.candidate_id for record in plan.full_size_records) == ("base",)
+    assert tuple(call[0] for call in calls) == ("reference", "operation")
+    assert plan.selected_candidate().candidate_id == "base"
+
+
 def test_tune_thorough_strategy_uses_declared_repeat_count(
     tmp_path: Path,
 ) -> None:

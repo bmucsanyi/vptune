@@ -1546,7 +1546,7 @@ def _balanced_cross_candidate_rows(
     retained_groups = tuple(rows for rows in retained.values() if rows)
 
     if not retained_groups:
-        return (baseline,)
+        return ()
 
     crossed = []
 
