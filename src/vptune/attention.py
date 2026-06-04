@@ -10,7 +10,9 @@ import torch
 from torch.nn import functional
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from vptune.candidates import AxisDescriptor
 from vptune.checks import tree_error_measurements, validate_thresholds
+from vptune.data import Candidate
 from vptune.errors import AdmissionError
 from vptune.tensor_tree import TensorTree
 
@@ -207,6 +209,66 @@ class MappingAttentionLocation:
             "scale": self.scale,
             "enable_gqa": self.enable_gqa,
         }
+
+
+def core_attention_axis(
+    frontends: Sequence[str] = CORE_ATTENTION_FRONTENDS,
+) -> AxisDescriptor:
+    """Return an axis descriptor for package-owned attention frontends.
+
+    Raises:
+        AdmissionError: If a frontend name is unsupported.
+    """
+    unsupported = tuple(
+        frontend for frontend in frontends if frontend not in CORE_ATTENTION_FRONTENDS
+    )
+
+    if unsupported:
+        message = f"unsupported core attention frontends: {unsupported}"
+        raise AdmissionError(message)
+
+    return AxisDescriptor(
+        name="core_attention_frontend",
+        settings_keys=("attention.frontend",),
+        allowed_values=tuple(frontends),
+        optional_settings_keys=(
+            "attention.sdpa_kernel",
+            "attention.sdpa_priority_list",
+            "attention.partition",
+            "attention.padding",
+        ),
+        adapter_id="vptune.core_attention",
+        adapter_version="0.0.1",
+        admission_rule=admit_core_attention,
+    )
+
+
+def admit_core_attention(candidate: Candidate) -> tuple[bool, str | None]:
+    """Return whether a package-owned attention row is admitted."""
+    try:
+        attention_settings_from_candidate(candidate.settings)
+    except AdmissionError as error:
+        return False, str(error)
+
+    return True, None
+
+
+def attention_settings_from_candidate(settings: Mapping[str, Any]) -> AttentionSettings:
+    """Build core attention settings from a candidate settings mapping.
+
+    Returns:
+        Core attention settings.
+    """
+    attention_settings = AttentionSettings(
+        frontend=_required_string_setting(settings, "attention.frontend"),
+        sdpa_kernel=_optional_string_setting(settings, "attention.sdpa_kernel"),
+        sdpa_priority=_sdpa_priority_setting(settings),
+        partition=_required_string_setting(settings, "attention.partition"),
+        padding=_required_string_setting(settings, "attention.padding"),
+    )
+    _validate_attention_settings(attention_settings)
+
+    return attention_settings
 
 
 def execute_attention(
@@ -589,6 +651,10 @@ def _sdpa_kernel_selection(
         message = "sdpa priority order applies only to priority_list"
         raise AdmissionError(message)
 
+    if settings.sdpa_kernel not in SDPA_BACKENDS:
+        message = f"unknown SDPA backend: {settings.sdpa_kernel}"
+        raise AdmissionError(message)
+
     return settings.sdpa_kernel, ()
 
 
@@ -641,7 +707,56 @@ def _validate_attention_settings(settings: AttentionSettings) -> None:
         message = "attention.sdpa_kernel applies only to pytorch_sdpa_direct"
         raise AdmissionError(message)
 
+    if settings.frontend != "pytorch_sdpa_direct" and settings.sdpa_priority:
+        message = "sdpa priority order applies only to pytorch_sdpa_direct"
+        raise AdmissionError(message)
+
+    if settings.frontend == "pytorch_sdpa_direct":
+        _sdpa_kernel_selection(settings)
+
     _validate_attention_partition_settings(settings)
+
+
+def _required_string_setting(settings: Mapping[str, Any], key: str) -> str:
+    value = settings.get(key)
+
+    if not isinstance(value, str):
+        message = f"{key} must be a string"
+        raise AdmissionError(message)
+
+    return value
+
+
+def _optional_string_setting(settings: Mapping[str, Any], key: str) -> str | None:
+    value = settings.get(key)
+
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        message = f"{key} must be a string"
+        raise AdmissionError(message)
+
+    return value
+
+
+def _sdpa_priority_setting(settings: Mapping[str, Any]) -> tuple[str, ...]:
+    value = settings.get("attention.sdpa_priority_list")
+
+    if value is None:
+        return ()
+
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        message = "attention.sdpa_priority_list must be a sequence of strings"
+        raise AdmissionError(message)
+
+    result = tuple(value)
+
+    if not all(isinstance(item, str) for item in result):
+        message = "attention.sdpa_priority_list must be a sequence of strings"
+        raise AdmissionError(message)
+
+    return result
 
 
 def _validate_attention_partition_settings(settings: AttentionSettings) -> None:

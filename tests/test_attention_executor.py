@@ -7,7 +7,9 @@ from typing import Any
 import pytest
 import torch
 
+import vptune as vp
 import vptune.attention as vpat
+import vptune.ext as vpx
 from vptune.errors import AdmissionError, ReferenceFailedError
 
 
@@ -68,6 +70,103 @@ def attention_settings(
         partition=partition,
         padding=padding,
     )
+
+
+def test_core_attention_axis_admits_executable_frontends() -> None:
+    registry = vpx.AxisRegistry()
+    registry.register(vpat.core_attention_axis())
+    rows = (
+        vp.Candidate(
+            "attention",
+            "sdpa",
+            {
+                "attention.frontend": "pytorch_sdpa_direct",
+                "attention.sdpa_kernel": "math",
+                "attention.partition": "full",
+                "attention.padding": "dense_padded",
+            },
+        ),
+        vp.Candidate(
+            "attention",
+            "patched",
+            {
+                "attention.frontend": "patched_eager",
+                "attention.partition": "full",
+                "attention.padding": "dense_padded",
+            },
+        ),
+        vp.Candidate(
+            "attention",
+            "packed",
+            {
+                "attention.frontend": "packed_exact",
+                "attention.partition": "packed_tokens",
+                "attention.padding": "unpadded_packed",
+            },
+        ),
+        vp.Candidate(
+            "attention",
+            "blockwise",
+            {
+                "attention.frontend": "blockwise_exact",
+                "attention.partition": "blockwise_queries",
+                "attention.padding": "dense_padded",
+            },
+        ),
+    )
+
+    for row in rows:
+        assert registry.admit(row).admission_status == "passed"
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {
+            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.sdpa_kernel": "unknown",
+            "attention.partition": "full",
+            "attention.padding": "dense_padded",
+        },
+        {
+            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.sdpa_kernel": "math",
+            "attention.padding": "dense_padded",
+        },
+        {
+            "attention.frontend": "packed_exact",
+            "attention.partition": "segmented_forward_ad",
+            "attention.padding": "unpadded_packed",
+        },
+    ],
+)
+def test_core_attention_axis_rejects_invalid_rows(
+    settings: dict[str, object],
+) -> None:
+    registry = vpx.AxisRegistry()
+    registry.register(vpat.core_attention_axis())
+
+    admitted = registry.admit(vp.Candidate("attention", "row", settings))
+
+    assert admitted.admission_status == "failed"
+
+
+def test_attention_settings_from_candidate_records_priority_order() -> None:
+    settings = vpat.attention_settings_from_candidate({
+        "attention.frontend": "pytorch_sdpa_direct",
+        "attention.sdpa_kernel": "priority_list",
+        "attention.sdpa_priority_list": ("flash_attention", "math"),
+        "attention.partition": "full",
+        "attention.padding": "dense_padded",
+    })
+
+    assert settings.signature() == {
+        "frontend": "pytorch_sdpa_direct",
+        "sdpa_kernel": "priority_list",
+        "sdpa_priority": ("flash_attention", "math"),
+        "partition": "full",
+        "padding": "dense_padded",
+    }
 
 
 def test_pytorch_sdpa_direct_matches_exact_attention() -> None:
