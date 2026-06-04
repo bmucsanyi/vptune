@@ -1368,7 +1368,7 @@ def _probe_balanced_group_rows(
         elif outcome.passed:
             active.append(candidate)
 
-    for stage_index, probe_input in enumerate(probe_inputs, start=1):
+    for probe_input in probe_inputs:
         if not active:
             break
 
@@ -1389,7 +1389,6 @@ def _probe_balanced_group_rows(
             record = _balanced_accumulated_record(
                 records_by_id.get(candidate.candidate_id),
                 record,
-                stage_index,
             )
             records_by_id[candidate.candidate_id] = record
             stage_records.append((candidate, record))
@@ -1424,29 +1423,20 @@ def _probe_balanced_group_rows(
 def _balanced_accumulated_record(
     previous: FullSizeRecord | None,
     current: FullSizeRecord,
-    stage_count: int,
 ) -> FullSizeRecord:
     if previous is None:
-        record = current
-    else:
-        record = dataclasses.replace(
-            current,
-            timing_samples=(
-                *previous.timing_samples,
-                *current.timing_samples,
-            ),
-            memory_samples=(
-                *previous.memory_samples,
-                *current.memory_samples,
-            ),
-        )
+        return current
 
     return dataclasses.replace(
-        record,
-        selection_metadata={
-            **dict(record.selection_metadata),
-            "balanced_group_stage_count": stage_count,
-        },
+        current,
+        timing_samples=(
+            *previous.timing_samples,
+            *current.timing_samples,
+        ),
+        memory_samples=(
+            *previous.memory_samples,
+            *current.memory_samples,
+        ),
     )
 
 
