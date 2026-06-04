@@ -5779,7 +5779,7 @@ def test_autobatch_domain_rejects_invalid_finite_search_shape() -> None:
         )
 
 
-def test_tune_delegates_autobatch_domain_to_autobatch_find(
+def test_tune_fast_strategy_delegates_autobatch_domain_to_autobatch_find(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = []
@@ -5836,13 +5836,16 @@ def test_tune_delegates_autobatch_domain_to_autobatch_find(
 
     monkeypatch.setattr(autobatch_bridge.autobatch, "find", fake_find)
 
-    target = cpu_target(
-        vp.TimingPolicy(
-            short_seconds=0.0,
-            medium_seconds=0.0,
-            long_warmups=0,
-            long_measured_calls=1,
-        )
+    target = dataclasses.replace(
+        cpu_target(
+            vp.TimingPolicy(
+                short_seconds=0.0,
+                medium_seconds=0.0,
+                long_warmups=0,
+                long_measured_calls=1,
+            )
+        ),
+        search_policy=vp.SearchPolicy(strategy="fast"),
     )
     problem = vp.Problem(
         model=model,

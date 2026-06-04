@@ -917,12 +917,12 @@ def _select_probe_result(
     return candidate, record
 
 
-def _require_exhaustive_search(target: Target) -> None:
-    if target.search_policy.strategy == "exhaustive":
+def _require_autobatch_search_strategy(target: Target) -> None:
+    if target.search_policy.strategy in {"exhaustive", "fast"}:
         return
 
     message = (
-        "search strategy requires a strategy-specific result shape: "
+        "autobatch domain search requires exhaustive or fast strategy: "
         f"{target.search_policy.strategy}"
     )
     raise MaterializationError(message)
@@ -1797,7 +1797,7 @@ def _probe_problem(
     domain = _single_autobatch_domain(runtime)
 
     if domain is not None:
-        _require_exhaustive_search(problem.target)
+        _require_autobatch_search_strategy(problem.target)
 
         return _probe_problem_with_autobatch(
             problem,
