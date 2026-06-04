@@ -5,6 +5,8 @@ from collections.abc import Callable, Mapping, Sequence
 from itertools import starmap
 from typing import Any
 
+import torch
+
 from vptune.admission import (
     FORWARD_AD_FIELDS,
     TORCH_FUNC_FIELDS,
@@ -2035,6 +2037,24 @@ def _axis_value_error(axis: AxisDescriptor, candidate: Candidate) -> str | None:
     return f"candidate axis value is not allowed: {axis.name}"
 
 
+def _compile_backend_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings["compile.backend"]
+
+        if not isinstance(value, str):
+            return False, "compile.backend must be a string"
+
+        if value == "registered_backend":
+            return False, "compile.backend requires a concrete PyTorch backend id"
+
+        if value == "inductor" or value in set(torch.compiler.list_backends()):
+            return True, None
+
+        return False, f"compile.backend is not registered with PyTorch: {value}"
+
+    return admit
+
+
 def _positive_int_axis(*keys: str) -> AdmissionRule:
     def admit(candidate: Candidate) -> tuple[bool, str | None]:
         for key in keys:
@@ -3127,7 +3147,12 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("compile.boundary",),
             COMPILE_BOUNDARY_VALUES,
         ),
-        AxisDescriptor("compile.backend", ("compile.backend",), ("inductor",)),
+        AxisDescriptor(
+            "compile.backend",
+            ("compile.backend",),
+            (),
+            admission_rule=_compile_backend_axis(),
+        ),
         AxisDescriptor(
             "compile.mode",
             ("compile.mode",),

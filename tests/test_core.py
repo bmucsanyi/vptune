@@ -5534,6 +5534,32 @@ def test_standard_axis_registry_validates_core_axes() -> None:
         vpx.AxisRegistry().register(vpx.AxisDescriptor("bad", ("x",), ()))
 
 
+def test_standard_axis_registry_accepts_concrete_registered_compile_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.compiler, "list_backends", lambda: ["custom_backend"])
+    registry = vpx.standard_axis_registry()
+    concrete = vp.Candidate(
+        "family",
+        "concrete-backend",
+        {"compile.backend": "custom_backend"},
+    )
+    placeholder = vp.Candidate(
+        "family",
+        "placeholder-backend",
+        {"compile.backend": "registered_backend"},
+    )
+    missing = vp.Candidate(
+        "family",
+        "missing-backend",
+        {"compile.backend": "missing_backend"},
+    )
+
+    assert registry.admit(concrete).admission_status == "passed"
+    assert registry.admit(placeholder).admission_status == "failed"
+    assert registry.admit(missing).admission_status == "failed"
+
+
 def test_problem_signature_includes_axis_registry_identity() -> None:
     model = torch.nn.Linear(1, 1)
     first_registry = vpx.AxisRegistry()
