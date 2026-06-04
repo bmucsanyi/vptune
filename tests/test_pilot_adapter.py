@@ -56,12 +56,13 @@ def cpu_target() -> vp.Target:
     return vp.Target(
         devices=("cpu",),
         accelerator="cpu",
-        allowed_dtypes=("float32",),
+        allowed_dtypes=("fp32",),
         allowed_attention_frontends=(),
         allowed_sdpa_kernels=(),
         allowed_sharding_modes=("single_device",),
         timing_policy=vp.TimingPolicy(),
         selection_policy=vp.SelectionPolicy(),
+        search_policy=vp.SearchPolicy(strategy="exhaustive"),
         determinism_policy={},
         environment_capture={"runtime": "test"},
     )
@@ -202,8 +203,8 @@ def test_pilot_lower_validates_family_problem_match() -> None:
     second_operator = vp.hvp("second", "loss", aggregation="sum")
     constraint = vp.CohortConstraint(
         name="dtype",
-        settings_keys=("model_dtype",),
-        assignments=({"model_dtype": "float32"},),
+        settings_keys=("dtype.model_compute",),
+        assignments=({"dtype.model_compute": "fp32"},),
         families=("first", "second"),
     )
 

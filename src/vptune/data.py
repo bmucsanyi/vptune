@@ -17,6 +17,7 @@ from vptune.tensor_tree import TensorTree
 
 SCHEMA_VERSION = 1
 PACKAGE_VERSION = "0.0.1"
+MIN_VARIANCE_REPEAT_COUNT = 2
 
 
 Batch = Mapping[str, Any]
@@ -105,6 +106,21 @@ class ReferenceCheck(Protocol):
         vector: TensorTree,
     ) -> "ReferenceResult":
         """Return reference measurements or raise on failure."""
+
+
+class FullSizeCheck(Protocol):
+    """Check a measured full-size output before selection."""
+
+    def identity(self) -> Mapping[str, Any]:
+        """Return stable full-size check identity."""
+
+    def __call__(
+        self,
+        candidate: "Candidate",
+        inputs: tuple[tuple[Batch, TensorTree], ...],
+        output: TensorTree,
+    ) -> Mapping[str, Any]:
+        """Return selection metadata for the measured output."""
 
 
 class CandidateAdmitter(Protocol):
@@ -246,11 +262,15 @@ class RuntimeConfig:
     axis_registry: CandidateAdmitter | None
     signature: Mapping[str, Any]
     autobatch_domains: tuple[AutobatchDomain, ...] = ()
+    full_size_check: FullSizeCheck | None = None
 
     def identity(self) -> dict[str, Any]:
         """Return stable runtime identity."""
         axis_signature = (
             None if self.axis_registry is None else self.axis_registry.signature()
+        )
+        full_size_check_identity = (
+            None if self.full_size_check is None else self.full_size_check.identity()
         )
 
         return {
@@ -260,6 +280,7 @@ class RuntimeConfig:
             "autobatch_domains": tuple(
                 domain.signature() for domain in self.autobatch_domains
             ),
+            "full_size_check": full_size_check_identity,
         }
 
 
@@ -302,9 +323,83 @@ class SelectionPolicy:
 
     near_fastest_multiplier: float = 1.05
     speed_statistic: str = "median_elapsed_seconds"
+    compiled_speed_statistic: str = "compile_amortized_steady_state_seconds"
+    distributed_speed_statistic: str = "global_elapsed_seconds"
+    rank_memory_reduction: str = "max_peak_reserved"
     tie_breaker: str = "min_peak_reserved_mib"
-    cohort_speed_statistic: str = "sum_median_elapsed_seconds"
+    cohort_speed_statistic: str = "sum_selection_score_seconds"
     cohort_tie_breaker: str = "sum_peak_reserved_mib"
+    accepted_status: str = "passed_current_reference_full_size_agreement_stable_memory"
+    compile_call_horizon: int = 1
+
+    def __post_init__(self) -> None:
+        """Validate policy fields.
+
+        Raises:
+            RuntimeError: If the compile call horizon is invalid.
+        """
+        if self.compile_call_horizon <= 0:
+            message = "compile_call_horizon must be positive"
+            raise RuntimeError(message)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SearchPolicy:
+    """Policy for candidate search strategy."""
+
+    strategy: str
+    retained_top_count: int | None = None
+    compile_call_horizons: tuple[int, ...] = ()
+    variance_repeat_count: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the search strategy.
+
+        Raises:
+            RuntimeError: If the search strategy is unsupported by the spec.
+        """
+        if self.strategy not in {
+            "admission",
+            "smoke",
+            "fast",
+            "balanced",
+            "thorough",
+            "exhaustive",
+        }:
+            message = f"unsupported search strategy: {self.strategy}"
+            raise RuntimeError(message)
+
+        if self.retained_top_count is not None and self.retained_top_count <= 0:
+            message = "retained_top_count must be positive"
+            raise RuntimeError(message)
+
+        if (
+            self.strategy in {"balanced", "thorough"}
+            and self.retained_top_count is None
+        ):
+            message = f"{self.strategy} search requires retained_top_count"
+            raise RuntimeError(message)
+
+        if any(horizon <= 0 for horizon in self.compile_call_horizons):
+            message = "compile_call_horizons must be positive"
+            raise RuntimeError(message)
+
+        if self.strategy == "thorough" and not self.compile_call_horizons:
+            message = "thorough search requires compile_call_horizons"
+            raise RuntimeError(message)
+
+        if (
+            self.variance_repeat_count is not None
+            and self.variance_repeat_count < MIN_VARIANCE_REPEAT_COUNT
+        ):
+            message = (
+                f"variance_repeat_count must be at least {MIN_VARIANCE_REPEAT_COUNT}"
+            )
+            raise RuntimeError(message)
+
+        if self.strategy == "thorough" and self.variance_repeat_count is None:
+            message = "thorough search requires variance_repeat_count"
+            raise RuntimeError(message)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -316,7 +411,7 @@ class CohortConstraint:
     assignments: tuple[Mapping[str, Any], ...]
     families: tuple[str, ...] = ()
     dependency_inheritance: str = "covered_families"
-    selection_aggregation: str = "sum_median_elapsed_seconds"
+    selection_aggregation: str = "sum_selection_score_seconds"
 
     def __post_init__(self) -> None:
         """Validate supported cohort constraint modes.
@@ -331,7 +426,7 @@ class CohortConstraint:
             )
             raise RuntimeError(message)
 
-        if self.selection_aggregation != "sum_median_elapsed_seconds":
+        if self.selection_aggregation != "sum_selection_score_seconds":
             message = (
                 "unsupported cohort selection aggregation: "
                 f"{self.selection_aggregation}"
@@ -381,6 +476,7 @@ class Target:
     allowed_sharding_modes: tuple[str, ...]
     timing_policy: TimingPolicy
     selection_policy: SelectionPolicy
+    search_policy: SearchPolicy
     determinism_policy: Mapping[str, Any]
     environment_capture: Mapping[str, Any]
 
@@ -398,6 +494,7 @@ class Target:
             "allowed_sharding_modes": self.allowed_sharding_modes,
             "timing_policy": dataclasses.asdict(self.timing_policy),
             "selection_policy": dataclasses.asdict(self.selection_policy),
+            "search_policy": dataclasses.asdict(self.search_policy),
             "determinism_policy": dict(self.determinism_policy),
             "environment": dict(self.environment_capture),
         }
@@ -413,6 +510,13 @@ class ParameterSurface:
     buffer_policy: str = "include"
     tied_weights_policy: str = "preserve"
     parametrization_policy: str = "active"
+    layer_groups: tuple[tuple[str, ...], ...] = ()
+    block_groups: tuple[tuple[str, ...], ...] = ()
+
+    def __post_init__(self) -> None:
+        """Validate declared layout groups."""
+        _validate_parameter_groups(self.names, self.layer_groups, "layer_groups")
+        _validate_parameter_groups(self.names, self.block_groups, "block_groups")
 
     def signature(self) -> dict[str, Any]:
         """Return a stable parameter-surface identity."""
@@ -425,6 +529,8 @@ def parameter_surface(
     include: Callable[[str, torch.nn.Parameter], bool] | None = None,
     buffers: str = "include",
     tied_weights: str = "preserve",
+    layer_groups: Sequence[Sequence[str]] = (),
+    block_groups: Sequence[Sequence[str]] = (),
 ) -> ParameterSurface:
     """Return a parameter surface from a module.
 
@@ -448,7 +554,38 @@ def parameter_surface(
         trainable=tuple(parameter.requires_grad for _, parameter in pairs),
         buffer_policy=buffers,
         tied_weights_policy=tied_weights,
+        layer_groups=_normalize_parameter_groups(layer_groups),
+        block_groups=_normalize_parameter_groups(block_groups),
     )
+
+
+def _normalize_parameter_groups(
+    groups: Sequence[Sequence[str]],
+) -> tuple[tuple[str, ...], ...]:
+    return tuple(tuple(group) for group in groups)
+
+
+def _validate_parameter_groups(
+    names: tuple[str, ...],
+    groups: tuple[tuple[str, ...], ...],
+    label: str,
+) -> None:
+    if not groups:
+        return
+
+    if any(not group for group in groups):
+        message = f"{label} must not contain empty groups"
+        raise RuntimeError(message)
+
+    flat = tuple(name for group in groups for name in group)
+
+    if set(flat) != set(names):
+        message = f"{label} must cover every parameter name exactly once"
+        raise RuntimeError(message)
+
+    if len(flat) != len(set(flat)):
+        message = f"{label} must not contain duplicate parameter names"
+        raise RuntimeError(message)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -492,6 +629,38 @@ class Family:
     dependencies: tuple[str, ...] = ()
     candidate_generator: str = "default"
     materialization_rule: str = "selected_operator"
+
+    def __post_init__(self) -> None:
+        """Derive composition dependencies from ordered children.
+
+        Raises:
+            MaterializationError: If composition dependencies are invalid.
+        """
+        if self.operator.kind != "composition":
+            return
+
+        if self.dependencies:
+            message = "composition family dependencies are derived from children"
+            raise MaterializationError(message)
+
+        children = self.operator.semantics.get("children")
+
+        if not isinstance(children, Sequence) or isinstance(children, str):
+            message = "composition operator must declare ordered children"
+            raise MaterializationError(message)
+
+        child_order = tuple(children)
+
+        if not child_order:
+            message = "composition operator must declare ordered children"
+            raise MaterializationError(message)
+
+        for child in child_order:
+            if not isinstance(child, str) or not child:
+                message = "composition children must be non-empty strings"
+                raise MaterializationError(message)
+
+        object.__setattr__(self, "dependencies", child_order)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -795,6 +964,7 @@ class Plan:
     records: Mapping[str, FullSizeRecord]
     input_signature: Mapping[str, Any]
     policy: SelectionPolicy
+    candidate_rows: tuple[Candidate, ...] = ()
     full_size_records: tuple[FullSizeRecord, ...] = ()
     check_records: tuple[CheckRecord, ...] = ()
     validation_records: tuple[CheckRecord, ...] = ()
@@ -1001,6 +1171,48 @@ class Plan:
             for family in sorted(self.validator_identities)
         }
 
+    def candidate_rows_for_record(self) -> tuple[Candidate, ...]:
+        """Return candidate rows saved in the plan summary."""
+        if self.candidate_rows:
+            return self.candidate_rows
+
+        candidates = {}
+
+        for record in (*self.full_size_records, *self.check_records):
+            candidate = self._candidate_for_result_record(record)
+            signature = to_json_value(candidate.signature())
+            candidates.setdefault(str(signature), candidate)
+
+        return tuple(candidates[key] for key in sorted(candidates))
+
+    def _candidate_for_result_record(
+        self,
+        record: FullSizeRecord | CheckRecord,
+    ) -> Candidate:
+        selected_candidate = self.selected.get(record.family)
+
+        if (
+            selected_candidate is not None
+            and selected_candidate.candidate_id == record.candidate_id
+            and to_json_value(selected_candidate.settings)
+            == to_json_value(record.candidate_settings)
+        ):
+            return selected_candidate
+
+        return Candidate(
+            family=record.family,
+            candidate_id=record.candidate_id,
+            settings=dict(record.candidate_settings),
+            dependency_identities={
+                family: dict(identity)
+                for family, identity in record.dependency_identities.items()
+            },
+            cohort_assignment=dict(record.cohort_assignment),
+            admission_status="passed",
+            generator_id=record.generator_id,
+            generator_version=record.generator_version,
+        )
+
     def to_record(self) -> dict[str, Any]:
         """Return the saved plan record."""
         return {
@@ -1019,6 +1231,9 @@ class Plan:
                 family: candidate.signature()
                 for family, candidate in sorted(self.selected.items())
             },
+            "candidate_rows": tuple(
+                candidate.signature() for candidate in self.candidate_rows_for_record()
+            ),
             "records": {
                 family: record.row_key()
                 for family, record in sorted(self.records.items())

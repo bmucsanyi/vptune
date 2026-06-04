@@ -21,9 +21,5 @@ class StaleRecordError(VPTuneError):
     """Raised when a saved record does not match the current run."""
 
 
-class MeasurementError(VPTuneError):
-    """Raised when candidate measurement cannot produce valid samples."""
-
-
 class MaterializationError(VPTuneError):
     """Raised when a selected plan cannot be materialized."""

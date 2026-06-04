@@ -246,6 +246,19 @@ def fisher_vp_dense_anchor(
     return (product / normalization).reshape_as(vector)
 
 
+def sampled_fisher_vp_dense_anchor(
+    sampled_score_gradients: torch.Tensor,
+    vector: torch.Tensor,
+    *,
+    normalization: float,
+) -> torch.Tensor:
+    """Return dense sampled score-gradient outer-product product."""
+    flat_vector = vector.reshape(-1)
+    product = sampled_score_gradients.T @ (sampled_score_gradients @ flat_vector)
+
+    return (product / normalization).reshape_as(vector)
+
+
 def empirical_fisher_vp_dense_anchor(
     per_example_gradients: torch.Tensor,
     vector: torch.Tensor,

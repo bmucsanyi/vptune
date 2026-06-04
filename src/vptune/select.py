@@ -6,6 +6,7 @@ from vptune.data import Candidate, FullSizeRecord, SelectionPolicy
 from vptune.errors import NoPassedCandidateError
 from vptune.identities import to_json_value
 from vptune.selection_core import (
+    full_size_agreement_satisfied,
     memory_stable,
     select_accepted_family,
     select_complete_cohort,
@@ -20,6 +21,7 @@ def record_accepted(
         record.status == "passed"
         and record.reference_passed
         and to_json_value(record.input_signature) == to_json_value(input_signature)
+        and full_size_agreement_satisfied(record)
         and memory_stable(record)
     )
 

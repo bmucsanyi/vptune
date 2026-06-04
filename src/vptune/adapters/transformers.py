@@ -7,22 +7,19 @@ from typing import Any, Protocol
 
 import torch
 
+from vptune.attention import AttentionSemantics, MappingAttentionLocation
 from vptune.candidates import AxisDescriptor
-from vptune.checks import tree_error_measurements, validate_thresholds
 from vptune.data import PACKAGE_VERSION, Candidate
 from vptune.errors import AdmissionError
 from vptune.identities import module_identity
-from vptune.tensor_tree import TensorTree
 
 EAGER_ATTENTION_FRONTENDS = (
     "transformers_eager",
-    "patched_eager",
     "paged|eager",
 )
 SDPA_ATTENTION_FRONTENDS = (
     "transformers_sdpa",
     "paged|sdpa",
-    "pytorch_sdpa_direct",
 )
 FLASH_ATTENTION_FRONTENDS = (
     "transformers_flash_attention_2",
@@ -36,15 +33,11 @@ CUSTOM_ATTENTION_FRONTENDS = (
     "transformers_flex_attention",
     "registered_transformers_attention",
 )
-PACKED_ATTENTION_FRONTENDS = ("packed_exact",)
-BLOCKWISE_ATTENTION_FRONTENDS = ("blockwise_exact",)
 TRANSFORMERS_ATTENTION_FRONTENDS = (
     *EAGER_ATTENTION_FRONTENDS,
     *SDPA_ATTENTION_FRONTENDS,
     *FLASH_ATTENTION_FRONTENDS,
     *CUSTOM_ATTENTION_FRONTENDS,
-    *PACKED_ATTENTION_FRONTENDS,
-    *BLOCKWISE_ATTENTION_FRONTENDS,
 )
 SDPA_KERNELS = (
     "math",
@@ -55,7 +48,7 @@ SDPA_KERNELS = (
     "priority_list",
 )
 NON_MATH_SDPA_KERNELS = tuple(kernel for kernel in SDPA_KERNELS if kernel != "math")
-FLASH_ATTENTION_DTYPES = ("float16", "bfloat16")
+FLASH_ATTENTION_DTYPES = ("fp16", "bf16")
 LOAD_TIME_ATTENTION_FRONTENDS = {
     "transformers_eager": "eager",
     "transformers_sdpa": "sdpa",
@@ -144,6 +137,20 @@ class TransformersModelLoader(Protocol):
         """Return a loaded model."""
 
 
+class TransformersAttentionConfigurable(Protocol):
+    """Object with a Transformers attention switch method."""
+
+    def set_attn_implementation(self, attn_implementation: str) -> None:
+        """Set the active Transformers attention implementation."""
+
+
+class TransformersRegistry(Protocol):
+    """Object with a Transformers-style register method."""
+
+    def register(self, name: str, function: Callable[..., Any]) -> None:
+        """Register a named callable."""
+
+
 def load_transformers_model(
     model_cls: TransformersModelLoader,
     *,
@@ -202,6 +209,125 @@ def transformers_attn_implementation(
         raise AdmissionError(message)
 
     return attn_implementation
+
+
+def set_transformers_attention_implementation(
+    model: TransformersAttentionConfigurable,
+    *,
+    attention_frontend: str,
+    attention_custom_kernel_id: str | None = None,
+) -> str:
+    """Set the active Transformers attention implementation.
+
+    Returns:
+        Transformers attention implementation string sent to the model.
+    """
+    attn_implementation = transformers_attn_implementation(
+        attention_frontend,
+        attention_custom_kernel_id=attention_custom_kernel_id,
+    )
+    model.set_attn_implementation(attn_implementation)
+
+    return attn_implementation
+
+
+def register_transformers_attention(
+    attention_interface: TransformersRegistry,
+    mask_interface: TransformersRegistry,
+    *,
+    attention_custom_kernel_id: str,
+    attention_function: Callable[..., Any],
+    mask_formatter_id: str,
+    mask_function: Callable[..., Any],
+) -> dict[str, Any]:
+    """Register a custom Transformers attention implementation and mask.
+
+    Returns:
+        Registration identity.
+
+    Raises:
+        AdmissionError: If the declared attention and mask ids cannot execute together.
+    """
+    settings = {
+        "attention.custom_kernel_id": attention_custom_kernel_id,
+        "attention.mask_formatter_id": mask_formatter_id,
+    }
+    error = _registered_attention_ids_error(settings)
+
+    if error is not None:
+        raise AdmissionError(error)
+
+    attention_interface.register(attention_custom_kernel_id, attention_function)
+    mask_interface.register(mask_formatter_id, mask_function)
+
+    return {
+        "attention_custom_kernel_id": attention_custom_kernel_id,
+        "mask_formatter_id": mask_formatter_id,
+    }
+
+
+def transformers_attention_location(
+    *,
+    query_key: str,
+    key_key: str,
+    value_key: str,
+    output_key: str,
+    mask_key: str | None,
+    inverse_permutation_key: str | None,
+    query_block_size_key: str | None,
+    dropout_p: float,
+    is_causal: bool,
+    scale: float | None,
+    enable_gqa: bool,
+    causal_policy: str,
+    sliding_window_policy: str,
+    padding_policy: str,
+    mask_convention: str,
+    dropout_rng: Mapping[str, Any],
+    qkv_layout: str,
+    head_layout: str,
+    scale_source: str,
+    use_cache: bool,
+    output_attentions: bool,
+    rope_parameters: Mapping[str, Any],
+    position_id_policy: Mapping[str, Any],
+    score_softcap: float | None,
+    final_logit_softcap: float | None,
+) -> MappingAttentionLocation:
+    """Return a core attention-location descriptor for Transformers rows.
+
+    Returns:
+        Core attention-location descriptor.
+    """
+    return MappingAttentionLocation(
+        semantics=AttentionSemantics(
+            causal_policy=causal_policy,
+            sliding_window_policy=sliding_window_policy,
+            padding_policy=padding_policy,
+            mask_convention=mask_convention,
+            dropout_rng=dropout_rng,
+            qkv_layout=qkv_layout,
+            head_layout=head_layout,
+            scale_source=scale_source,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            rope_parameters=rope_parameters,
+            position_id_policy=position_id_policy,
+            score_softcap=score_softcap,
+            final_logit_softcap=final_logit_softcap,
+        ),
+        query_key=query_key,
+        key_key=key_key,
+        value_key=value_key,
+        output_key=output_key,
+        mask_key=mask_key,
+        inverse_permutation_key=inverse_permutation_key,
+        query_block_size_key=query_block_size_key,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
 
 
 def transformers_model_identity(
@@ -280,8 +406,8 @@ def transformers_attention_axis(
             "attention.sdpa_priority_list",
             "attention.custom_kernel_id",
             "attention.mask_formatter_id",
-            "model_dtype",
-            "compute_dtype",
+            "dtype.parameter_storage",
+            "dtype.model_compute",
             "output_attentions",
             "module_mode",
             "dropout_p",
@@ -289,17 +415,6 @@ def transformers_attention_axis(
             "query_heads",
             "key_heads",
             "value_heads",
-            "patched_attention_id",
-            "patched_attention_semantics",
-            "packed_attention_id",
-            "packed_attention_semantics",
-            "packed_target_row_axis",
-            "packed_target_row_count",
-            "blockwise_attention_id",
-            "blockwise_attention_semantics",
-            "attention_block_size",
-            "blockwise_preserves_softcap",
-            "blockwise_preserves_mask",
         ),
         adapter_id="vptune.transformers",
         adapter_version=PACKAGE_VERSION,
@@ -376,52 +491,6 @@ def admit_transformers_cache(
     return True, None
 
 
-def check_patched_attention_reference(
-    reference: Callable[..., TensorTree],
-    patched: Callable[..., TensorTree],
-    args: Sequence[Any],
-    *,
-    thresholds: Mapping[str, float],
-) -> dict[str, float]:
-    """Validate patched attention output against a reference output.
-
-    Returns:
-        Error measurements for the patched output.
-    """
-    reference_output = reference(*args)
-    patched_output = patched(*args)
-    measurements = tree_error_measurements(patched_output, reference_output)
-    validate_thresholds(measurements, thresholds)
-
-    return measurements
-
-
-def check_patched_attention_vjp_reference(
-    reference: Callable[..., torch.Tensor],
-    patched: Callable[..., torch.Tensor],
-    args: Sequence[Any],
-    cotangent: torch.Tensor,
-    differentiable_arg_indices: Sequence[int],
-    *,
-    thresholds: Mapping[str, float],
-) -> dict[str, float]:
-    """Validate patched attention VJP against a reference VJP.
-
-    Returns:
-        Error measurements for the patched VJP.
-    """
-    indices = _validate_differentiable_arg_indices(
-        differentiable_arg_indices,
-        len(args),
-    )
-    reference_vjp = _attention_vjp(reference, args, cotangent, indices)
-    patched_vjp = _attention_vjp(patched, args, cotangent, indices)
-    measurements = tree_error_measurements(patched_vjp, reference_vjp)
-    validate_thresholds(measurements, thresholds)
-
-    return measurements
-
-
 def _attention_error(
     candidate: Candidate,
     policy: TransformersAttentionPolicy,
@@ -444,15 +513,6 @@ def _attention_error(
 
     if error is None:
         error = _gqa_error(candidate.settings)
-
-    if error is None:
-        error = _patched_attention_error(candidate.settings, attention_frontend)
-
-    if error is None:
-        error = _packed_attention_error(candidate.settings, policy, attention_frontend)
-
-    if error is None:
-        error = _blockwise_attention_error(candidate.settings, attention_frontend)
 
     if error is None:
         error = _registered_attention_error(candidate.settings, attention_frontend)
@@ -604,7 +664,7 @@ def _flash_attention_dtype_error(
     settings: Mapping[str, Any],
     attention_frontend: str,
 ) -> str | None:
-    dtype = settings.get("compute_dtype", settings.get("model_dtype"))
+    dtype = settings.get("dtype.model_compute", settings.get("dtype.parameter_storage"))
 
     if dtype not in FLASH_ATTENTION_DTYPES:
         return f"{attention_frontend} requires float16 or bfloat16 effective dtype"
@@ -662,70 +722,6 @@ def _gqa_error(settings: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _patched_attention_error(
-    settings: Mapping[str, Any],
-    attention_frontend: str,
-) -> str | None:
-    if attention_frontend != "patched_eager":
-        return None
-
-    return _semantic_attention_error(
-        settings,
-        id_key="patched_attention_id",
-        semantics_key="patched_attention_semantics",
-    )
-
-
-def _packed_attention_error(
-    settings: Mapping[str, Any],
-    policy: TransformersAttentionPolicy,
-    attention_frontend: str,
-) -> str | None:
-    if attention_frontend != "packed_exact":
-        return None
-
-    return _first_attention_error((
-        _semantic_attention_error(
-            settings,
-            id_key="packed_attention_id",
-            semantics_key="packed_attention_semantics",
-        ),
-        _required_string_setting(settings, "packed_target_row_axis"),
-        _required_positive_int_setting(settings, "packed_target_row_count"),
-        _required_true_setting(settings, "packed_preserves_softcap"),
-        _required_true_setting(settings, "packed_preserves_mask"),
-        _required_string_match(
-            settings,
-            "packed_mask_semantics",
-            policy.mask_semantics,
-        ),
-        _required_string_match(
-            settings,
-            "packed_causal_policy",
-            policy.causal_policy,
-        ),
-    ))
-
-
-def _blockwise_attention_error(
-    settings: Mapping[str, Any],
-    attention_frontend: str,
-) -> str | None:
-    if attention_frontend != "blockwise_exact":
-        return None
-
-    return _first_attention_error((
-        _semantic_attention_error(
-            settings,
-            id_key="blockwise_attention_id",
-            semantics_key="blockwise_attention_semantics",
-        ),
-        _required_positive_int_setting(settings, "attention_block_size"),
-        _required_true_setting(settings, "blockwise_preserves_softcap"),
-        _required_true_setting(settings, "blockwise_preserves_mask"),
-    ))
-
-
 def _registered_attention_error(
     settings: Mapping[str, Any],
     attention_frontend: str,
@@ -733,22 +729,27 @@ def _registered_attention_error(
     if attention_frontend != "registered_transformers_attention":
         return None
 
-    return _first_attention_error((
+    return _registered_attention_ids_error(settings)
+
+
+def _registered_attention_ids_error(settings: Mapping[str, Any]) -> str | None:
+    error = _first_attention_error((
         _required_string_setting(settings, "attention.custom_kernel_id"),
         _required_string_setting(settings, "attention.mask_formatter_id"),
     ))
 
+    if error is not None:
+        return error
 
-def _semantic_attention_error(
-    settings: Mapping[str, Any],
-    *,
-    id_key: str,
-    semantics_key: str,
-) -> str | None:
-    return _first_attention_error((
-        _required_string_setting(settings, id_key),
-        _required_mapping_setting(settings, semantics_key),
-    ))
+    if (
+        settings["attention.custom_kernel_id"]
+        != settings["attention.mask_formatter_id"]
+    ):
+        return (
+            "registered Transformers attention requires matching attention and mask ids"
+        )
+
+    return None
 
 
 def _first_attention_error(errors: Sequence[str | None]) -> str | None:
@@ -768,50 +769,9 @@ def _required_string_setting(settings: Mapping[str, Any], key: str) -> str | Non
     return None
 
 
-def _required_mapping_setting(settings: Mapping[str, Any], key: str) -> str | None:
-    value = settings.get(key)
-
-    if not isinstance(value, Mapping) or not value:
-        return f"{key} must be a non-empty mapping"
-
-    return None
-
-
-def _required_positive_int_setting(
-    settings: Mapping[str, Any],
-    key: str,
-) -> str | None:
-    value = settings.get(key)
-
-    if not isinstance(value, int) or value < 1:
-        return f"{key} must be a positive integer"
-
-    return None
-
-
 def _required_bool_setting(settings: Mapping[str, Any], key: str) -> str | None:
     if not isinstance(settings.get(key), bool):
         return f"{key} must be a bool"
-
-    return None
-
-
-def _required_true_setting(settings: Mapping[str, Any], key: str) -> str | None:
-    if settings.get(key) is not True:
-        return f"{key} must be true"
-
-    return None
-
-
-def _required_string_match(
-    settings: Mapping[str, Any],
-    key: str,
-    expected: str,
-) -> str | None:
-    value = settings.get(key)
-
-    if value != expected:
-        return f"{key} must match policy value {expected}"
 
     return None
 
@@ -830,68 +790,3 @@ def _policy_error(policy: TransformersAttentionPolicy) -> str | None:
         return "determinism policy must be recorded"
 
     return None
-
-
-def _validate_differentiable_arg_indices(
-    indices: Sequence[int],
-    arg_count: int,
-) -> tuple[int, ...]:
-    if not indices:
-        message = "differentiable_arg_indices must be non-empty"
-        raise AdmissionError(message)
-
-    unique = tuple(dict.fromkeys(indices))
-
-    if len(unique) != len(indices):
-        message = "differentiable_arg_indices must not contain duplicates"
-        raise AdmissionError(message)
-
-    for index in unique:
-        if index < 0 or index >= arg_count:
-            message = "differentiable_arg_indices contains an out-of-range index"
-            raise AdmissionError(message)
-
-    return unique
-
-
-def _attention_vjp(
-    function: Callable[..., torch.Tensor],
-    args: Sequence[Any],
-    cotangent: torch.Tensor,
-    indices: Sequence[int],
-) -> tuple[torch.Tensor, ...]:
-    active_args = []
-    call_args = list(args)
-
-    for index in indices:
-        argument = args[index]
-
-        if not isinstance(argument, torch.Tensor):
-            message = "differentiable attention arguments must be tensors"
-            raise AdmissionError(message)
-
-        if not argument.is_floating_point():
-            message = "differentiable attention arguments must be floating tensors"
-            raise AdmissionError(message)
-
-        active = argument.detach().clone().requires_grad_(True)
-        active_args.append(active)
-        call_args[index] = active
-
-    output = function(*call_args)
-
-    if not isinstance(output, torch.Tensor):
-        message = "attention VJP reference functions must return a tensor"
-        raise AdmissionError(message)
-
-    scalar = (output * cotangent).sum()
-    gradients = torch.autograd.grad(
-        scalar,
-        tuple(active_args),
-        allow_unused=True,
-    )
-
-    return tuple(
-        torch.zeros_like(argument) if gradient is None else gradient.detach()
-        for argument, gradient in zip(active_args, gradients, strict=True)
-    )

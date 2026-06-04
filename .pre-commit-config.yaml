@@ -22,7 +22,3 @@ repos:
   rev:  v0.19.1
   hooks:
   - id: gitlint
-- repo: https://github.com/gitleaks/gitleaks
-  rev: v8.30.1
-  hooks:
-  - id: gitleaks

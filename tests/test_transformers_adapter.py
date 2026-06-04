@@ -1,3 +1,6 @@
+import dataclasses
+from collections.abc import Callable
+
 import pytest
 import torch
 
@@ -5,7 +8,7 @@ import vptune as vp
 import vptune.adapters as vpa
 import vptune.ext as vpx
 from vptune.data import PACKAGE_VERSION
-from vptune.errors import AdmissionError, ReferenceFailedError
+from vptune.errors import AdmissionError
 
 
 def transformers_policy(*, use_cache: bool = False) -> vpa.TransformersAttentionPolicy:
@@ -55,6 +58,30 @@ class FakeModelLoader:
         return TinyTiedModule()
 
 
+class FakeTransformersRegistry:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def register(self, name: str, function: Callable[..., object]) -> None:
+        self.calls.append((name, function))
+
+
+class FakeAttentionConfigurable:
+    def __init__(self) -> None:
+        self.values = []
+
+    def set_attn_implementation(self, attn_implementation: str) -> None:
+        self.values.append(attn_implementation)
+
+
+def fake_attention() -> None:
+    return None
+
+
+def fake_mask() -> None:
+    return None
+
+
 def test_load_transformers_model_calls_from_pretrained_with_explicit_settings() -> None:
     calls = []
 
@@ -79,12 +106,54 @@ def test_load_transformers_model_calls_from_pretrained_with_explicit_settings() 
     ]
 
 
-def test_transformers_attn_implementation_maps_load_time_frontends() -> None:
-    assert vpa.transformers_attn_implementation("transformers_sdpa") == "sdpa"
-    assert (
-        vpa.transformers_attn_implementation("paged|flash_attention_3")
-        == "paged|flash_attention_3"
+def test_load_transformers_model_forwards_registered_attention_id() -> None:
+    calls = []
+
+    vpa.load_transformers_model(
+        FakeModelLoader(calls),
+        model_name_or_path="org/model",
+        revision="abc123",
+        torch_dtype=torch.float16,
+        attention_frontend="registered_transformers_attention",
+        attention_custom_kernel_id="custom_attention",
+        use_cache=True,
     )
+
+    assert calls == [
+        {
+            "model_name_or_path": "org/model",
+            "revision": "abc123",
+            "torch_dtype": torch.float16,
+            "attn_implementation": "custom_attention",
+            "use_cache": True,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("attention_frontend", "expected"),
+    [
+        ("transformers_eager", "eager"),
+        ("transformers_sdpa", "sdpa"),
+        ("transformers_flash_attention_2", "flash_attention_2"),
+        ("transformers_flash_attention_3", "flash_attention_3"),
+        ("transformers_flash_attention_4", "flash_attention_4"),
+        ("transformers_flex_attention", "flex_attention"),
+        ("paged|eager", "paged|eager"),
+        ("paged|sdpa", "paged|sdpa"),
+        ("paged|flash_attention_2", "paged|flash_attention_2"),
+        ("paged|flash_attention_3", "paged|flash_attention_3"),
+        ("paged|flash_attention_4", "paged|flash_attention_4"),
+    ],
+)
+def test_transformers_attn_implementation_maps_load_time_frontends(
+    attention_frontend: str,
+    expected: str,
+) -> None:
+    assert vpa.transformers_attn_implementation(attention_frontend) == expected
+
+
+def test_registered_transformers_attn_implementation_uses_custom_id() -> None:
     assert (
         vpa.transformers_attn_implementation(
             "registered_transformers_attention",
@@ -100,6 +169,113 @@ def test_transformers_attn_implementation_maps_load_time_frontends() -> None:
         vpa.transformers_attn_implementation("registered_transformers_attention")
 
 
+def test_set_transformers_attention_implementation_calls_model_method() -> None:
+    model = FakeAttentionConfigurable()
+
+    selected = vpa.set_transformers_attention_implementation(
+        model,
+        attention_frontend="transformers_sdpa",
+    )
+    custom = vpa.set_transformers_attention_implementation(
+        model,
+        attention_frontend="registered_transformers_attention",
+        attention_custom_kernel_id="custom_attention",
+    )
+
+    assert selected == "sdpa"
+    assert custom == "custom_attention"
+    assert model.values == ["sdpa", "custom_attention"]
+
+
+def test_register_transformers_attention_registers_attention_and_mask() -> None:
+    attention_registry = FakeTransformersRegistry()
+    mask_registry = FakeTransformersRegistry()
+
+    identity = vpa.register_transformers_attention(
+        attention_registry,
+        mask_registry,
+        attention_custom_kernel_id="custom_attention",
+        attention_function=fake_attention,
+        mask_formatter_id="custom_attention",
+        mask_function=fake_mask,
+    )
+
+    assert attention_registry.calls == [("custom_attention", fake_attention)]
+    assert mask_registry.calls == [("custom_attention", fake_mask)]
+    assert identity["attention_custom_kernel_id"] == "custom_attention"
+    assert identity["mask_formatter_id"] == "custom_attention"
+
+    with pytest.raises(vp.AdmissionError, match="matching attention and mask"):
+        vpa.register_transformers_attention(
+            attention_registry,
+            mask_registry,
+            attention_custom_kernel_id="custom_attention",
+            attention_function=fake_attention,
+            mask_formatter_id="custom_mask",
+            mask_function=fake_mask,
+        )
+
+
+def test_transformers_attention_location_executes_core_attention() -> None:
+    query = torch.arange(24, dtype=torch.float32).reshape(1, 2, 4, 3) / 17.0
+    key = torch.arange(24, 48, dtype=torch.float32).reshape(1, 2, 4, 3) / 19.0
+    value = torch.arange(48, 72, dtype=torch.float32).reshape(1, 2, 4, 3) / 23.0
+    location = vpa.transformers_attention_location(
+        query_key="query",
+        key_key="key",
+        value_key="value",
+        output_key="attention",
+        mask_key=None,
+        inverse_permutation_key=None,
+        query_block_size_key=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
+        enable_gqa=False,
+        causal_policy="bidirectional",
+        sliding_window_policy="none",
+        padding_policy="dense",
+        mask_convention="additive_or_bool",
+        dropout_rng={"policy": "disabled"},
+        qkv_layout="batch_heads_tokens_width",
+        head_layout="separate_qkv_heads",
+        scale_source="default_width",
+        use_cache=False,
+        output_attentions=False,
+        rope_parameters={"enabled": False},
+        position_id_policy={"type": "none"},
+        score_softcap=0.75,
+        final_logit_softcap=30.0,
+    )
+    settings = vpx.AttentionSettings(
+        frontend="patched_eager",
+        sdpa_kernel=None,
+        sdpa_priority=(),
+        partition="full",
+        padding="dense_padded",
+    )
+
+    output = vpx.execute_attention(
+        location,
+        {"query": query, "key": key, "value": value},
+        settings,
+    )
+    signature = location.signature()
+    scores = query @ key.transpose(-2, -1)
+    scores = scores / (float(query.size(-1)) ** 0.5)
+    scores = torch.tanh(scores / 0.75) * 0.75
+    expected = torch.softmax(scores, dim=-1) @ value
+
+    assert isinstance(output, dict)
+    assert len(output) == 1
+    key, output_tensor = next(iter(output.items()))
+    assert key == "attention"
+    assert isinstance(output_tensor, torch.Tensor)
+    torch.testing.assert_close(output_tensor, expected)
+    assert signature["semantics"]["rope_parameters"] == {"enabled": False}
+    assert signature["semantics"]["final_logit_softcap"] == pytest.approx(30.0)
+
+
 def test_transformers_model_identity_records_module_and_adapter_fields() -> None:
     model = TinyTiedModule()
     model.eval()
@@ -109,7 +285,7 @@ def test_transformers_model_identity_records_module_and_adapter_fields() -> None
         transformers_version="4.0.0",
         model_config_hash="config-hash",
         source_revision="revision",
-        dtype_policy={"model_dtype": "bfloat16"},
+        dtype_policy={"dtype.model_compute": "bf16"},
         tokenizer_identity={"name": "tokenizer", "revision": "tok-rev"},
         adapter_rules={"attention": "sdpa"},
     )
@@ -121,7 +297,7 @@ def test_transformers_model_identity_records_module_and_adapter_fields() -> None
     assert signature["transformers_version"] == "4.0.0"
     assert signature["model_config_hash"] == "config-hash"
     assert signature["source_revision"] == "revision"
-    assert signature["dtype_policy"] == {"model_dtype": "bfloat16"}
+    assert signature["dtype_policy"] == {"dtype.model_compute": "bf16"}
     assert signature["tokenizer_identity"] == {
         "name": "tokenizer",
         "revision": "tok-rev",
@@ -141,7 +317,7 @@ def test_transformers_model_identity_requires_explicit_fields() -> None:
             transformers_version="4.0.0",
             model_config_hash="",
             source_revision=None,
-            dtype_policy={"model_dtype": "bfloat16"},
+            dtype_policy={"dtype.model_compute": "bf16"},
             tokenizer_identity={"name": "tokenizer"},
             adapter_rules={"attention": "sdpa"},
         )
@@ -152,7 +328,7 @@ def test_transformers_model_identity_requires_explicit_fields() -> None:
             transformers_version="4.0.0",
             model_config_hash="config-hash",
             source_revision=None,
-            dtype_policy={"model_dtype": "bfloat16"},
+            dtype_policy={"dtype.model_compute": "bf16"},
             tokenizer_identity={},
             adapter_rules={"attention": "sdpa"},
         )
@@ -184,7 +360,7 @@ def test_transformers_cache_axis_composes_with_attention_axis() -> None:
     registry = vpx.AxisRegistry()
     registry.register(
         vpa.transformers_attention_axis(
-            ("pytorch_sdpa_direct",),
+            ("transformers_sdpa",),
             policy=policy,
         )
     )
@@ -195,7 +371,7 @@ def test_transformers_cache_axis_composes_with_attention_axis() -> None:
             "family",
             "row",
             {
-                "attention.frontend": "pytorch_sdpa_direct",
+                "attention.frontend": "transformers_sdpa",
                 "attention.sdpa_kernel": "math",
                 "module_mode": "eval",
                 "dropout_p": 0.0,
@@ -208,7 +384,7 @@ def test_transformers_cache_axis_composes_with_attention_axis() -> None:
             "family",
             "row",
             {
-                "attention.frontend": "pytorch_sdpa_direct",
+                "attention.frontend": "transformers_sdpa",
                 "attention.sdpa_kernel": "math",
                 "module_mode": "eval",
                 "dropout_p": 0.0,
@@ -221,11 +397,75 @@ def test_transformers_cache_axis_composes_with_attention_axis() -> None:
     assert rejected.admission_status == "failed"
 
 
-def test_transformers_attention_replaces_core_attention_axis() -> None:
+@pytest.mark.parametrize(
+    "sdpa_kernel",
+    [
+        "math",
+        "flash_attention",
+        "efficient_attention",
+        "cudnn_attention",
+        "overrideable",
+    ],
+)
+def test_transformers_sdpa_axis_admits_each_kernel_value(sdpa_kernel: str) -> None:
     policy = transformers_policy()
-    registry = vpx.standard_axis_registry(
-        exclude=("attention_frontend", "functional_call_admission")
+    axis = vpa.transformers_attention_axis(("transformers_sdpa",), policy=policy)
+    settings = {
+        "attention.frontend": "transformers_sdpa",
+        "attention.sdpa_kernel": sdpa_kernel,
+        "module_mode": "eval",
+        "dropout_p": 0.0,
+    }
+
+    if sdpa_kernel == "flash_attention":
+        settings["dtype.model_compute"] = "bf16"
+
+    assert axis.admit(vp.Candidate("family", sdpa_kernel, settings)) == (True, None)
+
+
+def test_transformers_sdpa_axis_admits_priority_list() -> None:
+    policy = transformers_policy()
+    axis = vpa.transformers_attention_axis(("transformers_sdpa",), policy=policy)
+    candidate = vp.Candidate(
+        "family",
+        "priority",
+        {
+            "attention.frontend": "transformers_sdpa",
+            "attention.sdpa_kernel": "priority_list",
+            "attention.sdpa_priority_list": ("flash_attention", "math"),
+            "dtype.model_compute": "bf16",
+            "module_mode": "eval",
+            "dropout_p": 0.0,
+        },
     )
+
+    assert axis.admit(candidate) == (True, None)
+
+
+def test_transformers_sdpa_axis_rejects_unavailable_forced_kernel() -> None:
+    policy = dataclasses.replace(
+        transformers_policy(),
+        forced_kernel_available=False,
+        forced_kernel_failure_reason="kernel missing",
+    )
+    axis = vpa.transformers_attention_axis(("transformers_sdpa",), policy=policy)
+    candidate = vp.Candidate(
+        "family",
+        "efficient",
+        {
+            "attention.frontend": "transformers_sdpa",
+            "attention.sdpa_kernel": "efficient_attention",
+            "module_mode": "eval",
+            "dropout_p": 0.0,
+        },
+    )
+
+    assert axis.admit(candidate) == (False, "kernel missing")
+
+
+def test_transformers_attention_registers_adapter_axis() -> None:
+    policy = transformers_policy()
+    registry = vpx.standard_axis_registry()
     registry.register(
         vpa.transformers_attention_axis(
             ("transformers_eager",),
@@ -258,7 +498,7 @@ def test_transformers_attention_requires_mode_and_effective_flash_dtype() -> Non
         "missing-mode",
         {
             "attention.frontend": "transformers_flash_attention_2",
-            "model_dtype": "bfloat16",
+            "dtype.model_compute": "bf16",
             "dropout_p": 0.0,
             "output_attentions": False,
         },
@@ -268,8 +508,8 @@ def test_transformers_attention_requires_mode_and_effective_flash_dtype() -> Non
         "float32-compute",
         {
             "attention.frontend": "transformers_flash_attention_2",
-            "model_dtype": "bfloat16",
-            "compute_dtype": "float32",
+            "dtype.parameter_storage": "bf16",
+            "dtype.model_compute": "fp32",
             "module_mode": "eval",
             "dropout_p": 0.0,
             "output_attentions": False,
@@ -280,8 +520,8 @@ def test_transformers_attention_requires_mode_and_effective_flash_dtype() -> Non
         "bf16-compute",
         {
             "attention.frontend": "transformers_flash_attention_2",
-            "model_dtype": "float32",
-            "compute_dtype": "bfloat16",
+            "dtype.parameter_storage": "fp32",
+            "dtype.model_compute": "bf16",
             "module_mode": "eval",
             "dropout_p": 0.0,
             "output_attentions": False,
@@ -298,7 +538,7 @@ def test_transformers_attention_axis_owns_optional_admission_fields() -> None:
     registry = vpx.AxisRegistry()
     registry.register(
         vpa.transformers_attention_axis(
-            ("transformers_flash_attention_2", "blockwise_exact"),
+            ("transformers_flash_attention_2", "registered_transformers_attention"),
             policy=policy,
         )
     )
@@ -307,24 +547,32 @@ def test_transformers_attention_axis_owns_optional_admission_fields() -> None:
         "flash",
         {
             "attention.frontend": "transformers_flash_attention_2",
-            "model_dtype": "bfloat16",
+            "dtype.model_compute": "bf16",
             "module_mode": "eval",
             "dropout_p": 0.0,
             "output_attentions": False,
         },
     )
-    blockwise = vp.Candidate(
+    registered = vp.Candidate(
         "family",
-        "blockwise",
+        "registered",
         {
-            "attention.frontend": "blockwise_exact",
+            "attention.frontend": "registered_transformers_attention",
             "module_mode": "eval",
             "dropout_p": 0.0,
-            "blockwise_attention_id": "blockwise-gemma-hvp",
-            "blockwise_attention_semantics": {"mask": "causal", "softcap": 30.0},
-            "attention_block_size": 16,
-            "blockwise_preserves_softcap": True,
-            "blockwise_preserves_mask": True,
+            "attention.custom_kernel_id": "custom_attention",
+            "attention.mask_formatter_id": "custom_attention",
+        },
+    )
+    mismatched_registered = vp.Candidate(
+        "family",
+        "mismatched-registered",
+        {
+            "attention.frontend": "registered_transformers_attention",
+            "module_mode": "eval",
+            "dropout_p": 0.0,
+            "attention.custom_kernel_id": "custom_attention",
+            "attention.mask_formatter_id": "custom_mask",
         },
     )
     missing_dropout = vp.Candidate(
@@ -332,247 +580,25 @@ def test_transformers_attention_axis_owns_optional_admission_fields() -> None:
         "missing-dropout",
         {
             "attention.frontend": "transformers_flash_attention_2",
-            "model_dtype": "bfloat16",
+            "dtype.model_compute": "bf16",
             "module_mode": "eval",
         },
     )
 
     assert registry.admit(flash).admission_status == "passed"
-    assert registry.admit(blockwise).admission_status == "passed"
+    assert registry.admit(registered).admission_status == "passed"
+    assert registry.admit(mismatched_registered).admission_status == "failed"
     assert registry.admit(missing_dropout).admission_status == "failed"
 
 
-def test_transformers_attention_admits_packed_and_blockwise_rows() -> None:
+def test_transformers_attention_axis_rejects_core_frontends() -> None:
     policy = transformers_policy()
-    axis = vpa.transformers_attention_axis(
-        ("packed_exact", "blockwise_exact"),
-        policy=policy,
-    )
-    packed = vp.Candidate(
-        "family",
-        "packed",
-        {
-            "attention.frontend": "packed_exact",
-            "module_mode": "eval",
-            "dropout_p": 0.0,
-            "packed_attention_id": "packed-gemma-target-rows",
-            "packed_attention_semantics": {"mask": "causal", "softcap": 30.0},
-            "packed_target_row_axis": "target_tokens",
-            "packed_target_row_count": 4,
-            "packed_preserves_softcap": True,
-            "packed_preserves_mask": True,
-            "packed_mask_semantics": "boolean_keep_mask",
-            "packed_causal_policy": "causal",
-        },
-    )
-    missing_packed_semantics = vp.Candidate(
-        "family",
-        "missing-packed-semantics",
-        {**packed.settings, "packed_attention_semantics": {}},
-    )
-    missing_packed_mask = vp.Candidate(
-        "family",
-        "missing-packed-mask",
-        {**packed.settings, "packed_preserves_mask": None},
-    )
-    false_packed_softcap = vp.Candidate(
-        "family",
-        "false-packed-softcap",
-        {**packed.settings, "packed_preserves_softcap": False},
-    )
-    wrong_packed_causal_policy = vp.Candidate(
-        "family",
-        "wrong-packed-causal-policy",
-        {**packed.settings, "packed_causal_policy": "bidirectional"},
-    )
-    blockwise = vp.Candidate(
-        "family",
-        "blockwise",
-        {
-            "attention.frontend": "blockwise_exact",
-            "module_mode": "eval",
-            "dropout_p": 0.0,
-            "blockwise_attention_id": "blockwise-gemma-hvp",
-            "blockwise_attention_semantics": {"mask": "causal", "softcap": 30.0},
-            "attention_block_size": 16,
-            "blockwise_preserves_softcap": True,
-            "blockwise_preserves_mask": True,
-        },
-    )
-    invalid_block_size = vp.Candidate(
-        "family",
-        "invalid-block-size",
-        {**blockwise.settings, "attention_block_size": 0},
-    )
-    missing_blockwise_mask = vp.Candidate(
-        "family",
-        "missing-blockwise-mask",
-        {**blockwise.settings, "blockwise_preserves_mask": None},
-    )
-    false_softcap = vp.Candidate(
-        "family",
-        "false-softcap",
-        {**blockwise.settings, "blockwise_preserves_softcap": False},
-    )
-    false_mask = vp.Candidate(
-        "family",
-        "false-mask",
-        {**blockwise.settings, "blockwise_preserves_mask": False},
+    core_frontends = (
+        "pytorch_sdpa_direct",
+        "patched_eager",
+        "packed_exact",
+        "blockwise_exact",
     )
 
-    assert axis.admit(packed) == (True, None)
-    assert axis.admit(missing_packed_semantics)[0] is False
-    assert axis.admit(missing_packed_mask)[0] is False
-    assert axis.admit(false_packed_softcap)[0] is False
-    assert axis.admit(wrong_packed_causal_policy)[0] is False
-    assert axis.admit(blockwise) == (True, None)
-    assert axis.admit(invalid_block_size)[0] is False
-    assert axis.admit(missing_blockwise_mask)[0] is False
-    assert axis.admit(false_softcap)[0] is False
-    assert axis.admit(false_mask)[0] is False
-
-
-def test_patched_attention_reference_check_accepts_matching_outputs() -> None:
-    query = torch.tensor([[1.0, 2.0], [0.5, -1.0]])
-    key = torch.tensor([[0.25, -0.5], [1.5, 0.75]])
-    value = torch.tensor([[0.0, 1.0], [2.0, -3.0]])
-
-    def reference(
-        input_query: torch.Tensor,
-        input_key: torch.Tensor,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        return input_query @ input_key.T + input_value
-
-    def patched(
-        input_query: torch.Tensor,
-        input_key: torch.Tensor,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        return input_query @ input_key.T + input_value
-
-    measurements = vpa.check_patched_attention_reference(
-        reference,
-        patched,
-        (query, key, value),
-        thresholds={"max_abs_diff": 0.0, "max_rel_diff": 0.0},
-    )
-
-    assert measurements["max_abs_diff"] == pytest.approx(0.0)
-    assert measurements["max_rel_diff"] == pytest.approx(0.0)
-
-
-def test_patched_attention_reference_check_rejects_mismatched_outputs() -> None:
-    query = torch.tensor([[1.0, 2.0], [0.5, -1.0]])
-    key = torch.tensor([[0.25, -0.5], [1.5, 0.75]])
-    value = torch.tensor([[0.0, 1.0], [2.0, -3.0]])
-
-    def reference(
-        input_query: torch.Tensor,
-        input_key: torch.Tensor,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        return input_query @ input_key.T + input_value
-
-    def patched(
-        input_query: torch.Tensor,
-        input_key: torch.Tensor,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        return input_query @ input_key.T + input_value + 0.5
-
-    with pytest.raises(ReferenceFailedError, match="measurement exceeds threshold"):
-        vpa.check_patched_attention_reference(
-            reference,
-            patched,
-            (query, key, value),
-            thresholds={"max_abs_diff": 1e-6, "max_rel_diff": 1e-6},
-        )
-
-
-def test_patched_attention_vjp_reference_check_accepts_matching_derivatives() -> None:
-    query = torch.tensor([[1.0, 2.0], [0.5, -1.0]])
-    key = torch.tensor([[0.25, -0.5], [1.5, 0.75]])
-    value = torch.tensor([[0.0, 1.0], [2.0, -3.0]])
-    cotangent = torch.ones(2, 2)
-
-    def reference(
-        input_query: torch.Tensor,
-        input_key: torch.Tensor,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        return input_query @ input_key.T + input_value
-
-    def patched(
-        input_query: torch.Tensor,
-        input_key: torch.Tensor,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        return input_query @ input_key.T + input_value
-
-    measurements = vpa.check_patched_attention_vjp_reference(
-        reference,
-        patched,
-        (query, key, value),
-        cotangent,
-        (0, 1, 2),
-        thresholds={"max_abs_diff": 0.0, "max_rel_diff": 0.0},
-    )
-
-    assert measurements["max_abs_diff"] == pytest.approx(0.0)
-    assert measurements["max_rel_diff"] == pytest.approx(0.0)
-
-
-def test_patched_attention_vjp_reference_check_rejects_mismatched_derivatives() -> None:
-    query = torch.tensor([[1.0, 2.0], [0.5, -1.0]])
-    key = torch.tensor([[0.25, -0.5], [1.5, 0.75]])
-    value = torch.tensor([[0.0, 1.0], [2.0, -3.0]])
-    cotangent = torch.ones(2, 2)
-
-    def reference(
-        input_query: torch.Tensor,
-        input_key: torch.Tensor,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        return input_query @ input_key.T + input_value
-
-    def patched(
-        input_query: torch.Tensor,
-        input_key: torch.Tensor,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        return 1.1 * (input_query @ input_key.T) + input_value
-
-    with pytest.raises(ReferenceFailedError, match="measurement exceeds threshold"):
-        vpa.check_patched_attention_vjp_reference(
-            reference,
-            patched,
-            (query, key, value),
-            cotangent,
-            (0, 1, 2),
-            thresholds={"max_abs_diff": 1e-6, "max_rel_diff": 1e-6},
-        )
-
-
-def test_patched_attention_vjp_reference_requires_explicit_arg_indices() -> None:
-    query = torch.tensor([[1.0, 2.0], [0.5, -1.0]])
-    key = torch.tensor([[0.25, -0.5], [1.5, 0.75]])
-    value = torch.tensor([[0.0, 1.0], [2.0, -3.0]])
-    cotangent = torch.ones(2, 2)
-
-    def reference(
-        input_query: torch.Tensor,
-        input_key: torch.Tensor,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        return input_query @ input_key.T + input_value
-
-    with pytest.raises(AdmissionError, match="non-empty"):
-        vpa.check_patched_attention_vjp_reference(
-            reference,
-            reference,
-            (query, key, value),
-            cotangent,
-            (),
-            thresholds={"max_abs_diff": 0.0, "max_rel_diff": 0.0},
-        )
+    with pytest.raises(vp.AdmissionError, match="unsupported Transformers attention"):
+        vpa.transformers_attention_axis(core_frontends, policy=policy)

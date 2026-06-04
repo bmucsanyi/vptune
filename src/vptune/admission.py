@@ -23,7 +23,7 @@ TORCH_FUNC_FIELDS = (
     "uses_data_dependent_control_flow",
     "uses_item",
     "has_dynamic_shape_output",
-    "vmap_randomness",
+    "vectorization.randomness",
     "requires_forward_ad",
     "forward_ad_supported",
 )
@@ -39,13 +39,13 @@ TORCH_FUNC_BOOL_FIELDS = (
 )
 FORWARD_AD_FIELDS = ("requires_forward_ad", "forward_ad_supported")
 CHECKPOINT_FIELDS = (
-    "use_reentrant",
-    "preserve_rng_state",
-    "determinism_check",
-    "context_fn",
-    "early_stop",
-    "moves_to_new_device",
-    "uses_global_state",
+    "checkpoint.use_reentrant",
+    "checkpoint.preserve_rng_state",
+    "checkpoint.determinism_check",
+    "checkpoint.context_fn",
+    "checkpoint.early_stop",
+    "checkpoint.moves_to_new_device",
+    "checkpoint.uses_global_state",
 )
 
 
@@ -160,8 +160,8 @@ def admit_torch_func(settings: Mapping[str, Any]) -> None:
             message = f"torch.func candidate rejected by flag: {flag}"
             raise AdmissionError(message)
 
-    if settings["vmap_randomness"] not in {"error", "same", "different"}:
-        message = "vmap_randomness is invalid"
+    if settings["vectorization.randomness"] not in {"error", "same", "different"}:
+        message = "vectorization.randomness is invalid"
         raise AdmissionError(message)
 
     if settings["requires_forward_ad"] and not settings["forward_ad_supported"]:
@@ -195,15 +195,45 @@ def admit_checkpoint(settings: Mapping[str, Any]) -> None:
         AdmissionError: If the candidate is not admissible.
     """
     require_fields(settings, CHECKPOINT_FIELDS)
+    _require_bool_token(
+        settings["checkpoint.use_reentrant"], "checkpoint.use_reentrant"
+    )
+    _require_bool_token(
+        settings["checkpoint.preserve_rng_state"],
+        "checkpoint.preserve_rng_state",
+    )
+    _require_bool_token(settings["checkpoint.early_stop"], "checkpoint.early_stop")
+    _require_bool_token(
+        settings["checkpoint.moves_to_new_device"],
+        "checkpoint.moves_to_new_device",
+    )
+    _require_bool_token(
+        settings["checkpoint.uses_global_state"],
+        "checkpoint.uses_global_state",
+    )
 
-    if settings["use_reentrant"]:
+    if settings["checkpoint.use_reentrant"] == "true":
         message = "checkpoint candidates must use non-reentrant checkpointing"
         raise AdmissionError(message)
 
-    if settings["moves_to_new_device"]:
+    if settings["checkpoint.determinism_check"] not in {"default", "none"}:
+        message = "checkpoint.determinism_check must be default or none"
+        raise AdmissionError(message)
+
+    if settings["checkpoint.context_fn"] not in {"none", "declared_context_pair"}:
+        message = "checkpoint.context_fn must be none or declared_context_pair"
+        raise AdmissionError(message)
+
+    if settings["checkpoint.moves_to_new_device"] == "true":
         message = "checkpoint candidate moves tensors to an undeclared device"
         raise AdmissionError(message)
 
-    if settings["uses_global_state"]:
+    if settings["checkpoint.uses_global_state"] == "true":
         message = "checkpoint candidate depends on global mutable state"
+        raise AdmissionError(message)
+
+
+def _require_bool_token(value: Any, label: str) -> None:
+    if value not in {"false", "true"}:
+        message = f"{label} must be false or true"
         raise AdmissionError(message)

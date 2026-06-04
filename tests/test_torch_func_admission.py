@@ -12,7 +12,7 @@ def torch_func_settings(**overrides: object) -> dict[str, object]:
         "uses_data_dependent_control_flow": False,
         "uses_item": False,
         "has_dynamic_shape_output": False,
-        "vmap_randomness": "error",
+        "vectorization.randomness": "error",
         "requires_forward_ad": False,
         "forward_ad_supported": False,
         **overrides,
@@ -30,7 +30,9 @@ def torch_func_settings(**overrides: object) -> dict[str, object]:
 def test_torch_func_admission_accepts_declared_vmap_randomness(
     randomness: str,
 ) -> None:
-    vpx.admit_torch_func(torch_func_settings(vmap_randomness=randomness))
+    vpx.admit_torch_func(
+        torch_func_settings(**{"vectorization.randomness": randomness})
+    )
 
 
 @pytest.mark.parametrize(
@@ -60,8 +62,10 @@ def test_torch_func_admission_rejects_forward_ad_coverage_failure() -> None:
 
 
 def test_torch_func_admission_rejects_invalid_vmap_randomness() -> None:
-    with pytest.raises(vp.AdmissionError, match="vmap_randomness"):
-        vpx.admit_torch_func(torch_func_settings(vmap_randomness="random"))
+    with pytest.raises(vp.AdmissionError, match=r"vectorization\.randomness"):
+        vpx.admit_torch_func(
+            torch_func_settings(**{"vectorization.randomness": "random"})
+        )
 
 
 def test_torch_func_admission_requires_boolean_flags() -> None:

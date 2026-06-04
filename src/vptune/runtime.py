@@ -1,40 +1,40 @@
 """Runtime builders for package-owned operator anchors."""
 
 import dataclasses
+import importlib
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from itertools import starmap
+from typing import Any, TypeGuard
 
 import torch
 
 from vptune.admission import (
-    FUNCTIONAL_CALL_FIELDS,
     TORCH_FUNC_FIELDS,
+    admit_checkpoint,
     admit_forward_ad,
-    admit_functional_call,
     admit_torch_func,
 )
 from vptune.anchors import (
-    dense_metric_inner,
     dense_metric_inverse_multiply,
     dense_metric_multiply,
-    empirical_fisher_vp_dense_anchor,
     finite_difference_hvp,
     finite_difference_jvp,
-    fisher_vp_dense_anchor,
     forward_ad_jvp_anchor,
     gradient_anchor,
     hvp_anchor,
     hvp_jvp_grad_anchor,
     hvp_reverse_over_reverse_anchor,
     jvp_anchor,
-    vjp_anchor,
     vjp_dot_identity_error,
 )
 from vptune.candidates import standard_axis_registry
+from vptune.checkpoint import checkpoint_operation
 from vptune.checks import (
     apply_dtype_floors,
+    numeric_error_bound_measurements,
     tree_error_measurements,
+    validate_numeric_error_bound,
     validate_thresholds,
 )
 from vptune.data import (
@@ -66,48 +66,287 @@ from vptune.data import (
 from vptune.errors import AdmissionError, MaterializationError, ReferenceFailedError
 from vptune.tensor_tree import (
     TensorTree,
+    tree_add_foreach,
+    tree_add_scalar_foreach,
     tree_dot,
+    tree_dot_foreach,
+    tree_elementwise_div_foreach,
+    tree_elementwise_mul_foreach,
     tree_from_leaves,
     tree_leaves,
     tree_map,
     tree_map2,
+    tree_mul_foreach,
     tree_signature,
+    tree_zeros_like_foreach,
 )
 
 GRADIENT_PATH = "autograd_grad"
+GRADIENT_TORCH_FUNC_PATH = "torch_func_grad"
+GRADIENT_TORCH_FUNC_VALUE_PATH = "torch_func_grad_and_value"
+GRADIENT_BACKWARD_MATERIALIZED_PATH = "backward_materialized_grad"
 JVP_PATH = "torch_func_jvp"
 JVP_FORWARD_AD_PATH = "forward_ad_jvp"
+JVP_LINEARIZE_PATH = "torch_func_linearize"
 VJP_PATH = "torch_func_vjp"
+VJP_AUTOGRAD_OUTPUTS_PATH = "autograd_grad_outputs"
+VJP_BACKWARD_MATERIALIZED_PATH = "backward_materialized_grad"
 HVP_REFERENCE_PATH = "reverse_over_reverse"
 HVP_FUNCTIONAL_PATH = "functional_hvp"
 HVP_JVP_GRAD_PATH = "jvp_grad"
+HVP_FORWARD_AD_PATH = "forward_ad_hvp"
+HVP_LINEARIZE_GRAD_PATH = "linearize_grad"
 VHP_PATH = "vhp"
 GGN_DENSE_PATH = "dense_ggn"
 GGN_JVP_HESSIAN_VJP_PATH = "jvp_hessian_vjp"
+GGN_FORWARD_AD_HESSIAN_VJP_PATH = "forward_ad_hessian_vjp"
+GGN_LINEARIZE_HESSIAN_VJP_PATH = "linearize_hessian_vjp"
 FISHER_DENSE_PATH = "dense_score_outer"
-FISHER_CATEGORICAL_EXACT_PATH = "categorical_exact"
-FISHER_CATEGORICAL_MC_PATH = "categorical_monte_carlo"
 FISHER_SCORE_GRADIENT_LOOP_PATH = "score_gradient_loop"
+FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH = "score_gradient_torch_func"
+FISHER_SCORE_GRADIENT_VMAP_PATH = "score_gradient_vmap"
+FISHER_BACKWARD_MATERIALIZED_PATH = "score_gradient_backward_materialized"
+FISHER_BLOCKWISE_SCORE_MATRIX_PATH = "blockwise_score_matrix"
+SAMPLED_FISHER_DENSE_PATH = "dense_sampled_score_outer"
+SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH = "sampled_score_gradient_loop"
+SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH = "sampled_score_gradient_torch_func"
+SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH = "sampled_score_gradient_vmap"
+SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH = (
+    "sampled_score_gradient_backward_materialized"
+)
+SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH = "sampled_blockwise_score_matrix"
 EMPIRICAL_FISHER_DENSE_PATH = "dense_empirical_fisher"
 EMPIRICAL_FISHER_GRADIENT_LOOP_PATH = "per_example_gradient_loop"
+EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH = "per_example_torch_func_grad_loop"
+EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH = "per_example_backward_materialized"
 EMPIRICAL_FISHER_GRADIENT_VMAP_PATH = "per_example_gradient_vmap"
+EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH = "blockwise_gradient_matrix"
 METRIC_DENSE_PATH = "dense_metric"
+METRIC_FACTORIZED_PATH = "factorized_metric"
+METRIC_BLOCKWISE_PATH = "blockwise_metric"
+METRIC_STREAMING_PATH = "streaming_metric"
 INVERSE_METRIC_DENSE_PATH = "dense_inverse_metric"
+INVERSE_METRIC_CG_PATH = "conjugate_gradient_inverse_metric"
+INVERSE_METRIC_CHOLESKY_PATH = "cholesky_inverse_metric"
+INVERSE_METRIC_EIGH_PATH = "eigh_inverse_metric"
+INVERSE_METRIC_SVD_PATH = "svd_inverse_metric"
+INVERSE_METRIC_FACTORIZED_PATH = "factorized_inverse_metric"
+INVERSE_METRIC_BLOCKWISE_PATH = "blockwise_inverse_metric"
+INVERSE_METRIC_WOODBURY_PATH = "woodbury_low_rank_inverse_metric"
 COMPOSITION_PATH = "sequential_composition"
-RUNTIME_DTYPE_SETTINGS = ("model_dtype", "compute_dtype")
+RUNTIME_DTYPE_SETTINGS = (
+    "dtype.parameter_storage",
+    "dtype.model_compute",
+    "dtype.autodiff_compute",
+    "dtype.accumulation",
+    "dtype.vector",
+    "dtype.intermediate",
+    "dtype.metric_factor",
+    "dtype.output",
+)
+METRIC_FACTOR_BATCH_KEYS = (
+    "metric_diagonal",
+    "low_rank_factors",
+    "kfac_factors",
+    "ggn_factors",
+)
+SPEC_PATH_KEYS = {
+    "gradient": "gradient.path",
+    "jvp": "jvp.path",
+    "vjp": "vjp.path",
+    "hvp": "hvp.path",
+    "ggnvp": "ggn.jvp_path",
+    "fisher_vp": "fisher.accumulation",
+    "sampled_fisher_vp": "sampled_fisher.accumulation",
+    "empirical_fisher_vp": "empirical_fisher.grad_path",
+    "metric": "metric.multiply_path",
+    "inverse_metric": "inverse_metric.solve_path",
+    "composition": "composition.execution",
+}
+SPEC_ADDITIONAL_RUNTIME_SETTINGS = (
+    "gradient.value_reuse",
+    "jvp.linearize_reuse",
+    "vjp.closure_reuse",
+    "hvp.graph_schedule",
+    "hvp.primal_reuse",
+    "hvp.gradient_reuse",
+    "ggn.loss_hessian_path",
+    "ggn.loss_hessian_kernel",
+    "ggn.vjp_path",
+    "ggn.jvp_reuse",
+    "ggn.cotangent_reuse",
+    "fisher.expectation_path",
+    "fisher.score_grad_path",
+    "sampled_fisher.sample_source",
+    "sampled_fisher.score_grad_path",
+    "sampled_fisher.exact_fisher_check",
+    "empirical_fisher.accumulation",
+    "metric.accumulation",
+    "metric.block_schedule",
+    "vectorization.mode",
+    "vectorization.batch_size",
+    "batch.fisher_sample_batch_size",
+    "batch.empirical_example_batch_size",
+    "batch.data_microbatch_size",
+    "chunk.class_block_size_with_exact_global_normalization",
+    "schedule.per_example",
+    "schedule.per_token",
+    "schedule.gradient_accumulation",
+    "input.batch_layout",
+    "input.length_grouping",
+    "teacher_outputs",
+    "input.host_to_device",
+    "input.residency",
+    "memory.vector_residency",
+    "memory.intermediate_residency",
+    "memory.factor_residency",
+    "memory.primal_outputs",
+    "memory.jvp_outputs",
+    "memory.output_cotangents",
+    "memory.output_buffers",
+    "fusion.norm",
+    "fusion.mlp",
+    "fusion.rope",
+    "fusion.logits",
+    "fusion.loss",
+    "layout.contiguity",
+    "layout.flatten_order",
+    "layout.vector_ops",
+    "layout.params",
+    "layout.vector",
+    "layout.output",
+    "layout.aliasing",
+    "layout.parametrizations",
+    "call.path",
+    "call.params",
+    "call.buffers",
+    "call.tied_weights",
+    "call.parametrizations",
+    "call.buffer_mutation",
+    "call.grad_mode",
+    "call.return_type",
+    "inverse_metric.iteration_budget",
+    "inverse_metric.preconditioner",
+    "inverse_metric.factor_reuse",
+    "inverse_metric.block_schedule",
+    "composition.child_evaluation",
+    "composition.validation",
+    "compile.enabled",
+    "compile.boundary",
+    "compile.backend",
+    "compile.mode",
+    "compile.fullgraph",
+    "compile.dynamic",
+    "compile.compiled_autograd",
+    "compile.options.epilogue_fusion",
+    "compile.options.shape_padding",
+    "compile.cuda_graphs",
+    "compile.cache_state",
+    "activation.recompute",
+    "activation.offload",
+    "activation.pack_hook",
+    "activation.unpack_hook",
+    "checkpoint.use_reentrant",
+    "checkpoint.early_stop",
+    "checkpoint.preserve_rng_state",
+    "checkpoint.determinism_check",
+    "checkpoint.context_fn",
+    "checkpoint.context_fn_callable",
+    "checkpoint.moves_to_new_device",
+    "checkpoint.uses_global_state",
+)
+SPEC_PATH_TO_RUNTIME = {
+    "gradient": {
+        "torch_autograd_grad": GRADIENT_PATH,
+        "torch_func_grad": GRADIENT_TORCH_FUNC_PATH,
+        "torch_func_grad_and_value": GRADIENT_TORCH_FUNC_VALUE_PATH,
+        "backward_materialized_grad": GRADIENT_BACKWARD_MATERIALIZED_PATH,
+    },
+    "jvp": {
+        "torch_func_jvp": JVP_PATH,
+        "forward_ad_dual": JVP_FORWARD_AD_PATH,
+        "torch_func_linearize": JVP_LINEARIZE_PATH,
+    },
+    "vjp": {
+        "torch_func_vjp": VJP_PATH,
+        "autograd_grad_outputs": VJP_AUTOGRAD_OUTPUTS_PATH,
+        "backward_materialized_grad": VJP_BACKWARD_MATERIALIZED_PATH,
+    },
+    "hvp": {
+        "reverse_over_reverse": HVP_REFERENCE_PATH,
+        "autograd_functional_hvp": HVP_FUNCTIONAL_PATH,
+        "autograd_functional_vhp": VHP_PATH,
+        "jvp_grad": HVP_JVP_GRAD_PATH,
+        "forward_ad_dual": HVP_FORWARD_AD_PATH,
+        "linearize_grad": HVP_LINEARIZE_GRAD_PATH,
+    },
+    "ggnvp": {
+        "dense_global": GGN_DENSE_PATH,
+        "torch_func_jvp": GGN_JVP_HESSIAN_VJP_PATH,
+        "forward_ad_dual": GGN_FORWARD_AD_HESSIAN_VJP_PATH,
+        "torch_func_linearize": GGN_LINEARIZE_HESSIAN_VJP_PATH,
+    },
+    "fisher_vp": {
+        "streaming_dot_accumulate": FISHER_SCORE_GRADIENT_LOOP_PATH,
+        "materialize_score_gradients": FISHER_DENSE_PATH,
+        "blockwise_score_matrix": FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
+    },
+    "sampled_fisher_vp": {
+        "streaming_dot_accumulate": SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+        "materialize_score_gradients": SAMPLED_FISHER_DENSE_PATH,
+        "blockwise_score_matrix": SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
+    },
+    "empirical_fisher_vp": {
+        "torch_autograd_grad_loop": EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+        "torch_func_grad": EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+        "vmap_grad": EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+        "backward_materialized_grad": EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
+        "blockwise_gradient_matrix": EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH,
+    },
+    "metric": {
+        "dense_matmul": METRIC_DENSE_PATH,
+        "factorized_multiply": METRIC_FACTORIZED_PATH,
+        "blockwise_multiply": METRIC_BLOCKWISE_PATH,
+        "streaming_multiply": METRIC_STREAMING_PATH,
+    },
+    "inverse_metric": {
+        "dense_solve": INVERSE_METRIC_DENSE_PATH,
+        "conjugate_gradient": INVERSE_METRIC_CG_PATH,
+        "cholesky_solve": INVERSE_METRIC_CHOLESKY_PATH,
+        "eigh_solve": INVERSE_METRIC_EIGH_PATH,
+        "svd_solve": INVERSE_METRIC_SVD_PATH,
+        "factorized_solve": INVERSE_METRIC_FACTORIZED_PATH,
+        "blockwise_solve": INVERSE_METRIC_BLOCKWISE_PATH,
+        "woodbury_low_rank_solve": INVERSE_METRIC_WOODBURY_PATH,
+    },
+    "composition": {
+        "materialize_each_child": COMPOSITION_PATH,
+        "stream_child_outputs": COMPOSITION_PATH,
+        "fuse_adjacent_children": COMPOSITION_PATH,
+        "compile_whole_composition": COMPOSITION_PATH,
+    },
+}
 BACKEND_SETTINGS = (
-    "matmul_precision",
-    "allow_tf32",
-    "allow_bf16_reduced_precision_reduction",
+    "autocast",
+    "numeric.float32_matmul_precision",
+    "numeric.bf16_reduced_precision_reduction",
+    "numeric.fp16_reduced_precision_reduction",
+    "numeric.deterministic_algorithms",
+)
+LOSS_SCALING_SETTINGS = (
+    "numeric.loss_scaling",
+    "numeric.loss_scale",
+    "numeric.loss_unscale_degree",
 )
 SUPPORTED_STANDARD_SETTINGS = (
     *RUNTIME_DTYPE_SETTINGS,
-    "operator_path",
+    *SPEC_PATH_KEYS.values(),
+    *SPEC_ADDITIONAL_RUNTIME_SETTINGS,
     *BACKEND_SETTINGS,
+    *LOSS_SCALING_SETTINGS,
     *TORCH_FUNC_FIELDS,
-    *FUNCTIONAL_CALL_FIELDS,
-    "vmap_chunk_size",
-    "vmap_batch_in_dims",
+    "vectorization.vmap_chunk_size",
+    "vectorization.in_dims",
 )
 MATRIX_DIMS = 2
 STANDARD_ANCHOR_PATHS = {
@@ -117,16 +356,168 @@ STANDARD_ANCHOR_PATHS = {
     "hvp": HVP_REFERENCE_PATH,
     "ggnvp": GGN_JVP_HESSIAN_VJP_PATH,
     "fisher_vp": FISHER_SCORE_GRADIENT_LOOP_PATH,
+    "sampled_fisher_vp": SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
     "empirical_fisher_vp": EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
     "metric": METRIC_DENSE_PATH,
     "inverse_metric": INVERSE_METRIC_DENSE_PATH,
 }
-SINGLE_OPERATOR_PATHS = {
+VMAP_RUNTIME_PATHS = (
+    FISHER_SCORE_GRADIENT_VMAP_PATH,
+    SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+    EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+)
+FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS = (
+    FISHER_SCORE_GRADIENT_LOOP_PATH,
+    FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+    FISHER_BACKWARD_MATERIALIZED_PATH,
+)
+SAMPLED_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS = (
+    SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+    SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+    SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
+)
+EMPIRICAL_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS = (
+    EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+    EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+    EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
+)
+HVP_VECTOR_LOOP_PATHS = (
+    HVP_REFERENCE_PATH,
+    HVP_FUNCTIONAL_PATH,
+    HVP_JVP_GRAD_PATH,
+    HVP_FORWARD_AD_PATH,
+    HVP_LINEARIZE_GRAD_PATH,
+    VHP_PATH,
+)
+HVP_VECTOR_VMAP_PATHS = (HVP_LINEARIZE_GRAD_PATH,)
+INVERSE_METRIC_DIRECT_SOLVE_PATHS = (
+    INVERSE_METRIC_DENSE_PATH,
+    INVERSE_METRIC_CHOLESKY_PATH,
+    INVERSE_METRIC_EIGH_PATH,
+    INVERSE_METRIC_SVD_PATH,
+)
+INVERSE_METRIC_FACTOR_REUSE_PATHS = (
+    *INVERSE_METRIC_DIRECT_SOLVE_PATHS,
+    INVERSE_METRIC_CG_PATH,
+    INVERSE_METRIC_FACTORIZED_PATH,
+    INVERSE_METRIC_BLOCKWISE_PATH,
+    INVERSE_METRIC_WOODBURY_PATH,
+)
+JVP_VECTOR_VMAP_PATHS = (JVP_PATH, JVP_LINEARIZE_PATH)
+VJP_VECTOR_VMAP_PATHS = (VJP_PATH,)
+GGN_VECTOR_VMAP_PATHS = (
+    GGN_JVP_HESSIAN_VJP_PATH,
+    GGN_LINEARIZE_HESSIAN_VJP_PATH,
+)
+FISHER_VECTOR_VMAP_PATHS = (
+    FISHER_DENSE_PATH,
+    FISHER_SCORE_GRADIENT_LOOP_PATH,
+    FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+    FISHER_SCORE_GRADIENT_VMAP_PATH,
+    FISHER_BACKWARD_MATERIALIZED_PATH,
+    FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
+)
+SAMPLED_FISHER_VECTOR_VMAP_PATHS = (
+    SAMPLED_FISHER_DENSE_PATH,
+    SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+    SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+    SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+    SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
+    SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
+)
+EMPIRICAL_FISHER_VECTOR_VMAP_PATHS = (
+    EMPIRICAL_FISHER_DENSE_PATH,
+    EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+    EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+    EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+    EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
+    EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH,
+)
+VECTOR_VMAP_RUNTIME_PATHS = {
+    "jvp": JVP_VECTOR_VMAP_PATHS,
+    "vjp": VJP_VECTOR_VMAP_PATHS,
+    "hvp": HVP_VECTOR_VMAP_PATHS,
+    "ggnvp": GGN_VECTOR_VMAP_PATHS,
+    "fisher_vp": FISHER_VECTOR_VMAP_PATHS,
+    "sampled_fisher_vp": SAMPLED_FISHER_VECTOR_VMAP_PATHS,
+    "empirical_fisher_vp": EMPIRICAL_FISHER_VECTOR_VMAP_PATHS,
+    "composition": (COMPOSITION_PATH,),
+}
+VECTOR_LOOP_RUNTIME_PATHS = {
+    "jvp": (JVP_PATH, JVP_FORWARD_AD_PATH, JVP_LINEARIZE_PATH),
+    "vjp": (
+        VJP_PATH,
+        VJP_AUTOGRAD_OUTPUTS_PATH,
+        VJP_BACKWARD_MATERIALIZED_PATH,
+    ),
+    "hvp": HVP_VECTOR_LOOP_PATHS,
+    "ggnvp": (
+        GGN_DENSE_PATH,
+        GGN_JVP_HESSIAN_VJP_PATH,
+        GGN_FORWARD_AD_HESSIAN_VJP_PATH,
+        GGN_LINEARIZE_HESSIAN_VJP_PATH,
+    ),
+    "fisher_vp": (
+        FISHER_DENSE_PATH,
+        FISHER_SCORE_GRADIENT_LOOP_PATH,
+        FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        FISHER_SCORE_GRADIENT_VMAP_PATH,
+        FISHER_BACKWARD_MATERIALIZED_PATH,
+        FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
+    ),
+    "sampled_fisher_vp": (
+        SAMPLED_FISHER_DENSE_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+        SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
+        SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
+    ),
+    "empirical_fisher_vp": (
+        EMPIRICAL_FISHER_DENSE_PATH,
+        EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+        EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+        EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+        EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
+        EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH,
+    ),
+    "inverse_metric": (
+        INVERSE_METRIC_DENSE_PATH,
+        INVERSE_METRIC_CG_PATH,
+        INVERSE_METRIC_CHOLESKY_PATH,
+        INVERSE_METRIC_EIGH_PATH,
+        INVERSE_METRIC_SVD_PATH,
+        INVERSE_METRIC_FACTORIZED_PATH,
+        INVERSE_METRIC_BLOCKWISE_PATH,
+        INVERSE_METRIC_WOODBURY_PATH,
+    ),
+    "composition": (COMPOSITION_PATH,),
+}
+SINGLE_RUNTIME_PATHS = {
     "gradient": GRADIENT_PATH,
     "vjp": VJP_PATH,
-    "metric": METRIC_DENSE_PATH,
-    "inverse_metric": INVERSE_METRIC_DENSE_PATH,
 }
+SPEC_REQUIRED_PATH_OPERATORS = {
+    "gradient",
+    "jvp",
+    "vjp",
+    "hvp",
+    "ggnvp",
+    "fisher_vp",
+    "sampled_fisher_vp",
+    "empirical_fisher_vp",
+    "metric",
+    "inverse_metric",
+    "composition",
+}
+
+
+def _is_tensor_tree_dict(value: TensorTree) -> TypeGuard[dict[str, TensorTree]]:
+    return isinstance(value, dict)
+
+
+def _is_tensor_tree_tuple(value: TensorTree) -> TypeGuard[tuple[TensorTree, ...]]:
+    return isinstance(value, tuple)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -144,12 +535,19 @@ class CompositionChild:
 def composition_operation_factory(
     operator: OperatorSpec,
     *,
-    order: Sequence[str],
     components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    fused_components: Mapping[
+        tuple[str, ...],
+        Callable[[Batch, TensorTree], TensorTree],
+    ]
+    | None = None,
+    children: Sequence[CompositionChild] = (),
 ) -> OperationFactory:
     """Return an operation factory for sequential operator composition."""
-    order_tuple = _composition_order(order)
+    order_tuple = _operator_composition_order(operator)
     component_map = dict(components)
+    fused_component_map = {} if fused_components is None else dict(fused_components)
+    child_map = _composition_child_map(order_tuple, children)
     _require_composition_components(order_tuple, component_map)
 
     def factory(
@@ -158,31 +556,77 @@ def composition_operation_factory(
         vector: TensorTree,
     ) -> CandidateOperation:
         _require_candidate_family(operator, candidate)
+        _require_supported_standard_settings(operator, candidate)
+        _require_path(
+            operator.kind,
+            _runtime_path(operator, candidate),
+            (COMPOSITION_PATH,),
+        )
+        executable_components = _composition_execution_components(
+            candidate.settings,
+            order_tuple,
+            component_map,
+            child_map,
+        )
+        fused_component = _fused_composition_component(
+            candidate.settings,
+            order_tuple,
+            fused_component_map,
+        )
+        _require_loss_scaling_settings(operator, candidate.settings)
+        _require_composition_execution_settings(candidate.settings)
+        executable_components = _compile_composition_child_components(
+            candidate.settings,
+            order_tuple,
+            executable_components,
+            batch,
+            vector,
+        )
+        output_buffer = _composition_output_buffer(candidate.settings, vector)
 
         def operation() -> TensorTree:
-            _require_supported_standard_settings(operator, candidate)
-            _require_path(
-                operator.kind,
-                _required_candidate_operator_path(candidate),
-                (COMPOSITION_PATH,),
-            )
             runtime_batch = _runtime_batch(batch, candidate.settings)
             result = _runtime_vector(vector, candidate.settings)
 
             def run_components() -> TensorTree:
-                component_result = result
+                return _run_composition_components(
+                    candidate.settings,
+                    order_tuple,
+                    executable_components,
+                    fused_component,
+                    runtime_batch,
+                    result,
+                )
 
-                for component_name in order_tuple:
-                    component_result = component_map[component_name](
-                        runtime_batch,
-                        component_result,
-                    )
+            def run_scaled_components() -> TensorTree:
+                component_output = run_components()
+                scaled_output = _loss_scaled_output_source(
+                    operator,
+                    candidate.settings,
+                    component_output,
+                )
 
-                return component_result
+                return _loss_unscaled_output(
+                    operator,
+                    candidate.settings,
+                    scaled_output,
+                )
 
-            return _run_with_backend_settings(candidate.settings, run_components)
+            return _run_with_backend_settings(
+                candidate.settings,
+                lambda: _run_with_call_grad_mode(
+                    candidate.settings,
+                    lambda: _runtime_output_to_buffer(
+                        _runtime_output(
+                            run_scaled_components(),
+                            candidate.settings,
+                        ),
+                        output_buffer,
+                    ),
+                ),
+            )
 
-        return operation
+        return _compile_operation(operator, candidate.settings, operation)
 
     return factory
 
@@ -190,10 +634,15 @@ def composition_operation_factory(
 def composition_reference_check(
     operator: OperatorSpec,
     *,
-    order: Sequence[str],
     components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
     anchor_components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    fused_components: Mapping[
+        tuple[str, ...],
+        Callable[[Batch, TensorTree], TensorTree],
+    ]
+    | None = None,
     thresholds: Mapping[str, float],
+    numeric_bound_fields: Mapping[str, Any] | None = None,
     children: Sequence[CompositionChild] = (),
 ) -> ReferenceCheck:
     """Return a reference check for sequential operator composition.
@@ -205,9 +654,11 @@ def composition_reference_check(
         message = "composition reference thresholds are required"
         raise MaterializationError(message)
 
-    order_tuple = _composition_order(order)
+    order_tuple = _operator_composition_order(operator)
     component_map = dict(components)
     anchor_component_map = dict(anchor_components)
+    fused_component_map = {} if fused_components is None else dict(fused_components)
+    bound_fields = {} if numeric_bound_fields is None else dict(numeric_bound_fields)
     child_map = _composition_child_map(order_tuple, children)
     _require_composition_components(order_tuple, component_map)
     _require_composition_components(order_tuple, anchor_component_map)
@@ -220,7 +671,21 @@ def composition_reference_check(
         try:
             anchor_candidate = dataclasses.replace(
                 candidate,
-                settings=_anchor_settings(candidate, COMPOSITION_PATH),
+                settings=_anchor_settings(operator, candidate, COMPOSITION_PATH),
+            )
+            candidate_components, anchor_components_for_row = (
+                _composition_reference_components(
+                    candidate.settings,
+                    order_tuple,
+                    component_map,
+                    anchor_component_map,
+                    child_map,
+                )
+            )
+            reference_children = _composition_reference_children(
+                candidate.settings,
+                order_tuple,
+                child_map,
             )
             candidate_output, anchor_output, component_errors, child_results = (
                 _composition_reference_outputs(
@@ -230,9 +695,10 @@ def composition_reference_check(
                     batch,
                     vector,
                     order_tuple,
-                    component_map,
-                    anchor_component_map,
-                    child_map,
+                    candidate_components,
+                    anchor_components_for_row,
+                    fused_component_map,
+                    reference_children,
                 )
             )
         except (MaterializationError, ReferenceFailedError) as error:
@@ -247,6 +713,13 @@ def composition_reference_check(
         apply_dtype_floors(effective_thresholds, candidate.settings)
         _require_thresholds_for_measurements(measurements, effective_thresholds)
         validate_thresholds(measurements, effective_thresholds)
+        _apply_numeric_error_bound(
+            measurements,
+            effective_thresholds,
+            candidate.settings,
+            bound_fields,
+            anchor_output,
+        )
 
         return ReferenceResult(
             "composition_anchor",
@@ -267,6 +740,10 @@ def _composition_reference_outputs(
     order: tuple[str, ...],
     components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
     anchor_components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    fused_components: Mapping[
+        tuple[str, ...],
+        Callable[[Batch, TensorTree], TensorTree],
+    ],
     children: Mapping[str, CompositionChild],
 ) -> tuple[
     TensorTree,
@@ -278,22 +755,33 @@ def _composition_reference_outputs(
     _require_candidate_family(operator, anchor_candidate)
     _require_supported_standard_settings(operator, candidate)
     _require_supported_standard_settings(operator, anchor_candidate)
+    _require_composition_execution_settings(candidate.settings)
+    _require_loss_scaling_settings(operator, candidate.settings)
     _require_path(
         operator.kind,
-        _required_candidate_operator_path(candidate),
+        _runtime_path(operator, candidate),
         (COMPOSITION_PATH,),
     )
     _require_path(
         operator.kind,
-        _required_candidate_operator_path(anchor_candidate),
+        _runtime_path(operator, anchor_candidate),
         (COMPOSITION_PATH,),
     )
     candidate_batch = _runtime_batch(batch, candidate.settings)
     anchor_batch = _runtime_batch(batch, anchor_candidate.settings)
     candidate_result = _runtime_vector(vector, candidate.settings)
     anchor_result = _runtime_vector(vector, anchor_candidate.settings)
+    fused_component = _fused_composition_component(
+        candidate.settings,
+        order,
+        fused_components,
+    )
+    fused_result = None
     component_errors = {}
     child_results = []
+
+    if fused_component is not None:
+        fused_result = fused_component(candidate_batch, candidate_result)
 
     for component_name in order:
         child = children.get(component_name)
@@ -330,7 +818,418 @@ def _composition_reference_outputs(
             anchor_result,
         )
 
+    if fused_result is not None:
+        component_errors["fused_composition"] = tree_error_measurements(
+            fused_result,
+            candidate_result,
+        )
+        candidate_result = fused_result
+
+    candidate_result = _loss_scaled_output_source(
+        operator,
+        candidate.settings,
+        candidate_result,
+    )
+    candidate_result = _loss_unscaled_output(
+        operator,
+        candidate.settings,
+        candidate_result,
+    )
+    candidate_result = _runtime_output(candidate_result, candidate.settings)
+    anchor_result = _runtime_output(anchor_result, anchor_candidate.settings)
+
     return candidate_result, anchor_result, component_errors, tuple(child_results)
+
+
+def _composition_execution_components(
+    settings: Mapping[str, Any],
+    order: tuple[str, ...],
+    components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    children: Mapping[str, CompositionChild],
+) -> Mapping[str, Callable[[Batch, TensorTree], TensorTree]]:
+    if settings.get("composition.execution") == "fuse_adjacent_children":
+        return components
+
+    mode = _composition_child_evaluation(settings)
+
+    if mode == "inline_child_lowering":
+        return components
+
+    child_components = {name: child.component for name, child in children.items()}
+    _require_composition_components(order, child_components)
+
+    return child_components
+
+
+def _fused_composition_component(
+    settings: Mapping[str, Any],
+    order: tuple[str, ...],
+    fused_components: Mapping[
+        tuple[str, ...],
+        Callable[[Batch, TensorTree], TensorTree],
+    ],
+) -> Callable[[Batch, TensorTree], TensorTree] | None:
+    if settings.get("composition.execution") != "fuse_adjacent_children":
+        return None
+
+    component = fused_components.get(order)
+
+    if component is None:
+        message = "fuse_adjacent_children requires a fused component for child order"
+        raise MaterializationError(message)
+
+    return component
+
+
+def _run_composition_components(
+    settings: Mapping[str, Any],
+    order: tuple[str, ...],
+    components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    fused_component: Callable[[Batch, TensorTree], TensorTree] | None,
+    batch: Batch,
+    vector: TensorTree,
+) -> TensorTree:
+    mode = settings.get("vectorization.mode")
+
+    if mode == "single_loop":
+        return _run_composition_vector_single_loop(
+            settings,
+            order,
+            components,
+            fused_component,
+            batch,
+            vector,
+        )
+
+    if mode == "manual_batch":
+        return _run_composition_vector_manual_batch(
+            settings,
+            order,
+            components,
+            fused_component,
+            batch,
+            vector,
+        )
+
+    if mode == "vmap":
+        return _run_composition_vector_vmap(
+            settings,
+            order,
+            components,
+            fused_component,
+            batch,
+            vector,
+        )
+
+    return _run_composition_single_vector(
+        settings,
+        order,
+        components,
+        fused_component,
+        batch,
+        vector,
+    )
+
+
+def _run_composition_single_vector(
+    settings: Mapping[str, Any],
+    order: tuple[str, ...],
+    components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    fused_component: Callable[[Batch, TensorTree], TensorTree] | None,
+    batch: Batch,
+    vector: TensorTree,
+) -> TensorTree:
+    if fused_component is not None:
+        return fused_component(batch, vector)
+
+    result = vector
+
+    for index, component_name in enumerate(order):
+        result = components[component_name](batch, result)
+        result = _composition_intermediate_residency(
+            settings,
+            result,
+            is_last=index == len(order) - 1,
+        )
+
+    return result
+
+
+def _composition_intermediate_residency(
+    settings: Mapping[str, Any],
+    result: TensorTree,
+    *,
+    is_last: bool,
+) -> TensorTree:
+    if is_last:
+        return result
+
+    residency = settings.get("memory.intermediate_residency")
+
+    if residency is None:
+        return result
+
+    return _tree_residency(result, residency, "memory.intermediate_residency")
+
+
+def _run_composition_vector_single_loop(
+    settings: Mapping[str, Any],
+    order: tuple[str, ...],
+    components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    fused_component: Callable[[Batch, TensorTree], TensorTree] | None,
+    batch: Batch,
+    vector: TensorTree,
+) -> TensorTree:
+    vector_in_dims = _vector_tree_in_dims(vector, settings)
+    vector_count = _vector_tree_batch_size(vector, vector_in_dims)
+    results = []
+
+    for index in range(vector_count):
+        selected_vector = _vector_tree_select(vector, vector_in_dims, index)
+        result = _run_composition_single_vector(
+            settings,
+            order,
+            components,
+            fused_component,
+            batch,
+            selected_vector,
+        )
+        results.append(result)
+
+    return _stack_tensor_trees(tuple(results), 0)
+
+
+def _run_composition_vector_manual_batch(
+    settings: Mapping[str, Any],
+    order: tuple[str, ...],
+    components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    fused_component: Callable[[Batch, TensorTree], TensorTree] | None,
+    batch: Batch,
+    vector: TensorTree,
+) -> TensorTree:
+    vector_in_dims = _vector_tree_in_dims(vector, settings)
+    vector_count = _vector_tree_batch_size(vector, vector_in_dims)
+    batch_size = _manual_vector_batch_size(settings)
+    results = []
+
+    for start in range(0, vector_count, batch_size):
+        stop = min(start + batch_size, vector_count)
+        chunk = _vector_tree_slice(vector, vector_in_dims, start, stop)
+        result = _run_composition_single_vector(
+            settings,
+            order,
+            components,
+            fused_component,
+            batch,
+            chunk,
+        )
+        results.append(result)
+
+    return _cat_tensor_trees(tuple(results), 0)
+
+
+def _run_composition_vector_vmap(
+    settings: Mapping[str, Any],
+    order: tuple[str, ...],
+    components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    fused_component: Callable[[Batch, TensorTree], TensorTree] | None,
+    batch: Batch,
+    vector: TensorTree,
+) -> TensorTree:
+    vector_in_dims = _vector_tree_in_dims(vector, settings)
+    chunk_size = _vmap_chunk_size(settings)
+
+    def composition_function(vector: TensorTree) -> TensorTree:
+        return _run_composition_single_vector(
+            settings,
+            order,
+            components,
+            fused_component,
+            batch,
+            vector,
+        )
+
+    return _torch_func_vmap(
+        composition_function,
+        in_dims=(vector_in_dims,),
+        randomness=settings["vectorization.randomness"],
+        chunk_size=chunk_size,
+    )(vector)
+
+
+def _compile_composition_child_components(
+    settings: Mapping[str, Any],
+    order: tuple[str, ...],
+    components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    batch: Batch,
+    vector: TensorTree,
+) -> Mapping[str, Callable[[Batch, TensorTree], TensorTree]]:
+    if settings.get("compile.boundary") != "composition_child":
+        return components
+
+    if settings.get("composition.execution") == "fuse_adjacent_children":
+        message = "compile.boundary=composition_child requires child calls"
+        raise MaterializationError(message)
+
+    _validate_compile_cache_state(settings)
+    compiled_components = {}
+    warm_result = _composition_child_warm_vector(settings, vector)
+    warm_batch = _composition_child_warm_batch(settings, batch)
+
+    for name in order:
+        compiled_component = _compiled_composition_component(
+            settings,
+            components[name],
+        )
+        compiled_components[name] = compiled_component
+
+        if warm_batch is not None and warm_result is not None:
+            warm_result = compiled_component(warm_batch, warm_result)
+
+    return compiled_components
+
+
+def _composition_child_warm_batch(
+    settings: Mapping[str, Any],
+    batch: Batch,
+) -> Batch | None:
+    if settings.get("compile.cache_state") != "warm_cache":
+        return None
+
+    return _runtime_batch(batch, settings)
+
+
+def _composition_child_warm_vector(
+    settings: Mapping[str, Any],
+    vector: TensorTree,
+) -> TensorTree | None:
+    if settings.get("compile.cache_state") != "warm_cache":
+        return None
+
+    warm_vector = _runtime_vector(vector, settings)
+    mode = settings.get("vectorization.mode")
+
+    if mode == "single_loop":
+        vector_in_dims = _vector_tree_in_dims(warm_vector, settings)
+
+        return _vector_tree_select(warm_vector, vector_in_dims, 0)
+
+    if mode == "manual_batch":
+        vector_in_dims = _vector_tree_in_dims(warm_vector, settings)
+        vector_count = _vector_tree_batch_size(warm_vector, vector_in_dims)
+        batch_size = _manual_vector_batch_size(settings)
+
+        return _vector_tree_slice(
+            warm_vector,
+            vector_in_dims,
+            0,
+            min(batch_size, vector_count),
+        )
+
+    return warm_vector
+
+
+def _compiled_composition_component(
+    settings: Mapping[str, Any],
+    component: Callable[[Batch, TensorTree], TensorTree],
+) -> Callable[[Batch, TensorTree], TensorTree]:
+    compiled_autograd = _compile_bool(settings, "compile.compiled_autograd")
+
+    def build_compiled() -> Callable[[Batch, TensorTree], TensorTree]:
+        return torch.compile(
+            component,
+            backend=_compile_backend(settings),
+            mode=_compile_mode(settings),
+            fullgraph=_compile_bool(settings, "compile.fullgraph"),
+            dynamic=_compile_optional_bool(settings, "compile.dynamic"),
+            options=_compile_options(settings),
+        )
+
+    if compiled_autograd:
+        with _compiled_autograd_patch():
+            compiled = build_compiled()
+    else:
+        compiled = build_compiled()
+
+    def compiled_component(batch: Batch, vector: TensorTree) -> TensorTree:
+        if compiled_autograd:
+            with _compiled_autograd_patch():
+                return compiled(batch, vector)
+
+        return compiled(batch, vector)
+
+    return compiled_component
+
+
+def _composition_reference_components(
+    settings: Mapping[str, Any],
+    order: tuple[str, ...],
+    components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    anchor_components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    children: Mapping[str, CompositionChild],
+) -> tuple[
+    Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+]:
+    mode = _composition_child_evaluation(settings)
+
+    if mode == "inline_child_lowering":
+        return components, anchor_components
+
+    child_components = {name: child.component for name, child in children.items()}
+    child_anchor_components = {
+        name: child.anchor_component for name, child in children.items()
+    }
+    _require_composition_components(order, child_components)
+    _require_composition_components(order, child_anchor_components)
+
+    return child_components, child_anchor_components
+
+
+def _composition_reference_children(
+    settings: Mapping[str, Any],
+    order: tuple[str, ...],
+    children: Mapping[str, CompositionChild],
+) -> Mapping[str, CompositionChild]:
+    validation = _composition_validation(settings)
+
+    if validation == "validate_composed_output":
+        return {}
+
+    _require_composition_children(order, children)
+
+    return children
+
+
+def _require_composition_execution_settings(settings: Mapping[str, Any]) -> None:
+    execution = settings.get("composition.execution")
+
+    if execution != "compile_whole_composition":
+        return
+
+    if settings.get("compile.enabled") != "true":
+        message = "compile_whole_composition requires compile.enabled=true"
+        raise MaterializationError(message)
+
+
+def _composition_child_evaluation(settings: Mapping[str, Any]) -> str:
+    value = settings.get("composition.child_evaluation")
+
+    if value not in {"selected_child_rows", "inline_child_lowering"}:
+        message = "composition.child_evaluation is invalid"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _composition_validation(settings: Mapping[str, Any]) -> str:
+    value = settings.get("composition.validation")
+
+    if value not in {"validate_each_child", "validate_composed_output"}:
+        message = "composition.validation is invalid"
+        raise MaterializationError(message)
+
+    return value
 
 
 def _composition_child_map(
@@ -350,6 +1249,15 @@ def _composition_child_map(
         raise MaterializationError(message)
 
     return child_map
+
+
+def _require_composition_children(
+    order: tuple[str, ...],
+    children: Mapping[str, CompositionChild],
+) -> None:
+    if set(children) != set(order):
+        message = "composition children must match composition order"
+        raise MaterializationError(message)
 
 
 def _merge_component_measurements(
@@ -377,7 +1285,7 @@ def _require_thresholds_for_measurements(
     measurements: Mapping[str, Any],
     thresholds: Mapping[str, float],
 ) -> None:
-    exact_required = ("psd_violation",)
+    exact_required = ("psd_violation", "damping_min", "condition_number_max")
     missing = tuple(
         key
         for key in measurements
@@ -395,7 +1303,7 @@ def _require_vhp_reference_policy(
     batch: Batch,
     thresholds: Mapping[str, float],
 ) -> None:
-    if candidate.settings.get("operator_path") != VHP_PATH:
+    if candidate.settings.get("hvp.path") != "autograd_functional_vhp":
         return
 
     required_thresholds = (
@@ -432,7 +1340,7 @@ def _semantic_measurements(
         }
 
     if operator.kind == "metric":
-        matrix = _batch_tensor(batch, "metric")
+        matrix = _metric_dense_matrix(operator, batch, vector)
 
         return {
             "symmetry_max_abs_diff": _matrix_symmetry_error(matrix),
@@ -440,19 +1348,28 @@ def _semantic_measurements(
         }
 
     if operator.kind == "inverse_metric":
-        matrix = _batch_tensor(batch, "metric")
+        matrix = _metric_dense_matrix(operator, batch, vector)
+        inverse_matrix = _inverse_metric_matrix(operator, matrix)
         vector_tensor = _flatten_vector(vector)
         output_tensor = _flatten_vector(output)
-
-        return {
-            "symmetry_max_abs_diff": _matrix_symmetry_error(matrix),
-            "psd_violation": _matrix_psd_violation(matrix),
+        measurements = {
+            "symmetry_max_abs_diff": _matrix_symmetry_error(inverse_matrix),
+            "psd_violation": _matrix_psd_violation(inverse_matrix),
             "inverse_residual": _inverse_residual(
-                matrix,
+                inverse_matrix,
                 output_tensor,
                 vector_tensor,
             ),
         }
+        damping = _inverse_metric_damping(operator)
+
+        if damping > 0.0:
+            measurements["damping_min"] = damping
+            measurements["condition_number_max"] = _matrix_condition_number(
+                inverse_matrix
+            )
+
+        return measurements
 
     return {}
 
@@ -481,7 +1398,11 @@ def _first_order_reference_measurements(
             return scalar(active_params, buffers, batch, context)
 
         finite_difference = finite_difference_jvp(scalar_function, params, vector)
-        directional = tree_dot(candidate_output, vector)
+        directional = _layout_aware_tree_dot(
+            candidate.settings,
+            candidate_output,
+            vector,
+        )
         errors = tree_error_measurements(directional, finite_difference)
 
         return {
@@ -501,7 +1422,11 @@ def _first_order_reference_measurements(
             return function(active_params, buffers, batch, context)
 
         finite_difference = finite_difference_jvp(tensor_function, params, vector)
-        errors = tree_error_measurements(candidate_output, finite_difference)
+        errors = _layout_aware_tree_error_measurements(
+            candidate,
+            candidate_output,
+            finite_difference,
+        )
 
         return {
             "directional_abs_diff": errors["max_abs_diff"],
@@ -541,6 +1466,7 @@ def _hvp_finite_difference_measurements(
     scalar_objectives: Mapping[str, ScalarObjective],
     anchor_candidate: Candidate,
     candidate_factory: OperationFactory,
+    parameter_surface: ParameterSurface | None,
 ) -> dict[str, float]:
     if operator.kind != "hvp":
         return {}
@@ -560,7 +1486,11 @@ def _hvp_finite_difference_measurements(
         params,
         vector,
     )
-    errors = tree_error_measurements(candidate_output, finite_difference)
+    errors = _layout_aware_tree_error_measurements(
+        candidate,
+        candidate_output,
+        finite_difference,
+    )
 
     measurements = {
         "directional_abs_diff": errors["max_abs_diff"],
@@ -573,11 +1503,26 @@ def _hvp_finite_difference_measurements(
         batch,
         symmetry_vector,
     )()
-    left = tree_dot(
-        _runtime_vector(symmetry_vector, candidate.settings),
+    left = _layout_aware_tree_dot(
+        candidate.settings,
+        _runtime_vector(
+            symmetry_vector,
+            candidate.settings,
+            candidate_output,
+            parameter_surface,
+        ),
         candidate_output,
     )
-    right = tree_dot(vector, anchor_symmetry)
+    right = _layout_aware_tree_dot(
+        candidate.settings,
+        _runtime_vector(
+            vector,
+            candidate.settings,
+            anchor_symmetry,
+            parameter_surface,
+        ),
+        anchor_symmetry,
+    )
     measurements["symmetry_max_abs_diff"] = float((left - right).abs().item())
 
     return measurements
@@ -591,6 +1536,7 @@ def _ggn_inner_product_measurements(
     candidate_output: TensorTree,
     anchor_candidate: Candidate,
     candidate_factory: OperationFactory,
+    parameter_surface: ParameterSurface | None,
 ) -> dict[str, float]:
     if operator.kind != "ggnvp" or _ggn_loss_geometry(operator) != "psd_metric":
         return {}
@@ -601,11 +1547,26 @@ def _ggn_inner_product_measurements(
         batch,
         symmetry_vector,
     )()
-    left = tree_dot(
-        _runtime_vector(symmetry_vector, candidate.settings),
+    left = _layout_aware_tree_dot(
+        candidate.settings,
+        _runtime_vector(
+            symmetry_vector,
+            candidate.settings,
+            candidate_output,
+            parameter_surface,
+        ),
         candidate_output,
     )
-    right = tree_dot(vector, anchor_symmetry)
+    right = _layout_aware_tree_dot(
+        candidate.settings,
+        _runtime_vector(
+            vector,
+            candidate.settings,
+            anchor_symmetry,
+            parameter_surface,
+        ),
+        anchor_symmetry,
+    )
 
     return {"inner_abs_diff": float((left - right).abs().item())}
 
@@ -630,6 +1591,643 @@ def _matrix_psd_violation(matrix: torch.Tensor) -> float:
     min_eigenvalue = torch.linalg.eigvalsh(matrix).min()
 
     return float(torch.clamp(-min_eigenvalue, min=0.0).item())
+
+
+def _inverse_metric_matrix(
+    operator: OperatorSpec, matrix: torch.Tensor
+) -> torch.Tensor:
+    return _damped_metric_matrix(matrix, _inverse_metric_damping(operator))
+
+
+def _metric_reference_output(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+) -> TensorTree:
+    matrix = _metric_dense_matrix(operator, batch, vector)
+    flat_vector = _flatten_vector(vector)
+    _require_finite_tensor(matrix, "metric matrix")
+    _require_finite_tensor(flat_vector, "metric vector")
+
+    if operator.kind == "metric":
+        result = dense_metric_multiply(matrix, flat_vector)
+    elif operator.kind == "inverse_metric":
+        result = dense_metric_inverse_multiply(
+            _inverse_metric_matrix(operator, matrix),
+            flat_vector,
+        )
+    else:
+        message = f"metric reference output is not supported for {operator.kind}"
+        raise MaterializationError(message)
+
+    _require_finite_tensor(result, "metric reference result")
+
+    return _wrap_flat_vector(vector, result)
+
+
+def _metric_dense_matrix(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+) -> torch.Tensor:
+    kind = _metric_representation_kind(operator)
+
+    if kind == "dense_matrix":
+        matrix = _batch_tensor(batch, "metric_matrix")
+    elif kind == "diagonal_tree":
+        diagonal = _flatten_vector(_metric_diagonal_tree(batch, vector))
+        matrix = torch.diag(diagonal)
+    elif kind == "block_diagonal":
+        matrix = torch.block_diag(*_metric_blocks(batch))
+    elif kind == "kfac_factors":
+        matrix = _kfac_dense_matrix(operator, batch)
+    elif kind == "low_rank_factors":
+        basis, diagonal = _low_rank_factors(batch, vector)
+        matrix = basis @ basis.T + torch.diag(diagonal)
+    elif kind == "ggn_derived_factors":
+        jacobian, loss_hessian = _ggn_metric_factors(batch, vector)
+        matrix = jacobian.T @ loss_hessian @ jacobian
+    else:
+        message = f"metric representation has no dense reference: {kind}"
+        raise MaterializationError(message)
+
+    _require_finite_tensor(matrix, "metric matrix")
+
+    return matrix
+
+
+def _metric_diagonal_tree(batch: Batch, vector: TensorTree) -> TensorTree:
+    diagonal = tree_map2(
+        lambda diag, template: diag.reshape_as(template),
+        _batch_tree(batch, "metric_diagonal"),
+        vector,
+    )
+    _require_finite_tree(diagonal, "metric diagonal")
+
+    return diagonal
+
+
+def _diagonal_metric_multiply(
+    batch: Batch,
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    diagonal = _metric_diagonal_tree(batch, vector)
+    result = _tree_elementwise_mul_runtime(settings, diagonal, vector)
+    _require_finite_tree(result, "metric result")
+
+    return result
+
+
+def _diagonal_inverse_metric_multiply(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    damping = _inverse_metric_damping(operator)
+    diagonal = _metric_diagonal_tree(batch, vector)
+    denominator = _tree_add_scalar_runtime(settings, diagonal, damping)
+    result = _tree_elementwise_div_runtime(settings, vector, denominator)
+    _require_finite_tree(result, "inverse metric result")
+
+    return result
+
+
+def _diagonal_inverse_metric_multiply_batch(
+    execution: "StandardExecution",
+) -> TensorTree:
+    damping = _inverse_metric_damping(execution.operator)
+    diagonal = _flatten_vector(_metric_diagonal_tree(execution.batch, execution.params))
+    vector_batch = _flat_inverse_metric_vector_batch(execution)
+    result = vector_batch / (diagonal + damping)
+    _require_finite_tensor(result, "batched diagonal inverse metric result")
+
+    return _wrap_flat_vector_batch(execution.params, result)
+
+
+def _metric_blocks(batch: Batch) -> tuple[torch.Tensor, ...]:
+    value = batch.get("metric_blocks")
+
+    if not isinstance(value, tuple) or not value:
+        message = "metric blocks are missing"
+        raise MaterializationError(message)
+
+    for block in value:
+        if not isinstance(block, torch.Tensor):
+            message = "metric block must be a tensor"
+            raise MaterializationError(message)
+
+        if block.ndim != MATRIX_DIMS or block.shape[0] != block.shape[1]:
+            message = "metric block must be square"
+            raise MaterializationError(message)
+
+        _require_finite_tensor(block, "metric block")
+
+    return value
+
+
+def _block_diagonal_metric_multiply(
+    batch: Batch,
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    result = _block_diagonal_apply(
+        _metric_blocks(batch),
+        _flatten_vector(vector),
+        settings,
+        "metric block multiply",
+    )
+
+    return _wrap_flat_vector(vector, result)
+
+
+def _block_diagonal_inverse_metric_multiply(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+) -> TensorTree:
+    damping = _inverse_metric_damping(operator)
+    result = _block_diagonal_solve(
+        _metric_blocks(batch),
+        _flatten_vector(vector),
+        damping,
+    )
+
+    return _wrap_flat_vector(vector, result)
+
+
+def _block_diagonal_inverse_metric_multiply_batch(
+    execution: "StandardExecution",
+) -> TensorTree:
+    damping = _inverse_metric_damping(execution.operator)
+    vector_batch = _flat_inverse_metric_vector_batch(execution)
+    result = _block_diagonal_solve_batch(
+        _metric_blocks(execution.batch),
+        vector_batch,
+        damping,
+    )
+
+    return _wrap_flat_vector_batch(execution.params, result)
+
+
+def _block_diagonal_apply(
+    blocks: tuple[torch.Tensor, ...],
+    vector: torch.Tensor,
+    settings: Mapping[str, Any],
+    name: str,
+) -> torch.Tensor:
+    parts = []
+    offset = 0
+
+    for block in blocks:
+        width = block.shape[1]
+        part = vector[offset : offset + width]
+
+        if part.numel() != width:
+            message = "metric blocks do not match vector length"
+            raise MaterializationError(message)
+
+        parts.append(_matmul_runtime(settings, block, part))
+        offset += width
+
+    if offset != vector.numel():
+        message = "metric blocks do not match vector length"
+        raise MaterializationError(message)
+
+    result = torch.cat(tuple(parts))
+    _require_finite_tensor(result, name)
+
+    return result
+
+
+def _block_diagonal_solve(
+    blocks: tuple[torch.Tensor, ...],
+    vector: torch.Tensor,
+    damping: float,
+) -> torch.Tensor:
+    parts = []
+    offset = 0
+
+    for block in blocks:
+        width = block.shape[1]
+        part = vector[offset : offset + width]
+
+        if part.numel() != width:
+            message = "metric blocks do not match vector length"
+            raise MaterializationError(message)
+
+        parts.append(
+            dense_metric_inverse_multiply(
+                _damped_metric_matrix(block, damping),
+                part,
+            )
+        )
+        offset += width
+
+    if offset != vector.numel():
+        message = "metric blocks do not match vector length"
+        raise MaterializationError(message)
+
+    result = torch.cat(tuple(parts))
+    _require_finite_tensor(result, "inverse metric block solve")
+
+    return result
+
+
+def _block_diagonal_solve_batch(
+    blocks: tuple[torch.Tensor, ...],
+    vector_batch: torch.Tensor,
+    damping: float,
+) -> torch.Tensor:
+    if vector_batch.ndim != MATRIX_DIMS:
+        message = "batched block inverse vectors must flatten to a matrix"
+        raise MaterializationError(message)
+
+    parts = []
+    offset = 0
+
+    for block in blocks:
+        width = block.shape[1]
+        part = vector_batch[:, offset : offset + width]
+
+        if part.shape[1] != width:
+            message = "metric blocks do not match vector width"
+            raise MaterializationError(message)
+
+        solved = torch.linalg.solve(
+            _damped_metric_matrix(block, damping),
+            part.T,
+        ).T
+        parts.append(solved)
+        offset += width
+
+    if offset != vector_batch.shape[1]:
+        message = "metric blocks do not match vector width"
+        raise MaterializationError(message)
+
+    result = torch.cat(tuple(parts), dim=1)
+    _require_finite_tensor(result, "batched inverse metric block solve")
+
+    return result
+
+
+def _low_rank_factors(
+    batch: Batch,
+    vector: TensorTree,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    value = batch.get("low_rank_factors")
+
+    if not isinstance(value, Mapping):
+        message = "low_rank_factors must be a mapping"
+        raise MaterializationError(message)
+
+    basis = value.get("basis")
+    diagonal = value.get("diagonal")
+    width = _flatten_vector(vector).numel()
+
+    if not isinstance(basis, torch.Tensor) or basis.ndim != MATRIX_DIMS:
+        message = "low_rank_factors.basis must be a two-dimensional tensor"
+        raise MaterializationError(message)
+
+    if basis.shape[0] != width:
+        message = "low_rank_factors.basis row count must match vector length"
+        raise MaterializationError(message)
+
+    if not isinstance(diagonal, torch.Tensor) or diagonal.ndim != 1:
+        message = "low_rank_factors.diagonal must be a one-dimensional tensor"
+        raise MaterializationError(message)
+
+    if diagonal.numel() != width:
+        message = "low_rank_factors.diagonal length must match vector length"
+        raise MaterializationError(message)
+
+    _require_finite_tensor(basis, "low-rank basis")
+    _require_finite_tensor(diagonal, "low-rank diagonal")
+
+    return basis, diagonal
+
+
+def _low_rank_metric_multiply(
+    batch: Batch,
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    flat_vector = _flatten_vector(vector)
+    basis, diagonal = _low_rank_factors(batch, vector)
+    basis_projection = _matmul_runtime(settings, basis.T, flat_vector)
+    result = (
+        _accumulation_tensor(diagonal, settings)
+        * _accumulation_tensor(flat_vector, settings)
+    ) + _matmul_runtime(settings, basis, basis_projection)
+    _require_finite_tensor(result, "low-rank metric result")
+
+    return _wrap_flat_vector(vector, result)
+
+
+def _low_rank_inverse_metric_multiply(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+) -> TensorTree:
+    flat_vector = _flatten_vector(vector)
+    basis, diagonal = _low_rank_factors(batch, vector)
+    base_diagonal = diagonal + _inverse_metric_damping(operator)
+    inverse_base_vector = flat_vector / base_diagonal
+    inverse_base_basis = basis / base_diagonal.unsqueeze(1)
+    inner = (
+        torch.eye(
+            basis.shape[1],
+            dtype=basis.dtype,
+            device=basis.device,
+        )
+        + basis.T @ inverse_base_basis
+    )
+    correction = inverse_base_basis @ torch.linalg.solve(
+        inner,
+        basis.T @ inverse_base_vector,
+    )
+    result = inverse_base_vector - correction
+    _require_finite_tensor(result, "low-rank inverse metric result")
+
+    return _wrap_flat_vector(vector, result)
+
+
+def _low_rank_inverse_metric_multiply_batch(
+    execution: "StandardExecution",
+) -> TensorTree:
+    vector_batch = _flat_inverse_metric_vector_batch(execution)
+    basis, diagonal = _low_rank_factors(execution.batch, execution.params)
+    base_diagonal = diagonal + _inverse_metric_damping(execution.operator)
+    inverse_base_vectors = vector_batch / base_diagonal
+    inverse_base_basis = basis / base_diagonal.unsqueeze(1)
+    inner = (
+        torch.eye(
+            basis.shape[1],
+            dtype=basis.dtype,
+            device=basis.device,
+        )
+        + basis.T @ inverse_base_basis
+    )
+    correction = (
+        inverse_base_basis @ torch.linalg.solve(inner, basis.T @ inverse_base_vectors.T)
+    ).T
+    result = inverse_base_vectors - correction
+    _require_finite_tensor(result, "batched low-rank inverse metric result")
+
+    return _wrap_flat_vector_batch(execution.params, result)
+
+
+def _kfac_metric_multiply(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    metric = KFACMetricOperator(_kfac_blocks(operator), settings=settings)
+
+    return metric.multiply(_kfac_factor_batch(batch), vector)
+
+
+def _kfac_inverse_metric_multiply(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+) -> TensorTree:
+    metric = KFACMetricOperator(
+        _kfac_blocks(operator),
+        damping=_inverse_metric_damping(operator),
+    )
+
+    return metric.inverse_multiply(_kfac_factor_batch(batch), vector)
+
+
+def _kfac_inverse_metric_multiply_batch(execution: "StandardExecution") -> TensorTree:
+    batch = _kfac_factor_batch(execution.batch)
+    vector_map = _kfac_vector_map(execution.vector)
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+    vector_count = _vector_tree_batch_size(execution.vector, vector_in_dims)
+    result = {}
+
+    if not isinstance(vector_in_dims, Mapping):
+        message = "KFAC vectorization.in_dims must be a mapping"
+        raise MaterializationError(message)
+
+    for block in _kfac_blocks(execution.operator):
+        left = _kfac_factor(batch, block.left_factor_key)
+        right = _kfac_factor(batch, block.right_factor_key)
+        value = _kfac_batched_vector_leaf(
+            vector_map,
+            vector_in_dims,
+            block,
+            left,
+            right,
+            vector_count,
+        )
+        product = _kfac_inverse_product_batch(
+            left,
+            right,
+            value,
+            _inverse_metric_damping(execution.operator),
+        )
+        _require_finite_tensor(
+            product,
+            f"batched inverse KFAC metric result {block.parameter_name}",
+        )
+        result[block.parameter_name] = product
+
+    return result
+
+
+def _kfac_dense_matrix(operator: OperatorSpec, batch: Batch) -> torch.Tensor:
+    factor_batch = _kfac_factor_batch(batch)
+    dense_blocks = []
+
+    for block in _kfac_blocks(operator):
+        left = _kfac_factor(factor_batch, block.left_factor_key)
+        right = _kfac_factor(factor_batch, block.right_factor_key)
+        dense_blocks.append(torch.kron(left, right))
+
+    matrix = torch.block_diag(*dense_blocks)
+    _require_finite_tensor(matrix, "KFAC dense matrix")
+
+    return matrix
+
+
+def _kfac_blocks(operator: OperatorSpec) -> tuple["KFACMetricBlock", ...]:
+    representation = _metric_representation(operator)
+    raw_blocks = representation.get("blocks")
+
+    if not isinstance(raw_blocks, tuple) or not raw_blocks:
+        message = "kfac_factors representation requires non-empty blocks"
+        raise MaterializationError(message)
+
+    blocks = []
+
+    for raw_block in raw_blocks:
+        if not isinstance(raw_block, Mapping):
+            message = "KFAC block descriptor must be a mapping"
+            raise MaterializationError(message)
+
+        parameter_name = raw_block.get("parameter")
+        left_factor_key = raw_block.get("left_factor")
+        right_factor_key = raw_block.get("right_factor")
+
+        if not isinstance(parameter_name, str):
+            message = "KFAC block parameter must be a string"
+            raise MaterializationError(message)
+
+        if not isinstance(left_factor_key, str):
+            message = "KFAC block left_factor must be a string"
+            raise MaterializationError(message)
+
+        if not isinstance(right_factor_key, str):
+            message = "KFAC block right_factor must be a string"
+            raise MaterializationError(message)
+
+        blocks.append(
+            KFACMetricBlock(
+                parameter_name,
+                left_factor_key,
+                right_factor_key,
+            )
+        )
+
+    return tuple(blocks)
+
+
+def _kfac_factor_batch(batch: Batch) -> Batch:
+    value = batch.get("kfac_factors")
+
+    if not isinstance(value, Mapping):
+        message = "kfac_factors must be a mapping"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _ggn_metric_factors(
+    batch: Batch,
+    vector: TensorTree,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    value = batch.get("ggn_factors")
+
+    if not isinstance(value, Mapping):
+        message = "ggn_factors must be a mapping"
+        raise MaterializationError(message)
+
+    jacobian = value.get("jacobian")
+    loss_hessian = value.get("loss_hessian")
+    width = _flatten_vector(vector).numel()
+
+    if not isinstance(jacobian, torch.Tensor) or jacobian.ndim != MATRIX_DIMS:
+        message = "ggn_factors.jacobian must be a two-dimensional tensor"
+        raise MaterializationError(message)
+
+    if jacobian.shape[1] != width:
+        message = "ggn_factors.jacobian column count must match vector length"
+        raise MaterializationError(message)
+
+    if (
+        not isinstance(loss_hessian, torch.Tensor)
+        or loss_hessian.ndim != MATRIX_DIMS
+        or loss_hessian.shape[0] != loss_hessian.shape[1]
+    ):
+        message = "ggn_factors.loss_hessian must be a square matrix"
+        raise MaterializationError(message)
+
+    if loss_hessian.shape[0] != jacobian.shape[0]:
+        message = "ggn_factors.loss_hessian shape must match jacobian rows"
+        raise MaterializationError(message)
+
+    _require_finite_tensor(jacobian, "GGN metric jacobian")
+    _require_finite_tensor(loss_hessian, "GGN metric loss hessian")
+
+    return jacobian, loss_hessian
+
+
+def _ggn_metric_multiply(
+    batch: Batch,
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    flat_vector = _flatten_vector(vector)
+    jacobian, loss_hessian = _ggn_metric_factors(batch, vector)
+    output_vector = _matmul_runtime(settings, jacobian, flat_vector)
+    loss_vector = _matmul_runtime(settings, loss_hessian, output_vector)
+    result = _matmul_runtime(settings, jacobian.T, loss_vector)
+    _require_finite_tensor(result, "GGN-derived metric result")
+
+    return _wrap_flat_vector(vector, result)
+
+
+def _ggn_inverse_metric_multiply(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+) -> TensorTree:
+    jacobian, loss_hessian = _ggn_metric_factors(batch, vector)
+    matrix = jacobian.T @ loss_hessian @ jacobian
+    solve_matrix = _damped_metric_matrix(matrix, _inverse_metric_damping(operator))
+    result = dense_metric_inverse_multiply(solve_matrix, _flatten_vector(vector))
+    _require_finite_tensor(result, "GGN-derived inverse metric result")
+
+    return _wrap_flat_vector(vector, result)
+
+
+def _ggn_inverse_metric_multiply_batch(execution: "StandardExecution") -> TensorTree:
+    jacobian, loss_hessian = _ggn_metric_factors(execution.batch, execution.params)
+    matrix = jacobian.T @ loss_hessian @ jacobian
+    solve_matrix = _damped_metric_matrix(
+        matrix,
+        _inverse_metric_damping(execution.operator),
+    )
+    vector_batch = _flat_inverse_metric_vector_batch(execution)
+    result = _dense_inverse_metric_solve_batch(
+        solve_matrix,
+        vector_batch,
+        INVERSE_METRIC_DENSE_PATH,
+    )
+    _require_finite_tensor(result, "batched GGN-derived inverse metric result")
+
+    return _wrap_flat_vector_batch(execution.params, result)
+
+
+def _damped_metric_matrix(matrix: torch.Tensor, damping: float) -> torch.Tensor:
+    if damping <= 0.0:
+        return matrix
+
+    if matrix.ndim != MATRIX_DIMS or matrix.shape[0] != matrix.shape[1]:
+        message = "metric matrix must be square"
+        raise MaterializationError(message)
+
+    identity = torch.eye(matrix.shape[0], dtype=matrix.dtype, device=matrix.device)
+
+    return matrix + damping * identity
+
+
+def _inverse_metric_damping(operator: OperatorSpec) -> float:
+    value = operator.semantics.get("damping")
+
+    if not isinstance(value, float):
+        message = "inverse metric damping must be a float"
+        raise MaterializationError(message)
+
+    if value < 0.0:
+        message = "inverse metric damping must be nonnegative"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _matrix_condition_number(matrix: torch.Tensor) -> float:
+    _require_finite_tensor(matrix, "metric matrix")
+    condition = torch.linalg.cond(matrix)
+
+    return float(condition.item())
 
 
 def _inverse_residual(
@@ -664,29 +2262,42 @@ def _require_finite_tree(tree: TensorTree, name: str) -> None:
 def composition_runtime_config(
     operator: OperatorSpec,
     *,
-    order: Sequence[str],
     components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
     anchor_components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
+    fused_components: Mapping[
+        tuple[str, ...],
+        Callable[[Batch, TensorTree], TensorTree],
+    ]
+    | None = None,
     children: Sequence[CompositionChild] = (),
     candidates: Sequence[Candidate],
     thresholds: Mapping[str, float],
     component_signature: Mapping[str, Any],
     anchor_component_signature: Mapping[str, Any],
     axis_registry: CandidateAdmitter | None,
+    numeric_bound_fields: Mapping[str, Any] | None = None,
 ) -> RuntimeConfig:
     """Return runtime config for sequential operator composition."""
+    bound_fields = {} if numeric_bound_fields is None else dict(numeric_bound_fields)
     operation_factory = composition_operation_factory(
         operator,
-        order=order,
         components=components,
+        fused_components=fused_components,
+        children=children,
     )
     reference_check = composition_reference_check(
         operator,
-        order=order,
         components=components,
         anchor_components=anchor_components,
+        fused_components=fused_components,
         thresholds=thresholds,
+        numeric_bound_fields=bound_fields,
         children=children,
+    )
+    fused_component_keys = (
+        ()
+        if fused_components is None
+        else tuple(tuple(key) for key in sorted(fused_components))
     )
 
     return RuntimeConfig(
@@ -698,12 +2309,14 @@ def composition_runtime_config(
         signature={
             "runtime": "composition",
             "operator": operator.signature(),
-            "order": _composition_order(order),
+            "order": _operator_composition_order(operator),
             "thresholds": dict(thresholds),
+            "numeric_bound_fields": bound_fields,
             "components": {
                 "candidate": dict(component_signature),
                 "anchor": dict(anchor_component_signature),
             },
+            "fused_components": fused_component_keys,
             "children": tuple(child.name for child in children),
         },
     )
@@ -720,9 +2333,21 @@ class StandardExecution:
     vector: TensorTree
     params: ParameterTree
     buffers: BufferTree
+    parameter_surface: ParameterSurface | None
     context: ObjectiveContext
     scalar_objectives: Mapping[str, ScalarObjective]
     function_objectives: Mapping[str, FunctionObjective]
+    teacher_objective: FunctionObjective | None = None
+    compiled_inner: CandidateOperation | None = None
+    compiled_scalar_function: Callable[[ParameterTree], torch.Tensor] | None = None
+    compiled_score_matrix: Callable[[], torch.Tensor] | None = None
+    compiled_ggn_loss_product: Callable[[TensorTree, TensorTree], TensorTree] | None = (
+        None
+    )
+    compiled_ggn_vjp: Callable[[TensorTree], TensorTree] | None = None
+    linearized_jvp: Callable[[TensorTree], TensorTree] | None = None
+    linearized_hvp: Callable[[TensorTree], TensorTree] | None = None
+    vjp_closure: Callable[[TensorTree], TensorTree] | None = None
 
 
 def standard_operation_factory(
@@ -730,8 +2355,10 @@ def standard_operation_factory(
     *,
     params: ParameterTree,
     buffers: BufferTree,
+    parameter_surface: ParameterSurface | None = None,
     scalar_objectives: Mapping[str, ScalarObjective] | None = None,
     function_objectives: Mapping[str, FunctionObjective] | None = None,
+    teacher_objective: FunctionObjective | None = None,
 ) -> OperationFactory:
     """Return an operation factory for package-owned standard operators."""
     scalar_map = {} if scalar_objectives is None else dict(scalar_objectives)
@@ -744,12 +2371,24 @@ def standard_operation_factory(
     ) -> CandidateOperation:
         _require_candidate_family(operator, candidate)
         _require_supported_standard_settings(operator, candidate)
-        path = _operator_path(operator, candidate)
+        _require_recomputed_teacher_objective(candidate.settings, teacher_objective)
+        path = _runtime_path(operator, candidate)
         _require_batch_inputs(operator, candidate, batch, phase="operation")
-        runtime_params = _runtime_params(params, candidate.settings)
+        runtime_params = _runtime_params(params, candidate.settings, parameter_surface)
         runtime_buffers = _runtime_buffers(buffers, candidate.settings)
-        runtime_batch = _runtime_batch(batch, candidate.settings)
-        runtime_vector = _runtime_vector(vector, candidate.settings)
+        runtime_batch = _runtime_batch(
+            batch,
+            candidate.settings,
+            move_input_residency=_move_input_residency_outside_measured_call(
+                candidate.settings
+            ),
+        )
+        runtime_vector = _runtime_vector(
+            vector,
+            candidate.settings,
+            runtime_params,
+            parameter_surface,
+        )
         context = ObjectiveContext(
             family=operator.family,
             candidate_id=candidate.candidate_id,
@@ -763,20 +2402,923 @@ def standard_operation_factory(
             vector=runtime_vector,
             params=runtime_params,
             buffers=runtime_buffers,
+            parameter_surface=parameter_surface,
             context=context,
             scalar_objectives=scalar_map,
             function_objectives=function_map,
+            teacher_objective=teacher_objective,
         )
+        execution = _loss_scaled_execution(execution)
+        execution = _prepare_standard_execution(execution)
+        execution = _prepare_compile_boundary_execution(execution)
+        output_buffer = _standard_output_buffer(execution)
 
         def operation() -> TensorTree:
+            operation_execution = _execution_with_inside_input_residency(execution)
+
             return _run_with_backend_settings(
                 candidate.settings,
-                lambda: _run_standard_operation(execution),
+                lambda: _run_with_call_grad_mode(
+                    candidate.settings,
+                    lambda: _runtime_output_to_buffer(
+                        _runtime_output(
+                            _run_standard_operation(operation_execution),
+                            candidate.settings,
+                            parameter_surface,
+                        ),
+                        output_buffer,
+                    ),
+                ),
             )
 
-        return operation
+        activated_operation = _activation_operation(execution, operation)
+
+        return _compile_operation(
+            operator,
+            candidate.settings,
+            activated_operation,
+        )
 
     return factory
+
+
+def _prepare_standard_execution(execution: StandardExecution) -> StandardExecution:
+    if execution.operator.kind == "jvp":
+        return _prepare_jvp_execution(execution)
+
+    if execution.operator.kind == "vjp":
+        return _prepare_vjp_execution(execution)
+
+    if execution.operator.kind == "hvp":
+        return _prepare_hvp_execution(execution)
+
+    return execution
+
+
+def _prepare_compile_boundary_execution(
+    execution: StandardExecution,
+) -> StandardExecution:
+    settings = execution.candidate.settings
+    boundary = settings.get("compile.boundary")
+
+    if settings.get("compile.enabled") != "true" or not isinstance(boundary, str):
+        return execution
+
+    return _prepare_enabled_compile_boundary_execution(execution, settings, boundary)
+
+
+def _prepare_enabled_compile_boundary_execution(
+    execution: StandardExecution,
+    settings: Mapping[str, Any],
+    boundary: str,
+) -> StandardExecution:
+    if boundary == "loss_closure":
+        return _prepare_loss_closure_compile_boundary(execution, settings)
+
+    inner_builders = {
+        ("gradient", "gradient_closure"): lambda: _run_gradient_by_path(execution),
+        ("jvp", "jvp_closure"): lambda: _run_jvp_by_path(execution),
+        ("vjp", "vjp_closure"): lambda: _run_vjp_by_path(execution),
+        ("hvp", "hvp_single_vector"): lambda: _run_hvp_single_vector(execution),
+        ("hvp", "hvp_batched_vectors"): lambda: _run_hvp_by_path(execution),
+        ("ggnvp", "ggn_full_product"): lambda: _run_ggnvp_by_path(execution),
+        ("ggnvp", "ggn_jvp"): lambda: _ggn_output_jvp_by_path(
+            execution,
+            _ggn_tensor_function(execution),
+        ),
+        ("metric", "metric_multiply"): lambda: _metric_multiply_by_path(
+            execution.operator,
+            execution.batch,
+            execution.vector,
+            execution.path,
+            settings,
+        ),
+        ("inverse_metric", "inverse_metric_solve"): lambda: _run_inverse_metric_by_mode(
+            execution
+        ),
+    }
+    score_builders = {
+        ("fisher_vp", "fisher_score_grad"): lambda: _fisher_score_gradients_by_path(
+            execution
+        ),
+        (
+            "sampled_fisher_vp",
+            "sampled_fisher_score_grad",
+        ): lambda: _sampled_fisher_score_gradients_by_path(execution),
+        (
+            "empirical_fisher_vp",
+            "empirical_fisher_example_grad",
+        ): lambda: _empirical_fisher_gradients_by_path(execution),
+    }
+    ggn_loss_product_builders = {
+        ("ggnvp", "ggn_loss_hessian_product"): lambda output, output_jvp: (
+            _ggn_loss_hessian_product_by_path(execution, output, output_jvp)
+        ),
+    }
+    ggn_vjp_builders = {
+        ("ggnvp", "ggn_vjp"): lambda output_cotangent: _run_ggnvp_vjp_by_path(
+            execution,
+            _ggn_tensor_function(execution),
+            output_cotangent,
+        ),
+    }
+    builder = inner_builders.get((execution.operator.kind, boundary))
+
+    if builder is not None:
+        return _prepare_inner_compile_boundary(execution, settings, builder)
+
+    score_builder = score_builders.get((execution.operator.kind, boundary))
+
+    if score_builder is not None:
+        return _prepare_score_matrix_compile_boundary(
+            execution,
+            settings,
+            score_builder,
+        )
+
+    loss_product_builder = ggn_loss_product_builders.get((
+        execution.operator.kind,
+        boundary,
+    ))
+
+    if loss_product_builder is not None:
+        return _prepare_ggn_loss_product_compile_boundary(
+            execution,
+            settings,
+            loss_product_builder,
+        )
+
+    vjp_builder = ggn_vjp_builders.get((execution.operator.kind, boundary))
+
+    if vjp_builder is None:
+        return execution
+
+    return _prepare_ggn_vjp_compile_boundary(execution, settings, vjp_builder)
+
+
+def _require_compiled_execution(
+    execution: StandardExecution,
+    settings: Mapping[str, Any],
+) -> None:
+    _require_compile_boundary(execution.operator, settings)
+
+    if _compile_bool(settings, "compile.compiled_autograd"):
+        _require_compiled_autograd_operator(execution.operator)
+
+
+def _prepare_inner_compile_boundary(
+    execution: StandardExecution,
+    settings: Mapping[str, Any],
+    builder: CandidateOperation,
+) -> StandardExecution:
+    _require_compiled_execution(execution, settings)
+    compiled_inner = _compiled_operation(settings, builder)
+
+    return dataclasses.replace(
+        execution,
+        compiled_inner=compiled_inner,
+    )
+
+
+def _prepare_loss_closure_compile_boundary(
+    execution: StandardExecution,
+    settings: Mapping[str, Any],
+) -> StandardExecution:
+    _require_compiled_execution(execution, settings)
+    scalar_function = _hvp_scalar_function(execution)
+    compiled_scalar_function = _compiled_scalar_function(
+        settings,
+        scalar_function,
+        execution.params,
+    )
+
+    return dataclasses.replace(
+        execution,
+        compiled_scalar_function=compiled_scalar_function,
+    )
+
+
+def _prepare_score_matrix_compile_boundary(
+    execution: StandardExecution,
+    settings: Mapping[str, Any],
+    builder: Callable[[], torch.Tensor],
+) -> StandardExecution:
+    _require_compiled_execution(execution, settings)
+    compiled_score_matrix = _compiled_tensor_operation(settings, builder)
+
+    return dataclasses.replace(
+        execution,
+        compiled_score_matrix=compiled_score_matrix,
+    )
+
+
+def _prepare_ggn_loss_product_compile_boundary(
+    execution: StandardExecution,
+    settings: Mapping[str, Any],
+    builder: Callable[[TensorTree, TensorTree], TensorTree],
+) -> StandardExecution:
+    _require_compiled_execution(execution, settings)
+    warm_inputs = (
+        _ggn_loss_product_warm_inputs(execution)
+        if settings.get("compile.cache_state") == "warm_cache"
+        else None
+    )
+    compiled_loss_product = _compiled_ggn_loss_product_operation(
+        settings,
+        builder,
+        None if warm_inputs is None else warm_inputs[0],
+        None if warm_inputs is None else warm_inputs[1],
+    )
+
+    return dataclasses.replace(
+        execution,
+        compiled_ggn_loss_product=compiled_loss_product,
+    )
+
+
+def _prepare_ggn_vjp_compile_boundary(
+    execution: StandardExecution,
+    settings: Mapping[str, Any],
+    builder: Callable[[TensorTree], TensorTree],
+) -> StandardExecution:
+    _require_compiled_execution(execution, settings)
+    warm_output_cotangent = (
+        _ggn_vjp_warm_input(execution)
+        if settings.get("compile.cache_state") == "warm_cache"
+        else None
+    )
+    compiled_vjp = _compiled_ggn_vjp_operation(
+        settings,
+        builder,
+        warm_output_cotangent,
+    )
+
+    return dataclasses.replace(
+        execution,
+        compiled_ggn_vjp=compiled_vjp,
+    )
+
+
+def _prepare_jvp_execution(execution: StandardExecution) -> StandardExecution:
+    reuse = execution.candidate.settings.get("jvp.linearize_reuse")
+
+    if reuse is None or reuse == "none":
+        return execution
+
+    if reuse != "reuse_at_same_primal":
+        message = f"jvp.linearize_reuse is unsupported: {reuse}"
+        raise MaterializationError(message)
+
+    if execution.path != JVP_LINEARIZE_PATH:
+        message = "reuse_at_same_primal requires torch_func_linearize"
+        raise MaterializationError(message)
+
+    _, jvp_function = torch.func.linearize(
+        _jvp_tensor_function(execution),
+        execution.params,
+    )
+
+    return dataclasses.replace(execution, linearized_jvp=jvp_function)
+
+
+def _prepare_vjp_execution(execution: StandardExecution) -> StandardExecution:
+    reuse = execution.candidate.settings.get("vjp.closure_reuse")
+
+    if reuse is None or reuse == "none":
+        return execution
+
+    if reuse != "reuse_vjp_closure_at_same_primal":
+        message = f"vjp.closure_reuse is unsupported: {reuse}"
+        raise MaterializationError(message)
+
+    if execution.path != VJP_PATH:
+        message = "reuse_vjp_closure_at_same_primal requires torch_func_vjp"
+        raise MaterializationError(message)
+
+    pullback = _vjp_pullback(
+        _vjp_tensor_function(execution),
+        execution.params,
+    )
+
+    def closure(cotangent: TensorTree) -> TensorTree:
+        (result,) = pullback(cotangent)
+
+        return result
+
+    return dataclasses.replace(execution, vjp_closure=closure)
+
+
+def _prepare_hvp_execution(execution: StandardExecution) -> StandardExecution:
+    reuse = execution.candidate.settings.get("hvp.gradient_reuse")
+
+    if reuse is None or reuse == "recompute_gradient":
+        return execution
+
+    if reuse != "reuse_gradient_closure":
+        message = f"hvp.gradient_reuse is unsupported: {reuse}"
+        raise MaterializationError(message)
+
+    if execution.path != HVP_LINEARIZE_GRAD_PATH:
+        message = "reuse_gradient_closure requires linearize_grad"
+        raise MaterializationError(message)
+
+    gradient_function = torch.func.grad(_hvp_scalar_function(execution))
+    _, hvp_function = torch.func.linearize(gradient_function, execution.params)
+
+    return dataclasses.replace(execution, linearized_hvp=hvp_function)
+
+
+def _activation_operation(
+    execution: StandardExecution,
+    operation: CandidateOperation,
+) -> CandidateOperation:
+    settings = execution.candidate.settings
+
+    if not _has_activation_settings(settings):
+        return operation
+
+    def function(*_: torch.Tensor) -> TensorTree:
+        return operation()
+
+    try:
+        return checkpoint_operation(
+            execution.candidate,
+            function,
+            _activation_tensor_args(execution),
+            policy_key="activation.recompute",
+        )
+    except AdmissionError as error:
+        raise MaterializationError(str(error)) from error
+
+
+def _activation_tensor_args(execution: StandardExecution) -> tuple[torch.Tensor, ...]:
+    return (
+        *_tensor_args(execution.params),
+        *_tensor_args(execution.buffers),
+        *_tensor_args(execution.batch),
+        *_tensor_args(execution.vector),
+    )
+
+
+def _tensor_args(value: Any) -> tuple[torch.Tensor, ...]:
+    if isinstance(value, torch.Tensor):
+        return (value,)
+
+    if isinstance(value, Mapping):
+        return tuple(
+            tensor for child in value.values() for tensor in _tensor_args(child)
+        )
+
+    if isinstance(value, tuple):
+        return tuple(tensor for child in value for tensor in _tensor_args(child))
+
+    return ()
+
+
+def _has_activation_settings(settings: Mapping[str, Any]) -> bool:
+    return any(key.startswith(("activation.", "checkpoint.")) for key in settings)
+
+
+def _execution_with_inside_input_residency(
+    execution: StandardExecution,
+) -> StandardExecution:
+    if _move_input_residency_outside_measured_call(execution.candidate.settings):
+        return execution
+
+    return dataclasses.replace(
+        execution,
+        batch=_runtime_batch_input_residency(
+            execution.batch,
+            execution.candidate.settings,
+        ),
+    )
+
+
+def _move_input_residency_outside_measured_call(
+    settings: Mapping[str, Any],
+) -> bool:
+    value = settings.get("input.host_to_device")
+
+    if value is None or value == "outside_measured_call":
+        return True
+
+    if value == "inside_measured_call":
+        return False
+
+    message = f"input.host_to_device is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _compile_operation(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+    operation: CandidateOperation,
+) -> CandidateOperation:
+    enabled = settings.get("compile.enabled")
+
+    if enabled is None or enabled == "false":
+        return operation
+
+    if enabled != "true":
+        message = f"compile.enabled is unsupported: {enabled}"
+        raise MaterializationError(message)
+
+    _require_compile_boundary(operator, settings)
+
+    compiled_autograd = _compile_bool(settings, "compile.compiled_autograd")
+    if compiled_autograd:
+        _require_compiled_autograd_operator(operator)
+
+    if _compile_boundary_runs_inside_operator(operator.kind, settings):
+        return operation
+
+    return _compiled_operation(settings, operation)
+
+
+def _compile_boundary_runs_inside_operator(
+    operator_kind: str,
+    settings: Mapping[str, Any],
+) -> bool:
+    return (operator_kind, settings.get("compile.boundary")) in {
+        ("gradient", "loss_closure"),
+        ("gradient", "gradient_closure"),
+        ("jvp", "jvp_closure"),
+        ("vjp", "vjp_closure"),
+        ("hvp", "loss_closure"),
+        ("hvp", "hvp_single_vector"),
+        ("hvp", "hvp_batched_vectors"),
+        ("ggnvp", "ggn_full_product"),
+        ("ggnvp", "ggn_jvp"),
+        ("ggnvp", "ggn_loss_hessian_product"),
+        ("ggnvp", "ggn_vjp"),
+        ("fisher_vp", "fisher_score_grad"),
+        ("sampled_fisher_vp", "sampled_fisher_score_grad"),
+        ("empirical_fisher_vp", "empirical_fisher_example_grad"),
+        ("metric", "metric_multiply"),
+        ("inverse_metric", "inverse_metric_solve"),
+        ("composition", "composition_child"),
+    }
+
+
+def _compiled_operation(
+    settings: Mapping[str, Any],
+    operation: CandidateOperation,
+) -> CandidateOperation:
+    compiled_autograd = _compile_bool(settings, "compile.compiled_autograd")
+
+    def build_compiled() -> CandidateOperation:
+        return torch.compile(
+            operation,
+            backend=_compile_backend(settings),
+            mode=_compile_mode(settings),
+            fullgraph=_compile_bool(settings, "compile.fullgraph"),
+            dynamic=_compile_optional_bool(settings, "compile.dynamic"),
+            options=_compile_options(settings),
+        )
+
+    if compiled_autograd:
+        with _compiled_autograd_patch():
+            compiled = build_compiled()
+    else:
+        compiled = build_compiled()
+
+    def compiled_operation() -> TensorTree:
+        if compiled_autograd:
+            with _compiled_autograd_patch():
+                return compiled()
+
+        return compiled()
+
+    cache_state = settings.get("compile.cache_state")
+    _validate_compile_cache_state(settings)
+
+    if cache_state == "warm_cache":
+        compiled_operation()
+
+    return compiled_operation
+
+
+def _validate_compile_cache_state(settings: Mapping[str, Any]) -> None:
+    if settings.get("compile.cache_state") in {"cold_compile", "warm_cache"}:
+        return
+
+    message = "compile.cache_state must be cold_compile or warm_cache"
+    raise MaterializationError(message)
+
+
+def _compiled_tensor_operation(
+    settings: Mapping[str, Any],
+    operation: Callable[[], torch.Tensor],
+) -> Callable[[], torch.Tensor]:
+    compiled_autograd = _compile_bool(settings, "compile.compiled_autograd")
+
+    def build_compiled() -> Callable[[], torch.Tensor]:
+        return torch.compile(
+            operation,
+            backend=_compile_backend(settings),
+            mode=_compile_mode(settings),
+            fullgraph=_compile_bool(settings, "compile.fullgraph"),
+            dynamic=_compile_optional_bool(settings, "compile.dynamic"),
+            options=_compile_options(settings),
+        )
+
+    if compiled_autograd:
+        with _compiled_autograd_patch():
+            compiled = build_compiled()
+    else:
+        compiled = build_compiled()
+
+    def compiled_operation() -> torch.Tensor:
+        if compiled_autograd:
+            with _compiled_autograd_patch():
+                return compiled()
+
+        return compiled()
+
+    cache_state = settings.get("compile.cache_state")
+    _validate_compile_cache_state(settings)
+
+    if cache_state == "warm_cache":
+        compiled_operation()
+
+    return compiled_operation
+
+
+def _compiled_scalar_function(
+    settings: Mapping[str, Any],
+    operation: Callable[[ParameterTree], torch.Tensor],
+    warm_params: ParameterTree,
+) -> Callable[[ParameterTree], torch.Tensor]:
+    compiled_autograd = _compile_bool(settings, "compile.compiled_autograd")
+
+    def build_compiled() -> Callable[[ParameterTree], torch.Tensor]:
+        return torch.compile(
+            operation,
+            backend=_compile_backend(settings),
+            mode=_compile_mode(settings),
+            fullgraph=_compile_bool(settings, "compile.fullgraph"),
+            dynamic=_compile_optional_bool(settings, "compile.dynamic"),
+            options=_compile_options(settings),
+        )
+
+    if compiled_autograd:
+        with _compiled_autograd_patch():
+            compiled = build_compiled()
+    else:
+        compiled = build_compiled()
+
+    def compiled_function(params: ParameterTree) -> torch.Tensor:
+        if compiled_autograd:
+            with _compiled_autograd_patch():
+                return compiled(params)
+
+        return compiled(params)
+
+    cache_state = settings.get("compile.cache_state")
+    _validate_compile_cache_state(settings)
+
+    if cache_state == "warm_cache":
+        compiled_function(warm_params)
+
+    return compiled_function
+
+
+def _compiled_ggn_loss_product_operation(
+    settings: Mapping[str, Any],
+    operation: Callable[[TensorTree, TensorTree], TensorTree],
+    warm_output: TensorTree | None,
+    warm_output_jvp: TensorTree | None,
+) -> Callable[[TensorTree, TensorTree], TensorTree]:
+    compiled_autograd = _compile_bool(settings, "compile.compiled_autograd")
+
+    def build_compiled() -> Callable[[TensorTree, TensorTree], TensorTree]:
+        return torch.compile(
+            operation,
+            backend=_compile_backend(settings),
+            mode=_compile_mode(settings),
+            fullgraph=_compile_bool(settings, "compile.fullgraph"),
+            dynamic=_compile_optional_bool(settings, "compile.dynamic"),
+            options=_compile_options(settings),
+        )
+
+    if compiled_autograd:
+        with _compiled_autograd_patch():
+            compiled = build_compiled()
+    else:
+        compiled = build_compiled()
+
+    def compiled_operation(output: TensorTree, output_jvp: TensorTree) -> TensorTree:
+        if compiled_autograd:
+            with _compiled_autograd_patch():
+                return compiled(output, output_jvp)
+
+        return compiled(output, output_jvp)
+
+    cache_state = settings.get("compile.cache_state")
+    _validate_compile_cache_state(settings)
+
+    if cache_state == "warm_cache":
+        if warm_output is None or warm_output_jvp is None:
+            message = "GGN loss-product warm cache requires warm inputs"
+            raise MaterializationError(message)
+
+        compiled_operation(warm_output, warm_output_jvp)
+
+    return compiled_operation
+
+
+def _compiled_ggn_vjp_operation(
+    settings: Mapping[str, Any],
+    operation: Callable[[TensorTree], TensorTree],
+    warm_output_cotangent: TensorTree | None,
+) -> Callable[[TensorTree], TensorTree]:
+    compiled_autograd = _compile_bool(settings, "compile.compiled_autograd")
+
+    def build_compiled() -> Callable[[TensorTree], TensorTree]:
+        return torch.compile(
+            operation,
+            backend=_compile_backend(settings),
+            mode=_compile_mode(settings),
+            fullgraph=_compile_bool(settings, "compile.fullgraph"),
+            dynamic=_compile_optional_bool(settings, "compile.dynamic"),
+            options=_compile_options(settings),
+        )
+
+    if compiled_autograd:
+        with _compiled_autograd_patch():
+            compiled = build_compiled()
+    else:
+        compiled = build_compiled()
+
+    def compiled_operation(output_cotangent: TensorTree) -> TensorTree:
+        if compiled_autograd:
+            with _compiled_autograd_patch():
+                return compiled(output_cotangent)
+
+        return compiled(output_cotangent)
+
+    cache_state = settings.get("compile.cache_state")
+    _validate_compile_cache_state(settings)
+
+    if cache_state == "warm_cache":
+        if warm_output_cotangent is None:
+            message = "GGN VJP warm cache requires warm output cotangent"
+            raise MaterializationError(message)
+
+        compiled_operation(warm_output_cotangent)
+
+    return compiled_operation
+
+
+def _require_compile_boundary(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+) -> None:
+    boundary = settings.get("compile.boundary")
+
+    if not isinstance(boundary, str):
+        message = "compile.boundary is required"
+        raise MaterializationError(message)
+
+    if _compile_boundary_supported(operator.kind, boundary, settings):
+        return
+
+    message = f"compile.boundary={boundary} is not lowered for {operator.kind}"
+    raise MaterializationError(message)
+
+
+def _compile_boundary_supported(
+    operator_kind: str,
+    boundary: str,
+    settings: Mapping[str, Any],
+) -> bool:
+    if boundary == "whole_operator":
+        return True
+
+    if boundary == "loss_closure":
+        return operator_kind in {"gradient", "hvp"}
+
+    if operator_kind == "hvp":
+        return _hvp_compile_boundary_supported(boundary, settings)
+
+    if operator_kind == "ggnvp":
+        return _ggn_compile_boundary_supported(boundary, settings)
+
+    if operator_kind in {
+        "fisher_vp",
+        "sampled_fisher_vp",
+        "empirical_fisher_vp",
+    }:
+        return _score_matrix_compile_boundary_supported(
+            operator_kind,
+            boundary,
+            settings,
+        )
+
+    boundaries = {
+        "gradient": "gradient_closure",
+        "jvp": "jvp_closure",
+        "vjp": "vjp_closure",
+        "metric": "metric_multiply",
+        "inverse_metric": "inverse_metric_solve",
+        "composition": "composition_child",
+    }
+
+    return boundaries.get(operator_kind) == boundary
+
+
+def _hvp_compile_boundary_supported(
+    boundary: str,
+    settings: Mapping[str, Any],
+) -> bool:
+    vectorized = settings.get("vectorization.mode") in {"single_loop", "vmap"}
+
+    if boundary == "hvp_single_vector":
+        return not vectorized
+
+    if boundary == "hvp_batched_vectors":
+        return vectorized
+
+    return False
+
+
+def _ggn_compile_boundary_supported(
+    boundary: str,
+    settings: Mapping[str, Any],
+) -> bool:
+    if boundary == "ggn_full_product":
+        return True
+
+    if settings.get("vectorization.mode") in {"single_loop", "manual_batch", "vmap"}:
+        return False
+
+    if boundary == "ggn_jvp":
+        return settings.get("ggn.jvp_path") in {
+            "torch_func_jvp",
+            "forward_ad_dual",
+            "torch_func_linearize",
+        }
+
+    if boundary == "ggn_loss_hessian_product":
+        return settings.get("ggn.jvp_path") in {
+            "torch_func_jvp",
+            "forward_ad_dual",
+            "torch_func_linearize",
+        }
+
+    if boundary != "ggn_vjp":
+        return False
+
+    return settings.get("ggn.vjp_path") in {
+        "torch_func_vjp",
+        "autograd_grad_outputs",
+    }
+
+
+def _score_matrix_compile_boundary_supported(
+    operator_kind: str,
+    boundary: str,
+    settings: Mapping[str, Any],
+) -> bool:
+    if operator_kind == "fisher_vp":
+        return boundary == "fisher_score_grad" and settings.get(
+            "fisher.score_grad_path"
+        ) in {
+            "torch_autograd_grad_loop",
+            "torch_func_grad",
+            "vmap_grad",
+            "backward_materialized_grad",
+        }
+
+    if operator_kind == "sampled_fisher_vp":
+        return boundary == "sampled_fisher_score_grad" and settings.get(
+            "sampled_fisher.score_grad_path"
+        ) in {
+            "torch_autograd_grad_loop",
+            "torch_func_grad",
+            "vmap_grad",
+            "backward_materialized_grad",
+        }
+
+    return boundary == "empirical_fisher_example_grad" and settings.get(
+        "empirical_fisher.grad_path"
+    ) in {
+        "torch_autograd_grad_loop",
+        "torch_func_grad",
+        "vmap_grad",
+        "backward_materialized_grad",
+    }
+
+
+def _compiled_autograd_patch() -> Any:
+    config = importlib.import_module("torch._dynamo.config")
+
+    return config.patch({"compiled_autograd": True})
+
+
+def _require_compiled_autograd_operator(operator: OperatorSpec) -> None:
+    if operator.kind in {
+        "gradient",
+        "vjp",
+        "hvp",
+        "ggnvp",
+        "fisher_vp",
+        "sampled_fisher_vp",
+        "empirical_fisher_vp",
+    }:
+        return
+
+    message = (
+        "compile.compiled_autograd=true requires a backward or higher-order "
+        f"operator, got {operator.kind}"
+    )
+    raise MaterializationError(message)
+
+
+def _compile_backend(settings: Mapping[str, Any]) -> str:
+    value = settings.get("compile.backend")
+
+    if not isinstance(value, str):
+        message = "compile.backend is required"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _compile_mode(settings: Mapping[str, Any]) -> str | None:
+    value = settings.get("compile.mode")
+
+    if value is None:
+        return None
+
+    if value in {"default", "max-autotune"}:
+        return value
+
+    message = f"compile.mode is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _compile_bool(settings: Mapping[str, Any], key: str) -> bool:
+    value = settings.get(key)
+
+    if value == "true":
+        return True
+
+    if value == "false":
+        return False
+
+    message = f"{key} must be true or false"
+    raise MaterializationError(message)
+
+
+def _compile_optional_bool(settings: Mapping[str, Any], key: str) -> bool | None:
+    value = settings.get(key)
+
+    if value is None:
+        return None
+
+    if value == "true":
+        return True
+
+    if value == "false":
+        return False
+
+    message = f"{key} must be None, true, or false"
+    raise MaterializationError(message)
+
+
+def _compile_options(settings: Mapping[str, Any]) -> dict[str, Any] | None:
+    options = {}
+
+    if _compile_bool(settings, "compile.options.epilogue_fusion"):
+        options["epilogue_fusion"] = True
+
+    if _compile_bool(settings, "compile.options.shape_padding"):
+        options["shape_padding"] = True
+
+    if _compile_bool(settings, "compile.cuda_graphs"):
+        options["triton.cudagraphs"] = True
+
+    if not options:
+        return None
+
+    return options
+
+
+def _apply_numeric_error_bound(
+    measurements: dict[str, float],
+    thresholds: Mapping[str, float],
+    settings: Mapping[str, Any],
+    bound_fields: Mapping[str, Any],
+    reference: TensorTree,
+) -> None:
+    bound_measurements = numeric_error_bound_measurements(
+        settings,
+        bound_fields,
+        reference,
+    )
+    validate_numeric_error_bound(measurements, thresholds, bound_measurements)
+    measurements.update(bound_measurements)
 
 
 def standard_reference_check(
@@ -785,8 +3327,11 @@ def standard_reference_check(
     params: ParameterTree,
     buffers: BufferTree,
     thresholds: Mapping[str, float],
+    parameter_surface: ParameterSurface | None = None,
+    numeric_bound_fields: Mapping[str, Any] | None = None,
     scalar_objectives: Mapping[str, ScalarObjective] | None = None,
     function_objectives: Mapping[str, FunctionObjective] | None = None,
+    teacher_objective: FunctionObjective | None = None,
 ) -> ReferenceCheck:
     """Return a reference check backed by package-owned anchors.
 
@@ -799,12 +3344,15 @@ def standard_reference_check(
 
     scalar_map = {} if scalar_objectives is None else dict(scalar_objectives)
     function_map = {} if function_objectives is None else dict(function_objectives)
+    bound_fields = {} if numeric_bound_fields is None else dict(numeric_bound_fields)
     candidate_factory = standard_operation_factory(
         operator,
         params=params,
         buffers=buffers,
+        parameter_surface=parameter_surface,
         scalar_objectives=scalar_map,
         function_objectives=function_map,
+        teacher_objective=teacher_objective,
     )
 
     def check(
@@ -842,6 +3390,7 @@ def standard_reference_check(
                 buffers=buffers,
                 scalar_objectives=scalar_map,
                 function_objectives=function_map,
+                parameter_surface=parameter_surface,
             )
         except ReferenceFailedError:
             raise
@@ -852,6 +3401,13 @@ def standard_reference_check(
         apply_dtype_floors(effective_thresholds, candidate.settings)
         _require_thresholds_for_measurements(measurements, effective_thresholds)
         validate_thresholds(measurements, effective_thresholds)
+        _apply_numeric_error_bound(
+            measurements,
+            effective_thresholds,
+            candidate.settings,
+            bound_fields,
+            anchor_output,
+        )
 
         return ReferenceResult(
             "standard_anchor",
@@ -875,7 +3431,11 @@ def _standard_reference_outputs(
     _require_batch_inputs(operator, anchor_candidate, batch, phase="reference")
     _require_vhp_reference_policy(candidate, batch, thresholds)
     candidate_output = candidate_factory(candidate, batch, vector)()
-    anchor_output = candidate_factory(anchor_candidate, batch, vector)()
+
+    if operator.kind in {"metric", "inverse_metric"}:
+        anchor_output = _metric_reference_output(operator, batch, vector)
+    else:
+        anchor_output = candidate_factory(anchor_candidate, batch, vector)()
 
     return anchor_candidate, candidate_output, anchor_output
 
@@ -909,19 +3469,49 @@ def _required_batch_inputs(
         message = f"operator batch_inputs must declare {phase}"
         raise MaterializationError(message)
 
+    declared = _ggn_declared_batch_inputs(operator, candidate, declared, phase)
     path_inputs = _candidate_batch_inputs(operator, candidate)
+    teacher_inputs = _teacher_output_batch_inputs(candidate)
 
-    return tuple(dict.fromkeys((*declared, *path_inputs)))
+    return tuple(dict.fromkeys((*declared, *path_inputs, *teacher_inputs)))
+
+
+def _teacher_output_batch_inputs(candidate: Candidate) -> tuple[str, ...]:
+    if "teacher_outputs" not in candidate.settings:
+        return ()
+
+    return ("teacher_outputs",)
+
+
+def _ggn_declared_batch_inputs(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    declared: tuple[str, ...],
+    phase: str,
+) -> tuple[str, ...]:
+    if operator.kind != "ggnvp":
+        return declared
+
+    if phase != "operation":
+        return declared
+
+    if candidate.settings.get("ggn.loss_hessian_path") != "closed_form_softmax_ce_kl":
+        return declared
+
+    return tuple(key for key in declared if key != "loss_hessian")
 
 
 def _candidate_batch_inputs(
     operator: OperatorSpec,
     candidate: Candidate,
 ) -> tuple[str, ...]:
-    path = _operator_path(operator, candidate)
+    path = _runtime_path(operator, candidate)
 
     if operator.kind == "fisher_vp":
         return _fisher_batch_inputs(operator, path)
+
+    if operator.kind == "sampled_fisher_vp":
+        return _sampled_fisher_batch_inputs(operator, path)
 
     if operator.kind == "empirical_fisher_vp":
         return _empirical_fisher_batch_inputs(operator, path)
@@ -932,8 +3522,6 @@ def _candidate_batch_inputs(
 def _fisher_batch_inputs(operator: OperatorSpec, path: str) -> tuple[str, ...]:
     if path not in {
         FISHER_DENSE_PATH,
-        FISHER_CATEGORICAL_EXACT_PATH,
-        FISHER_CATEGORICAL_MC_PATH,
         FISHER_SCORE_GRADIENT_LOOP_PATH,
     }:
         return ()
@@ -943,22 +3531,32 @@ def _fisher_batch_inputs(operator: OperatorSpec, path: str) -> tuple[str, ...]:
     if path == FISHER_DENSE_PATH:
         inputs = ("score_gradients",)
 
-    return (*inputs, *_fisher_denominator_batch_inputs(operator, path))
+    return (*inputs, *_fisher_denominator_batch_inputs(operator))
 
 
-def _fisher_denominator_batch_inputs(
-    operator: OperatorSpec,
-    path: str,
-) -> tuple[str, ...]:
+def _sampled_fisher_batch_inputs(operator: OperatorSpec, path: str) -> tuple[str, ...]:
+    if path not in {
+        SAMPLED_FISHER_DENSE_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+    }:
+        return ()
+
+    inputs = ()
+
+    if path == SAMPLED_FISHER_DENSE_PATH:
+        inputs = ("sampled_score_gradients",)
+
+    return (*inputs, *_fisher_denominator_batch_inputs(operator))
+
+
+def _fisher_denominator_batch_inputs(operator: OperatorSpec) -> tuple[str, ...]:
     denominator = _operator_semantic(operator, "denominator")
 
     if denominator == "batch_normalization":
         return ("normalization",)
 
-    if denominator == "num_examples" and path not in {
-        FISHER_CATEGORICAL_EXACT_PATH,
-        FISHER_CATEGORICAL_MC_PATH,
-    }:
+    if denominator == "num_examples":
         return ("num_examples",)
 
     return ()
@@ -1000,8 +3598,13 @@ def _standard_reference_measurements(
     buffers: BufferTree,
     scalar_objectives: Mapping[str, ScalarObjective],
     function_objectives: Mapping[str, FunctionObjective],
+    parameter_surface: ParameterSurface | None,
 ) -> dict[str, Any]:
-    measurements = tree_error_measurements(candidate_output, anchor_output)
+    measurements = _layout_aware_tree_error_measurements(
+        candidate,
+        candidate_output,
+        anchor_output,
+    )
     _augment_ggn_dense_cross_check(
         operator,
         candidate,
@@ -1023,6 +3626,7 @@ def _standard_reference_measurements(
             candidate_output,
             anchor_candidate,
             candidate_factory,
+            parameter_surface,
         )
     )
     measurements.update(
@@ -1050,6 +3654,7 @@ def _standard_reference_measurements(
             scalar_objectives=scalar_objectives,
             anchor_candidate=anchor_candidate,
             candidate_factory=candidate_factory,
+            parameter_surface=parameter_surface,
         )
     )
 
@@ -1070,10 +3675,14 @@ def _augment_ggn_dense_cross_check(
 
     dense_candidate = dataclasses.replace(
         candidate,
-        settings=_anchor_settings(candidate, GGN_DENSE_PATH),
+        settings=_anchor_settings(operator, candidate, GGN_DENSE_PATH),
     )
     dense_output = candidate_factory(dense_candidate, batch, vector)()
-    errors = tree_error_measurements(candidate_output, dense_output)
+    errors = _layout_aware_tree_error_measurements(
+        candidate,
+        candidate_output,
+        dense_output,
+    )
     measurements["max_abs_diff"] = max(
         float(measurements["max_abs_diff"]),
         float(errors["max_abs_diff"]),
@@ -1085,6 +3694,31 @@ def _augment_ggn_dense_cross_check(
     measurements["dense_anchor_errors"] = dict(errors)
 
 
+def _layout_aware_tree_error_measurements(
+    candidate: Candidate,
+    candidate_output: TensorTree,
+    anchor_output: TensorTree,
+) -> dict[str, float]:
+    if candidate.settings.get("layout.output") != "flat_contiguous":
+        return tree_error_measurements(candidate_output, anchor_output)
+
+    return tree_error_measurements(
+        _flatten_vector(candidate_output),
+        _flatten_vector(anchor_output),
+    )
+
+
+def _layout_aware_tree_dot(
+    settings: Mapping[str, Any],
+    left: TensorTree,
+    right: TensorTree,
+) -> torch.Tensor:
+    if settings.get("layout.output") != "flat_contiguous":
+        return _tree_dot_runtime(settings, left, right)
+
+    return _dot_runtime(settings, _flatten_vector(left), _flatten_vector(right))
+
+
 def standard_runtime_config(
     operator: OperatorSpec,
     *,
@@ -1094,24 +3728,33 @@ def standard_runtime_config(
     thresholds: Mapping[str, float],
     objective_signature: Mapping[str, Any],
     axis_registry: CandidateAdmitter | None,
+    parameter_surface: ParameterSurface | None = None,
+    numeric_bound_fields: Mapping[str, Any] | None = None,
     scalar_objectives: Mapping[str, ScalarObjective] | None = None,
     function_objectives: Mapping[str, FunctionObjective] | None = None,
+    teacher_objective: FunctionObjective | None = None,
 ) -> RuntimeConfig:
     """Return runtime config for package-owned standard operators."""
+    bound_fields = {} if numeric_bound_fields is None else dict(numeric_bound_fields)
     operation_factory = standard_operation_factory(
         operator,
         params=params,
         buffers=buffers,
+        parameter_surface=parameter_surface,
         scalar_objectives=scalar_objectives,
         function_objectives=function_objectives,
+        teacher_objective=teacher_objective,
     )
     reference_check = standard_reference_check(
         operator,
         params=params,
         buffers=buffers,
         thresholds=thresholds,
+        parameter_surface=parameter_surface,
+        numeric_bound_fields=bound_fields,
         scalar_objectives=scalar_objectives,
         function_objectives=function_objectives,
+        teacher_objective=teacher_objective,
     )
     materializer = _standard_materializer(operation_factory, operator)
 
@@ -1126,8 +3769,13 @@ def standard_runtime_config(
             "operator": operator.signature(),
             "params": tree_signature(params),
             "buffers": tree_signature(buffers),
+            "parameter_surface": (
+                None if parameter_surface is None else parameter_surface.signature()
+            ),
             "thresholds": dict(thresholds),
+            "numeric_bound_fields": bound_fields,
             "objective": dict(objective_signature),
+            "teacher_objective": teacher_objective is not None,
         },
     )
 
@@ -1145,14 +3793,20 @@ def standard_problem(
     candidates: Mapping[str, Mapping[str, Any]],
     thresholds: Mapping[str, float],
     objective_signature: Mapping[str, Any],
+    numeric_bound_fields: Mapping[str, Any] | None = None,
     scalar_objectives: Mapping[str, ScalarObjective] | None = None,
     function_objectives: Mapping[str, FunctionObjective] | None = None,
+    teacher_objective: FunctionObjective | None = None,
 ) -> Problem:
     """Return a standard PyTorch tuning problem from explicit settings.
 
     Raises:
         MaterializationError: If candidate settings are empty.
     """
+    if operator.kind == "composition":
+        message = "standard_problem requires TuningRun for composition operators"
+        raise MaterializationError(message)
+
     if not candidates:
         message = "problem candidate_settings are required"
         raise MaterializationError(message)
@@ -1174,10 +3828,13 @@ def standard_problem(
         buffers=buffers,
         candidates=candidate_rows,
         thresholds=thresholds,
+        numeric_bound_fields=numeric_bound_fields,
         objective_signature=objective_signature,
         axis_registry=standard_axis_registry(),
+        parameter_surface=parameter_surface,
         scalar_objectives=scalar_objectives,
         function_objectives=function_objectives,
+        teacher_objective=teacher_objective,
     )
 
     return Problem(
@@ -1198,6 +3855,7 @@ def standard_problem(
 
 
 def _run_standard_operation(execution: StandardExecution) -> TensorTree:
+    _require_loss_scaling_settings(execution.operator, execution.candidate.settings)
     runner = STANDARD_RUNNERS.get(execution.operator.kind)
 
     if runner is None:
@@ -1207,7 +3865,226 @@ def _run_standard_operation(execution: StandardExecution) -> TensorTree:
         )
         raise MaterializationError(message)
 
-    return runner(execution)
+    execution = _execution_with_recomputed_teacher_outputs(execution)
+
+    if _uses_microbatch_accumulation(execution):
+        return _run_microbatch_accumulate(execution)
+
+    result = runner(execution)
+    result = _loss_scaled_output_source(
+        execution.operator,
+        execution.candidate.settings,
+        result,
+    )
+
+    return _loss_unscaled_output(
+        execution.operator,
+        execution.candidate.settings,
+        result,
+    )
+
+
+def _loss_scaled_execution(execution: StandardExecution) -> StandardExecution:
+    scale = _loss_scale(execution.candidate.settings)
+
+    if scale is None:
+        return execution
+
+    if execution.operator.kind in {"gradient", "hvp"}:
+        return dataclasses.replace(
+            execution,
+            scalar_objectives=_scaled_scalar_objectives(execution, scale),
+        )
+
+    if execution.operator.kind in {"jvp", "vjp"}:
+        return dataclasses.replace(
+            execution,
+            function_objectives=_scaled_function_objectives(execution, scale),
+        )
+
+    if execution.operator.kind == "ggnvp":
+        return dataclasses.replace(
+            execution,
+            batch=_scaled_loss_hessian_batch(execution.batch, scale),
+        )
+
+    return execution
+
+
+def _scaled_scalar_objectives(
+    execution: StandardExecution,
+    scale: float,
+) -> Mapping[str, ScalarObjective]:
+    objective_id = execution.operator.objective_id
+    objective = _scalar_objective(execution.operator, execution.scalar_objectives)
+    objectives = dict(execution.scalar_objectives)
+
+    def scaled(
+        params: ParameterTree,
+        buffers: BufferTree,
+        batch: Batch,
+        context: ObjectiveContext,
+    ) -> torch.Tensor:
+        return objective(params, buffers, batch, context) * scale
+
+    objectives[objective_id] = scaled
+
+    return objectives
+
+
+def _scaled_function_objectives(
+    execution: StandardExecution,
+    scale: float,
+) -> Mapping[str, FunctionObjective]:
+    objective_id = execution.operator.objective_id
+    objective = _function_objective(execution.operator, execution.function_objectives)
+    objectives = dict(execution.function_objectives)
+
+    def scaled(
+        params: ParameterTree,
+        buffers: BufferTree,
+        batch: Batch,
+        context: ObjectiveContext,
+    ) -> TensorTree:
+        return tree_map(
+            lambda tensor: tensor * scale,
+            objective(params, buffers, batch, context),
+        )
+
+    objectives[objective_id] = scaled
+
+    return objectives
+
+
+def _scaled_loss_hessian_batch(batch: Batch, scale: float) -> Batch:
+    if "loss_hessian" not in batch:
+        return batch
+
+    result = dict(batch)
+    result["loss_hessian"] = _scaled_tensor(
+        batch["loss_hessian"],
+        scale,
+        "loss_hessian",
+    )
+
+    return result
+
+
+def _loss_scaled_output_source(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+    result: TensorTree,
+) -> TensorTree:
+    scale = _loss_scale(settings)
+
+    if scale is None:
+        return result
+
+    if operator.kind in {"metric", "inverse_metric", "composition"}:
+        return _tree_scale_runtime(settings, result, scale)
+
+    return result
+
+
+def _loss_unscaled_output(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+    result: TensorTree,
+) -> TensorTree:
+    scale = _loss_scale(settings)
+
+    if scale is None:
+        return result
+
+    degree = _loss_unscale_degree(operator, settings)
+
+    return _tree_scale_runtime(settings, result, 1.0 / (scale**degree))
+
+
+def _require_loss_scaling_settings(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+) -> None:
+    mode = settings.get("numeric.loss_scaling")
+    has_scale = "numeric.loss_scale" in settings
+    has_degree = "numeric.loss_unscale_degree" in settings
+
+    if mode is None:
+        if has_scale or has_degree:
+            message = "numeric.loss_scaling is required for loss-scale fields"
+            raise MaterializationError(message)
+
+        return
+
+    if mode == "none":
+        if has_scale or has_degree:
+            message = "numeric.loss_scaling=none forbids loss-scale fields"
+            raise MaterializationError(message)
+
+        return
+
+    if mode != "static_scale_with_exact_unscale":
+        message = f"numeric.loss_scaling is unsupported: {mode}"
+        raise MaterializationError(message)
+
+    _loss_scale(settings)
+    _loss_unscale_degree(operator, settings)
+
+
+def _loss_scale(settings: Mapping[str, Any]) -> float | None:
+    mode = settings.get("numeric.loss_scaling")
+
+    if mode is None or mode == "none":
+        return None
+
+    value = settings.get("numeric.loss_scale")
+
+    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0.0:
+        message = "numeric.loss_scale must be a positive float"
+        raise MaterializationError(message)
+
+    return float(value)
+
+
+def _loss_unscale_degree(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+) -> int:
+    value = settings.get("numeric.loss_unscale_degree")
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        message = "numeric.loss_unscale_degree must be an integer"
+        raise MaterializationError(message)
+
+    expected = _expected_loss_unscale_degree(operator)
+
+    if value != expected:
+        message = (
+            "numeric.loss_unscale_degree does not match operator: "
+            f"{value} != {expected}"
+        )
+        raise MaterializationError(message)
+
+    return value
+
+
+def _expected_loss_unscale_degree(operator: OperatorSpec) -> int:
+    if operator.kind in {
+        "fisher_vp",
+        "sampled_fisher_vp",
+        "empirical_fisher_vp",
+    }:
+        return 2
+
+    return 1
+
+
+def _scaled_tensor(value: Any, scale: float, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        message = f"{name} must be a tensor"
+        raise MaterializationError(message)
+
+    return value * scale
 
 
 def _composition_order(order: Sequence[str]) -> tuple[str, ...]:
@@ -1229,6 +4106,20 @@ def _composition_order(order: Sequence[str]) -> tuple[str, ...]:
     return order_result
 
 
+def _operator_composition_order(operator: OperatorSpec) -> tuple[str, ...]:
+    if operator.kind != "composition":
+        message = f"operator is not a composition: {operator.kind}"
+        raise MaterializationError(message)
+
+    children = operator.semantics.get("children")
+
+    if not isinstance(children, Sequence) or isinstance(children, str):
+        message = "composition operator must declare ordered children"
+        raise MaterializationError(message)
+
+    return _composition_order(children)
+
+
 def _require_composition_components(
     order: tuple[str, ...],
     components: Mapping[str, Callable[[Batch, TensorTree], TensorTree]],
@@ -1239,35 +4130,173 @@ def _require_composition_components(
 
 
 def _run_gradient(execution: StandardExecution) -> TensorTree:
-    _require_single_operator_path(execution)
-    scalar = _scalar_objective(execution.operator, execution.scalar_objectives)
+    if execution.compiled_inner is not None:
+        return execution.compiled_inner()
 
-    def scalar_function(active_params: ParameterTree) -> torch.Tensor:
-        return scalar(
-            active_params,
-            execution.buffers,
-            execution.batch,
-            execution.context,
-        )
-
-    return gradient_anchor(scalar_function, execution.params)
+    return _run_gradient_by_path(execution)
 
 
-def _run_jvp(execution: StandardExecution) -> TensorTree:
+def _run_gradient_by_path(execution: StandardExecution) -> TensorTree:
     _require_path(
         execution.operator.kind,
         execution.path,
-        (JVP_PATH, JVP_FORWARD_AD_PATH),
+        (
+            GRADIENT_PATH,
+            GRADIENT_TORCH_FUNC_PATH,
+            GRADIENT_TORCH_FUNC_VALUE_PATH,
+            GRADIENT_BACKWARD_MATERIALIZED_PATH,
+        ),
     )
-    function = _function_objective(execution.operator, execution.function_objectives)
 
-    def tensor_function(active_params: ParameterTree) -> TensorTree:
-        return function(
-            active_params,
-            execution.buffers,
-            execution.batch,
-            execution.context,
+    scalar_function = _hvp_scalar_function(execution)
+
+    if execution.path == GRADIENT_PATH:
+        return gradient_anchor(scalar_function, execution.params)
+
+    if execution.path == GRADIENT_TORCH_FUNC_PATH:
+        result = torch.func.grad(scalar_function)(execution.params)
+        _require_finite_tree(result, "gradient result")
+
+        return result
+
+    if execution.path == GRADIENT_TORCH_FUNC_VALUE_PATH:
+        result, value = torch.func.grad_and_value(scalar_function)(execution.params)
+        _require_finite_tree(result, "gradient result")
+        _require_gradient_value_reuse(execution, value)
+
+        return result
+
+    return _run_materialized_gradient(execution)
+
+
+def _uses_microbatch_accumulation(execution: StandardExecution) -> bool:
+    return (
+        execution.candidate.settings.get("schedule.gradient_accumulation")
+        == "microbatch_accumulate"
+    )
+
+
+def _run_microbatch_accumulate(
+    execution: StandardExecution,
+) -> TensorTree:
+    if execution.operator.aggregation != "sum":
+        message = "microbatch_accumulate requires sum aggregation"
+        raise MaterializationError(message)
+
+    batch, batch_in_dims = _microbatch_in_dims(execution.batch)
+    batch_size = _per_example_batch_size(
+        batch,
+        batch_in_dims,
+        "microbatch accumulation",
+    )
+    microbatch_size = _data_microbatch_size(execution.candidate.settings)
+    accumulated = None
+
+    for start in range(0, batch_size, microbatch_size):
+        stop = min(start + microbatch_size, batch_size)
+        subbatch = _per_example_batch_slice(batch, batch_in_dims, start, stop)
+        subexecution = dataclasses.replace(
+            execution,
+            batch=subbatch,
+            candidate=dataclasses.replace(
+                execution.candidate,
+                settings=_single_step_microbatch_settings(execution.candidate.settings),
+            ),
         )
+        subresult = _run_standard_operation(subexecution)
+        accumulated = (
+            subresult
+            if accumulated is None
+            else _tree_add_runtime(
+                execution.candidate.settings,
+                accumulated,
+                subresult,
+            )
+        )
+
+    if accumulated is None:
+        message = "microbatch accumulation requires a nonempty batch"
+        raise MaterializationError(message)
+
+    _require_finite_tree(accumulated, "microbatch result")
+
+    return accumulated
+
+
+def _single_step_microbatch_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(settings)
+    result["schedule.gradient_accumulation"] = "single_step"
+    result.pop("batch.data_microbatch_size", None)
+
+    return result
+
+
+def _microbatch_in_dims(batch: Batch) -> tuple[dict[str, Any], dict[str, int | None]]:
+    return _per_example_batch_in_dims(batch, "microbatch accumulation")
+
+
+def _require_gradient_value_reuse(
+    execution: StandardExecution,
+    value: torch.Tensor,
+) -> None:
+    reuse = execution.candidate.settings.get("gradient.value_reuse")
+
+    if reuse is None or reuse == "gradient_only":
+        return
+
+    if reuse != "gradient_and_primal_value":
+        message = f"gradient.value_reuse is unsupported: {reuse}"
+        raise MaterializationError(message)
+
+    if execution.path != GRADIENT_TORCH_FUNC_VALUE_PATH:
+        message = "gradient_and_primal_value requires torch_func_grad_and_value"
+        raise MaterializationError(message)
+
+    _require_finite_tensor(value, "gradient primal value")
+
+
+def _run_materialized_gradient(
+    execution: StandardExecution,
+) -> TensorTree:
+    scalar_function = _hvp_scalar_function(execution)
+    active_params = _grad_enabled_params(execution.params)
+    value = scalar_function(active_params)
+    value.backward()
+    result = _parameter_grad_tree(active_params)
+    _require_finite_tree(result, "gradient result")
+
+    return result
+
+
+def _run_jvp(execution: StandardExecution) -> TensorTree:
+    if execution.compiled_inner is not None:
+        return execution.compiled_inner()
+
+    return _run_jvp_by_path(execution)
+
+
+def _run_jvp_by_path(execution: StandardExecution) -> TensorTree:
+    _require_path(
+        execution.operator.kind,
+        execution.path,
+        (JVP_PATH, JVP_FORWARD_AD_PATH, JVP_LINEARIZE_PATH),
+    )
+    mode = execution.candidate.settings.get("vectorization.mode")
+
+    if mode == "single_loop":
+        return _run_jvp_vector_single_loop(execution)
+
+    if mode == "manual_batch":
+        return _run_jvp_vector_manual_batch(execution)
+
+    if mode == "vmap":
+        return _run_jvp_vector_vmap(execution)
+
+    return _run_jvp_single_vector(execution)
+
+
+def _run_jvp_single_vector(execution: StandardExecution) -> TensorTree:
+    tensor_function = _jvp_tensor_function(execution)
 
     if execution.path == JVP_FORWARD_AD_PATH:
         return forward_ad_jvp_anchor(
@@ -1276,11 +4305,84 @@ def _run_jvp(execution: StandardExecution) -> TensorTree:
             execution.vector,
         )
 
+    if execution.path == JVP_LINEARIZE_PATH:
+        if execution.linearized_jvp is not None:
+            return execution.linearized_jvp(execution.vector)
+
+        _, jvp_function = torch.func.linearize(tensor_function, execution.params)
+
+        return jvp_function(execution.vector)
+
     return jvp_anchor(tensor_function, execution.params, execution.vector)
 
 
-def _run_vjp(execution: StandardExecution) -> TensorTree:
-    _require_single_operator_path(execution)
+def _run_jvp_vector_single_loop(execution: StandardExecution) -> TensorTree:
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+    vector_count = _vector_tree_batch_size(execution.vector, vector_in_dims)
+    results = []
+
+    for index in range(vector_count):
+        vector = _vector_tree_select(execution.vector, vector_in_dims, index)
+        result = _run_jvp_single_vector(dataclasses.replace(execution, vector=vector))
+        results.append(result)
+
+    return _stack_tensor_trees(tuple(results), 0)
+
+
+def _run_jvp_vector_manual_batch(execution: StandardExecution) -> TensorTree:
+    return _run_vector_manual_batches(execution, _run_jvp_vector_single_loop)
+
+
+def _run_jvp_vector_vmap(execution: StandardExecution) -> TensorTree:
+    if execution.path not in JVP_VECTOR_VMAP_PATHS:
+        message = "vectorization.mode=vmap requires a torch.func JVP path"
+        raise MaterializationError(message)
+
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+    chunk_size = _vmap_chunk_size(execution.candidate.settings)
+
+    if execution.path == JVP_LINEARIZE_PATH:
+        if execution.linearized_jvp is not None:
+            jvp_function = execution.linearized_jvp
+        else:
+            _, jvp_function = torch.func.linearize(
+                _jvp_tensor_function(execution),
+                execution.params,
+            )
+
+        return _torch_func_vmap(
+            jvp_function,
+            in_dims=(vector_in_dims,),
+            randomness=execution.candidate.settings["vectorization.randomness"],
+            chunk_size=chunk_size,
+        )(execution.vector)
+
+    tensor_function = _jvp_tensor_function(execution)
+
+    def jvp_function(vector: TensorTree) -> TensorTree:
+        return jvp_anchor(
+            tensor_function,
+            execution.params,
+            vector,
+        )
+
+    return _torch_func_vmap(
+        jvp_function,
+        in_dims=(vector_in_dims,),
+        randomness=execution.candidate.settings["vectorization.randomness"],
+        chunk_size=chunk_size,
+    )(execution.vector)
+
+
+def _jvp_tensor_function(
+    execution: StandardExecution,
+) -> Callable[[ParameterTree], TensorTree]:
     function = _function_objective(execution.operator, execution.function_objectives)
 
     def tensor_function(active_params: ParameterTree) -> TensorTree:
@@ -1291,15 +4393,511 @@ def _run_vjp(execution: StandardExecution) -> TensorTree:
             execution.context,
         )
 
-    return vjp_anchor(tensor_function, execution.params, execution.vector)
+    return tensor_function
 
 
-def _run_hvp(execution: StandardExecution) -> TensorTree:
+def _run_vjp(execution: StandardExecution) -> TensorTree:
+    if execution.compiled_inner is not None:
+        return execution.compiled_inner()
+
+    return _run_vjp_by_path(execution)
+
+
+def _run_vjp_by_path(execution: StandardExecution) -> TensorTree:
     _require_path(
         execution.operator.kind,
         execution.path,
-        (HVP_REFERENCE_PATH, HVP_FUNCTIONAL_PATH, HVP_JVP_GRAD_PATH, VHP_PATH),
+        (
+            VJP_PATH,
+            VJP_AUTOGRAD_OUTPUTS_PATH,
+            VJP_BACKWARD_MATERIALIZED_PATH,
+        ),
     )
+    mode = execution.candidate.settings.get("vectorization.mode")
+
+    if mode == "single_loop":
+        return _run_vjp_vector_single_loop(execution)
+
+    if mode == "manual_batch":
+        return _run_vjp_vector_manual_batch(execution)
+
+    if mode == "vmap":
+        return _run_vjp_vector_vmap(execution)
+
+    return _run_vjp_single_vector(execution)
+
+
+def _run_vjp_single_vector(execution: StandardExecution) -> TensorTree:
+    tensor_function = _vjp_tensor_function(execution)
+
+    if execution.path == VJP_PATH:
+        if execution.vjp_closure is not None:
+            return execution.vjp_closure(execution.vector)
+
+        pullback = _vjp_pullback(
+            tensor_function,
+            execution.params,
+        )
+        (result,) = pullback(execution.vector)
+
+        return result
+
+    return _run_autograd_vjp(execution, tensor_function)
+
+
+def _run_vjp_vector_single_loop(execution: StandardExecution) -> TensorTree:
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+    vector_count = _vector_tree_batch_size(execution.vector, vector_in_dims)
+    results = []
+
+    for index in range(vector_count):
+        vector = _vector_tree_select(execution.vector, vector_in_dims, index)
+        result = _run_vjp_single_vector(dataclasses.replace(execution, vector=vector))
+        results.append(result)
+
+    return _stack_tensor_trees(tuple(results), 0)
+
+
+def _run_vjp_vector_manual_batch(execution: StandardExecution) -> TensorTree:
+    return _run_vector_manual_batches(execution, _run_vjp_vector_single_loop)
+
+
+def _run_vjp_vector_vmap(execution: StandardExecution) -> TensorTree:
+    if execution.path not in VJP_VECTOR_VMAP_PATHS:
+        message = "vectorization.mode=vmap requires torch_func_vjp"
+        raise MaterializationError(message)
+
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+    chunk_size = _vmap_chunk_size(execution.candidate.settings)
+
+    closure = execution.vjp_closure
+
+    if closure is not None:
+
+        def vjp_function(vector: TensorTree) -> TensorTree:
+            return closure(vector)
+
+    else:
+        pullback = _vjp_pullback(
+            _vjp_tensor_function(execution),
+            execution.params,
+        )
+
+        def vjp_function(vector: TensorTree) -> TensorTree:
+            (result,) = pullback(vector)
+
+            return result
+
+    return _torch_func_vmap(
+        vjp_function,
+        in_dims=(vector_in_dims,),
+        randomness=execution.candidate.settings["vectorization.randomness"],
+        chunk_size=chunk_size,
+    )(execution.vector)
+
+
+def _vjp_tensor_function(
+    execution: StandardExecution,
+) -> Callable[[ParameterTree], TensorTree]:
+    function = _function_objective(execution.operator, execution.function_objectives)
+
+    def tensor_function(active_params: ParameterTree) -> TensorTree:
+        return function(
+            active_params,
+            execution.buffers,
+            execution.batch,
+            execution.context,
+        )
+
+    return tensor_function
+
+
+def _vjp_pullback(
+    tensor_function: Callable[[ParameterTree], TensorTree],
+    params: ParameterTree,
+) -> Callable[[TensorTree], tuple[TensorTree]]:
+    vjp_result = torch.func.vjp(tensor_function, params, has_aux=False)
+
+    return vjp_result[1]
+
+
+def _run_autograd_vjp(
+    execution: StandardExecution,
+    tensor_function: Callable[[ParameterTree], TensorTree],
+) -> TensorTree:
+    if execution.path == VJP_AUTOGRAD_OUTPUTS_PATH:
+        return _autograd_grad_outputs_vjp(
+            tensor_function,
+            execution.params,
+            execution.vector,
+        )
+
+    active_params = _grad_enabled_params(execution.params)
+    output = tensor_function(active_params)
+    output_leaves = tree_leaves(output)
+    cotangent_leaves = tree_leaves(
+        tree_map2(
+            lambda out, cotangent: cotangent.reshape_as(out), output, execution.vector
+        )
+    )
+
+    torch.autograd.backward(output_leaves, grad_tensors=cotangent_leaves)
+    result = _parameter_grad_tree(active_params)
+    _require_finite_tree(result, "VJP result")
+
+    return result
+
+
+def _autograd_grad_outputs_vjp(
+    tensor_function: Callable[[ParameterTree], TensorTree],
+    params: ParameterTree,
+    cotangent: TensorTree,
+) -> TensorTree:
+    active_params = _grad_enabled_params(params)
+    output = tensor_function(active_params)
+    output_leaves = tree_leaves(output)
+    cotangent_leaves = tree_leaves(
+        tree_map2(lambda out, cotangent: cotangent.reshape_as(out), output, cotangent)
+    )
+    gradients = torch.autograd.grad(
+        output_leaves,
+        tuple(active_params.values()),
+        grad_outputs=cotangent_leaves,
+        allow_unused=True,
+    )
+    result = tree_from_leaves(
+        active_params,
+        tuple(
+            torch.zeros_like(param) if gradient is None else gradient.detach()
+            for param, gradient in zip(active_params.values(), gradients, strict=True)
+        ),
+    )
+    _require_finite_tree(result, "VJP result")
+
+    return result
+
+
+def _run_hvp(execution: StandardExecution) -> TensorTree:
+    if execution.compiled_inner is not None:
+        return execution.compiled_inner()
+
+    return _run_hvp_by_path(execution)
+
+
+def _run_hvp_by_path(execution: StandardExecution) -> TensorTree:
+    _require_path(
+        execution.operator.kind,
+        execution.path,
+        (
+            HVP_REFERENCE_PATH,
+            HVP_FUNCTIONAL_PATH,
+            HVP_JVP_GRAD_PATH,
+            HVP_FORWARD_AD_PATH,
+            HVP_LINEARIZE_GRAD_PATH,
+            VHP_PATH,
+        ),
+    )
+    mode = execution.candidate.settings.get("vectorization.mode")
+
+    if mode == "single_loop":
+        return _run_hvp_vector_single_loop(execution)
+
+    if mode == "manual_batch":
+        return _run_hvp_vector_manual_batch(execution)
+
+    if mode == "vmap":
+        return _run_hvp_vector_vmap(execution)
+
+    return _run_hvp_single_vector(execution)
+
+
+def _run_hvp_single_vector(execution: StandardExecution) -> TensorTree:
+    scalar_function = _hvp_scalar_function(execution)
+
+    if execution.path == HVP_REFERENCE_PATH:
+        result = hvp_reverse_over_reverse_anchor(
+            scalar_function,
+            execution.params,
+            execution.vector,
+        )
+    elif execution.path == HVP_FUNCTIONAL_PATH:
+        result = hvp_anchor(scalar_function, execution.params, execution.vector)
+    elif execution.path == VHP_PATH:
+        result = _run_hvp_vhp_path(execution)
+    elif execution.path == HVP_FORWARD_AD_PATH:
+        result = _run_hvp_forward_ad_path(execution)
+    elif execution.path == HVP_LINEARIZE_GRAD_PATH:
+        if execution.linearized_hvp is not None:
+            result = execution.linearized_hvp(execution.vector)
+        else:
+            gradient_function = torch.func.grad(scalar_function)
+            _, hvp_function = torch.func.linearize(
+                gradient_function,
+                execution.params,
+            )
+            result = hvp_function(execution.vector)
+    else:
+        result = hvp_jvp_grad_anchor(
+            scalar_function,
+            execution.params,
+            execution.vector,
+        )
+
+    return result
+
+
+def _run_hvp_vector_single_loop(execution: StandardExecution) -> TensorTree:
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+    vector_count = _vector_tree_batch_size(execution.vector, vector_in_dims)
+
+    if _hvp_uses_reverse_reuse(execution.candidate.settings):
+        return _run_hvp_reused_reverse_vectors(
+            execution,
+            vector_in_dims,
+            vector_count,
+        )
+
+    results = []
+
+    for index in range(vector_count):
+        vector = _vector_tree_select(execution.vector, vector_in_dims, index)
+        result = _run_hvp_single_vector(dataclasses.replace(execution, vector=vector))
+        results.append(result)
+
+    return _stack_tensor_trees(tuple(results), 0)
+
+
+def _run_hvp_vector_manual_batch(execution: StandardExecution) -> TensorTree:
+    return _run_vector_manual_batches(execution, _run_hvp_vector_single_loop)
+
+
+def _run_vector_manual_batches(
+    execution: StandardExecution,
+    runner: Callable[[StandardExecution], TensorTree],
+) -> TensorTree:
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+    vector_count = _vector_tree_batch_size(execution.vector, vector_in_dims)
+    batch_size = _manual_vector_batch_size(execution.candidate.settings)
+    results = []
+
+    for start in range(0, vector_count, batch_size):
+        stop = min(start + batch_size, vector_count)
+        vector = _vector_tree_slice(execution.vector, vector_in_dims, start, stop)
+        result = runner(dataclasses.replace(execution, vector=vector))
+        results.append(result)
+
+    return _cat_tensor_trees(tuple(results), 0)
+
+
+def _run_vector_single_loop(
+    execution: StandardExecution,
+    runner: Callable[[StandardExecution], TensorTree],
+) -> TensorTree:
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+    vector_count = _vector_tree_batch_size(execution.vector, vector_in_dims)
+    results = []
+
+    for index in range(vector_count):
+        vector = _vector_tree_select(execution.vector, vector_in_dims, index)
+        result = runner(dataclasses.replace(execution, vector=vector))
+        results.append(result)
+
+    return _stack_tensor_trees(tuple(results), 0)
+
+
+def _hvp_uses_reverse_reuse(settings: Mapping[str, Any]) -> bool:
+    return (
+        settings.get("hvp.graph_schedule") == "retain_graph_across_vectors"
+        or settings.get("hvp.primal_reuse") == "reuse_primal"
+    )
+
+
+def _run_hvp_reused_reverse_vectors(
+    execution: StandardExecution,
+    vector_in_dims: Any,
+    vector_count: int,
+) -> TensorTree:
+    scalar_function = _hvp_scalar_function(execution)
+    active_params = _grad_enabled_params(execution.params)
+    value = scalar_function(active_params)
+    retain_gradient_graph = (
+        execution.candidate.settings.get("hvp.graph_schedule")
+        == "retain_graph_across_vectors"
+    )
+
+    if retain_gradient_graph:
+        return _run_hvp_reused_gradient_graph_vectors(
+            execution,
+            active_params,
+            value,
+            vector_in_dims,
+            vector_count,
+        )
+
+    return _run_hvp_reused_primal_vectors(
+        execution,
+        active_params,
+        value,
+        vector_in_dims,
+        vector_count,
+    )
+
+
+def _run_hvp_reused_gradient_graph_vectors(
+    execution: StandardExecution,
+    active_params: ParameterTree,
+    value: torch.Tensor,
+    vector_in_dims: Any,
+    vector_count: int,
+) -> TensorTree:
+    gradient_tree = _hvp_gradient_tree(
+        active_params,
+        value,
+        retain_graph=True,
+    )
+    results = []
+
+    for index in range(vector_count):
+        vector = _vector_tree_select(execution.vector, vector_in_dims, index)
+        result = _hvp_from_gradient_tree(
+            active_params,
+            gradient_tree,
+            vector,
+            execution.candidate.settings,
+            retain_graph=index != vector_count - 1,
+        )
+        results.append(result)
+
+    return _stack_tensor_trees(tuple(results), 0)
+
+
+def _run_hvp_reused_primal_vectors(
+    execution: StandardExecution,
+    active_params: ParameterTree,
+    value: torch.Tensor,
+    vector_in_dims: Any,
+    vector_count: int,
+) -> TensorTree:
+    results = []
+
+    for index in range(vector_count):
+        vector = _vector_tree_select(execution.vector, vector_in_dims, index)
+        gradient_tree = _hvp_gradient_tree(
+            active_params,
+            value,
+            retain_graph=index != vector_count - 1,
+        )
+        result = _hvp_from_gradient_tree(
+            active_params,
+            gradient_tree,
+            vector,
+            execution.candidate.settings,
+            retain_graph=False,
+        )
+        results.append(result)
+
+    return _stack_tensor_trees(tuple(results), 0)
+
+
+def _hvp_gradient_tree(
+    active_params: ParameterTree,
+    value: torch.Tensor,
+    *,
+    retain_graph: bool,
+) -> TensorTree:
+    leaves = tuple(active_params.values())
+    gradient_leaves = torch.autograd.grad(
+        value,
+        leaves,
+        create_graph=True,
+        retain_graph=retain_graph,
+        allow_unused=True,
+    )
+
+    return tree_from_leaves(
+        active_params,
+        tuple(
+            torch.zeros_like(leaf) if gradient is None else gradient
+            for leaf, gradient in zip(leaves, gradient_leaves, strict=True)
+        ),
+    )
+
+
+def _hvp_from_gradient_tree(
+    active_params: ParameterTree,
+    gradient_tree: TensorTree,
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+    *,
+    retain_graph: bool,
+) -> TensorTree:
+    leaves = tuple(active_params.values())
+    dot = _tree_dot_runtime(settings, gradient_tree, vector)
+    hvp_leaves = torch.autograd.grad(
+        dot,
+        leaves,
+        retain_graph=retain_graph,
+        allow_unused=True,
+    )
+
+    return tree_from_leaves(
+        active_params,
+        tuple(
+            torch.zeros_like(leaf) if hvp is None else hvp.detach()
+            for leaf, hvp in zip(leaves, hvp_leaves, strict=True)
+        ),
+    )
+
+
+def _run_hvp_vector_vmap(execution: StandardExecution) -> TensorTree:
+    if execution.path not in HVP_VECTOR_VMAP_PATHS:
+        message = "vectorization.mode=vmap requires linearize_grad HVP"
+        raise MaterializationError(message)
+
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+    chunk_size = _vmap_chunk_size(execution.candidate.settings)
+
+    if execution.linearized_hvp is not None:
+        hvp_function = execution.linearized_hvp
+    else:
+        gradient_function = torch.func.grad(_hvp_scalar_function(execution))
+        _, hvp_function = torch.func.linearize(
+            gradient_function,
+            execution.params,
+        )
+
+    return _torch_func_vmap(
+        hvp_function,
+        in_dims=(vector_in_dims,),
+        randomness=execution.candidate.settings["vectorization.randomness"],
+        chunk_size=chunk_size,
+    )(execution.vector)
+
+
+def _hvp_scalar_function(
+    execution: StandardExecution,
+) -> Callable[[ParameterTree], torch.Tensor]:
+    if execution.compiled_scalar_function is not None:
+        return execution.compiled_scalar_function
+
     scalar = _scalar_objective(execution.operator, execution.scalar_objectives)
 
     def scalar_function(active_params: ParameterTree) -> torch.Tensor:
@@ -1310,29 +4908,68 @@ def _run_hvp(execution: StandardExecution) -> TensorTree:
             execution.context,
         )
 
-    if execution.path == HVP_REFERENCE_PATH:
-        return hvp_reverse_over_reverse_anchor(
-            scalar_function,
-            execution.params,
-            execution.vector,
+    return scalar_function
+
+
+def _run_hvp_forward_ad_path(
+    execution: StandardExecution,
+) -> TensorTree:
+    scalar_function = _hvp_scalar_function(execution)
+
+    def gradient_function(active_params: ParameterTree) -> TensorTree:
+        active_leaves = tree_leaves(active_params)
+        value = scalar_function(active_params)
+        gradients = torch.autograd.grad(
+            value,
+            active_leaves,
+            allow_unused=True,
+            create_graph=True,
         )
 
-    if execution.path == HVP_FUNCTIONAL_PATH:
-        return hvp_anchor(scalar_function, execution.params, execution.vector)
+        return tree_from_leaves(
+            active_params,
+            tuple(
+                torch.zeros_like(leaf) if gradient is None else gradient
+                for leaf, gradient in zip(active_leaves, gradients, strict=True)
+            ),
+        )
 
-    if execution.path == VHP_PATH:
-        return _run_hvp_vhp_path(execution, scalar)
+    primal_params = _grad_enabled_params(execution.params)
+    vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
 
-    return hvp_jvp_grad_anchor(scalar_function, execution.params, execution.vector)
+    with torch.autograd.forward_ad.dual_level():
+        dual_params = {
+            name: torch.autograd.forward_ad.make_dual(param, vector)
+            for (name, param), vector in zip(
+                primal_params.items(),
+                vector_leaves,
+                strict=True,
+            )
+        }
+        dual_gradients = gradient_function(dual_params)
+
+        def tangent_leaf(output: torch.Tensor) -> torch.Tensor:
+            primal, tangent = torch.autograd.forward_ad.unpack_dual(output)
+
+            if tangent is None:
+                return torch.zeros_like(primal)
+
+            return tangent
+
+        result = tree_map(tangent_leaf, dual_gradients)
+
+    _require_finite_tree(result, "HVP result")
+
+    return result
 
 
 def _run_hvp_vhp_path(
     execution: StandardExecution,
-    scalar: ScalarObjective,
 ) -> TensorTree:
     parameter_items = tuple(execution.params.items())
     vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
     parameter_leaves = tuple(tensor for _, tensor in parameter_items)
+    compiled_scalar_function = _hvp_scalar_function(execution)
 
     def scalar_function(*active_leaves: torch.Tensor) -> torch.Tensor:
         active_params = {
@@ -1340,12 +4977,7 @@ def _run_hvp_vhp_path(
             for (name, _), active in zip(parameter_items, active_leaves, strict=True)
         }
 
-        return scalar(
-            active_params,
-            execution.buffers,
-            execution.batch,
-            execution.context,
-        )
+        return compiled_scalar_function(active_params)
 
     _, result_leaves = torch.autograd.functional.vhp(
         scalar_function,
@@ -1357,14 +4989,47 @@ def _run_hvp_vhp_path(
 
 
 def _run_ggnvp(execution: StandardExecution) -> TensorTree:
+    if (
+        execution.compiled_inner is not None
+        and execution.candidate.settings.get("compile.boundary") == "ggn_full_product"
+    ):
+        return execution.compiled_inner()
+
+    return _run_ggnvp_by_path(execution)
+
+
+def _run_ggnvp_by_path(execution: StandardExecution) -> TensorTree:
     _require_path(
         execution.operator.kind,
         execution.path,
-        (GGN_DENSE_PATH, GGN_JVP_HESSIAN_VJP_PATH),
+        (
+            GGN_DENSE_PATH,
+            GGN_JVP_HESSIAN_VJP_PATH,
+            GGN_FORWARD_AD_HESSIAN_VJP_PATH,
+            GGN_LINEARIZE_HESSIAN_VJP_PATH,
+        ),
     )
     _ggn_loss_geometry(execution.operator)
+    mode = execution.candidate.settings.get("vectorization.mode")
 
-    if execution.path == GGN_JVP_HESSIAN_VJP_PATH:
+    if mode == "single_loop":
+        return _run_ggnvp_vector_single_loop(execution)
+
+    if mode == "manual_batch":
+        return _run_ggnvp_vector_manual_batch(execution)
+
+    if mode == "vmap":
+        return _run_ggnvp_vector_vmap(execution)
+
+    return _run_ggnvp_single_vector(execution)
+
+
+def _run_ggnvp_single_vector(execution: StandardExecution) -> TensorTree:
+    if execution.path in {
+        GGN_JVP_HESSIAN_VJP_PATH,
+        GGN_FORWARD_AD_HESSIAN_VJP_PATH,
+        GGN_LINEARIZE_HESSIAN_VJP_PATH,
+    }:
         return _run_ggnvp_jvp_hessian_vjp(execution)
 
     function = _function_objective(execution.operator, execution.function_objectives)
@@ -1402,15 +5067,149 @@ def _run_ggnvp(execution: StandardExecution) -> TensorTree:
         output.numel(),
     )
     _require_finite_tensor(jacobian, "GGN jacobian")
-    result = jacobian.T @ (loss_hessian @ (jacobian @ vector_tensor.reshape(-1)))
+    output_vector = _matmul_runtime(
+        execution.candidate.settings,
+        jacobian,
+        vector_tensor.reshape(-1),
+    )
+    loss_vector = _matmul_runtime(
+        execution.candidate.settings,
+        loss_hessian,
+        output_vector,
+    )
+    result = _matmul_runtime(execution.candidate.settings, jacobian.T, loss_vector)
     _require_finite_tensor(result, "GGN result")
 
     return _wrap_flat_vector(execution.params, result)
 
 
-def _run_ggnvp_jvp_hessian_vjp(execution: StandardExecution) -> TensorTree:
-    function = _function_objective(execution.operator, execution.function_objectives)
+def _run_ggnvp_vector_single_loop(execution: StandardExecution) -> TensorTree:
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+    vector_count = _vector_tree_batch_size(execution.vector, vector_in_dims)
+    results = []
+
+    for index in range(vector_count):
+        vector = _vector_tree_select(execution.vector, vector_in_dims, index)
+        result = _run_ggnvp_single_vector(
+            dataclasses.replace(
+                execution,
+                vector=vector,
+                compiled_inner=None,
+                compiled_ggn_loss_product=None,
+                compiled_ggn_vjp=None,
+            )
+        )
+        results.append(result)
+
+    return _stack_tensor_trees(tuple(results), 0)
+
+
+def _run_ggnvp_vector_manual_batch(execution: StandardExecution) -> TensorTree:
+    return _run_vector_manual_batches(execution, _run_ggnvp_vector_single_loop)
+
+
+def _run_ggnvp_vector_vmap(execution: StandardExecution) -> TensorTree:
+    if execution.path not in GGN_VECTOR_VMAP_PATHS:
+        message = "vectorization.mode=vmap requires a torch.func GGN JVP path"
+        raise MaterializationError(message)
+
+    if execution.candidate.settings.get("ggn.vjp_path") != "torch_func_vjp":
+        message = "vectorization.mode=vmap requires ggn.vjp_path=torch_func_vjp"
+        raise MaterializationError(message)
+
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+    chunk_size = _vmap_chunk_size(execution.candidate.settings)
+    tensor_function = _ggn_tensor_function(execution)
+    output = tensor_function(execution.params)
+    _require_finite_tree(output, "GGN output")
+    _require_ggn_loss_hessian_vector_vmap_inputs(execution, output)
+
+    if execution.path == GGN_LINEARIZE_HESSIAN_VJP_PATH:
+        _, jvp_function = torch.func.linearize(tensor_function, execution.params)
+    else:
+
+        def jvp_function(vector: TensorTree) -> TensorTree:
+            return jvp_anchor(tensor_function, execution.params, vector)
+
+    pullback = _vjp_pullback(tensor_function, execution.params)
+
+    def ggn_function(vector: TensorTree) -> TensorTree:
+        output_jvp = jvp_function(vector)
+        output_cotangent = _ggn_loss_hessian_product_unchecked(
+            execution,
+            output,
+            output_jvp,
+        )
+        (result,) = pullback(output_cotangent)
+
+        return result
+
+    result = _torch_func_vmap(
+        ggn_function,
+        in_dims=(vector_in_dims,),
+        randomness=execution.candidate.settings["vectorization.randomness"],
+        chunk_size=chunk_size,
+    )(execution.vector)
+    _require_finite_tree(result, "GGN result")
+
+    return result
+
+
+def _require_ggn_loss_hessian_vector_vmap_inputs(
+    execution: StandardExecution,
+    output: TensorTree,
+) -> None:
+    if (
+        execution.candidate.settings.get("ggn.loss_hessian_path")
+        == "closed_form_softmax_ce_kl"
+    ):
+        return
+
+    flat_output = _flatten_vector(output)
     loss_hessian = _batch_tensor(execution.batch, "loss_hessian")
+    _require_loss_hessian_shape(loss_hessian, flat_output.numel())
+    _require_finite_tensor(loss_hessian, "loss_hessian")
+
+
+def _run_ggnvp_jvp_hessian_vjp(execution: StandardExecution) -> TensorTree:
+    tensor_function = _ggn_tensor_function(execution)
+    output = tensor_function(execution.params)
+    output_jvp = _ggn_output_jvp(execution, tensor_function)
+
+    if _ggn_recomputes_jvp(execution.candidate.settings):
+        output_jvp = _ggn_output_jvp(execution, tensor_function)
+
+    output_cotangent = _ggn_loss_hessian_product(
+        execution,
+        output,
+        output_jvp,
+    )
+
+    if _ggn_recomputes_output_cotangent(execution.candidate.settings):
+        output_cotangent = _ggn_loss_hessian_product(
+            execution,
+            output,
+            output_jvp,
+        )
+
+    _require_finite_tree(output_cotangent, "GGN output cotangent")
+
+    result = _run_ggnvp_vjp(execution, tensor_function, output_cotangent)
+    _require_finite_tree(result, "GGN result")
+
+    return result
+
+
+def _ggn_tensor_function(
+    execution: StandardExecution,
+) -> Callable[[ParameterTree], TensorTree]:
+    function = _function_objective(execution.operator, execution.function_objectives)
 
     def tensor_function(active_params: ParameterTree) -> TensorTree:
         return function(
@@ -1420,22 +5219,334 @@ def _run_ggnvp_jvp_hessian_vjp(execution: StandardExecution) -> TensorTree:
             execution.context,
         )
 
+    return tensor_function
+
+
+def _ggn_loss_product_warm_inputs(
+    execution: StandardExecution,
+) -> tuple[TensorTree, TensorTree]:
+    tensor_function = _ggn_tensor_function(execution)
     output = tensor_function(execution.params)
-    output_jvp = jvp_anchor(tensor_function, execution.params, execution.vector)
+    output_jvp = _ggn_output_jvp_by_path(execution, tensor_function)
+
+    return output, output_jvp
+
+
+def _ggn_vjp_warm_input(execution: StandardExecution) -> TensorTree:
+    output, output_jvp = _ggn_loss_product_warm_inputs(execution)
+
+    return _ggn_loss_hessian_product_by_path(execution, output, output_jvp)
+
+
+def _ggn_output_jvp(
+    execution: StandardExecution,
+    tensor_function: Callable[[ParameterTree], TensorTree],
+) -> TensorTree:
+    if (
+        execution.compiled_inner is not None
+        and execution.candidate.settings.get("compile.boundary") == "ggn_jvp"
+    ):
+        return execution.compiled_inner()
+
+    return _ggn_output_jvp_by_path(execution, tensor_function)
+
+
+def _ggn_output_jvp_by_path(
+    execution: StandardExecution,
+    tensor_function: Callable[[ParameterTree], TensorTree],
+) -> TensorTree:
+    if execution.path == GGN_LINEARIZE_HESSIAN_VJP_PATH:
+        _, jvp_function = torch.func.linearize(tensor_function, execution.params)
+
+        return jvp_function(execution.vector)
+
+    if execution.path == GGN_FORWARD_AD_HESSIAN_VJP_PATH:
+        return forward_ad_jvp_anchor(
+            tensor_function,
+            execution.params,
+            execution.vector,
+        )
+
+    return jvp_anchor(tensor_function, execution.params, execution.vector)
+
+
+def _ggn_recomputes_jvp(settings: Mapping[str, Any]) -> bool:
+    return settings.get("ggn.jvp_reuse") == "recompute_jvp"
+
+
+def _ggn_recomputes_output_cotangent(settings: Mapping[str, Any]) -> bool:
+    return settings.get("ggn.cotangent_reuse") == "recompute_output_cotangent"
+
+
+def _ggn_loss_hessian_product(
+    execution: StandardExecution,
+    output: TensorTree,
+    output_jvp: TensorTree,
+) -> TensorTree:
+    if (
+        execution.compiled_ggn_loss_product is not None
+        and execution.candidate.settings.get("compile.boundary")
+        == "ggn_loss_hessian_product"
+    ):
+        return execution.compiled_ggn_loss_product(output, output_jvp)
+
+    return _ggn_loss_hessian_product_by_path(execution, output, output_jvp)
+
+
+def _ggn_loss_hessian_product_by_path(
+    execution: StandardExecution,
+    output: TensorTree,
+    output_jvp: TensorTree,
+) -> TensorTree:
+    path = execution.candidate.settings.get("ggn.loss_hessian_path")
+
+    if path == "closed_form_softmax_ce_kl":
+        return _ggn_closed_form_softmax_ce_kl_product(
+            execution.candidate.settings,
+            output,
+            output_jvp,
+        )
+
     flat_output_jvp = _flatten_vector(output_jvp)
+    loss_hessian = _batch_tensor(execution.batch, "loss_hessian")
     _require_loss_hessian_shape(loss_hessian, flat_output_jvp.numel())
     _require_finite_tensor(loss_hessian, "loss_hessian")
     _require_finite_tensor(flat_output_jvp, "GGN output JVP")
-    output_cotangent = _wrap_flat_vector(
+
+    return _wrap_flat_vector(
         output,
-        loss_hessian @ flat_output_jvp.reshape(-1),
+        _matmul_runtime(
+            execution.candidate.settings,
+            loss_hessian,
+            flat_output_jvp.reshape(-1),
+        ),
     )
-    _require_finite_tree(output_cotangent, "GGN output cotangent")
 
-    result = vjp_anchor(tensor_function, execution.params, output_cotangent)
-    _require_finite_tree(result, "GGN result")
 
-    return result
+def _ggn_loss_hessian_product_unchecked(
+    execution: StandardExecution,
+    output: TensorTree,
+    output_jvp: TensorTree,
+) -> TensorTree:
+    path = execution.candidate.settings.get("ggn.loss_hessian_path")
+
+    if path == "closed_form_softmax_ce_kl":
+        return _ggn_closed_form_softmax_ce_kl_product_unchecked(
+            execution.candidate.settings,
+            output,
+            output_jvp,
+        )
+
+    flat_output_jvp = _flatten_vector(output_jvp)
+    loss_hessian = _batch_tensor(execution.batch, "loss_hessian")
+
+    return _wrap_flat_vector(
+        output,
+        _matmul_runtime(
+            execution.candidate.settings,
+            loss_hessian,
+            flat_output_jvp.reshape(-1),
+        ),
+    )
+
+
+def _ggn_closed_form_softmax_ce_kl_product(
+    settings: Mapping[str, Any],
+    output: TensorTree,
+    output_jvp: TensorTree,
+) -> TensorTree:
+    if not isinstance(output, torch.Tensor) or not isinstance(output_jvp, torch.Tensor):
+        message = "closed-form CE/KL GGN requires tensor logits and tensor JVP"
+        raise MaterializationError(message)
+
+    if output.shape != output_jvp.shape:
+        message = "closed-form CE/KL logits and JVP shapes must match"
+        raise MaterializationError(message)
+
+    if output.ndim == 0:
+        message = "closed-form CE/KL logits must have a class dimension"
+        raise MaterializationError(message)
+
+    _require_finite_tensor(output, "GGN logits")
+    _require_finite_tensor(output_jvp, "GGN output JVP")
+    kernel = settings.get("ggn.loss_hessian_kernel")
+
+    if kernel == "dense_global":
+        return _softmax_ce_kl_product_dense_global(settings, output, output_jvp)
+
+    if kernel == "streaming_global":
+        return _softmax_ce_kl_product_streaming_global(settings, output, output_jvp)
+
+    if kernel == "two_pass_chunked_global":
+        block_size = _class_block_size_with_exact_global_normalization(settings)
+
+        return _softmax_ce_kl_product_two_pass_chunked_global(
+            settings,
+            output,
+            output_jvp,
+            block_size,
+        )
+
+    message = f"ggn.loss_hessian_kernel is unsupported: {kernel}"
+    raise MaterializationError(message)
+
+
+def _ggn_closed_form_softmax_ce_kl_product_unchecked(
+    settings: Mapping[str, Any],
+    output: TensorTree,
+    output_jvp: TensorTree,
+) -> TensorTree:
+    if not isinstance(output, torch.Tensor) or not isinstance(output_jvp, torch.Tensor):
+        message = "closed-form CE/KL GGN requires tensor logits and tensor JVP"
+        raise MaterializationError(message)
+
+    if output.shape != output_jvp.shape:
+        message = "closed-form CE/KL logits and JVP shapes must match"
+        raise MaterializationError(message)
+
+    if output.ndim == 0:
+        message = "closed-form CE/KL logits must have a class dimension"
+        raise MaterializationError(message)
+
+    kernel = settings.get("ggn.loss_hessian_kernel")
+
+    if kernel == "dense_global":
+        return _softmax_ce_kl_product_dense_global(settings, output, output_jvp)
+
+    if kernel == "streaming_global":
+        return _softmax_ce_kl_product_streaming_global(settings, output, output_jvp)
+
+    if kernel == "two_pass_chunked_global":
+        block_size = _class_block_size_with_exact_global_normalization(settings)
+
+        return _softmax_ce_kl_product_two_pass_chunked_global(
+            settings,
+            output,
+            output_jvp,
+            block_size,
+        )
+
+    message = f"ggn.loss_hessian_kernel is unsupported: {kernel}"
+    raise MaterializationError(message)
+
+
+def _softmax_ce_kl_product_dense_global(
+    settings: Mapping[str, Any],
+    logits: torch.Tensor,
+    tangent: torch.Tensor,
+) -> torch.Tensor:
+    probabilities = torch.softmax(logits, dim=-1)
+    runtime_probabilities = _accumulation_tensor(probabilities, settings)
+    runtime_tangent = _accumulation_tensor(tangent, settings)
+    mean_tangent = (runtime_probabilities * runtime_tangent).sum(
+        dim=-1,
+        keepdim=True,
+    )
+
+    return runtime_probabilities * (runtime_tangent - mean_tangent)
+
+
+def _softmax_ce_kl_product_streaming_global(
+    settings: Mapping[str, Any],
+    logits: torch.Tensor,
+    tangent: torch.Tensor,
+) -> torch.Tensor:
+    max_logits = logits.max(dim=-1, keepdim=True).values
+    unnormalized = _accumulation_tensor((logits - max_logits).exp(), settings)
+    runtime_tangent = _accumulation_tensor(tangent, settings)
+    denominator = unnormalized.sum(dim=-1, keepdim=True)
+    probabilities = unnormalized / denominator
+    mean_tangent = (probabilities * runtime_tangent).sum(dim=-1, keepdim=True)
+
+    return probabilities * (runtime_tangent - mean_tangent)
+
+
+def _softmax_ce_kl_product_two_pass_chunked_global(
+    settings: Mapping[str, Any],
+    logits: torch.Tensor,
+    tangent: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    chunks = torch.split(logits, block_size, dim=-1)
+    tangent_chunks = torch.split(tangent, block_size, dim=-1)
+    max_logits = chunks[0].max(dim=-1, keepdim=True).values
+
+    for chunk in chunks[1:]:
+        max_logits = torch.maximum(max_logits, chunk.max(dim=-1, keepdim=True).values)
+
+    accumulator_template = _accumulation_tensor(max_logits, settings)
+    denominator = torch.zeros_like(accumulator_template)
+    weighted_tangent_sum = torch.zeros_like(accumulator_template)
+
+    for chunk, tangent_chunk in zip(chunks, tangent_chunks, strict=True):
+        unnormalized = _accumulation_tensor((chunk - max_logits).exp(), settings)
+        runtime_tangent_chunk = _accumulation_tensor(tangent_chunk, settings)
+        denominator = denominator + unnormalized.sum(dim=-1, keepdim=True)
+        weighted_tangent_sum = weighted_tangent_sum + (
+            unnormalized * runtime_tangent_chunk
+        ).sum(dim=-1, keepdim=True)
+
+    mean_tangent = weighted_tangent_sum / denominator
+    outputs = []
+
+    for chunk, tangent_chunk in zip(chunks, tangent_chunks, strict=True):
+        unnormalized = _accumulation_tensor((chunk - max_logits).exp(), settings)
+        runtime_tangent_chunk = _accumulation_tensor(tangent_chunk, settings)
+        probabilities = unnormalized / denominator
+        outputs.append(probabilities * (runtime_tangent_chunk - mean_tangent))
+
+    return torch.cat(tuple(outputs), dim=-1)
+
+
+def _class_block_size_with_exact_global_normalization(
+    settings: Mapping[str, Any],
+) -> int:
+    key = "chunk.class_block_size_with_exact_global_normalization"
+    value = settings.get(key)
+
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        message = f"{key} must be a positive integer"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _run_ggnvp_vjp(
+    execution: StandardExecution,
+    tensor_function: Callable[[ParameterTree], TensorTree],
+    output_cotangent: TensorTree,
+) -> TensorTree:
+    if (
+        execution.compiled_ggn_vjp is not None
+        and execution.candidate.settings.get("compile.boundary") == "ggn_vjp"
+    ):
+        return execution.compiled_ggn_vjp(output_cotangent)
+
+    return _run_ggnvp_vjp_by_path(execution, tensor_function, output_cotangent)
+
+
+def _run_ggnvp_vjp_by_path(
+    execution: StandardExecution,
+    tensor_function: Callable[[ParameterTree], TensorTree],
+    output_cotangent: TensorTree,
+) -> TensorTree:
+    path = execution.candidate.settings.get("ggn.vjp_path")
+
+    if path == "torch_func_vjp":
+        pullback = _vjp_pullback(tensor_function, execution.params)
+        (result,) = pullback(output_cotangent)
+
+        return result
+
+    if path == "autograd_grad_outputs":
+        return _autograd_grad_outputs_vjp(
+            tensor_function,
+            execution.params,
+            output_cotangent,
+        )
+
+    message = f"ggn.vjp_path is unsupported: {path}"
+    raise MaterializationError(message)
 
 
 def _dense_jacobian_tree(
@@ -1468,208 +5579,313 @@ def _run_fisher_vp(execution: StandardExecution) -> TensorTree:
         execution.path,
         (
             FISHER_DENSE_PATH,
-            FISHER_CATEGORICAL_EXACT_PATH,
-            FISHER_CATEGORICAL_MC_PATH,
             FISHER_SCORE_GRADIENT_LOOP_PATH,
+            FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+            FISHER_SCORE_GRADIENT_VMAP_PATH,
+            FISHER_BACKWARD_MATERIALIZED_PATH,
+            FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
         ),
     )
+    mode = execution.candidate.settings.get("vectorization.mode")
 
-    if execution.path == FISHER_CATEGORICAL_EXACT_PATH:
-        score_gradients = _categorical_fisher_gradient_matrix(execution)
-    elif execution.path == FISHER_CATEGORICAL_MC_PATH:
-        score_gradients = _categorical_monte_carlo_fisher_gradient_matrix(execution)
-    elif execution.path == FISHER_SCORE_GRADIENT_LOOP_PATH:
+    if mode == "single_loop":
+        return _run_fisher_vp_vector_single_loop(execution)
+
+    if mode == "manual_batch":
+        return _run_fisher_vp_vector_manual_batch(execution)
+
+    if mode == "vmap":
+        return _run_fisher_vp_vector_vmap(execution)
+
+    return _run_fisher_vp_single_vector(execution)
+
+
+def _run_fisher_vp_single_vector(execution: StandardExecution) -> TensorTree:
+
+    if execution.path in {
+        FISHER_SCORE_GRADIENT_LOOP_PATH,
+        FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        FISHER_SCORE_GRADIENT_VMAP_PATH,
+        FISHER_BACKWARD_MATERIALIZED_PATH,
+    }:
         _require_explicit_score_fisher_semantics(execution.operator)
-        score_gradients = _per_example_gradient_matrix(execution)
+        score_gradients = _fisher_score_gradients(execution)
+    elif execution.path == FISHER_BLOCKWISE_SCORE_MATRIX_PATH:
+        _require_valid_fisher_semantics(execution.operator)
+
+        return _run_blockwise_score_matrix_product(
+            execution,
+            "score_gradient_blocks",
+            _fisher_normalization(execution),
+            "score_gradients",
+        )
     else:
         _require_valid_fisher_semantics(execution.operator)
         score_gradients = _batch_tensor(execution.batch, "score_gradients")
 
+    score_gradients = _loss_scaled_score_matrix(execution, score_gradients)
     vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
     vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
     _require_finite_tensor(score_gradients, "score_gradients")
     _require_finite_tensor(vector_tensor, "Fisher vector")
-    result = fisher_vp_dense_anchor(
+    result = _score_matrix_product(
         score_gradients,
         vector_tensor,
-        normalization=_fisher_normalization(execution),
+        _fisher_normalization(execution),
+        execution.candidate.settings,
     )
     _require_finite_tensor(result, "Fisher result")
 
     return _wrap_flat_vector(execution.params, result)
 
 
-def _categorical_fisher_gradient_matrix(execution: StandardExecution) -> torch.Tensor:
-    _require_fisher_semantics(
-        execution.operator,
-        {
-            "distribution": "categorical",
-            "label_policy": "model_distribution",
-            "expectation": "exact",
-            "sample_space": "classes",
-            "loss_reduction": "log_prob",
-        },
-    )
-    function = _function_objective(execution.operator, execution.function_objectives)
-    parameter_items = tuple(execution.params.items())
-    active_leaves = tuple(
-        tensor.detach().clone().requires_grad_(True) for _, tensor in parameter_items
-    )
+def _run_fisher_vp_vector_single_loop(execution: StandardExecution) -> TensorTree:
+    return _run_vector_single_loop(execution, _run_fisher_vp_single_vector)
 
-    def logits_function(*leaves: torch.Tensor) -> torch.Tensor:
-        active_params = {
-            name: leaf for (name, _), leaf in zip(parameter_items, leaves, strict=True)
-        }
-        logits = function(
-            active_params,
-            execution.buffers,
-            execution.batch,
-            execution.context,
+
+def _run_fisher_vp_vector_manual_batch(execution: StandardExecution) -> TensorTree:
+    return _run_vector_manual_batches(execution, _run_fisher_vp_vector_single_loop)
+
+
+def _run_fisher_vp_vector_vmap(execution: StandardExecution) -> TensorTree:
+    if execution.path == FISHER_BLOCKWISE_SCORE_MATRIX_PATH:
+        _require_valid_fisher_semantics(execution.operator)
+
+        return _run_blockwise_score_matrix_product_vmap(
+            execution,
+            "score_gradient_blocks",
+            _fisher_normalization(execution),
+            "score_gradients",
         )
 
-        return _categorical_logits_matrix(execution.operator, logits)
+    score_gradients = _fisher_score_matrix_for_product(execution)
 
-    logits_matrix = logits_function(*active_leaves)
-    _require_finite_tensor(logits_matrix, "categorical Fisher logits")
-    log_probs = torch.log_softmax(logits_matrix, dim=-1)
-    probabilities = log_probs.exp().detach()
-    gradient_rows = []
-
-    for row in range(log_probs.shape[0]):
-        for label in range(log_probs.shape[1]):
-            term = log_probs[row, label]
-            gradient_result = torch.autograd.grad(
-                term,
-                active_leaves,
-                retain_graph=row < log_probs.shape[0] - 1
-                or label < log_probs.shape[1] - 1,
-                allow_unused=True,
-            )
-            gradients = tuple(
-                torch.zeros_like(leaf) if gradient is None else gradient.detach()
-                for leaf, gradient in zip(
-                    active_leaves,
-                    gradient_result,
-                    strict=True,
-                )
-            )
-            weight = torch.sqrt(probabilities[row, label])
-            gradient_rows.append(
-                weight
-                * torch.cat(tuple(gradient.reshape(-1) for gradient in gradients))
-            )
-
-    return torch.stack(gradient_rows)
+    return _run_score_matrix_product_vmap(
+        execution,
+        score_gradients,
+        _fisher_normalization(execution),
+        "Fisher",
+    )
 
 
-def _categorical_monte_carlo_fisher_gradient_matrix(
+def _fisher_score_matrix_for_product(
     execution: StandardExecution,
 ) -> torch.Tensor:
-    _require_fisher_semantics(
-        execution.operator,
-        {
-            "distribution": "categorical",
-            "label_policy": "model_distribution",
-            "expectation": "monte_carlo",
-            "sample_space": "classes",
-            "loss_reduction": "log_prob",
-        },
-    )
-    sample_count = _operator_semantic_positive_int(execution.operator, "sample_count")
-    seed = _operator_semantic_int(execution.operator, "seed")
-    function = _function_objective(execution.operator, execution.function_objectives)
-    parameter_items = tuple(execution.params.items())
-    active_leaves = tuple(
-        tensor.detach().clone().requires_grad_(True) for _, tensor in parameter_items
-    )
+    if execution.path in {
+        FISHER_SCORE_GRADIENT_LOOP_PATH,
+        FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        FISHER_SCORE_GRADIENT_VMAP_PATH,
+        FISHER_BACKWARD_MATERIALIZED_PATH,
+    }:
+        _require_explicit_score_fisher_semantics(execution.operator)
 
-    def logits_function(*leaves: torch.Tensor) -> torch.Tensor:
-        active_params = {
-            name: leaf for (name, _), leaf in zip(parameter_items, leaves, strict=True)
-        }
-        logits = function(
-            active_params,
-            execution.buffers,
-            execution.batch,
-            execution.context,
+        return _loss_scaled_score_matrix(execution, _fisher_score_gradients(execution))
+
+    if execution.path == FISHER_DENSE_PATH:
+        _require_valid_fisher_semantics(execution.operator)
+
+        return _loss_scaled_score_matrix(
+            execution,
+            _batch_tensor(execution.batch, "score_gradients"),
         )
 
-        return _categorical_logits_matrix(execution.operator, logits)
+    message = "Fisher vector vmap requires a score-gradient matrix path"
+    raise MaterializationError(message)
 
-    logits_matrix = logits_function(*active_leaves)
-    _require_finite_tensor(logits_matrix, "Monte Carlo Fisher logits")
-    log_probs = torch.log_softmax(logits_matrix, dim=-1)
-    probabilities = log_probs.exp().detach()
-    generator = torch.Generator(device=probabilities.device)
-    generator.manual_seed(seed)
-    labels = torch.multinomial(
-        probabilities,
-        sample_count,
-        replacement=True,
-        generator=generator,
+
+def _fisher_score_gradients(execution: StandardExecution) -> torch.Tensor:
+    if (
+        execution.compiled_score_matrix is not None
+        and execution.candidate.settings.get("compile.boundary") == "fisher_score_grad"
+    ):
+        return execution.compiled_score_matrix()
+
+    return _fisher_score_gradients_by_path(execution)
+
+
+def _fisher_score_gradients_by_path(execution: StandardExecution) -> torch.Tensor:
+    if _uses_manual_per_example_schedule(execution):
+        return _per_example_gradient_matrix_manual_batches(execution)
+
+    if execution.path == FISHER_SCORE_GRADIENT_LOOP_PATH:
+        return _per_example_gradient_matrix(execution)
+
+    if execution.path == FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH:
+        return _per_example_gradient_matrix_torch_func(execution)
+
+    if execution.path == FISHER_SCORE_GRADIENT_VMAP_PATH:
+        return _per_example_gradient_matrix_vmap(execution)
+
+    if execution.path == FISHER_BACKWARD_MATERIALIZED_PATH:
+        return _per_example_gradient_matrix_backward(execution)
+
+    message = "fisher score-gradient boundary requires a score-gradient path"
+    raise MaterializationError(message)
+
+
+def _run_sampled_fisher_vp(execution: StandardExecution) -> TensorTree:
+    _require_path(
+        execution.operator.kind,
+        execution.path,
+        (
+            SAMPLED_FISHER_DENSE_PATH,
+            SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+            SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+            SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+            SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
+            SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
+        ),
+    )
+    mode = execution.candidate.settings.get("vectorization.mode")
+
+    if mode == "single_loop":
+        return _run_sampled_fisher_vp_vector_single_loop(execution)
+
+    if mode == "manual_batch":
+        return _run_sampled_fisher_vp_vector_manual_batch(execution)
+
+    if mode == "vmap":
+        return _run_sampled_fisher_vp_vector_vmap(execution)
+
+    return _run_sampled_fisher_vp_single_vector(execution)
+
+
+def _run_sampled_fisher_vp_single_vector(execution: StandardExecution) -> TensorTree:
+    _require_sampled_fisher_semantics(execution)
+
+    if execution.path in {
+        SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+        SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
+    }:
+        sampled_score_gradients = _sampled_fisher_score_gradients(execution)
+    elif execution.path == SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH:
+        return _run_blockwise_score_matrix_product(
+            execution,
+            "sampled_score_gradient_blocks",
+            _sampled_fisher_normalization(execution),
+            "sampled_score_gradients",
+        )
+    else:
+        sampled_score_gradients = _batch_tensor(
+            execution.batch,
+            "sampled_score_gradients",
+        )
+
+    sampled_score_gradients = _loss_scaled_score_matrix(
+        execution,
+        sampled_score_gradients,
+    )
+    vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
+    vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
+    _require_finite_tensor(sampled_score_gradients, "sampled_score_gradients")
+    _require_finite_tensor(vector_tensor, "sampled Fisher vector")
+    result = _score_matrix_product(
+        sampled_score_gradients,
+        vector_tensor,
+        _sampled_fisher_normalization(execution),
+        execution.candidate.settings,
+    )
+    _require_finite_tensor(result, "sampled Fisher result")
+    _check_sampled_fisher_exact_bound(execution, result)
+
+    return _wrap_flat_vector(execution.params, result)
+
+
+def _run_sampled_fisher_vp_vector_single_loop(
+    execution: StandardExecution,
+) -> TensorTree:
+    return _run_vector_single_loop(execution, _run_sampled_fisher_vp_single_vector)
+
+
+def _run_sampled_fisher_vp_vector_manual_batch(
+    execution: StandardExecution,
+) -> TensorTree:
+    return _run_vector_manual_batches(
+        execution,
+        _run_sampled_fisher_vp_vector_single_loop,
     )
 
-    return _monte_carlo_fisher_rows(log_probs, labels, active_leaves, sample_count)
+
+def _run_sampled_fisher_vp_vector_vmap(execution: StandardExecution) -> TensorTree:
+    _require_sampled_fisher_semantics(execution)
+
+    if execution.path == SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH:
+        result = _blockwise_score_matrix_product_batch_vmap(
+            execution,
+            "sampled_score_gradient_blocks",
+            _sampled_fisher_normalization(execution),
+            "sampled_score_gradients",
+        )
+    else:
+        result = _score_matrix_product_batch_vmap(
+            execution,
+            _sampled_fisher_score_matrix_for_product(execution),
+            _sampled_fisher_normalization(execution),
+            "sampled Fisher",
+        )
+
+    _check_sampled_fisher_exact_bound(execution, result)
+
+    return _wrap_flat_vector_batch(execution.params, result)
 
 
-def _monte_carlo_fisher_rows(
-    log_probs: torch.Tensor,
-    labels: torch.Tensor,
-    active_leaves: tuple[torch.Tensor, ...],
-    sample_count: int,
+def _sampled_fisher_score_matrix_for_product(
+    execution: StandardExecution,
 ) -> torch.Tensor:
-    gradient_rows = []
+    if execution.path in {
+        SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+        SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
+    }:
+        return _loss_scaled_score_matrix(
+            execution,
+            _sampled_fisher_score_gradients(execution),
+        )
 
-    for row in range(labels.shape[0]):
-        for sample_index in range(sample_count):
-            term = log_probs[row, int(labels[row, sample_index])]
-            gradient_result = torch.autograd.grad(
-                term,
-                active_leaves,
-                retain_graph=row < labels.shape[0] - 1
-                or sample_index < sample_count - 1,
-                allow_unused=True,
-            )
-            gradients = tuple(
-                torch.zeros_like(leaf) if gradient is None else gradient.detach()
-                for leaf, gradient in zip(
-                    active_leaves,
-                    gradient_result,
-                    strict=True,
-                )
-            )
-            gradient_rows.append(
-                torch.cat(tuple(gradient.reshape(-1) for gradient in gradients))
-                / math.sqrt(float(sample_count))
-            )
+    if execution.path == SAMPLED_FISHER_DENSE_PATH:
+        return _loss_scaled_score_matrix(
+            execution,
+            _batch_tensor(execution.batch, "sampled_score_gradients"),
+        )
 
-    return torch.stack(gradient_rows)
+    message = "sampled Fisher vector vmap requires a score-gradient matrix path"
+    raise MaterializationError(message)
 
 
-def _categorical_logits_matrix(
-    operator: OperatorSpec,
-    logits: TensorTree,
+def _sampled_fisher_score_gradients(execution: StandardExecution) -> torch.Tensor:
+    if (
+        execution.compiled_score_matrix is not None
+        and execution.candidate.settings.get("compile.boundary")
+        == "sampled_fisher_score_grad"
+    ):
+        return execution.compiled_score_matrix()
+
+    return _sampled_fisher_score_gradients_by_path(execution)
+
+
+def _sampled_fisher_score_gradients_by_path(
+    execution: StandardExecution,
 ) -> torch.Tensor:
-    if not isinstance(logits, torch.Tensor):
-        message = "categorical Fisher requires tensor logits"
-        raise MaterializationError(message)
+    if _uses_manual_per_example_schedule(execution):
+        return _per_example_gradient_matrix_manual_batches(execution)
 
-    if logits.ndim < MATRIX_DIMS:
-        message = "categorical Fisher logits must include data and class axes"
-        raise MaterializationError(message)
+    if execution.path == SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH:
+        return _per_example_gradient_matrix(execution)
 
-    axis = _operator_semantic_int(operator, "logits_axis")
+    if execution.path == SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH:
+        return _per_example_gradient_matrix_torch_func(execution)
 
-    if axis < 0:
-        axis += logits.ndim
+    if execution.path == SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH:
+        return _per_example_gradient_matrix_vmap(execution)
 
-    if axis < 0 or axis >= logits.ndim:
-        message = "categorical Fisher logits_axis is out of range"
-        raise MaterializationError(message)
+    if execution.path == SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH:
+        return _per_example_gradient_matrix_backward(execution)
 
-    moved = torch.movedim(logits, axis, -1)
-
-    return moved.reshape(-1, moved.shape[-1])
+    message = "sampled Fisher score-gradient boundary requires a score-gradient path"
+    raise MaterializationError(message)
 
 
 def _run_empirical_fisher_vp(execution: StandardExecution) -> TensorTree:
@@ -1679,33 +5895,501 @@ def _run_empirical_fisher_vp(execution: StandardExecution) -> TensorTree:
         (
             EMPIRICAL_FISHER_DENSE_PATH,
             EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+            EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+            EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
             EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+            EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH,
         ),
     )
+    mode = execution.candidate.settings.get("vectorization.mode")
 
-    if execution.path == EMPIRICAL_FISHER_GRADIENT_LOOP_PATH:
-        per_example_gradients = _per_example_gradient_matrix(execution)
-    elif execution.path == EMPIRICAL_FISHER_GRADIENT_VMAP_PATH:
-        per_example_gradients = _per_example_gradient_matrix_vmap(execution)
+    if mode == "single_loop":
+        return _run_empirical_fisher_vp_vector_single_loop(execution)
+
+    if mode == "manual_batch":
+        return _run_empirical_fisher_vp_vector_manual_batch(execution)
+
+    if mode == "vmap":
+        return _run_empirical_fisher_vp_vector_vmap(execution)
+
+    return _run_empirical_fisher_vp_single_vector(execution)
+
+
+def _run_empirical_fisher_vp_single_vector(execution: StandardExecution) -> TensorTree:
+
+    if execution.path in {
+        EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+        EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+        EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
+        EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+    }:
+        per_example_gradients = _empirical_fisher_gradients(execution)
+    elif execution.path == EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH:
+        blocks = _batch_tensor_blocks(
+            execution.batch,
+            "per_example_gradient_blocks",
+        )
+
+        return _run_blockwise_score_matrix_product(
+            execution,
+            "per_example_gradient_blocks",
+            _empirical_fisher_normalization(
+                execution.batch,
+                execution.operator,
+                blocks[0],
+            ),
+            "per_example_gradients",
+        )
     else:
         per_example_gradients = _batch_tensor(execution.batch, "per_example_gradients")
 
+    per_example_gradients = _loss_scaled_score_matrix(execution, per_example_gradients)
     vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
     vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
     _require_finite_tensor(per_example_gradients, "per_example_gradients")
     _require_finite_tensor(vector_tensor, "empirical Fisher vector")
-    result = empirical_fisher_vp_dense_anchor(
+    result = _score_matrix_product(
         per_example_gradients,
         vector_tensor,
-        normalization=_empirical_fisher_normalization(
+        _empirical_fisher_normalization(
             execution.batch,
             execution.operator,
             per_example_gradients,
         ),
+        execution.candidate.settings,
     )
     _require_finite_tensor(result, "empirical Fisher result")
 
     return _wrap_flat_vector(execution.params, result)
+
+
+def _run_empirical_fisher_vp_vector_single_loop(
+    execution: StandardExecution,
+) -> TensorTree:
+    return _run_vector_single_loop(execution, _run_empirical_fisher_vp_single_vector)
+
+
+def _run_empirical_fisher_vp_vector_manual_batch(
+    execution: StandardExecution,
+) -> TensorTree:
+    return _run_vector_manual_batches(
+        execution,
+        _run_empirical_fisher_vp_vector_single_loop,
+    )
+
+
+def _run_empirical_fisher_vp_vector_vmap(execution: StandardExecution) -> TensorTree:
+    if execution.path == EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH:
+        blocks = _batch_tensor_blocks(
+            execution.batch,
+            "per_example_gradient_blocks",
+        )
+
+        return _run_blockwise_score_matrix_product_vmap(
+            execution,
+            "per_example_gradient_blocks",
+            _empirical_fisher_normalization(
+                execution.batch,
+                execution.operator,
+                blocks[0],
+            ),
+            "per_example_gradients",
+        )
+
+    per_example_gradients = _empirical_fisher_score_matrix_for_product(execution)
+
+    return _run_score_matrix_product_vmap(
+        execution,
+        per_example_gradients,
+        _empirical_fisher_normalization(
+            execution.batch,
+            execution.operator,
+            per_example_gradients,
+        ),
+        "empirical Fisher",
+    )
+
+
+def _empirical_fisher_score_matrix_for_product(
+    execution: StandardExecution,
+) -> torch.Tensor:
+    if execution.path in {
+        EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+        EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+        EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
+        EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+    }:
+        return _loss_scaled_score_matrix(
+            execution,
+            _empirical_fisher_gradients(execution),
+        )
+
+    if execution.path == EMPIRICAL_FISHER_DENSE_PATH:
+        return _loss_scaled_score_matrix(
+            execution,
+            _batch_tensor(execution.batch, "per_example_gradients"),
+        )
+
+    message = "empirical Fisher vector vmap requires a score-gradient matrix path"
+    raise MaterializationError(message)
+
+
+def _empirical_fisher_gradients(execution: StandardExecution) -> torch.Tensor:
+    if (
+        execution.compiled_score_matrix is not None
+        and execution.candidate.settings.get("compile.boundary")
+        == "empirical_fisher_example_grad"
+    ):
+        return execution.compiled_score_matrix()
+
+    return _empirical_fisher_gradients_by_path(execution)
+
+
+def _empirical_fisher_gradients_by_path(
+    execution: StandardExecution,
+) -> torch.Tensor:
+    if _uses_manual_per_example_schedule(execution):
+        return _per_example_gradient_matrix_manual_batches(execution)
+
+    if execution.path == EMPIRICAL_FISHER_GRADIENT_LOOP_PATH:
+        return _per_example_gradient_matrix(execution)
+
+    if execution.path == EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH:
+        return _per_example_gradient_matrix_torch_func(execution)
+
+    if execution.path == EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH:
+        return _per_example_gradient_matrix_backward(execution)
+
+    if execution.path == EMPIRICAL_FISHER_GRADIENT_VMAP_PATH:
+        return _per_example_gradient_matrix_vmap(execution)
+
+    message = "empirical Fisher example-gradient boundary requires a gradient path"
+    raise MaterializationError(message)
+
+
+def _run_blockwise_score_matrix_product(
+    execution: StandardExecution,
+    batch_key: str,
+    normalization: float,
+    label: str,
+) -> TensorTree:
+    blocks = _loss_scaled_score_blocks(
+        execution,
+        _batch_tensor_blocks(execution.batch, batch_key),
+    )
+    vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
+    vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
+    result = _blockwise_score_matrix_product(
+        blocks,
+        vector_tensor,
+        normalization,
+        label,
+        execution.candidate.settings,
+    )
+
+    return _wrap_flat_vector(execution.params, result)
+
+
+def _blockwise_score_matrix_product(
+    blocks: tuple[torch.Tensor, ...],
+    vector: torch.Tensor,
+    normalization: float,
+    label: str,
+    settings: Mapping[str, Any],
+) -> torch.Tensor:
+    first_block = blocks[0]
+    offset = first_block.shape[1]
+    score_dot = _matmul_runtime(settings, first_block, vector[:offset])
+
+    for block in blocks[1:]:
+        width = block.shape[1]
+        stop = offset + width
+
+        if stop > vector.numel():
+            message = f"{label} block columns exceed vector length"
+            raise MaterializationError(message)
+
+        score_dot = score_dot + _matmul_runtime(settings, block, vector[offset:stop])
+        offset = stop
+
+    if offset != vector.numel():
+        message = f"{label} block columns must match vector length"
+        raise MaterializationError(message)
+
+    pieces = tuple(_matmul_runtime(settings, block.T, score_dot) for block in blocks)
+    result = torch.cat(pieces) / normalization
+    _require_finite_tensor(result, f"{label} blockwise result")
+
+    return result
+
+
+def _run_score_matrix_product_vmap(
+    execution: StandardExecution,
+    score_gradients: torch.Tensor,
+    normalization: float,
+    label: str,
+) -> TensorTree:
+    result = _score_matrix_product_batch_vmap(
+        execution,
+        score_gradients,
+        normalization,
+        label,
+    )
+
+    return _wrap_flat_vector_batch(execution.params, result)
+
+
+def _score_matrix_product(
+    score_gradients: torch.Tensor,
+    vector: torch.Tensor,
+    normalization: float,
+    settings: Mapping[str, Any],
+) -> torch.Tensor:
+    score_dot = _matmul_runtime(settings, score_gradients, vector)
+
+    return _matmul_runtime(settings, score_gradients.T, score_dot) / normalization
+
+
+def _score_matrix_product_batch_vmap(
+    execution: StandardExecution,
+    score_gradients: torch.Tensor,
+    normalization: float,
+    label: str,
+) -> torch.Tensor:
+    vector_batch = _flat_vector_batch(execution)
+    _require_score_matrix_product_inputs(
+        score_gradients,
+        vector_batch,
+        f"{label} score_gradients",
+    )
+    chunk_size = _vmap_chunk_size(execution.candidate.settings)
+
+    def product(flat_vector: torch.Tensor) -> torch.Tensor:
+        score_dot = _matmul_runtime(
+            execution.candidate.settings,
+            score_gradients,
+            flat_vector,
+        )
+
+        return (
+            _matmul_runtime(
+                execution.candidate.settings,
+                score_gradients.T,
+                score_dot,
+            )
+            / normalization
+        )
+
+    result = _torch_func_vmap(
+        product,
+        in_dims=0,
+        randomness=execution.candidate.settings["vectorization.randomness"],
+        chunk_size=chunk_size,
+    )(vector_batch)
+    _require_finite_tensor(result, f"{label} batched result")
+
+    return result
+
+
+def _run_blockwise_score_matrix_product_vmap(
+    execution: StandardExecution,
+    batch_key: str,
+    normalization: float,
+    label: str,
+) -> TensorTree:
+    result = _blockwise_score_matrix_product_batch_vmap(
+        execution,
+        batch_key,
+        normalization,
+        label,
+    )
+
+    return _wrap_flat_vector_batch(execution.params, result)
+
+
+def _blockwise_score_matrix_product_batch_vmap(
+    execution: StandardExecution,
+    batch_key: str,
+    normalization: float,
+    label: str,
+) -> torch.Tensor:
+    blocks = _loss_scaled_score_blocks(
+        execution,
+        _batch_tensor_blocks(execution.batch, batch_key),
+    )
+    vector_batch = _flat_vector_batch(execution)
+    _require_blockwise_score_matrix_product_inputs(blocks, vector_batch, label)
+    chunk_size = _vmap_chunk_size(execution.candidate.settings)
+
+    def product(flat_vector: torch.Tensor) -> torch.Tensor:
+        return _blockwise_score_matrix_product_unchecked(
+            blocks,
+            flat_vector,
+            normalization,
+            execution.candidate.settings,
+        )
+
+    result = _torch_func_vmap(
+        product,
+        in_dims=0,
+        randomness=execution.candidate.settings["vectorization.randomness"],
+        chunk_size=chunk_size,
+    )(vector_batch)
+    _require_finite_tensor(result, f"{label} blockwise batched result")
+
+    return result
+
+
+def _blockwise_score_matrix_product_unchecked(
+    blocks: tuple[torch.Tensor, ...],
+    vector: torch.Tensor,
+    normalization: float,
+    settings: Mapping[str, Any],
+) -> torch.Tensor:
+    first_block = blocks[0]
+    offset = first_block.shape[1]
+    score_dot = _matmul_runtime(settings, first_block, vector[:offset])
+
+    for block in blocks[1:]:
+        width = block.shape[1]
+        stop = offset + width
+        score_dot = score_dot + _matmul_runtime(settings, block, vector[offset:stop])
+        offset = stop
+
+    pieces = tuple(_matmul_runtime(settings, block.T, score_dot) for block in blocks)
+
+    return torch.cat(pieces) / normalization
+
+
+def _flat_vector_batch(execution: StandardExecution) -> torch.Tensor:
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+
+    return _flatten_vector_batch(execution.params, execution.vector, vector_in_dims)
+
+
+def _require_score_matrix_product_inputs(
+    score_gradients: torch.Tensor,
+    vector_batch: torch.Tensor,
+    label: str,
+) -> None:
+    if score_gradients.ndim != MATRIX_DIMS:
+        message = f"{label} must be a two-dimensional tensor"
+        raise MaterializationError(message)
+
+    if vector_batch.ndim != MATRIX_DIMS:
+        message = "vectorized Fisher vectors must flatten to a matrix"
+        raise MaterializationError(message)
+
+    if score_gradients.shape[1] != vector_batch.shape[1]:
+        message = f"{label} column count must match vector width"
+        raise MaterializationError(message)
+
+    _require_finite_tensor(score_gradients, label)
+    _require_finite_tensor(vector_batch, "vectorized Fisher vectors")
+
+
+def _require_blockwise_score_matrix_product_inputs(
+    blocks: tuple[torch.Tensor, ...],
+    vector_batch: torch.Tensor,
+    label: str,
+) -> None:
+    if vector_batch.ndim != MATRIX_DIMS:
+        message = "vectorized Fisher vectors must flatten to a matrix"
+        raise MaterializationError(message)
+
+    width = sum(block.shape[1] for block in blocks)
+
+    if width != vector_batch.shape[1]:
+        message = f"{label} block columns must match vector width"
+        raise MaterializationError(message)
+
+    _require_finite_tensor(vector_batch, "vectorized Fisher vectors")
+
+
+def _uses_manual_per_example_schedule(execution: StandardExecution) -> bool:
+    if execution.candidate.settings.get("schedule.per_example") != "manual_batch":
+        return False
+
+    return execution.path in {
+        *FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
+        *SAMPLED_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
+        *EMPIRICAL_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
+    }
+
+
+def _per_example_gradient_matrix_manual_batches(
+    execution: StandardExecution,
+) -> torch.Tensor:
+    batch, batch_in_dims = _per_example_batch_in_dims(
+        execution.batch,
+        "per-example manual batching",
+    )
+    example_count = _per_example_batch_size(
+        batch,
+        batch_in_dims,
+        "per-example manual batching",
+    )
+    batch_size = _per_example_manual_batch_size(execution)
+    rows = []
+
+    for start in range(0, example_count, batch_size):
+        stop = min(start + batch_size, example_count)
+        subbatch = _per_example_batch_slice(batch, batch_in_dims, start, stop)
+        subexecution = dataclasses.replace(execution, batch=subbatch)
+        rows.append(_per_example_gradient_matrix_without_manual_batch(subexecution))
+
+    return torch.cat(tuple(rows), dim=0)
+
+
+def _per_example_gradient_matrix_without_manual_batch(
+    execution: StandardExecution,
+) -> torch.Tensor:
+    if execution.path in {
+        FISHER_SCORE_GRADIENT_LOOP_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+        EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+    }:
+        return _per_example_gradient_matrix(execution)
+
+    if execution.path in {
+        FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+    }:
+        return _per_example_gradient_matrix_torch_func(execution)
+
+    if execution.path in {
+        FISHER_BACKWARD_MATERIALIZED_PATH,
+        SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
+        EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
+    }:
+        return _per_example_gradient_matrix_backward(execution)
+
+    message = (
+        f"schedule.per_example=manual_batch is incompatible with path: {execution.path}"
+    )
+    raise MaterializationError(message)
+
+
+def _per_example_manual_batch_size(execution: StandardExecution) -> int:
+    if execution.operator.kind in {"fisher_vp", "sampled_fisher_vp"}:
+        key = "batch.fisher_sample_batch_size"
+    elif execution.operator.kind == "empirical_fisher_vp":
+        key = "batch.empirical_example_batch_size"
+    else:
+        message = "per-example manual batching requires a Fisher-family operator"
+        raise MaterializationError(message)
+
+    value = execution.candidate.settings.get(key)
+
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        message = f"{key} must be a positive integer"
+        raise MaterializationError(message)
+
+    return value
 
 
 def _per_example_gradient_matrix(execution: StandardExecution) -> torch.Tensor:
@@ -1766,6 +6450,110 @@ def _per_example_gradient_matrix(execution: StandardExecution) -> torch.Tensor:
     return torch.stack(gradient_rows)
 
 
+def _loss_scaled_score_matrix(
+    execution: StandardExecution,
+    matrix: torch.Tensor,
+) -> torch.Tensor:
+    scale = _loss_scale(execution.candidate.settings)
+
+    if scale is None:
+        return matrix
+
+    return matrix * scale
+
+
+def _loss_scaled_score_blocks(
+    execution: StandardExecution,
+    blocks: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    scale = _loss_scale(execution.candidate.settings)
+
+    if scale is None:
+        return blocks
+
+    return tuple(block * scale for block in blocks)
+
+
+def _per_example_gradient_matrix_torch_func(
+    execution: StandardExecution,
+) -> torch.Tensor:
+    function = _function_objective(execution.operator, execution.function_objectives)
+    parameter_items = tuple(execution.params.items())
+    active_params = {
+        name: tensor.detach().clone().requires_grad_(True)
+        for name, tensor in parameter_items
+    }
+    terms = _per_example_terms(function, active_params, execution)
+    gradient_rows = []
+
+    for index in range(terms.numel()):
+
+        def single_loss(
+            active: ParameterTree,
+            term_index: int = index,
+        ) -> torch.Tensor:
+            active_terms = _per_example_terms(function, active, execution)
+
+            return active_terms[term_index]
+
+        gradients = torch.func.grad(single_loss)(active_params)
+        pieces = tuple(gradients[name].reshape(-1) for name, _ in parameter_items)
+        gradient_rows.append(torch.cat(pieces))
+
+    return torch.stack(gradient_rows)
+
+
+def _per_example_gradient_matrix_backward(execution: StandardExecution) -> torch.Tensor:
+    function = _function_objective(execution.operator, execution.function_objectives)
+    parameter_items = tuple(execution.params.items())
+    active_params = {
+        name: tensor.detach().clone().requires_grad_(True)
+        for name, tensor in parameter_items
+    }
+    terms = _per_example_terms(function, active_params, execution)
+    gradient_rows = []
+
+    for index in range(terms.numel()):
+        for param in active_params.values():
+            param.grad = None
+
+        terms[index].backward(retain_graph=index < terms.numel() - 1)
+        pieces = tuple(
+            torch.zeros_like(param).reshape(-1)
+            if param.grad is None
+            else param.grad.detach().reshape(-1)
+            for param in active_params.values()
+        )
+        gradient_rows.append(torch.cat(pieces))
+
+    return torch.stack(gradient_rows)
+
+
+def _per_example_terms(
+    function: FunctionObjective,
+    active_params: ParameterTree,
+    execution: StandardExecution,
+) -> torch.Tensor:
+    output = function(
+        active_params,
+        execution.buffers,
+        execution.batch,
+        execution.context,
+    )
+
+    if not isinstance(output, torch.Tensor):
+        message = "per-example gradient path requires tensor objective output"
+        raise MaterializationError(message)
+
+    terms = output.reshape(-1)
+
+    if terms.numel() == 0:
+        message = "per-example gradient path requires at least one objective term"
+        raise MaterializationError(message)
+
+    return terms
+
+
 def _per_example_gradient_matrix_vmap(execution: StandardExecution) -> torch.Tensor:
     try:
         admit_torch_func(execution.candidate.settings)
@@ -1778,8 +6566,8 @@ def _per_example_gradient_matrix_vmap(execution: StandardExecution) -> torch.Ten
         name: tensor.detach().clone().requires_grad_(True)
         for name, tensor in parameter_items
     }
-    batched_batch, batch_in_dims = _vmap_batch(execution.batch, execution.candidate)
-    chunk_size = _vmap_chunk_size(execution.candidate.settings)
+    batched_batch, batch_in_dims = _per_example_vmap_batch(execution.batch)
+    chunk_size = _per_example_vmap_chunk_size(execution)
 
     def single_loss(
         active_params: ParameterTree,
@@ -1807,7 +6595,7 @@ def _per_example_gradient_matrix_vmap(execution: StandardExecution) -> torch.Ten
     gradients = _torch_func_vmap(
         _torch_func_grad(single_loss),
         in_dims=(None, batch_in_dims),
-        randomness=str(execution.candidate.settings["vmap_randomness"]),
+        randomness=str(execution.candidate.settings["vectorization.randomness"]),
         chunk_size=chunk_size,
     )(active_params, batched_batch)
     row_count = _vmap_batch_size(batched_batch, batch_in_dims)
@@ -1820,65 +6608,108 @@ def _per_example_gradient_matrix_vmap(execution: StandardExecution) -> torch.Ten
     return torch.cat(tuple(pieces), dim=1)
 
 
-def _vmap_batch(
+def _per_example_vmap_batch(
     batch: Batch,
-    candidate: Candidate,
 ) -> tuple[dict[str, Any], dict[str, int | None]]:
-    raw_in_dims = candidate.settings.get("vmap_batch_in_dims")
+    return _per_example_batch_in_dims(batch, "per-example vmap")
 
-    if not isinstance(raw_in_dims, Mapping):
-        message = "per-example vmap requires vmap_batch_in_dims"
-        raise MaterializationError(message)
 
-    if set(raw_in_dims) != set(batch):
-        message = "vmap_batch_in_dims must cover every batch key"
-        raise MaterializationError(message)
-
+def _per_example_batch_in_dims(
+    batch: Batch,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, int | None]]:
     result = {}
     in_dims = {}
     expected_size = None
 
     for key, value in batch.items():
-        raw_dim = raw_in_dims[key]
+        result[key] = value
 
-        if raw_dim is None:
-            result[key] = value
+        if not isinstance(value, torch.Tensor):
             in_dims[key] = None
             continue
 
-        if not isinstance(raw_dim, int) or isinstance(raw_dim, bool):
-            message = "vmap_batch_in_dims values must be integers or None"
+        if value.ndim == 0:
+            message = f"{label} tensor batch field is scalar: {key}"
             raise MaterializationError(message)
 
-        if not isinstance(value, torch.Tensor):
-            message = f"per-example vmap mapped batch value must be a tensor: {key}"
-            raise MaterializationError(message)
-
-        dim = raw_dim
-
-        if dim < 0:
-            dim += value.ndim
-
-        if dim < 0 or dim >= value.ndim:
-            message = f"vmap_batch_in_dims axis is out of range: {key}"
-            raise MaterializationError(message)
-
-        leading_size = value.shape[dim]
+        leading_size = value.shape[0]
 
         if expected_size is None:
             expected_size = leading_size
         elif leading_size != expected_size:
-            message = "per-example vmap batch leading dimensions differ"
+            message = f"{label} batch leading dimensions differ"
             raise MaterializationError(message)
 
-        result[key] = value
-        in_dims[key] = raw_dim
+        in_dims[key] = 0
 
     if expected_size is None or expected_size == 0:
-        message = "per-example vmap requires a nonempty mapped batch"
+        message = f"{label} requires a nonempty mapped batch"
         raise MaterializationError(message)
 
     return result, in_dims
+
+
+def _per_example_batch_size(
+    batch: Mapping[str, Any],
+    in_dims: Mapping[str, int | None],
+    label: str,
+) -> int:
+    for key, value in batch.items():
+        dim = in_dims[key]
+
+        if isinstance(value, torch.Tensor) and dim is not None:
+            if dim < 0:
+                dim += value.ndim
+
+            return value.shape[dim]
+
+    message = f"{label} requires a nonempty mapped batch"
+    raise MaterializationError(message)
+
+
+def _per_example_batch_slice(
+    batch: Mapping[str, Any],
+    in_dims: Mapping[str, int | None],
+    start: int,
+    stop: int,
+) -> dict[str, Any]:
+    result = {}
+
+    for key, value in batch.items():
+        dim = in_dims[key]
+
+        if isinstance(value, torch.Tensor) and dim is not None:
+            result[key] = value.narrow(dim, start, stop - start)
+        else:
+            result[key] = value
+
+    return result
+
+
+def _per_example_vmap_chunk_size(execution: StandardExecution) -> int | None:
+    if execution.operator.kind in {"fisher_vp", "sampled_fisher_vp"}:
+        key = "batch.fisher_sample_batch_size"
+    elif execution.operator.kind == "empirical_fisher_vp":
+        key = "batch.empirical_example_batch_size"
+    else:
+        message = "per-example vmap chunk size requires a Fisher-family operator"
+        raise MaterializationError(message)
+
+    chunk_size = execution.candidate.settings.get(key)
+
+    if chunk_size is None:
+        return None
+
+    if (
+        not isinstance(chunk_size, int)
+        or isinstance(chunk_size, bool)
+        or chunk_size < 1
+    ):
+        message = f"{key} must be a positive integer"
+        raise MaterializationError(message)
+
+    return chunk_size
 
 
 def _vmap_batch_size(
@@ -1899,17 +6730,373 @@ def _vmap_batch_size(
 
 
 def _vmap_chunk_size(settings: Mapping[str, Any]) -> int | None:
-    chunk_size = settings.get("vmap_chunk_size")
+    chunk_size = settings.get("vectorization.vmap_chunk_size")
 
     if chunk_size is None:
-        message = "per_example_gradient_vmap requires vmap_chunk_size"
+        message = "vectorization.mode=vmap requires vectorization.vmap_chunk_size"
         raise MaterializationError(message)
 
-    if not isinstance(chunk_size, int) or chunk_size < 1:
-        message = "vmap_chunk_size must be a positive integer"
+    if (
+        not isinstance(chunk_size, int)
+        or isinstance(chunk_size, bool)
+        or chunk_size < 1
+    ):
+        message = "vectorization.vmap_chunk_size must be a positive integer"
         raise MaterializationError(message)
 
     return chunk_size
+
+
+def _manual_vector_batch_size(settings: Mapping[str, Any]) -> int:
+    batch_size = settings.get("vectorization.batch_size")
+
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or batch_size < 1
+    ):
+        message = (
+            "vectorization.mode=manual_batch requires positive vectorization.batch_size"
+        )
+        raise MaterializationError(message)
+
+    return batch_size
+
+
+def _vector_tree_in_dims(
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+) -> Any:
+    raw_in_dims = settings.get("vectorization.in_dims")
+
+    if raw_in_dims is None:
+        message = "vectorized vector inputs require vectorization.in_dims"
+        raise MaterializationError(message)
+
+    return _validate_vector_tree_in_dims(vector, raw_in_dims)
+
+
+def _validate_vector_tree_in_dims(vector: TensorTree, raw_in_dims: Any) -> Any:
+    if isinstance(vector, torch.Tensor):
+        return _validate_vector_tensor_in_dim(vector, raw_in_dims)
+
+    if _is_tensor_tree_dict(vector):
+        return _validate_vector_dict_in_dims(vector, raw_in_dims)
+
+    if _is_tensor_tree_tuple(vector):
+        return _validate_vector_tuple_in_dims(vector, raw_in_dims)
+
+    message = f"unsupported vector tree node: {type(vector).__name__}"
+    raise MaterializationError(message)
+
+
+def _validate_vector_tensor_in_dim(
+    vector: torch.Tensor,
+    raw_in_dim: Any,
+) -> int | None:
+    if raw_in_dim is None:
+        return None
+
+    if not isinstance(raw_in_dim, int) or isinstance(raw_in_dim, bool):
+        message = "vectorization.in_dims values must be integers or None"
+        raise MaterializationError(message)
+
+    dim = raw_in_dim
+
+    if dim < 0:
+        dim += vector.ndim
+
+    if dim < 0 or dim >= vector.ndim:
+        message = "vectorization.in_dims axis is out of range"
+        raise MaterializationError(message)
+
+    if vector.shape[dim] == 0:
+        message = "vectorized vector inputs require a nonempty mapped dimension"
+        raise MaterializationError(message)
+
+    return raw_in_dim
+
+
+def _validate_vector_dict_in_dims(
+    vector: dict[str, TensorTree],
+    raw_in_dims: Any,
+) -> dict[str, Any]:
+    if not isinstance(raw_in_dims, Mapping):
+        message = "vectorization.in_dims must match the vector tree"
+        raise MaterializationError(message)
+
+    if set(raw_in_dims) != set(vector):
+        message = "vectorization.in_dims must cover every vector key"
+        raise MaterializationError(message)
+
+    return {
+        key: _validate_vector_tree_in_dims(vector[key], raw_in_dims[key])
+        for key in vector
+    }
+
+
+def _validate_vector_tuple_in_dims(
+    vector: tuple[TensorTree, ...],
+    raw_in_dims: Any,
+) -> tuple[Any, ...]:
+    if not isinstance(raw_in_dims, tuple):
+        message = "vectorization.in_dims must match the vector tree"
+        raise MaterializationError(message)
+
+    if len(raw_in_dims) != len(vector):
+        message = "vectorization.in_dims must cover every vector element"
+        raise MaterializationError(message)
+
+    result = []
+
+    for value, in_dim in zip(vector, raw_in_dims, strict=True):
+        result.append(_validate_vector_tree_in_dims(value, in_dim))
+
+    return tuple(result)
+
+
+def _vector_tree_batch_size(vector: TensorTree, in_dims: Any) -> int:
+    sizes = []
+    _collect_vector_tree_batch_sizes(vector, in_dims, sizes)
+
+    if not sizes:
+        message = "vectorized vector inputs require at least one mapped leaf"
+        raise MaterializationError(message)
+
+    first_size = sizes[0]
+
+    for size in sizes[1:]:
+        if size != first_size:
+            message = "vectorized vector mapped dimensions differ"
+            raise MaterializationError(message)
+
+    return first_size
+
+
+def _collect_vector_tree_batch_sizes(
+    vector: TensorTree,
+    in_dims: Any,
+    sizes: list[int],
+) -> None:
+    if isinstance(vector, torch.Tensor):
+        if in_dims is None:
+            return
+
+        dim = _normalized_vector_dim(vector, in_dims)
+        sizes.append(vector.shape[dim])
+        return
+
+    if _is_tensor_tree_dict(vector):
+        for key in vector:
+            _collect_vector_tree_batch_sizes(vector[key], in_dims[key], sizes)
+
+        return
+
+    if _is_tensor_tree_tuple(vector):
+        for value, in_dim in zip(vector, in_dims, strict=True):
+            _collect_vector_tree_batch_sizes(value, in_dim, sizes)
+
+        return
+
+    message = f"unsupported vector tree node: {type(vector).__name__}"
+    raise MaterializationError(message)
+
+
+def _vector_tree_select(vector: TensorTree, in_dims: Any, index: int) -> TensorTree:
+    if isinstance(vector, torch.Tensor):
+        if in_dims is None:
+            return vector
+
+        dim = _normalized_vector_dim(vector, in_dims)
+
+        return vector.select(dim, index)
+
+    if _is_tensor_tree_dict(vector):
+        return {
+            key: _vector_tree_select(vector[key], in_dims[key], index) for key in vector
+        }
+
+    if _is_tensor_tree_tuple(vector):
+        return tuple(
+            _vector_tree_select(value, in_dim, index)
+            for value, in_dim in zip(vector, in_dims, strict=True)
+        )
+
+    message = f"unsupported vector tree node: {type(vector).__name__}"
+    raise MaterializationError(message)
+
+
+def _vector_tree_slice(
+    vector: TensorTree,
+    in_dims: Any,
+    start: int,
+    stop: int,
+) -> TensorTree:
+    if isinstance(vector, torch.Tensor):
+        if in_dims is None:
+            return vector
+
+        dim = _normalized_vector_dim(vector, in_dims)
+
+        return vector.narrow(dim, start, stop - start)
+
+    if _is_tensor_tree_dict(vector):
+        return {
+            key: _vector_tree_slice(vector[key], in_dims[key], start, stop)
+            for key in vector
+        }
+
+    if _is_tensor_tree_tuple(vector):
+        return tuple(
+            _vector_tree_slice(value, in_dim, start, stop)
+            for value, in_dim in zip(vector, in_dims, strict=True)
+        )
+
+    message = f"unsupported vector tree node: {type(vector).__name__}"
+    raise MaterializationError(message)
+
+
+def _normalized_vector_dim(vector: torch.Tensor, in_dim: int) -> int:
+    dim = in_dim
+
+    if dim < 0:
+        dim += vector.ndim
+
+    if dim < 0 or dim >= vector.ndim:
+        message = "vectorization.in_dims axis is out of range"
+        raise MaterializationError(message)
+
+    return dim
+
+
+def _stack_tensor_trees(outputs: Sequence[TensorTree], dim: int) -> TensorTree:
+    if not outputs:
+        message = "cannot stack an empty tensor-tree sequence"
+        raise MaterializationError(message)
+
+    first = outputs[0]
+
+    if isinstance(first, torch.Tensor):
+        leaves = []
+
+        for output in outputs:
+            if not isinstance(output, torch.Tensor):
+                message = "tensor tree structures differ"
+                raise MaterializationError(message)
+
+            leaves.append(output)
+
+        return torch.stack(tuple(leaves), dim=dim)
+
+    if _is_tensor_tree_dict(first):
+        return _stack_tensor_tree_dicts(outputs, first, dim)
+
+    if _is_tensor_tree_tuple(first):
+        return _stack_tensor_tree_tuples(outputs, first, dim)
+
+    message = f"unsupported tensor tree node: {type(first).__name__}"
+    raise MaterializationError(message)
+
+
+def _cat_tensor_trees(outputs: Sequence[TensorTree], dim: int) -> TensorTree:
+    if not outputs:
+        message = "cannot concatenate an empty tensor-tree sequence"
+        raise MaterializationError(message)
+
+    first = outputs[0]
+
+    if isinstance(first, torch.Tensor):
+        leaves = []
+
+        for output in outputs:
+            if not isinstance(output, torch.Tensor):
+                message = "tensor tree structures differ"
+                raise MaterializationError(message)
+
+            leaves.append(output)
+
+        return torch.cat(tuple(leaves), dim=dim)
+
+    if _is_tensor_tree_dict(first):
+        dict_outputs = _require_tensor_tree_dict_outputs(outputs, first)
+
+        return {
+            key: _cat_tensor_trees(tuple(output[key] for output in dict_outputs), dim)
+            for key in first
+        }
+
+    if _is_tensor_tree_tuple(first):
+        tuple_outputs = _require_tensor_tree_tuple_outputs(outputs, first)
+
+        return tuple(
+            _cat_tensor_trees(tuple(output[index] for output in tuple_outputs), dim)
+            for index in range(len(first))
+        )
+
+    message = f"unsupported tensor tree node: {type(first).__name__}"
+    raise MaterializationError(message)
+
+
+def _stack_tensor_tree_dicts(
+    outputs: Sequence[TensorTree],
+    first: dict[str, TensorTree],
+    dim: int,
+) -> TensorTree:
+    dict_outputs = _require_tensor_tree_dict_outputs(outputs, first)
+    result = {}
+
+    for key in first:
+        child_outputs = tuple(output[key] for output in dict_outputs)
+        result[key] = _stack_tensor_trees(tuple(child_outputs), dim)
+
+    return result
+
+
+def _require_tensor_tree_dict_outputs(
+    outputs: Sequence[TensorTree],
+    first: dict[str, TensorTree],
+) -> tuple[dict[str, TensorTree], ...]:
+    result = []
+
+    for output in outputs:
+        if not _is_tensor_tree_dict(output) or set(output) != set(first):
+            message = "tensor tree mapping keys differ"
+            raise MaterializationError(message)
+
+        result.append(output)
+
+    return tuple(result)
+
+
+def _stack_tensor_tree_tuples(
+    outputs: Sequence[TensorTree],
+    first: tuple[TensorTree, ...],
+    dim: int,
+) -> TensorTree:
+    tuple_outputs = _require_tensor_tree_tuple_outputs(outputs, first)
+    result = []
+
+    for index in range(len(first)):
+        child_outputs = tuple(output[index] for output in tuple_outputs)
+        result.append(_stack_tensor_trees(tuple(child_outputs), dim))
+
+    return tuple(result)
+
+
+def _require_tensor_tree_tuple_outputs(
+    outputs: Sequence[TensorTree],
+    first: tuple[TensorTree, ...],
+) -> tuple[tuple[TensorTree, ...], ...]:
+    result = []
+
+    for output in outputs:
+        if not _is_tensor_tree_tuple(output) or len(output) != len(first):
+            message = "tensor tree sequence lengths differ"
+            raise MaterializationError(message)
+
+        result.append(output)
+
+    return tuple(result)
 
 
 def _torch_func_grad(function: Callable[..., torch.Tensor]) -> Callable[..., Any]:
@@ -1921,36 +7108,801 @@ def _torch_func_vmap(function: Callable[..., Any], **kwargs: Any) -> Callable[..
 
 
 def _run_metric(execution: StandardExecution) -> TensorTree:
-    _require_single_operator_path(execution)
-    matrix = _batch_tensor(execution.batch, "metric")
-    vector_tensor = _flatten_vector(execution.vector)
-    _require_finite_tensor(matrix, "metric matrix")
-    _require_finite_tensor(vector_tensor, "metric vector")
-    result = dense_metric_multiply(matrix, vector_tensor)
-    _require_finite_tensor(result, "metric result")
+    _require_path(
+        execution.operator.kind,
+        execution.path,
+        (
+            METRIC_DENSE_PATH,
+            METRIC_FACTORIZED_PATH,
+            METRIC_BLOCKWISE_PATH,
+            METRIC_STREAMING_PATH,
+        ),
+    )
+    _require_metric_accumulation_settings(
+        execution.path,
+        execution.candidate.settings,
+    )
+    if execution.compiled_inner is None:
+        result = _metric_multiply_by_path(
+            execution.operator,
+            execution.batch,
+            execution.vector,
+            execution.path,
+            execution.candidate.settings,
+        )
+    else:
+        result = execution.compiled_inner()
 
-    return _wrap_flat_vector(execution.vector, result)
+    _require_finite_tree(result, "metric result")
+
+    return result
+
+
+def _require_metric_accumulation_settings(
+    metric_path: str,
+    settings: Mapping[str, Any],
+) -> None:
+    value = settings.get("metric.accumulation")
+
+    if metric_path == METRIC_DENSE_PATH:
+        if value is not None:
+            message = "metric.accumulation applies only to non-dense metric paths"
+            raise MaterializationError(message)
+
+        return
+
+    if value is None:
+        message = "metric.accumulation is required for non-dense metric paths"
+        raise MaterializationError(message)
+
+    expected = (
+        "streaming" if metric_path == METRIC_STREAMING_PATH else "materialized_blocks"
+    )
+
+    if value != expected:
+        message = f"metric.accumulation must be {expected} for this path"
+        raise MaterializationError(message)
+
+
+def _metric_multiply_by_path(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+    metric_path: str,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    if metric_path == METRIC_FACTORIZED_PATH:
+        return _factorized_metric_multiply(operator, batch, vector, settings)
+
+    if metric_path == METRIC_BLOCKWISE_PATH:
+        _require_metric_representation(operator, ("block_diagonal",))
+
+        return _block_diagonal_metric_multiply(batch, vector, settings)
+
+    if metric_path == METRIC_STREAMING_PATH:
+        return _streaming_metric_multiply(operator, batch, vector, settings)
+
+    if metric_path == METRIC_DENSE_PATH:
+        _require_metric_representation(operator, ("dense_matrix",))
+        matrix = _metric_dense_matrix(operator, batch, vector)
+        vector_tensor = _flatten_vector(vector)
+        _require_finite_tensor(matrix, "metric matrix")
+        _require_finite_tensor(vector_tensor, "metric vector")
+        flat_result = _matmul_runtime(settings, matrix, vector_tensor)
+        _require_finite_tensor(flat_result, "metric result")
+
+        return _wrap_flat_vector(vector, flat_result)
+
+    message = f"metric path is not lowered: {metric_path}"
+    raise MaterializationError(message)
+
+
+def _factorized_metric_multiply(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    kind = _metric_representation_kind(operator)
+
+    if kind == "diagonal_tree":
+        return _diagonal_metric_multiply(batch, vector, settings)
+
+    if kind == "low_rank_factors":
+        return _low_rank_metric_multiply(batch, vector, settings)
+
+    if kind == "kfac_factors":
+        return _kfac_metric_multiply(operator, batch, vector, settings)
+
+    if kind == "ggn_derived_factors":
+        return _ggn_metric_multiply(batch, vector, settings)
+
+    message = f"factorized metric path is not lowered for representation: {kind}"
+    raise MaterializationError(message)
+
+
+def _streaming_metric_multiply(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    kind = _metric_representation_kind(operator)
+
+    if kind == "diagonal_tree":
+        return _diagonal_metric_multiply(batch, vector, settings)
+
+    if kind == "block_diagonal":
+        return _block_diagonal_metric_multiply(batch, vector, settings)
+
+    if kind == "low_rank_factors":
+        return _low_rank_metric_multiply(batch, vector, settings)
+
+    if kind == "kfac_factors":
+        return _kfac_metric_multiply(operator, batch, vector, settings)
+
+    if kind == "ggn_derived_factors":
+        return _ggn_metric_multiply(batch, vector, settings)
+
+    message = f"metric streaming path is not lowered for representation: {kind}"
+    raise MaterializationError(message)
 
 
 def _run_inverse_metric(execution: StandardExecution) -> TensorTree:
-    _require_single_operator_path(execution)
-    matrix = _batch_tensor(execution.batch, "metric")
+    _require_path(
+        execution.operator.kind,
+        execution.path,
+        (
+            INVERSE_METRIC_DENSE_PATH,
+            INVERSE_METRIC_CG_PATH,
+            INVERSE_METRIC_CHOLESKY_PATH,
+            INVERSE_METRIC_EIGH_PATH,
+            INVERSE_METRIC_SVD_PATH,
+            INVERSE_METRIC_FACTORIZED_PATH,
+            INVERSE_METRIC_BLOCKWISE_PATH,
+            INVERSE_METRIC_WOODBURY_PATH,
+        ),
+    )
+
+    if execution.compiled_inner is None:
+        result = _run_inverse_metric_by_mode(execution)
+    else:
+        result = execution.compiled_inner()
+
+    _require_finite_tree(result, "inverse metric result")
+
+    return result
+
+
+def _run_inverse_metric_by_mode(execution: StandardExecution) -> TensorTree:
+    mode = execution.candidate.settings.get("vectorization.mode")
+
+    if mode == "single_loop":
+        return _run_inverse_metric_vector_single_loop(execution)
+
+    if mode == "manual_batch":
+        return _run_vector_manual_batches(
+            execution,
+            _run_inverse_metric_vector_single_loop,
+        )
+
+    return _inverse_metric_solve_by_path(execution)
+
+
+def _run_inverse_metric_vector_single_loop(
+    execution: StandardExecution,
+) -> TensorTree:
+    if _uses_inverse_metric_factor_reuse(execution):
+        return _run_inverse_metric_reused_factor_batch(execution)
+
+    return _run_vector_single_loop(execution, _inverse_metric_solve_by_path)
+
+
+def _uses_inverse_metric_factor_reuse(execution: StandardExecution) -> bool:
+    return (
+        execution.candidate.settings.get("inverse_metric.factor_reuse")
+        == "reuse_factor_across_rhs"
+    )
+
+
+def _run_inverse_metric_reused_factor_batch(
+    execution: StandardExecution,
+) -> TensorTree:
+    if execution.path not in INVERSE_METRIC_FACTOR_REUSE_PATHS:
+        message = "reuse_factor_across_rhs requires a factor-reuse solve path"
+        raise MaterializationError(message)
+
+    if execution.path in INVERSE_METRIC_DIRECT_SOLVE_PATHS:
+        return _run_inverse_metric_reused_dense_factor_batch(execution)
+
+    if execution.path == INVERSE_METRIC_CG_PATH:
+        return _conjugate_gradient_inverse_metric_multiply_batch(execution)
+
+    if execution.path == INVERSE_METRIC_FACTORIZED_PATH:
+        return _factorized_inverse_metric_multiply_batch(execution)
+
+    if execution.path == INVERSE_METRIC_BLOCKWISE_PATH:
+        _require_metric_representation(execution.operator, ("block_diagonal",))
+
+        return _block_diagonal_inverse_metric_multiply_batch(execution)
+
+    _require_metric_representation(execution.operator, ("low_rank_factors",))
+
+    return _low_rank_inverse_metric_multiply_batch(execution)
+
+
+def _run_inverse_metric_reused_dense_factor_batch(
+    execution: StandardExecution,
+) -> TensorTree:
+    _require_metric_representation(execution.operator, ("dense_matrix",))
+    inverse_matrix = _inverse_metric_matrix(
+        execution.operator,
+        _metric_dense_matrix(execution.operator, execution.batch, execution.vector),
+    )
+    vector_batch = _flat_inverse_metric_vector_batch(execution)
+    _require_finite_tensor(inverse_matrix, "metric matrix")
+    _require_finite_tensor(vector_batch, "inverse metric vector batch")
+    result = _dense_inverse_metric_solve_batch(
+        inverse_matrix,
+        vector_batch,
+        execution.path,
+    )
+    _require_finite_tensor(result, "inverse metric batched result")
+
+    return _wrap_flat_vector_batch(execution.params, result)
+
+
+def _factorized_inverse_metric_multiply_batch(
+    execution: StandardExecution,
+) -> TensorTree:
+    kind = _metric_representation_kind(execution.operator)
+
+    if kind == "diagonal_tree":
+        return _diagonal_inverse_metric_multiply_batch(execution)
+
+    if kind == "low_rank_factors":
+        return _low_rank_inverse_metric_multiply_batch(execution)
+
+    if kind == "kfac_factors":
+        return _kfac_inverse_metric_multiply_batch(execution)
+
+    if kind == "ggn_derived_factors":
+        return _ggn_inverse_metric_multiply_batch(execution)
+
+    message = f"factorized inverse batch path is not lowered for representation: {kind}"
+    raise MaterializationError(message)
+
+
+def _flat_inverse_metric_vector_batch(execution: StandardExecution) -> torch.Tensor:
+    vector_in_dims = _vector_tree_in_dims(
+        execution.vector,
+        execution.candidate.settings,
+    )
+
+    return _flatten_vector_batch(execution.params, execution.vector, vector_in_dims)
+
+
+def _inverse_metric_solve_by_path(execution: StandardExecution) -> TensorTree:
+    if execution.path == INVERSE_METRIC_CG_PATH:
+        return _conjugate_gradient_inverse_metric_multiply(execution)
+
+    if execution.path == INVERSE_METRIC_FACTORIZED_PATH:
+        kind = _metric_representation_kind(execution.operator)
+
+        if kind == "diagonal_tree":
+            result = _diagonal_inverse_metric_multiply(
+                execution.operator,
+                execution.batch,
+                execution.vector,
+                execution.candidate.settings,
+            )
+        elif kind == "low_rank_factors":
+            result = _low_rank_inverse_metric_multiply(
+                execution.operator,
+                execution.batch,
+                execution.vector,
+            )
+        elif kind == "kfac_factors":
+            result = _kfac_inverse_metric_multiply(
+                execution.operator,
+                execution.batch,
+                execution.vector,
+            )
+        elif kind == "ggn_derived_factors":
+            result = _ggn_inverse_metric_multiply(
+                execution.operator,
+                execution.batch,
+                execution.vector,
+            )
+        else:
+            message = (
+                f"factorized inverse path is not lowered for representation: {kind}"
+            )
+            raise MaterializationError(message)
+
+        return result
+
+    if execution.path == INVERSE_METRIC_BLOCKWISE_PATH:
+        _require_metric_representation(execution.operator, ("block_diagonal",))
+
+        return _block_diagonal_inverse_metric_multiply(
+            execution.operator,
+            execution.batch,
+            execution.vector,
+        )
+
+    if execution.path == INVERSE_METRIC_WOODBURY_PATH:
+        _require_metric_representation(execution.operator, ("low_rank_factors",))
+
+        return _low_rank_inverse_metric_multiply(
+            execution.operator,
+            execution.batch,
+            execution.vector,
+        )
+
+    _require_metric_representation(execution.operator, ("dense_matrix",))
+    inverse_matrix = _inverse_metric_matrix(
+        execution.operator,
+        _metric_dense_matrix(execution.operator, execution.batch, execution.vector),
+    )
     vector_tensor = _flatten_vector(execution.vector)
-    _require_finite_tensor(matrix, "metric matrix")
+    _require_finite_tensor(inverse_matrix, "metric matrix")
     _require_finite_tensor(vector_tensor, "inverse metric vector")
-    result = dense_metric_inverse_multiply(matrix, vector_tensor)
+    result = _dense_inverse_metric_solve(
+        inverse_matrix,
+        vector_tensor,
+        execution.path,
+    )
     _require_finite_tensor(result, "inverse metric result")
 
     return _wrap_flat_vector(execution.vector, result)
 
 
+def _conjugate_gradient_inverse_metric_multiply(
+    execution: StandardExecution,
+) -> TensorTree:
+    budget = _inverse_metric_iteration_budget(execution.candidate.settings)
+    preconditioner = _inverse_metric_preconditioner(execution.candidate.settings)
+    metric_path = _metric_runtime_path_from_settings(execution.candidate.settings)
+    _require_metric_accumulation_settings(metric_path, execution.candidate.settings)
+    damping = _inverse_metric_damping(execution.operator)
+    vector = _flatten_vector(execution.vector)
+
+    if math.isclose(float(vector.norm().item()), 0.0, rel_tol=0.0, abs_tol=0.0):
+        return _tree_zeros_like_runtime(execution.candidate.settings, execution.vector)
+
+    solution = torch.zeros_like(vector)
+    residual = vector - _metric_apply_flat(
+        execution.operator,
+        execution.batch,
+        execution.vector,
+        solution,
+        damping,
+        metric_path,
+        execution.candidate.settings,
+    )
+    preconditioned = _apply_inverse_metric_preconditioner(
+        execution.operator,
+        execution.batch,
+        execution.vector,
+        residual,
+        preconditioner,
+        execution.candidate.settings,
+    )
+    direction = preconditioned
+    residual_dot = _dot_runtime(
+        execution.candidate.settings,
+        residual,
+        preconditioned,
+    )
+
+    for _ in range(budget):
+        matrix_direction = _metric_apply_flat(
+            execution.operator,
+            execution.batch,
+            execution.vector,
+            direction,
+            damping,
+            metric_path,
+            execution.candidate.settings,
+        )
+        step = residual_dot / _dot_runtime(
+            execution.candidate.settings,
+            direction,
+            matrix_direction,
+        )
+        solution = solution + step * direction
+        residual = residual - step * matrix_direction
+        preconditioned = _apply_inverse_metric_preconditioner(
+            execution.operator,
+            execution.batch,
+            execution.vector,
+            residual,
+            preconditioner,
+            execution.candidate.settings,
+        )
+        next_residual_dot = _dot_runtime(
+            execution.candidate.settings,
+            residual,
+            preconditioned,
+        )
+        direction = preconditioned + (next_residual_dot / residual_dot) * direction
+        residual_dot = next_residual_dot
+
+    _require_finite_tensor(solution, "conjugate gradient result")
+
+    return _wrap_flat_vector(execution.vector, solution)
+
+
+def _conjugate_gradient_inverse_metric_multiply_batch(
+    execution: StandardExecution,
+) -> TensorTree:
+    budget = _inverse_metric_iteration_budget(execution.candidate.settings)
+    preconditioner = _inverse_metric_preconditioner(execution.candidate.settings)
+    metric_path = _metric_runtime_path_from_settings(execution.candidate.settings)
+    _require_metric_accumulation_settings(metric_path, execution.candidate.settings)
+    damping = _inverse_metric_damping(execution.operator)
+    vector_batch = _flat_inverse_metric_vector_batch(execution)
+    active = torch.linalg.vector_norm(vector_batch, dim=1) > 0
+    solution = torch.zeros_like(vector_batch)
+
+    if torch.count_nonzero(active).item() == 0:
+        return _wrap_flat_vector_batch(execution.params, solution)
+
+    solution[active] = _conjugate_gradient_inverse_metric_active_batch(
+        execution,
+        vector_batch[active],
+        budget,
+        preconditioner,
+        metric_path,
+        damping,
+    )
+    _require_finite_tensor(solution, "batched conjugate gradient result")
+
+    return _wrap_flat_vector_batch(execution.params, solution)
+
+
+def _conjugate_gradient_inverse_metric_active_batch(
+    execution: StandardExecution,
+    active_vectors: torch.Tensor,
+    budget: int,
+    preconditioner: str,
+    metric_path: str,
+    damping: float,
+) -> torch.Tensor:
+    active_solution = torch.zeros_like(active_vectors)
+    residual = active_vectors - _metric_apply_flat_batch(
+        execution.operator,
+        execution.batch,
+        execution.params,
+        active_solution,
+        damping,
+        metric_path,
+        execution.candidate.settings,
+    )
+    preconditioned = _apply_inverse_metric_preconditioner_batch(
+        execution.operator,
+        execution.batch,
+        execution.params,
+        residual,
+        preconditioner,
+        execution.candidate.settings,
+    )
+    direction = preconditioned
+    residual_dot = _batched_dot_runtime(
+        execution.candidate.settings,
+        residual,
+        preconditioned,
+    )
+
+    for _ in range(budget):
+        matrix_direction = _metric_apply_flat_batch(
+            execution.operator,
+            execution.batch,
+            execution.params,
+            direction,
+            damping,
+            metric_path,
+            execution.candidate.settings,
+        )
+        step = residual_dot / _batched_dot_runtime(
+            execution.candidate.settings,
+            direction,
+            matrix_direction,
+        )
+        active_solution = active_solution + step[:, None] * direction
+        residual = residual - step[:, None] * matrix_direction
+        preconditioned = _apply_inverse_metric_preconditioner_batch(
+            execution.operator,
+            execution.batch,
+            execution.params,
+            residual,
+            preconditioner,
+            execution.candidate.settings,
+        )
+        next_residual_dot = _batched_dot_runtime(
+            execution.candidate.settings,
+            residual,
+            preconditioned,
+        )
+        direction = preconditioned + (next_residual_dot / residual_dot)[:, None] * (
+            direction
+        )
+        residual_dot = next_residual_dot
+
+    _require_finite_tensor(active_solution, "batched conjugate gradient result")
+
+    return active_solution
+
+
+def _metric_runtime_path_from_settings(settings: Mapping[str, Any]) -> str:
+    value = settings.get("metric.multiply_path")
+
+    if not isinstance(value, str):
+        message = "metric.multiply_path is required"
+        raise MaterializationError(message)
+
+    path = SPEC_PATH_TO_RUNTIME["metric"].get(value)
+
+    if path is None:
+        message = f"metric.multiply_path value is not lowered: {value}"
+        raise MaterializationError(message)
+
+    return path
+
+
+def _metric_apply_flat(
+    operator: OperatorSpec,
+    batch: Batch,
+    template: TensorTree,
+    flat_vector: torch.Tensor,
+    damping: float,
+    metric_path: str,
+    settings: Mapping[str, Any],
+) -> torch.Tensor:
+    vector = _wrap_flat_vector(template, flat_vector)
+    result = _metric_multiply_by_path(operator, batch, vector, metric_path, settings)
+    flat_result = _flatten_vector(result) + damping * flat_vector
+    _require_finite_tensor(flat_result, "metric apply result")
+
+    return flat_result
+
+
+def _metric_apply_flat_batch(
+    operator: OperatorSpec,
+    batch: Batch,
+    template: TensorTree,
+    flat_batch: torch.Tensor,
+    damping: float,
+    metric_path: str,
+    settings: Mapping[str, Any],
+) -> torch.Tensor:
+    parts = [
+        _metric_apply_flat(
+            operator,
+            batch,
+            template,
+            flat_vector,
+            damping,
+            metric_path,
+            settings,
+        )
+        for flat_vector in flat_batch
+    ]
+
+    result = torch.stack(tuple(parts), dim=0)
+    _require_finite_tensor(result, "batched metric apply result")
+
+    return result
+
+
+def _apply_inverse_metric_preconditioner(
+    operator: OperatorSpec,
+    batch: Batch,
+    template: TensorTree,
+    residual: torch.Tensor,
+    preconditioner: str,
+    settings: Mapping[str, Any],
+) -> torch.Tensor:
+    residual_tree = _wrap_flat_vector(template, residual)
+
+    if preconditioner == "none":
+        result = residual
+    elif preconditioner == "diagonal":
+        diagonal = torch.diag(
+            _inverse_metric_matrix(
+                operator,
+                _metric_dense_matrix(operator, batch, template),
+            )
+        )
+        result = residual / diagonal
+    elif preconditioner == "block_diagonal":
+        result = _flatten_vector(
+            _block_or_kfac_preconditioner(operator, batch, residual_tree)
+        )
+    elif preconditioner == "factorized_metric":
+        result = _flatten_vector(
+            _factorized_metric_preconditioner(operator, batch, residual_tree, settings)
+        )
+    else:
+        message = f"inverse metric preconditioner is unsupported: {preconditioner}"
+        raise MaterializationError(message)
+
+    _require_finite_tensor(result, "inverse metric preconditioner result")
+
+    return result
+
+
+def _apply_inverse_metric_preconditioner_batch(
+    operator: OperatorSpec,
+    batch: Batch,
+    template: TensorTree,
+    residual_batch: torch.Tensor,
+    preconditioner: str,
+    settings: Mapping[str, Any],
+) -> torch.Tensor:
+    parts = [
+        _apply_inverse_metric_preconditioner(
+            operator,
+            batch,
+            template,
+            residual,
+            preconditioner,
+            settings,
+        )
+        for residual in residual_batch
+    ]
+
+    result = torch.stack(tuple(parts), dim=0)
+    _require_finite_tensor(result, "batched inverse metric preconditioner result")
+
+    return result
+
+
+def _block_or_kfac_preconditioner(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+) -> TensorTree:
+    kind = _metric_representation_kind(operator)
+
+    if kind == "block_diagonal":
+        result = _block_diagonal_inverse_metric_multiply(operator, batch, vector)
+    elif kind == "kfac_factors":
+        result = _kfac_inverse_metric_multiply(operator, batch, vector)
+    else:
+        message = f"block preconditioner is not lowered for representation: {kind}"
+        raise MaterializationError(message)
+
+    return result
+
+
+def _factorized_metric_preconditioner(
+    operator: OperatorSpec,
+    batch: Batch,
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    kind = _metric_representation_kind(operator)
+
+    if kind == "diagonal_tree":
+        result = _diagonal_inverse_metric_multiply(operator, batch, vector, settings)
+    elif kind == "low_rank_factors":
+        result = _low_rank_inverse_metric_multiply(operator, batch, vector)
+    elif kind == "kfac_factors":
+        result = _kfac_inverse_metric_multiply(operator, batch, vector)
+    elif kind == "ggn_derived_factors":
+        result = _ggn_inverse_metric_multiply(operator, batch, vector)
+    else:
+        message = f"factorized preconditioner is not lowered for representation: {kind}"
+        raise MaterializationError(message)
+
+    return result
+
+
+def _inverse_metric_iteration_budget(settings: Mapping[str, Any]) -> int:
+    value = settings.get("inverse_metric.iteration_budget")
+
+    if not isinstance(value, int) or value < 1:
+        message = "inverse_metric.iteration_budget must be a positive integer"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _inverse_metric_preconditioner(settings: Mapping[str, Any]) -> str:
+    value = settings.get("inverse_metric.preconditioner")
+
+    if not isinstance(value, str):
+        message = "inverse_metric.preconditioner is required"
+        raise MaterializationError(message)
+
+    if value not in {"none", "diagonal", "block_diagonal", "factorized_metric"}:
+        message = f"inverse_metric.preconditioner is unsupported: {value}"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _dense_inverse_metric_solve(
+    matrix: torch.Tensor,
+    vector: torch.Tensor,
+    path: str,
+) -> torch.Tensor:
+    flat_vector = vector.reshape(-1)
+
+    if path == INVERSE_METRIC_DENSE_PATH:
+        return dense_metric_inverse_multiply(matrix, flat_vector)
+
+    if path == INVERSE_METRIC_CHOLESKY_PATH:
+        factor = torch.linalg.cholesky(matrix)
+        solution = torch.cholesky_solve(flat_vector[:, None], factor)
+
+        return solution.reshape_as(vector)
+
+    if path == INVERSE_METRIC_EIGH_PATH:
+        eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+        coefficients = eigenvectors.T @ flat_vector
+        solution = eigenvectors @ (coefficients / eigenvalues)
+
+        return solution.reshape_as(vector)
+
+    if path == INVERSE_METRIC_SVD_PATH:
+        left, singular_values, right_h = torch.linalg.svd(matrix, full_matrices=False)
+        coefficients = left.T @ flat_vector
+        solution = right_h.T @ (coefficients / singular_values)
+
+        return solution.reshape_as(vector)
+
+    message = f"inverse metric solve path is not lowered: {path}"
+    raise MaterializationError(message)
+
+
+def _dense_inverse_metric_solve_batch(
+    matrix: torch.Tensor,
+    vector_batch: torch.Tensor,
+    path: str,
+) -> torch.Tensor:
+    if vector_batch.ndim != MATRIX_DIMS:
+        message = "batched inverse metric vectors must flatten to a matrix"
+        raise MaterializationError(message)
+
+    rhs = vector_batch.T
+
+    if path == INVERSE_METRIC_DENSE_PATH:
+        return torch.linalg.solve(matrix, rhs).T
+
+    if path == INVERSE_METRIC_CHOLESKY_PATH:
+        factor = torch.linalg.cholesky(matrix)
+
+        return torch.cholesky_solve(rhs, factor).T
+
+    if path == INVERSE_METRIC_EIGH_PATH:
+        eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+        coefficients = eigenvectors.T @ rhs
+
+        return (eigenvectors @ (coefficients / eigenvalues[:, None])).T
+
+    if path == INVERSE_METRIC_SVD_PATH:
+        left, singular_values, right_h = torch.linalg.svd(matrix, full_matrices=False)
+        coefficients = left.T @ rhs
+
+        return (right_h.T @ (coefficients / singular_values[:, None])).T
+
+    message = f"batched inverse metric solve path is not lowered: {path}"
+    raise MaterializationError(message)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class StandardMetricOperator:
-    """Materialized dense metric selected by the standard runtime."""
+    """Materialized metric selected by the standard runtime."""
 
     candidate: Candidate
     record: FullSizeRecord
+    representation: Mapping[str, Any]
     default_operation: str = "multiply"
+    damping: float = 0.0
+    inverse_path: str = INVERSE_METRIC_DENSE_PATH
 
     def __call__(self, batch: Batch, vector: TensorTree) -> TensorTree:
         """Return the selected metric-vector product.
@@ -1971,11 +7923,9 @@ class StandardMetricOperator:
         """Return metric-vector product."""
 
         def callback() -> TensorTree:
-            matrix, runtime_vector = self._matrix_and_vector(batch, vector)
-            result = dense_metric_multiply(matrix, _flatten_vector(runtime_vector))
-            _require_finite_tensor(result, "metric result")
+            runtime_batch, runtime_vector = self._runtime_inputs(batch, vector)
 
-            return _wrap_flat_vector(runtime_vector, result)
+            return self._multiply_runtime(runtime_batch, runtime_vector)
 
         return _run_with_backend_settings(self.candidate.settings, callback)
 
@@ -1983,16 +7933,161 @@ class StandardMetricOperator:
         """Return inverse metric-vector product."""
 
         def callback() -> TensorTree:
-            matrix, runtime_vector = self._matrix_and_vector(batch, vector)
-            result = dense_metric_inverse_multiply(
-                matrix,
-                _flatten_vector(runtime_vector),
-            )
-            _require_finite_tensor(result, "inverse metric result")
+            runtime_batch, runtime_vector = self._runtime_inputs(batch, vector)
 
-            return _wrap_flat_vector(runtime_vector, result)
+            return self._inverse_runtime(runtime_batch, runtime_vector)
 
         return _run_with_backend_settings(self.candidate.settings, callback)
+
+    def _multiply_runtime(self, batch: Batch, vector: TensorTree) -> TensorTree:
+        metric_operator = self._operator_spec("metric")
+        path = _runtime_path(metric_operator, self.candidate)
+
+        if path in {METRIC_FACTORIZED_PATH, METRIC_STREAMING_PATH}:
+            result = self._factorized_or_streaming_multiply(
+                metric_operator,
+                path,
+                batch,
+                vector,
+            )
+        elif path == METRIC_BLOCKWISE_PATH:
+            _require_metric_representation(metric_operator, ("block_diagonal",))
+            result = _block_diagonal_metric_multiply(
+                batch,
+                vector,
+                self.candidate.settings,
+            )
+        else:
+            _require_metric_representation(metric_operator, ("dense_matrix",))
+            matrix = self._dense_matrix(batch, vector)
+            flat_result = _matmul_runtime(
+                self.candidate.settings,
+                matrix,
+                _flatten_vector(vector),
+            )
+            _require_finite_tensor(flat_result, "metric result")
+            result = _wrap_flat_vector(vector, flat_result)
+
+        _require_finite_tree(result, "metric result")
+
+        return result
+
+    def _factorized_or_streaming_multiply(
+        self,
+        operator: OperatorSpec,
+        path: str,
+        batch: Batch,
+        vector: TensorTree,
+    ) -> TensorTree:
+        kind = _metric_representation_kind(operator)
+
+        if kind == "diagonal_tree":
+            result = _diagonal_metric_multiply(
+                batch,
+                vector,
+                self.candidate.settings,
+            )
+        elif kind == "low_rank_factors":
+            result = _low_rank_metric_multiply(batch, vector, self.candidate.settings)
+        elif kind == "kfac_factors":
+            result = _kfac_metric_multiply(
+                operator,
+                batch,
+                vector,
+                self.candidate.settings,
+            )
+        elif kind == "ggn_derived_factors":
+            result = _ggn_metric_multiply(batch, vector, self.candidate.settings)
+        elif path == METRIC_STREAMING_PATH and kind == "block_diagonal":
+            result = _block_diagonal_metric_multiply(
+                batch,
+                vector,
+                self.candidate.settings,
+            )
+        else:
+            message = f"metric path is not lowered for representation: {path}/{kind}"
+            raise MaterializationError(message)
+
+        return result
+
+    def _inverse_runtime(self, batch: Batch, vector: TensorTree) -> TensorTree:
+        inverse_operator = self._operator_for_inverse()
+
+        if self.inverse_path == INVERSE_METRIC_CG_PATH:
+            execution = StandardExecution(
+                inverse_operator,
+                self.candidate,
+                self.inverse_path,
+                batch,
+                vector,
+                {},
+                {},
+                None,
+                ObjectiveContext(
+                    family=self.record.family,
+                    candidate_id=self.candidate.candidate_id,
+                    settings=dict(self.candidate.settings),
+                ),
+                {},
+                {},
+            )
+            result = _conjugate_gradient_inverse_metric_multiply(execution)
+        elif self.inverse_path == INVERSE_METRIC_FACTORIZED_PATH:
+            result = self._factorized_inverse(inverse_operator, batch, vector)
+        elif self.inverse_path == INVERSE_METRIC_BLOCKWISE_PATH:
+            _require_metric_representation(inverse_operator, ("block_diagonal",))
+            result = _block_diagonal_inverse_metric_multiply(
+                inverse_operator,
+                batch,
+                vector,
+            )
+        elif self.inverse_path == INVERSE_METRIC_WOODBURY_PATH:
+            _require_metric_representation(inverse_operator, ("low_rank_factors",))
+            result = _low_rank_inverse_metric_multiply(inverse_operator, batch, vector)
+        else:
+            _require_metric_representation(inverse_operator, ("dense_matrix",))
+            matrix = self._dense_matrix(batch, vector)
+            inverse_matrix = _damped_metric_matrix(matrix, self.damping)
+            flat_result = _dense_inverse_metric_solve(
+                inverse_matrix,
+                _flatten_vector(vector),
+                self.inverse_path,
+            )
+            _require_finite_tensor(flat_result, "inverse metric result")
+            result = _wrap_flat_vector(vector, flat_result)
+
+        _require_finite_tree(result, "inverse metric result")
+
+        return result
+
+    def _factorized_inverse(
+        self,
+        operator: OperatorSpec,
+        batch: Batch,
+        vector: TensorTree,
+    ) -> TensorTree:
+        kind = _metric_representation_kind(operator)
+
+        if kind == "diagonal_tree":
+            result = _diagonal_inverse_metric_multiply(
+                operator,
+                batch,
+                vector,
+                self.candidate.settings,
+            )
+        elif kind == "low_rank_factors":
+            result = _low_rank_inverse_metric_multiply(operator, batch, vector)
+        elif kind == "kfac_factors":
+            result = _kfac_inverse_metric_multiply(operator, batch, vector)
+        elif kind == "ggn_derived_factors":
+            result = _ggn_inverse_metric_multiply(operator, batch, vector)
+        else:
+            message = (
+                f"factorized inverse path is not lowered for representation: {kind}"
+            )
+            raise MaterializationError(message)
+
+        return result
 
     def inner(
         self,
@@ -2003,35 +8098,71 @@ class StandardMetricOperator:
         """Return metric inner product."""
 
         def callback() -> torch.Tensor:
-            runtime_batch = _runtime_batch(batch, self.candidate.settings)
-            runtime_left = _runtime_vector(left, self.candidate.settings)
+            runtime_batch, runtime_left = self._runtime_inputs(batch, left)
             runtime_right = _runtime_vector(right, self.candidate.settings)
-            matrix = _batch_tensor(runtime_batch, "metric")
             left_tensor = _flatten_vector(runtime_left)
-            right_tensor = _flatten_vector(runtime_right)
-            _require_finite_tensor(matrix, "metric matrix")
             _require_finite_tensor(left_tensor, "metric inner left vector")
-            _require_finite_tensor(right_tensor, "metric inner right vector")
-            result = dense_metric_inner(matrix, left_tensor, right_tensor)
+            metric_right = self.multiply(runtime_batch, runtime_right)
+            result = _tree_dot_runtime(
+                self.candidate.settings,
+                runtime_left,
+                metric_right,
+            )
             _require_finite_tensor(result, "metric inner result")
 
             return result
 
         return _run_with_backend_settings(self.candidate.settings, callback)
 
-    def _matrix_and_vector(
+    def _runtime_inputs(
         self,
         batch: Batch,
         vector: TensorTree,
-    ) -> tuple[torch.Tensor, TensorTree]:
+    ) -> tuple[Batch, TensorTree]:
         runtime_batch = _runtime_batch(batch, self.candidate.settings)
         runtime_vector = _runtime_vector(vector, self.candidate.settings)
-        matrix = _batch_tensor(runtime_batch, "metric")
         vector_tensor = _flatten_vector(runtime_vector)
-        _require_finite_tensor(matrix, "metric matrix")
         _require_finite_tensor(vector_tensor, "metric vector")
 
-        return matrix, runtime_vector
+        return runtime_batch, runtime_vector
+
+    def _dense_matrix(self, batch: Batch, vector: TensorTree) -> torch.Tensor:
+        operator = self._operator_spec("metric")
+
+        return _metric_dense_matrix(operator, batch, vector)
+
+    def _operator_for_inverse(self) -> OperatorSpec:
+        return self._operator_spec(
+            "inverse_metric",
+            {"damping": self.damping},
+        )
+
+    def _operator_spec(
+        self,
+        kind: str,
+        semantics: Mapping[str, Any] | None = None,
+    ) -> OperatorSpec:
+        full_semantics = {"representation": dict(self.representation)}
+
+        if semantics is not None:
+            full_semantics.update(semantics)
+
+        return OperatorSpec(
+            self.record.family,
+            kind,
+            self.record.family,
+            aggregation="sum",
+            semantics=full_semantics,
+        )
+
+    def _representation_kind(self) -> str:
+        value = self.representation.get("kind")
+
+        if not isinstance(value, str):
+            message = "metric representation kind is required"
+            raise MaterializationError(message)
+
+        return value
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -2048,6 +8179,8 @@ class KFACMetricOperator:
     """Metric operations backed by Kronecker-factored blocks."""
 
     blocks: tuple[KFACMetricBlock, ...]
+    damping: float = 0.0
+    settings: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
     def __call__(self, batch: Batch, vector: TensorTree) -> TensorTree:
         """Return metric-vector product."""
@@ -2063,7 +8196,11 @@ class KFACMetricOperator:
             right = _kfac_factor(batch, block.right_factor_key)
             value = _kfac_vector_leaf(vector_map, block)
             _require_kfac_shapes(block, left, right, value)
-            product = left @ value @ right.T
+            product = _matmul_runtime(
+                self.settings,
+                _matmul_runtime(self.settings, left, value),
+                right.T,
+            )
             _require_finite_tensor(
                 product, f"KFAC metric result {block.parameter_name}"
             )
@@ -2081,8 +8218,7 @@ class KFACMetricOperator:
             right = _kfac_factor(batch, block.right_factor_key)
             value = _kfac_vector_leaf(vector_map, block)
             _require_kfac_shapes(block, left, right, value)
-            left_solved = torch.linalg.solve(left, value)
-            product = torch.linalg.solve(right, left_solved.T).T
+            product = _kfac_inverse_product(left, right, value, self.damping)
             _require_finite_tensor(
                 product,
                 f"inverse KFAC metric result {block.parameter_name}",
@@ -2098,7 +8234,7 @@ class KFACMetricOperator:
         right: TensorTree,
     ) -> torch.Tensor:
         """Return KFAC metric inner product."""
-        return tree_dot(left, self.multiply(batch, right))
+        return _tree_dot_runtime(self.settings, left, self.multiply(batch, right))
 
 
 def _kfac_vector_map(vector: TensorTree) -> dict[str, TensorTree]:
@@ -2123,6 +8259,90 @@ def _kfac_factor(batch: Batch, key: str) -> torch.Tensor:
         raise MaterializationError(message)
 
     return value
+
+
+def _kfac_inverse_product(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    value: torch.Tensor,
+    damping: float,
+) -> torch.Tensor:
+    if damping <= 0.0:
+        left_solved = torch.linalg.solve(left, value)
+
+        return torch.linalg.solve(right, left_solved.T).T
+
+    left_eigenvalues, left_eigenvectors = torch.linalg.eigh(left)
+    right_eigenvalues, right_eigenvectors = torch.linalg.eigh(right)
+    rotated = left_eigenvectors.T @ value @ right_eigenvectors
+    denominator = left_eigenvalues[:, None] * right_eigenvalues[None, :] + damping
+    solved = rotated / denominator
+
+    return left_eigenvectors @ solved @ right_eigenvectors.T
+
+
+def _kfac_inverse_product_batch(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    value: torch.Tensor,
+    damping: float,
+) -> torch.Tensor:
+    if damping <= 0.0:
+        left_solved = torch.linalg.solve(left, value)
+
+        return torch.linalg.solve(right, left_solved.mT).mT
+
+    left_eigenvalues, left_eigenvectors = torch.linalg.eigh(left)
+    right_eigenvalues, right_eigenvectors = torch.linalg.eigh(right)
+    rotated = left_eigenvectors.T @ value @ right_eigenvectors
+    denominator = left_eigenvalues[:, None] * right_eigenvalues[None, :] + damping
+    solved = rotated / denominator
+
+    return left_eigenvectors @ solved @ right_eigenvectors.T
+
+
+def _kfac_batched_vector_leaf(
+    vector: Mapping[str, TensorTree],
+    in_dims: Mapping[str, Any],
+    block: KFACMetricBlock,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    vector_count: int,
+) -> torch.Tensor:
+    value = vector.get(block.parameter_name)
+    in_dim = in_dims.get(block.parameter_name)
+
+    if not isinstance(value, torch.Tensor):
+        message = f"KFAC vector leaf is missing or not a tensor: {block.parameter_name}"
+        raise MaterializationError(message)
+
+    _require_finite_tensor(value, f"KFAC vector {block.parameter_name}")
+
+    if in_dim is None:
+        _require_kfac_shapes(block, left, right, value)
+
+        return value.expand(vector_count, *value.shape)
+
+    if not isinstance(in_dim, int) or isinstance(in_dim, bool):
+        message = "KFAC vectorization.in_dims values must be integers or None"
+        raise MaterializationError(message)
+
+    dim = _normalized_vector_dim(value, in_dim)
+    expected = (left.shape[0], right.shape[0])
+    unbatched_shape = value.shape[:dim] + value.shape[dim + 1 :]
+
+    if tuple(unbatched_shape) != expected:
+        message = (
+            f"KFAC vector leaf shape mismatch for {block.parameter_name}: "
+            f"{tuple(unbatched_shape)} != {expected}"
+        )
+        raise MaterializationError(message)
+
+    if value.shape[dim] != vector_count:
+        message = "KFAC vectorized dimensions differ"
+        raise MaterializationError(message)
+
+    return value.movedim(dim, 0)
 
 
 def _kfac_vector_leaf(
@@ -2167,6 +8387,7 @@ STANDARD_RUNNERS = {
     "hvp": _run_hvp,
     "ggnvp": _run_ggnvp,
     "fisher_vp": _run_fisher_vp,
+    "sampled_fisher_vp": _run_sampled_fisher_vp,
     "empirical_fisher_vp": _run_empirical_fisher_vp,
     "metric": _run_metric,
     "inverse_metric": _run_inverse_metric,
@@ -2186,13 +8407,20 @@ def _standard_materializer(
             raise MaterializationError(message)
 
         if operator is not None and operator.kind == "metric":
-            return StandardMetricOperator(candidate, record)
+            return StandardMetricOperator(
+                candidate,
+                record,
+                _metric_representation(operator),
+            )
 
         if operator is not None and operator.kind == "inverse_metric":
             return StandardMetricOperator(
                 candidate,
                 record,
+                _metric_representation(operator),
                 default_operation="inverse_multiply",
+                damping=_inverse_metric_damping(operator),
+                inverse_path=_runtime_path(operator, candidate),
             )
 
         def selected(batch: Batch, vector: TensorTree) -> TensorTree:
@@ -2208,25 +8436,241 @@ def _standard_materializer(
     )
 
 
-def _operator_path(operator: OperatorSpec, candidate: Candidate) -> str:
-    path = candidate.settings.get("operator_path")
-    singleton_path = SINGLE_OPERATOR_PATHS.get(operator.kind)
+def _runtime_path(operator: OperatorSpec, candidate: Candidate) -> str:
+    spec_path = _spec_runtime_path(operator, candidate)
 
-    if singleton_path is None:
-        return _required_candidate_operator_path(candidate)
+    if spec_path is not None:
+        if "operator_path" in candidate.settings:
+            message = "candidate cannot mix operator_path with SPEC path keys"
+            raise MaterializationError(message)
 
-    if path is not None:
+        return spec_path
+
+    if "operator_path" in candidate.settings:
         message = f"operator_path is not a setting for {operator.kind}"
         raise MaterializationError(message)
 
-    return singleton_path
+    if operator.kind in SPEC_REQUIRED_PATH_OPERATORS:
+        key = SPEC_PATH_KEYS[operator.kind]
+        message = f"{key} is required for {operator.kind}"
+        raise MaterializationError(message)
+
+    message = f"standard runtime has no SPEC path key for {operator.kind}"
+    raise MaterializationError(message)
 
 
-def _required_candidate_operator_path(candidate: Candidate) -> str:
-    path = candidate.settings.get("operator_path")
+def _spec_runtime_path(operator: OperatorSpec, candidate: Candidate) -> str | None:
+    if operator.kind == "fisher_vp":
+        return _fisher_spec_runtime_path(candidate)
 
-    if not isinstance(path, str):
-        message = f"candidate operator_path is required: {candidate.candidate_id}"
+    if operator.kind == "sampled_fisher_vp":
+        return _sampled_fisher_spec_runtime_path(candidate)
+
+    if operator.kind == "empirical_fisher_vp":
+        return _empirical_fisher_spec_runtime_path(candidate)
+
+    key = SPEC_PATH_KEYS.get(operator.kind)
+
+    if key is None or key not in candidate.settings:
+        return None
+
+    value = candidate.settings[key]
+    path_map = SPEC_PATH_TO_RUNTIME[operator.kind]
+    path = path_map.get(value)
+
+    if path is None:
+        message = f"{key} value is not lowered by standard runtime: {value}"
+        raise MaterializationError(message)
+
+    return path
+
+
+def _fisher_spec_runtime_path(candidate: Candidate) -> str | None:
+    accumulation_key = SPEC_PATH_KEYS["fisher_vp"]
+    accumulation = candidate.settings.get(accumulation_key)
+    _require_fisher_expectation_path(candidate.settings)
+
+    if accumulation == "materialize_score_gradients":
+        return _fisher_non_streaming_path(
+            candidate.settings,
+            "materialize_score_gradients",
+            FISHER_DENSE_PATH,
+        )
+
+    if accumulation == "blockwise_score_matrix":
+        return _fisher_non_streaming_path(
+            candidate.settings,
+            "blockwise_score_matrix",
+            FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
+        )
+
+    if accumulation not in {None, "streaming_dot_accumulate"}:
+        message = f"fisher.accumulation value is not lowered: {accumulation}"
+        raise MaterializationError(message)
+
+    if accumulation is None:
+        return None
+
+    return _fisher_streaming_path(candidate.settings)
+
+
+def _require_fisher_expectation_path(settings: Mapping[str, Any]) -> None:
+    expectation_key = "fisher.expectation_path"
+
+    if expectation_key not in settings:
+        message = "fisher.expectation_path is required for FisherVP rows"
+        raise MaterializationError(message)
+
+    if settings[expectation_key] != "explicit_full_expectation_score_rows":
+        message = "fisher.expectation_path is unsupported"
+        raise MaterializationError(message)
+
+
+def _fisher_non_streaming_path(
+    settings: Mapping[str, Any],
+    accumulation: str,
+    path: str,
+) -> str:
+    score_path_key = "fisher.score_grad_path"
+
+    if score_path_key in settings:
+        message = f"fisher.score_grad_path is not used with {accumulation}"
+        raise MaterializationError(message)
+
+    return path
+
+
+def _fisher_streaming_path(settings: Mapping[str, Any]) -> str:
+    score_path_key = "fisher.score_grad_path"
+    score_path = settings.get(score_path_key)
+
+    if score_path_key not in settings:
+        message = "fisher.score_grad_path is required for streaming rows"
+        raise MaterializationError(message)
+
+    if score_path == "torch_autograd_grad_loop":
+        return FISHER_SCORE_GRADIENT_LOOP_PATH
+
+    if score_path == "torch_func_grad":
+        return FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH
+
+    if score_path == "vmap_grad":
+        return FISHER_SCORE_GRADIENT_VMAP_PATH
+
+    if score_path == "backward_materialized_grad":
+        return FISHER_BACKWARD_MATERIALIZED_PATH
+
+    message = f"{score_path_key} value is not lowered by standard runtime: {score_path}"
+    raise MaterializationError(message)
+
+
+def _sampled_fisher_spec_runtime_path(candidate: Candidate) -> str | None:
+    accumulation_key = SPEC_PATH_KEYS["sampled_fisher_vp"]
+    accumulation = candidate.settings.get(accumulation_key)
+
+    if accumulation == "materialize_score_gradients":
+        return _sampled_fisher_non_streaming_path(
+            candidate.settings,
+            "materialize_score_gradients",
+            SAMPLED_FISHER_DENSE_PATH,
+        )
+
+    if accumulation == "blockwise_score_matrix":
+        return _sampled_fisher_non_streaming_path(
+            candidate.settings,
+            "blockwise_score_matrix",
+            SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
+        )
+
+    if accumulation not in {None, "streaming_dot_accumulate"}:
+        message = f"sampled_fisher.accumulation value is not lowered: {accumulation}"
+        raise MaterializationError(message)
+
+    if accumulation is None:
+        return None
+
+    return _sampled_fisher_streaming_path(candidate.settings)
+
+
+def _sampled_fisher_non_streaming_path(
+    settings: Mapping[str, Any],
+    accumulation: str,
+    path: str,
+) -> str:
+    score_path_key = "sampled_fisher.score_grad_path"
+
+    if score_path_key in settings:
+        message = f"sampled_fisher.score_grad_path is not used with {accumulation}"
+        raise MaterializationError(message)
+
+    return path
+
+
+def _sampled_fisher_streaming_path(settings: Mapping[str, Any]) -> str:
+    score_path_key = "sampled_fisher.score_grad_path"
+    score_path = settings.get(score_path_key)
+
+    if score_path_key not in settings:
+        message = "sampled_fisher.score_grad_path is required for streaming rows"
+        raise MaterializationError(message)
+
+    if score_path == "torch_autograd_grad_loop":
+        return SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH
+
+    if score_path == "torch_func_grad":
+        return SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH
+
+    if score_path == "vmap_grad":
+        return SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH
+
+    if score_path == "backward_materialized_grad":
+        return SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH
+
+    message = f"{score_path_key} value is not lowered by standard runtime: {score_path}"
+    raise MaterializationError(message)
+
+
+def _empirical_fisher_spec_runtime_path(candidate: Candidate) -> str | None:
+    grad_key = SPEC_PATH_KEYS["empirical_fisher_vp"]
+    accumulation_key = "empirical_fisher.accumulation"
+    grad_path = candidate.settings.get(grad_key)
+    accumulation = candidate.settings.get(accumulation_key)
+
+    if accumulation == "materialize_per_example_gradients":
+        if grad_key in candidate.settings:
+            message = (
+                "empirical_fisher.grad_path is not used with "
+                "materialize_per_example_gradients"
+            )
+            raise MaterializationError(message)
+
+        return EMPIRICAL_FISHER_DENSE_PATH
+
+    if accumulation == "blockwise_gradient_matrix":
+        if grad_key in candidate.settings:
+            message = (
+                "empirical_fisher.grad_path is not used with blockwise_gradient_matrix"
+            )
+            raise MaterializationError(message)
+
+        return EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH
+
+    if accumulation not in {None, "streaming_dot_accumulate"}:
+        message = f"empirical_fisher.accumulation value is not lowered: {accumulation}"
+        raise MaterializationError(message)
+
+    if grad_key not in candidate.settings:
+        return None
+
+    if not isinstance(grad_path, str):
+        message = "empirical_fisher.grad_path must be a string"
+        raise MaterializationError(message)
+
+    path_map = SPEC_PATH_TO_RUNTIME["empirical_fisher_vp"]
+    path = path_map.get(grad_path)
+
+    if path is None:
+        message = f"{grad_key} value is not lowered by standard runtime: {grad_path}"
         raise MaterializationError(message)
 
     return path
@@ -2244,17 +8688,40 @@ def _require_supported_standard_settings(
         message = f"standard runtime settings are unsupported: {unsupported}"
         raise MaterializationError(message)
 
-    path = _operator_path(operator, candidate)
+    path = _runtime_path(operator, candidate)
+    _require_dtype_runtime_settings(candidate.settings)
+    _require_teacher_output_settings(candidate.settings)
+    _require_input_schedule_settings(path, candidate.settings)
+    _require_input_residency_settings(candidate.settings)
+    _require_memory_residency_settings(operator, candidate.settings)
+    _require_memory_recompute_settings(operator, candidate.settings)
+    _require_output_buffer_settings(candidate.settings)
+    _require_fusion_settings(candidate.settings)
+    _require_call_runtime_settings(candidate.settings)
+    _require_ggn_loss_hessian_settings(operator, candidate.settings)
+    _require_ggn_vjp_path_settings(operator, path, candidate.settings)
+    _require_ggn_reuse_settings(operator, path, candidate.settings)
+    _require_hvp_reuse_settings(operator, path, candidate.settings)
+    _require_vectorization_mode_settings(operator.kind, path, candidate.settings)
+    _require_activation_runtime_settings(candidate.settings)
 
-    for key in ("vmap_chunk_size", "vmap_batch_in_dims"):
-        if key in candidate.settings and path != EMPIRICAL_FISHER_GRADIENT_VMAP_PATH:
-            message = f"{key} is only supported by per_example_gradient_vmap"
-            raise MaterializationError(message)
+    _require_vectorization_setting_keys(operator.kind, path, candidate.settings)
 
     if path in {
         JVP_PATH,
+        JVP_LINEARIZE_PATH,
+        GRADIENT_TORCH_FUNC_PATH,
+        GRADIENT_TORCH_FUNC_VALUE_PATH,
         VJP_PATH,
         HVP_JVP_GRAD_PATH,
+        HVP_LINEARIZE_GRAD_PATH,
+        GGN_JVP_HESSIAN_VJP_PATH,
+        GGN_LINEARIZE_HESSIAN_VJP_PATH,
+        FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        FISHER_SCORE_GRADIENT_VMAP_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+        EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
         EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
     }:
         try:
@@ -2262,59 +8729,1914 @@ def _require_supported_standard_settings(
         except AdmissionError as error:
             raise MaterializationError(str(error)) from error
 
-    if path in {JVP_PATH, JVP_FORWARD_AD_PATH, HVP_JVP_GRAD_PATH}:
+    if (
+        operator.kind == "ggnvp"
+        and candidate.settings.get("ggn.vjp_path") == "torch_func_vjp"
+    ):
+        try:
+            admit_torch_func(candidate.settings)
+        except AdmissionError as error:
+            raise MaterializationError(str(error)) from error
+
+    if candidate.settings.get("vectorization.mode") == "vmap":
+        try:
+            admit_torch_func(candidate.settings)
+        except AdmissionError as error:
+            raise MaterializationError(str(error)) from error
+
+    if path in {
+        JVP_PATH,
+        JVP_FORWARD_AD_PATH,
+        HVP_JVP_GRAD_PATH,
+        GGN_JVP_HESSIAN_VJP_PATH,
+    }:
         try:
             admit_forward_ad(candidate.settings)
         except AdmissionError as error:
             raise MaterializationError(str(error)) from error
 
-    if any(field in candidate.settings for field in FUNCTIONAL_CALL_FIELDS):
-        try:
-            admit_functional_call(candidate.settings)
-        except AdmissionError as error:
-            raise MaterializationError(str(error)) from error
+    _require_gradient_value_reuse_settings(operator, path, candidate.settings)
+    _require_jvp_linearize_reuse_settings(operator, path, candidate.settings)
+    _require_vjp_closure_reuse_settings(operator, path, candidate.settings)
+    _require_metric_runtime_settings(operator, path, candidate.settings)
+    _require_inverse_metric_factor_reuse_settings(
+        operator,
+        path,
+        candidate.settings,
+    )
+    _require_layout_runtime_settings(candidate.settings)
+
+
+def _require_vectorization_mode_settings(
+    operator_kind: str,
+    path: str | None,
+    settings: Mapping[str, Any],
+) -> None:
+    mode_key = "vectorization.mode"
+
+    if mode_key not in settings:
+        return
+
+    mode = settings[mode_key]
+
+    if mode == "manual_batch":
+        if not _supports_vector_loop(operator_kind, path):
+            message = (
+                "vectorization.mode=manual_batch requires a supported vector-product "
+                "path"
+            )
+            raise MaterializationError(message)
+
+        _manual_vector_batch_size(settings)
+        _require_vectorization_in_dims_setting(settings)
+
+        return
+
+    if mode == "vmap":
+        if _supports_vector_vmap(operator_kind, path):
+            _vmap_chunk_size(settings)
+            _require_vectorization_in_dims_setting(settings)
+
+            return
+
+        if operator_kind == "hvp":
+            message = "vectorization.mode=vmap requires linearize_grad HVP"
+            raise MaterializationError(message)
+
+        message = "vectorization.mode=vmap requires vector-axis vmap lowering"
+        raise MaterializationError(message)
+
+    if mode == "single_loop":
+        if not _supports_vector_loop(operator_kind, path):
+            message = (
+                "vectorization.mode=single_loop requires a supported vector-product "
+                "path"
+            )
+            raise MaterializationError(message)
+
+        _require_vectorization_in_dims_setting(settings)
+
+        return
+
+    message = f"vectorization.mode is unsupported: {mode}"
+    raise MaterializationError(message)
+
+
+def _require_vectorization_setting_keys(
+    operator_kind: str,
+    path: str | None,
+    settings: Mapping[str, Any],
+) -> None:
+    mode = settings.get("vectorization.mode")
+
+    if "vectorization.vmap_chunk_size" in settings:
+        if mode != "vmap":
+            message = "vectorization.vmap_chunk_size is only supported by vmap rows"
+            raise MaterializationError(message)
+
+        if not _supports_vector_vmap(
+            operator_kind,
+            path,
+        ):
+            message = "vectorization.vmap_chunk_size is only supported by vmap rows"
+            raise MaterializationError(message)
+
+    if "vectorization.batch_size" in settings and mode != "manual_batch":
+        message = "vectorization.batch_size is only supported by manual_batch rows"
+        raise MaterializationError(message)
+
+    if "vectorization.in_dims" not in settings:
+        return
+
+    if _supports_vector_loop(operator_kind, path) and mode in {
+        "single_loop",
+        "manual_batch",
+    }:
+        return
+
+    if _supports_vector_vmap(operator_kind, path) and mode == "vmap":
+        return
+
+    message = "vectorization.in_dims is unsupported for this operator path"
+    raise MaterializationError(message)
+
+
+def _supports_vector_loop(operator_kind: str, path: str | None) -> bool:
+    return path in VECTOR_LOOP_RUNTIME_PATHS.get(operator_kind, ())
+
+
+def _supports_vector_vmap(operator_kind: str, path: str | None) -> bool:
+    return path in VECTOR_VMAP_RUNTIME_PATHS.get(operator_kind, ())
+
+
+def _require_vectorization_in_dims_setting(settings: Mapping[str, Any]) -> None:
+    if "vectorization.in_dims" in settings:
+        return
+
+    message = "vectorized rows require vectorization.in_dims"
+    raise MaterializationError(message)
+
+
+def _require_dtype_runtime_settings(settings: Mapping[str, Any]) -> None:
+    model_compute = settings.get("dtype.model_compute")
+    autodiff_compute = settings.get("dtype.autodiff_compute")
+
+    if model_compute is None or autodiff_compute is None:
+        return
+
+    if model_compute == autodiff_compute:
+        return
+
+    message = (
+        "different dtype.model_compute and dtype.autodiff_compute values require "
+        "model-call binding support"
+    )
+    raise MaterializationError(message)
+
+
+def _require_teacher_output_settings(settings: Mapping[str, Any]) -> None:
+    value = settings.get("teacher_outputs")
+
+    if value is None:
+        return
+
+    if value in {"precomputed_cpu", "precomputed_cpu_pinned", "precomputed_gpu"}:
+        return
+
+    if value == "recomputed_with_equality_check":
+        return
+
+    message = f"teacher_outputs is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _require_recomputed_teacher_objective(
+    settings: Mapping[str, Any],
+    teacher_objective: FunctionObjective | None,
+) -> None:
+    if settings.get("teacher_outputs") != "recomputed_with_equality_check":
+        return
+
+    if teacher_objective is None:
+        message = "recomputed teacher outputs require a teacher objective"
+        raise MaterializationError(message)
+
+
+def _require_call_runtime_settings(settings: Mapping[str, Any]) -> None:
+    call_core_keys = ("call.path", "call.params", "call.buffers")
+
+    if any(key in settings for key in call_core_keys):
+        missing = tuple(key for key in call_core_keys if key not in settings)
+
+        if missing:
+            message = f"call path settings are incomplete: {missing}"
+            raise MaterializationError(message)
+
+    path = settings.get("call.path")
+
+    if path not in {None, "functional_call"}:
+        message = f"call.path requires model-call binding: {path}"
+        raise MaterializationError(message)
+
+    params = settings.get("call.params")
+
+    if params not in {None, "explicit_params"}:
+        message = f"call.params requires model-call binding: {params}"
+        raise MaterializationError(message)
+
+    buffers = settings.get("call.buffers")
+
+    if buffers not in {None, "explicit_buffers"}:
+        message = f"call.buffers requires model-call binding: {buffers}"
+        raise MaterializationError(message)
+
+    tied_weights = settings.get("call.tied_weights")
+
+    if tied_weights not in {None, "preserve_alias_groups"}:
+        message = f"call.tied_weights is unsupported: {tied_weights}"
+        raise MaterializationError(message)
+
+    parametrizations = settings.get("call.parametrizations")
+
+    if parametrizations not in {None, "preserve_parametrizations"}:
+        message = f"call.parametrizations is unsupported: {parametrizations}"
+        raise MaterializationError(message)
+
+    buffer_mutation = settings.get("call.buffer_mutation")
+
+    if buffer_mutation not in {None, "forbidden"}:
+        message = f"call.buffer_mutation requires model-call binding: {buffer_mutation}"
+        raise MaterializationError(message)
+
+    return_type = settings.get("call.return_type")
+
+    if return_type not in {None, "raw_tensor_tree"}:
+        message = f"call.return_type requires output-field binding: {return_type}"
+        raise MaterializationError(message)
+
+
+def _require_input_schedule_settings(
+    path: str | None,
+    settings: Mapping[str, Any],
+) -> None:
+    per_example = settings.get("schedule.per_example")
+
+    if per_example is None:
+        if path in VMAP_RUNTIME_PATHS:
+            message = "vmap_grad rows require schedule.per_example=vmap"
+            raise MaterializationError(message)
+    else:
+        _require_per_example_schedule(path, per_example)
+
+    _require_per_example_batch_size_settings(path, settings)
+
+    schedule_value = settings.get("schedule.per_token")
+
+    if schedule_value not in {None, "loop"}:
+        if schedule_value == "packed":
+            message = "schedule.per_token=packed requires packed input binding"
+            raise MaterializationError(message)
+
+        message = f"schedule.per_token is unsupported: {schedule_value}"
+        raise MaterializationError(message)
+
+    batch_layout = settings.get("input.batch_layout")
+
+    if batch_layout not in {None, "dense_padded"}:
+        message = f"input.batch_layout requires input-layout binding: {batch_layout}"
+        raise MaterializationError(message)
+
+    length_grouping = settings.get("input.length_grouping")
+
+    if length_grouping not in {None, "none"}:
+        message = (
+            f"input.length_grouping requires input-order restoration: {length_grouping}"
+        )
+        raise MaterializationError(message)
+
+    gradient_accumulation = settings.get("schedule.gradient_accumulation")
+
+    if gradient_accumulation in {None, "single_step"}:
+        if "batch.data_microbatch_size" in settings:
+            message = (
+                "batch.data_microbatch_size requires "
+                "schedule.gradient_accumulation=microbatch_accumulate"
+            )
+            raise MaterializationError(message)
+
+        return
+
+    if gradient_accumulation != "microbatch_accumulate":
+        message = (
+            f"schedule.gradient_accumulation is unsupported: {gradient_accumulation}"
+        )
+        raise MaterializationError(message)
+
+    if (
+        settings.get("compile.enabled") == "true"
+        and settings.get("compile.boundary") == "loss_closure"
+    ):
+        message = "loss_closure compile boundary is incompatible with microbatching"
+        raise MaterializationError(message)
+
+    _data_microbatch_size(settings)
+
+
+def _data_microbatch_size(settings: Mapping[str, Any]) -> int:
+    key = "batch.data_microbatch_size"
+    value = settings.get(key)
+
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        message = f"{key} must be a positive integer"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _require_per_example_schedule(path: str | None, value: Any) -> None:
+    loop_paths = {
+        FISHER_SCORE_GRADIENT_LOOP_PATH,
+        FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        FISHER_BACKWARD_MATERIALIZED_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
+        EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+        EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+        EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
+    }
+
+    if value == "loop":
+        if path in loop_paths:
+            return
+
+        message = f"schedule.per_example=loop is incompatible with path: {path}"
+        raise MaterializationError(message)
+
+    if value == "vmap":
+        if path in VMAP_RUNTIME_PATHS:
+            return
+
+        message = f"schedule.per_example=vmap is incompatible with path: {path}"
+        raise MaterializationError(message)
+
+    if value == "manual_batch":
+        if path in {
+            *FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
+            *SAMPLED_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
+            *EMPIRICAL_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
+        }:
+            return
+
+        message = f"schedule.per_example=manual_batch is incompatible with path: {path}"
+        raise MaterializationError(message)
+
+    message = f"schedule.per_example is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _require_per_example_batch_size_settings(
+    path: str | None,
+    settings: Mapping[str, Any],
+) -> None:
+    _require_per_example_batch_size_setting(
+        path,
+        settings,
+        "batch.fisher_sample_batch_size",
+        {
+            FISHER_SCORE_GRADIENT_VMAP_PATH,
+            SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+        },
+        {
+            *FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
+            *SAMPLED_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
+        },
+    )
+    _require_per_example_batch_size_setting(
+        path,
+        settings,
+        "batch.empirical_example_batch_size",
+        {EMPIRICAL_FISHER_GRADIENT_VMAP_PATH},
+        set(EMPIRICAL_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS),
+    )
+
+
+def _require_per_example_batch_size_setting(
+    path: str | None,
+    settings: Mapping[str, Any],
+    key: str,
+    allowed_paths: set[str],
+    manual_paths: set[str],
+) -> None:
+    schedule = settings.get("schedule.per_example")
+
+    if key not in settings:
+        if schedule == "manual_batch" and path in manual_paths:
+            message = f"{key} is required for schedule.per_example=manual_batch"
+            raise MaterializationError(message)
+
+        return
+
+    if not (
+        (schedule == "vmap" and path in allowed_paths)
+        or (schedule == "manual_batch" and path in manual_paths)
+    ):
+        message = (
+            f"{key} requires schedule.per_example=vmap or manual_batch on a "
+            "matching path"
+        )
+        raise MaterializationError(message)
+
+    value = settings[key]
+
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        message = f"{key} must be a positive integer"
+        raise MaterializationError(message)
+
+
+def _require_input_residency_settings(settings: Mapping[str, Any]) -> None:
+    residency = settings.get("input.residency")
+    host_to_device = settings.get("input.host_to_device")
+
+    if residency is None and host_to_device is None:
+        return
+
+    if residency not in {"cpu_staged", "cpu_pinned", "gpu"}:
+        message = f"input.residency is unsupported: {residency}"
+        raise MaterializationError(message)
+
+    if host_to_device not in {"outside_measured_call", "inside_measured_call"}:
+        message = f"input.host_to_device is unsupported: {host_to_device}"
+        raise MaterializationError(message)
+
+
+def _require_memory_residency_settings(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+) -> None:
+    vector_residency = settings.get("memory.vector_residency")
+    factor_residency = settings.get("memory.factor_residency")
+    intermediate_residency = settings.get("memory.intermediate_residency")
+
+    if vector_residency is not None:
+        _require_runtime_residency(
+            vector_residency,
+            "memory.vector_residency",
+            allow_mmap=False,
+        )
+
+    if factor_residency is not None:
+        _require_runtime_residency(
+            factor_residency,
+            "memory.factor_residency",
+            allow_mmap=False,
+        )
+
+    if intermediate_residency is None:
+        return
+
+    if operator.kind == "composition":
+        _require_runtime_residency(
+            intermediate_residency,
+            "memory.intermediate_residency",
+            allow_mmap=False,
+        )
+
+        if settings.get("composition.execution") == "fuse_adjacent_children":
+            message = (
+                "memory.intermediate_residency requires visible composition child "
+                "boundaries"
+            )
+            raise MaterializationError(message)
+
+        return
+
+    if intermediate_residency in {"gpu", "cpu_staged", "cpu_pinned"}:
+        message = "memory.intermediate_residency requires named intermediate boundaries"
+        raise MaterializationError(message)
+
+    message = f"memory.intermediate_residency is unsupported: {intermediate_residency}"
+    raise MaterializationError(message)
+
+
+def _require_memory_recompute_settings(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+) -> None:
+    for key in (
+        "memory.primal_outputs",
+        "memory.jvp_outputs",
+        "memory.output_cotangents",
+    ):
+        value = settings.get(key)
+
+        if value is None or value == "retain":
+            continue
+
+        if value == "recompute":
+            if _memory_recompute_supported(operator, settings, key):
+                continue
+
+            message = f"{key}=recompute requires matching operator recompute setting"
+            raise MaterializationError(message)
+
+        message = f"{key} is unsupported: {value}"
+        raise MaterializationError(message)
+
+
+def _memory_recompute_supported(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+    key: str,
+) -> bool:
+    if operator.kind == "hvp" and key == "memory.primal_outputs":
+        return settings.get("hvp.primal_reuse") == "recompute_primal"
+
+    if operator.kind == "ggnvp" and key == "memory.jvp_outputs":
+        return settings.get("ggn.jvp_reuse") == "recompute_jvp"
+
+    if operator.kind == "ggnvp" and key == "memory.output_cotangents":
+        return settings.get("ggn.cotangent_reuse") == "recompute_output_cotangent"
+
+    return False
+
+
+def _require_runtime_residency(
+    value: Any,
+    key: str,
+    *,
+    allow_mmap: bool,
+) -> None:
+    if value in {"cpu_staged", "cpu_pinned", "gpu"}:
+        return
+
+    if value == "mmap_cpu" and not allow_mmap:
+        message = f"{key}=mmap_cpu requires memory-mapped tensor metadata"
+        raise MaterializationError(message)
+
+    message = f"{key} is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _require_output_buffer_settings(settings: Mapping[str, Any]) -> None:
+    value = settings.get("memory.output_buffers")
+
+    if value is None or value == "fresh_allocation":
+        return
+
+    if value == "preallocated":
+        return
+
+    message = f"memory.output_buffers is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _require_fusion_settings(settings: Mapping[str, Any]) -> None:
+    for key, fused_values in _fusion_value_domains().items():
+        value = settings.get(key)
+
+        if value is None or value == "model_default":
+            continue
+
+        if value in fused_values:
+            message = f"{key}={value} requires a registered fused implementation"
+            raise MaterializationError(message)
+
+        message = f"{key} is unsupported: {value}"
+        raise MaterializationError(message)
+
+
+def _fusion_value_domains() -> Mapping[str, set[str]]:
+    return {
+        "fusion.norm": {"fused_rmsnorm", "fused_layernorm"},
+        "fusion.mlp": {"fused_mlp"},
+        "fusion.rope": {"fused_rope"},
+        "fusion.logits": {"fused_logits_projection"},
+        "fusion.loss": {"fused_ce", "fused_kl"},
+    }
+
+
+def _require_activation_runtime_settings(settings: Mapping[str, Any]) -> None:
+    if not _has_activation_settings(settings):
+        return
+
+    recompute = settings.get("activation.recompute")
+    offload = settings.get("activation.offload")
+
+    if recompute not in {
+        "none",
+        "checkpoint_non_reentrant_by_layer",
+        "checkpoint_selective",
+    }:
+        if recompute == "manual_recompute":
+            message = "manual_recompute requires recompute-region metadata"
+            raise MaterializationError(message)
+
+        message = f"activation.recompute is unsupported: {recompute}"
+        raise MaterializationError(message)
+
+    if offload not in {"none", "saved_tensor_hooks_cpu", "custom_saved_tensor_hooks"}:
+        message = f"activation.offload is unsupported: {offload}"
+        raise MaterializationError(message)
+
+    if (
+        recompute == "checkpoint_selective"
+        and settings.get("checkpoint.context_fn") != "declared_context_pair"
+    ):
+        message = (
+            "checkpoint_selective requires checkpoint.context_fn=declared_context_pair"
+        )
+        raise MaterializationError(message)
+
+    if recompute in {"checkpoint_non_reentrant_by_layer", "checkpoint_selective"}:
+        _admit_checkpoint_runtime(settings)
+
+        return
+
+    _require_disabled_checkpoint_settings(settings)
+
+    if offload == "custom_saved_tensor_hooks":
+        pack_hook = settings.get("activation.pack_hook")
+        unpack_hook = settings.get("activation.unpack_hook")
+
+        if not callable(pack_hook) or not callable(unpack_hook):
+            message = (
+                "custom_saved_tensor_hooks requires activation pack and unpack hooks"
+            )
+            raise MaterializationError(message)
+
+
+def _admit_checkpoint_runtime(settings: Mapping[str, Any]) -> None:
+    try:
+        admit_checkpoint(settings)
+    except AdmissionError as error:
+        raise MaterializationError(str(error)) from error
+
+
+def _require_disabled_checkpoint_settings(settings: Mapping[str, Any]) -> None:
+    disabled = {
+        "checkpoint.use_reentrant": "false",
+        "checkpoint.early_stop": "false",
+        "checkpoint.preserve_rng_state": "false",
+        "checkpoint.determinism_check": "none",
+        "checkpoint.context_fn": "none",
+        "checkpoint.moves_to_new_device": "false",
+        "checkpoint.uses_global_state": "false",
+    }
+
+    for key, value in disabled.items():
+        if key in settings and settings[key] != value:
+            message = f"activation.recompute=none requires {key}={value}"
+            raise MaterializationError(message)
+
+
+def _require_gradient_value_reuse_settings(
+    operator: OperatorSpec,
+    path: str,
+    settings: Mapping[str, Any],
+) -> None:
+    if operator.kind != "gradient":
+        return
+
+    reuse = settings.get("gradient.value_reuse")
+
+    if reuse is None or reuse == "gradient_only":
+        return
+
+    if reuse != "gradient_and_primal_value":
+        message = f"gradient.value_reuse is unsupported: {reuse}"
+        raise MaterializationError(message)
+
+    if path != GRADIENT_TORCH_FUNC_VALUE_PATH:
+        message = "gradient_and_primal_value requires torch_func_grad_and_value"
+        raise MaterializationError(message)
+
+
+def _require_jvp_linearize_reuse_settings(
+    operator: OperatorSpec,
+    path: str,
+    settings: Mapping[str, Any],
+) -> None:
+    if operator.kind != "jvp":
+        return
+
+    reuse = settings.get("jvp.linearize_reuse")
+
+    if reuse is None or reuse == "none":
+        return
+
+    if reuse != "reuse_at_same_primal":
+        message = f"jvp.linearize_reuse is unsupported: {reuse}"
+        raise MaterializationError(message)
+
+    if path != JVP_LINEARIZE_PATH:
+        message = "reuse_at_same_primal requires torch_func_linearize"
+        raise MaterializationError(message)
+
+
+def _require_vjp_closure_reuse_settings(
+    operator: OperatorSpec,
+    path: str,
+    settings: Mapping[str, Any],
+) -> None:
+    if operator.kind != "vjp":
+        return
+
+    reuse = settings.get("vjp.closure_reuse")
+
+    if reuse is None or reuse == "none":
+        return
+
+    if reuse != "reuse_vjp_closure_at_same_primal":
+        message = f"vjp.closure_reuse is unsupported: {reuse}"
+        raise MaterializationError(message)
+
+    if path != VJP_PATH:
+        message = "reuse_vjp_closure_at_same_primal requires torch_func_vjp"
+        raise MaterializationError(message)
+
+
+def _require_metric_runtime_settings(
+    operator: OperatorSpec,
+    path: str,
+    settings: Mapping[str, Any],
+) -> None:
+    has_metric_settings = (
+        "metric.multiply_path" in settings
+        or "metric.accumulation" in settings
+        or "metric.block_schedule" in settings
+        or "inverse_metric.block_schedule" in settings
+    )
+
+    if operator.kind == "metric":
+        _require_metric_block_schedule(operator, settings, "metric.block_schedule")
+        _require_metric_accumulation_settings(path, settings)
+
+        return
+
+    if operator.kind == "inverse_metric":
+        _require_metric_block_schedule(
+            operator,
+            settings,
+            "inverse_metric.block_schedule",
+        )
+
+        if path != INVERSE_METRIC_CG_PATH:
+            if "metric.multiply_path" in settings or "metric.accumulation" in settings:
+                message = (
+                    "metric settings apply only to metric rows and conjugate_gradient "
+                    "inverse_metric rows"
+                )
+                raise MaterializationError(message)
+
+            return
+
+        metric_path = _metric_runtime_path_from_settings(settings)
+        _require_metric_accumulation_settings(metric_path, settings)
+
+        return
+
+    if has_metric_settings:
+        message = (
+            "metric settings apply only to metric rows and conjugate_gradient "
+            "inverse_metric rows"
+        )
+        raise MaterializationError(message)
+
+
+def _require_inverse_metric_factor_reuse_settings(
+    operator: OperatorSpec,
+    path: str | None,
+    settings: Mapping[str, Any],
+) -> None:
+    value = settings.get("inverse_metric.factor_reuse")
+
+    if value is None:
+        return
+
+    if operator.kind != "inverse_metric":
+        message = "inverse_metric.factor_reuse applies only to inverse_metric rows"
+        raise MaterializationError(message)
+
+    if value == "refactor_each_rhs":
+        return
+
+    if value == "reuse_factor_across_rhs":
+        if settings.get("vectorization.mode") not in {"single_loop", "manual_batch"}:
+            message = "reuse_factor_across_rhs requires vectorized inverse metric input"
+            raise MaterializationError(message)
+
+        if path not in INVERSE_METRIC_FACTOR_REUSE_PATHS:
+            message = "reuse_factor_across_rhs requires a factor-reuse solve path"
+            raise MaterializationError(message)
+
+        return
+
+    message = f"inverse_metric.factor_reuse is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _require_metric_block_schedule(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+    axis_key: str,
+) -> None:
+    value = settings.get(axis_key)
+
+    if value is None:
+        return
+
+    representation = _metric_representation(operator)
+    kind = _metric_representation_kind(operator)
+
+    if kind not in {"block_diagonal", "kfac_factors"}:
+        message = f"{axis_key} requires blocks or KFAC factors"
+        raise MaterializationError(message)
+
+    schedule = representation.get("block_schedule")
+
+    if not isinstance(schedule, str):
+        message = f"{axis_key} requires representation.block_schedule"
+        raise MaterializationError(message)
+
+    if value != schedule:
+        message = f"{axis_key} must match representation.block_schedule"
+        raise MaterializationError(message)
+
+
+def _require_layout_runtime_settings(settings: Mapping[str, Any]) -> None:
+    flatten_order = settings.get("layout.flatten_order")
+
+    if flatten_order is not None and flatten_order != "canonical_parameter_order":
+        message = f"layout.flatten_order is unsupported: {flatten_order}"
+        raise MaterializationError(message)
+
+    _layout_tree_input(settings, "layout.params")
+    _layout_tree_input(settings, "layout.vector")
+    _layout_output(settings)
+    _layout_single_value(
+        settings,
+        "layout.aliasing",
+        "preserve_tied_weight_aliases",
+    )
+    _layout_single_value(
+        settings,
+        "layout.parametrizations",
+        "preserve_active_parametrizations",
+    )
+    _layout_vector_ops(settings)
+
+
+def _layout_tree_input(settings: Mapping[str, Any], key: str) -> None:
+    value = settings.get(key)
+
+    if value is None or value == "parameter_tree":
+        return
+
+    if value in {"flat_contiguous", "per_layer_flat", "per_block_flat"}:
+        return
+
+    message = f"{key}={value} requires tree reconstruction support"
+    raise MaterializationError(message)
+
+
+def _layout_output(settings: Mapping[str, Any]) -> str:
+    value = settings.get("layout.output")
+
+    if value is None or value == "parameter_tree":
+        return "parameter_tree"
+
+    if value == "flat_contiguous":
+        return "flat_contiguous"
+
+    if value in {"per_layer_flat", "per_block_flat"}:
+        return "parameter_tree"
+
+    message = f"layout.output is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _layout_single_value(
+    settings: Mapping[str, Any],
+    key: str,
+    expected: str,
+) -> None:
+    value = settings.get(key)
+
+    if value is None or value == expected:
+        return
+
+    message = f"{key} is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _layout_vector_ops(settings: Mapping[str, Any]) -> str:
+    value = settings.get("layout.vector_ops")
+
+    if value is None or value == "python_loop":
+        return "python_loop"
+
+    if value == "foreach":
+        return "foreach"
+
+    message = f"layout.vector_ops is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _tree_zeros_like_runtime(
+    settings: Mapping[str, Any],
+    tree: TensorTree,
+) -> TensorTree:
+    if _layout_vector_ops(settings) == "foreach":
+        return tree_zeros_like_foreach(tree)
+
+    return tree_map(torch.zeros_like, tree)
+
+
+def _tree_dot_runtime(
+    settings: Mapping[str, Any],
+    left: TensorTree,
+    right: TensorTree,
+) -> torch.Tensor:
+    left = _accumulation_tree(left, settings)
+    right = _accumulation_tree(right, settings)
+
+    if _layout_vector_ops(settings) == "foreach":
+        return tree_dot_foreach(left, right)
+
+    return tree_dot(left, right)
+
+
+def _tree_add_runtime(
+    settings: Mapping[str, Any],
+    left: TensorTree,
+    right: TensorTree,
+) -> TensorTree:
+    left = _accumulation_tree(left, settings)
+    right = _accumulation_tree(right, settings)
+
+    if _layout_vector_ops(settings) == "foreach":
+        return tree_add_foreach(left, right)
+
+    return tree_map2(torch.add, left, right)
+
+
+def _dot_runtime(
+    settings: Mapping[str, Any],
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> torch.Tensor:
+    return torch.dot(
+        _accumulation_tensor(left, settings),
+        _accumulation_tensor(right, settings),
+    )
+
+
+def _batched_dot_runtime(
+    settings: Mapping[str, Any],
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> torch.Tensor:
+    left_accumulation = _accumulation_tensor(left, settings)
+    right_accumulation = _accumulation_tensor(right, settings)
+
+    return torch.sum(left_accumulation * right_accumulation, dim=1)
+
+
+def _matmul_runtime(
+    settings: Mapping[str, Any],
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> torch.Tensor:
+    return _accumulation_tensor(left, settings) @ _accumulation_tensor(
+        right,
+        settings,
+    )
+
+
+def _tree_scale_runtime(
+    settings: Mapping[str, Any],
+    tree: TensorTree,
+    scale: float,
+) -> TensorTree:
+    if _layout_vector_ops(settings) == "foreach":
+        return tree_mul_foreach(tree, scale)
+
+    return tree_map(lambda tensor: tensor * scale, tree)
+
+
+def _tree_elementwise_mul_runtime(
+    settings: Mapping[str, Any],
+    left: TensorTree,
+    right: TensorTree,
+) -> TensorTree:
+    if _layout_vector_ops(settings) == "foreach":
+        return tree_elementwise_mul_foreach(left, right)
+
+    return tree_map2(torch.mul, left, right)
+
+
+def _tree_elementwise_div_runtime(
+    settings: Mapping[str, Any],
+    left: TensorTree,
+    right: TensorTree,
+) -> TensorTree:
+    if _layout_vector_ops(settings) == "foreach":
+        return tree_elementwise_div_foreach(left, right)
+
+    return tree_map2(torch.div, left, right)
+
+
+def _tree_add_scalar_runtime(
+    settings: Mapping[str, Any],
+    tree: TensorTree,
+    scalar: float,
+) -> TensorTree:
+    if _layout_vector_ops(settings) == "foreach":
+        return tree_add_scalar_foreach(tree, scalar)
+
+    return tree_map(lambda tensor: tensor + scalar, tree)
+
+
+def _require_ggn_vjp_path_settings(
+    operator: OperatorSpec,
+    path: str,
+    settings: Mapping[str, Any],
+) -> None:
+    if operator.kind != "ggnvp":
+        return
+
+    value = settings.get("ggn.vjp_path")
+
+    if path == GGN_DENSE_PATH:
+        if value is not None:
+            message = "ggn.vjp_path is not used with dense_global"
+            raise MaterializationError(message)
+
+        return
+
+    if value is None:
+        message = "ggn.vjp_path is required for JVP-Hessian-VJP rows"
+        raise MaterializationError(message)
+
+    if value not in {"torch_func_vjp", "autograd_grad_outputs"}:
+        message = f"ggn.vjp_path is unsupported: {value}"
+        raise MaterializationError(message)
+
+
+def _require_ggn_loss_hessian_settings(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+) -> None:
+    if operator.kind != "ggnvp":
+        return
+
+    path = settings.get("ggn.loss_hessian_path")
+    kernel = settings.get("ggn.loss_hessian_kernel")
+    chunk_key = "chunk.class_block_size_with_exact_global_normalization"
+
+    if path is None and kernel is None:
+        if chunk_key in settings:
+            message = f"{chunk_key} requires two_pass_chunked_global"
+            raise MaterializationError(message)
+
+        return
+
+    if path is None or kernel is None:
+        message = "GGN loss-Hessian rows require path and kernel settings"
+        raise MaterializationError(message)
+
+    if path == "closed_form_softmax_ce_kl":
+        if kernel not in {
+            "dense_global",
+            "streaming_global",
+            "two_pass_chunked_global",
+        }:
+            message = f"ggn.loss_hessian_kernel is unsupported: {kernel}"
+            raise MaterializationError(message)
+
+        if kernel == "two_pass_chunked_global":
+            _class_block_size_with_exact_global_normalization(settings)
+        elif chunk_key in settings:
+            message = f"{chunk_key} requires two_pass_chunked_global"
+            raise MaterializationError(message)
+
+        return
+
+    if path != "autodiff_loss_hvp":
+        message = f"ggn.loss_hessian_path is not lowered by standard runtime: {path}"
+        raise MaterializationError(message)
+
+    if kernel != "dense_global":
+        message = (
+            f"ggn.loss_hessian_kernel is not lowered by standard runtime: {kernel}"
+        )
+        raise MaterializationError(message)
+
+    if chunk_key in settings:
+        message = f"{chunk_key} requires two_pass_chunked_global"
+        raise MaterializationError(message)
+
+
+def _require_hvp_reuse_settings(
+    operator: OperatorSpec,
+    path: str,
+    settings: Mapping[str, Any],
+) -> None:
+    graph_schedule = settings.get("hvp.graph_schedule")
+    primal_reuse = settings.get("hvp.primal_reuse")
+    gradient_reuse = settings.get("hvp.gradient_reuse")
+
+    if operator.kind != "hvp":
+        if graph_schedule is not None:
+            message = "hvp.graph_schedule applies only to HVP rows"
+            raise MaterializationError(message)
+
+        if primal_reuse is not None:
+            message = "hvp.primal_reuse applies only to HVP rows"
+            raise MaterializationError(message)
+
+        if gradient_reuse is not None:
+            message = "hvp.gradient_reuse applies only to HVP rows"
+            raise MaterializationError(message)
+
+        return
+
+    if graph_schedule == "retain_graph_across_vectors":
+        _require_hvp_reverse_reuse_settings(path, settings)
+
+        if primal_reuse != "reuse_primal":
+            message = (
+                "retain_graph_across_vectors requires hvp.primal_reuse=reuse_primal"
+            )
+            raise MaterializationError(message)
+    elif graph_schedule not in {None, "rebuild_graph_per_vector"}:
+        message = f"hvp.graph_schedule is unsupported: {graph_schedule}"
+        raise MaterializationError(message)
+
+    if primal_reuse == "reuse_primal":
+        _require_hvp_reverse_reuse_settings(path, settings)
+    elif primal_reuse not in {None, "recompute_primal"}:
+        message = f"hvp.primal_reuse is unsupported: {primal_reuse}"
+        raise MaterializationError(message)
+
+    if gradient_reuse in {None, "recompute_gradient"}:
+        return
+
+    if gradient_reuse != "reuse_gradient_closure":
+        message = f"hvp.gradient_reuse is unsupported: {gradient_reuse}"
+        raise MaterializationError(message)
+
+    if path != HVP_LINEARIZE_GRAD_PATH:
+        message = "reuse_gradient_closure requires linearize_grad"
+        raise MaterializationError(message)
+
+
+def _require_hvp_reverse_reuse_settings(
+    path: str,
+    settings: Mapping[str, Any],
+) -> None:
+    if path != HVP_REFERENCE_PATH:
+        message = "HVP graph and primal reuse require reverse_over_reverse"
+        raise MaterializationError(message)
+
+    if settings.get("vectorization.mode") != "single_loop":
+        message = "HVP graph and primal reuse require vectorization.mode=single_loop"
+        raise MaterializationError(message)
+
+    if "vectorization.in_dims" not in settings:
+        message = "HVP graph and primal reuse require vectorization.in_dims"
+        raise MaterializationError(message)
+
+
+def _require_ggn_reuse_settings(
+    operator: OperatorSpec,
+    path: str,
+    settings: Mapping[str, Any],
+) -> None:
+    jvp_reuse = settings.get("ggn.jvp_reuse")
+    cotangent_reuse = settings.get("ggn.cotangent_reuse")
+
+    if operator.kind != "ggnvp":
+        if jvp_reuse is not None:
+            message = "ggn.jvp_reuse applies only to GGNVP rows"
+            raise MaterializationError(message)
+
+        if cotangent_reuse is not None:
+            message = "ggn.cotangent_reuse applies only to GGNVP rows"
+            raise MaterializationError(message)
+
+        return
+
+    if path == GGN_DENSE_PATH:
+        if jvp_reuse is not None:
+            message = "ggn.jvp_reuse is not used with dense_global"
+            raise MaterializationError(message)
+
+        if cotangent_reuse is not None:
+            message = "ggn.cotangent_reuse is not used with dense_global"
+            raise MaterializationError(message)
+
+        return
+
+    if jvp_reuse not in {None, "reuse_jvp", "recompute_jvp"}:
+        message = f"ggn.jvp_reuse is unsupported: {jvp_reuse}"
+        raise MaterializationError(message)
+
+    if cotangent_reuse not in {
+        None,
+        "reuse_output_cotangent",
+        "recompute_output_cotangent",
+    }:
+        message = f"ggn.cotangent_reuse is unsupported: {cotangent_reuse}"
+        raise MaterializationError(message)
 
 
 def _runtime_params(
     params: ParameterTree,
     settings: Mapping[str, Any],
+    parameter_surface: ParameterSurface | None,
 ) -> ParameterTree:
-    dtype = _runtime_compute_dtype(settings)
+    dtype = _parameter_dtype(settings)
 
     if dtype is None:
-        return params
+        result = _runtime_named_tensor_contiguity(params, settings)
+    else:
+        result = _runtime_named_tensor_contiguity(
+            {key: tensor.to(dtype=dtype) for key, tensor in params.items()},
+            settings,
+        )
 
-    return {key: tensor.to(dtype=dtype) for key, tensor in params.items()}
+    if settings.get("layout.params") == "flat_contiguous":
+        return _wrap_flat_parameter_tree(
+            result,
+            _flatten_vector(result).contiguous(),
+        )
+
+    return _runtime_grouped_parameter_layout(
+        result,
+        settings,
+        "layout.params",
+        parameter_surface,
+    )
+
+
+def _runtime_grouped_parameter_layout(
+    tree: ParameterTree,
+    settings: Mapping[str, Any],
+    key: str,
+    parameter_surface: ParameterSurface | None,
+) -> ParameterTree:
+    groups = _parameter_layout_groups(settings, key, parameter_surface)
+
+    if groups is None:
+        return tree
+
+    return _wrap_grouped_parameter_tree(tree, groups, key)
+
+
+def _parameter_layout_groups(
+    settings: Mapping[str, Any],
+    key: str,
+    parameter_surface: ParameterSurface | None,
+) -> tuple[tuple[str, ...], ...] | None:
+    layout = settings.get(key)
+
+    if layout in {None, "parameter_tree", "flat_contiguous"}:
+        return None
+
+    if layout == "per_layer_flat":
+        return _declared_parameter_groups(parameter_surface, "layer_groups", key)
+
+    if layout == "per_block_flat":
+        return _declared_parameter_groups(parameter_surface, "block_groups", key)
+
+    return None
+
+
+def _declared_parameter_groups(
+    parameter_surface: ParameterSurface | None,
+    group_field: str,
+    key: str,
+) -> tuple[tuple[str, ...], ...]:
+    if parameter_surface is None:
+        message = f"{key} requires declared {group_field}"
+        raise MaterializationError(message)
+
+    groups = (
+        parameter_surface.layer_groups
+        if group_field == "layer_groups"
+        else parameter_surface.block_groups
+    )
+
+    if not groups:
+        message = f"{key} requires declared {group_field}"
+        raise MaterializationError(message)
+
+    return groups
+
+
+def _wrap_grouped_parameter_tree(
+    tree: ParameterTree,
+    groups: tuple[tuple[str, ...], ...],
+    key: str,
+) -> ParameterTree:
+    grouped = dict(tree)
+
+    for group in groups:
+        _require_group_names(tree, group, key)
+        flat = torch.cat(tuple(tree[name].reshape(-1) for name in group)).contiguous()
+        offset = 0
+
+        for name in group:
+            tensor = tree[name]
+            stop = offset + tensor.numel()
+            grouped[name] = flat[offset:stop].reshape_as(tensor)
+            offset = stop
+
+    return grouped
+
+
+def _require_group_names(
+    tree: ParameterTree,
+    group: tuple[str, ...],
+    key: str,
+) -> None:
+    missing = tuple(name for name in group if name not in tree)
+
+    if missing:
+        message = f"{key} declared groups contain missing parameters: {missing}"
+        raise MaterializationError(message)
+
+
+def _runtime_grouped_output_layout(
+    tree: TensorTree,
+    settings: Mapping[str, Any],
+    parameter_surface: ParameterSurface | None,
+) -> TensorTree:
+    groups = _parameter_layout_groups(settings, "layout.output", parameter_surface)
+
+    if groups is None:
+        return tree
+
+    result = _parameter_tree_from_tensor_tree(
+        tree,
+        "grouped output layout",
+    )
+
+    return _wrap_grouped_parameter_tree(result, groups, "layout.output")
+
+
+def _parameter_tree_from_tensor_tree(
+    tree: TensorTree,
+    label: str,
+) -> ParameterTree:
+    if not isinstance(tree, dict):
+        message = f"{label} requires a parameter-tree tensor mapping"
+        raise MaterializationError(message)
+
+    result = dict[str, torch.Tensor]()
+
+    for key, value in tree.items():
+        if not isinstance(key, str):
+            message = f"{label} requires string keys"
+            raise MaterializationError(message)
+
+        if not isinstance(value, torch.Tensor):
+            message = f"{label} requires tensor leaves"
+            raise MaterializationError(message)
+
+        result[key] = value
+
+    return result
 
 
 def _runtime_buffers(
     buffers: BufferTree,
     settings: Mapping[str, Any],
 ) -> BufferTree:
-    dtype = _runtime_compute_dtype(settings)
+    dtype = _parameter_dtype(settings)
 
     if dtype is None:
-        return buffers
+        return _runtime_named_tensor_contiguity(buffers, settings)
 
-    return {key: tensor.to(dtype=dtype) for key, tensor in buffers.items()}
+    return _runtime_named_tensor_contiguity(
+        {key: tensor.to(dtype=dtype) for key, tensor in buffers.items()},
+        settings,
+    )
 
 
-def _runtime_batch(batch: Batch, settings: Mapping[str, Any]) -> Batch:
-    dtype = _runtime_compute_dtype(settings)
+def _runtime_batch(
+    batch: Batch,
+    settings: Mapping[str, Any],
+    *,
+    move_input_residency: bool = True,
+) -> Batch:
+    dtype = _batch_dtype(settings)
+    metric_factor_dtype = _dtype_setting(settings, "dtype.metric_factor")
+    metric_factor_residency = settings.get("memory.factor_residency")
 
-    if dtype is None:
+    if (
+        dtype is None
+        and metric_factor_dtype is None
+        and metric_factor_residency is None
+    ):
+        return _runtime_batch_after_contiguity(
+            batch,
+            settings,
+            move_input_residency=move_input_residency,
+        )
+
+    result = (
+        batch
+        if dtype is None
+        else {key: _runtime_batch_value(value, dtype) for key, value in batch.items()}
+    )
+
+    if metric_factor_dtype is None and metric_factor_residency is None:
+        return _runtime_batch_after_contiguity(
+            result,
+            settings,
+            move_input_residency=move_input_residency,
+        )
+
+    if metric_factor_dtype is not None:
+        result = {
+            key: _runtime_metric_factor_value(key, value, metric_factor_dtype)
+            for key, value in result.items()
+        }
+
+    if metric_factor_residency is not None:
+        result = {
+            key: _runtime_metric_factor_residency_value(
+                key,
+                value,
+                metric_factor_residency,
+            )
+            for key, value in result.items()
+        }
+
+    return _runtime_batch_after_contiguity(
+        result,
+        settings,
+        move_input_residency=move_input_residency,
+    )
+
+
+def _runtime_batch_after_contiguity(
+    batch: Batch,
+    settings: Mapping[str, Any],
+    *,
+    move_input_residency: bool,
+) -> Batch:
+    result = _runtime_batch_contiguity(batch, settings)
+
+    if move_input_residency:
+        result = _runtime_batch_input_residency(result, settings)
+
+    return _runtime_batch_teacher_outputs(result, settings)
+
+
+def _runtime_batch_input_residency(
+    batch: Batch,
+    settings: Mapping[str, Any],
+) -> Batch:
+    residency = settings.get("input.residency")
+
+    if residency is None:
         return batch
 
-    return {key: _runtime_batch_value(value, dtype) for key, value in batch.items()}
+    result = dict(batch)
+
+    for key, value in batch.items():
+        if key != "teacher_outputs":
+            result[key] = _input_residency_value(value, residency)
+
+    return result
 
 
-def _runtime_vector(vector: TensorTree, settings: Mapping[str, Any]) -> TensorTree:
-    dtype = _runtime_compute_dtype(settings)
+def _input_residency_value(value: Any, residency: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _input_residency_tensor(value, residency)
+
+    if isinstance(value, dict):
+        return {
+            key: _input_residency_value(child, residency)
+            for key, child in value.items()
+        }
+
+    if isinstance(value, tuple):
+        return tuple(_input_residency_value(child, residency) for child in value)
+
+    return value
+
+
+def _input_residency_tensor(tensor: torch.Tensor, residency: Any) -> torch.Tensor:
+    return _residency_tensor(tensor, residency, "input.residency")
+
+
+def _tree_residency(tree: TensorTree, residency: Any, key: str) -> TensorTree:
+    return tree_map(lambda tensor: _residency_tensor(tensor, residency, key), tree)
+
+
+def _residency_tensor(
+    tensor: torch.Tensor,
+    residency: Any,
+    key: str,
+) -> torch.Tensor:
+    if residency == "cpu_staged":
+        return tensor.to(device=torch.device("cpu"))
+
+    if residency == "cpu_pinned":
+        cpu_tensor = tensor.to(device=torch.device("cpu"))
+
+        try:
+            return cpu_tensor.pin_memory()
+        except RuntimeError as error:
+            raise MaterializationError(str(error)) from error
+
+    if residency == "gpu":
+        if not torch.cuda.is_available():
+            message = f"{key}=gpu requires CUDA"
+            raise MaterializationError(message)
+
+        return tensor.to(device=torch.device("cuda"))
+
+    if residency == "mmap_cpu":
+        message = f"{key}=mmap_cpu requires memory-mapped tensor metadata"
+        raise MaterializationError(message)
+
+    message = f"{key} is unsupported: {residency}"
+    raise MaterializationError(message)
+
+
+def _runtime_batch_teacher_outputs(
+    batch: Batch,
+    settings: Mapping[str, Any],
+) -> Batch:
+    value = settings.get("teacher_outputs")
+
+    if value is None:
+        return batch
+
+    if "teacher_outputs" not in batch:
+        message = "teacher_outputs batch field is required"
+        raise MaterializationError(message)
+
+    result = dict(batch)
+
+    if value == "precomputed_cpu":
+        result["teacher_outputs"] = _teacher_outputs_to_device(
+            batch["teacher_outputs"],
+            torch.device("cpu"),
+        )
+
+        return result
+
+    if value == "precomputed_cpu_pinned":
+        result["teacher_outputs"] = _teacher_outputs_pin_cpu(batch["teacher_outputs"])
+
+        return result
+
+    if value == "precomputed_gpu":
+        if not torch.cuda.is_available():
+            message = "precomputed_gpu teacher outputs require CUDA"
+            raise MaterializationError(message)
+
+        result["teacher_outputs"] = _teacher_outputs_to_device(
+            batch["teacher_outputs"],
+            torch.device("cuda"),
+        )
+
+        return result
+
+    if value == "recomputed_with_equality_check":
+        _require_teacher_output_tree(batch["teacher_outputs"])
+
+        return result
+
+    message = f"teacher_outputs is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _execution_with_recomputed_teacher_outputs(
+    execution: StandardExecution,
+) -> StandardExecution:
+    if execution.candidate.settings.get("teacher_outputs") != (
+        "recomputed_with_equality_check"
+    ):
+        return execution
+
+    if execution.teacher_objective is None:
+        message = "recomputed teacher outputs require a teacher objective"
+        raise MaterializationError(message)
+
+    fixed_outputs = execution.batch.get("teacher_outputs")
+    _require_teacher_output_tree(fixed_outputs)
+    recomputed_outputs = execution.teacher_objective(
+        execution.params,
+        execution.buffers,
+        execution.batch,
+        execution.context,
+    )
+    _require_teacher_outputs_match(fixed_outputs, recomputed_outputs)
+    batch = dict(execution.batch)
+    batch["teacher_outputs"] = recomputed_outputs
+
+    return dataclasses.replace(execution, batch=batch)
+
+
+def _teacher_outputs_to_device(value: Any, device: torch.device) -> TensorTree:
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device)
+
+    if isinstance(value, dict):
+        return {
+            key: _teacher_outputs_to_device(child, device)
+            for key, child in value.items()
+        }
+
+    if isinstance(value, tuple):
+        return tuple(_teacher_outputs_to_device(child, device) for child in value)
+
+    message = "teacher_outputs batch field must be a tensor tree"
+    raise MaterializationError(message)
+
+
+def _require_teacher_output_tree(value: Any) -> None:
+    if isinstance(value, torch.Tensor):
+        return
+
+    if isinstance(value, dict):
+        for child in value.values():
+            _require_teacher_output_tree(child)
+
+        return
+
+    if isinstance(value, tuple):
+        for child in value:
+            _require_teacher_output_tree(child)
+
+        return
+
+    message = "teacher_outputs batch field must be a tensor tree"
+    raise MaterializationError(message)
+
+
+def _require_teacher_outputs_match(fixed: Any, recomputed: Any) -> None:
+    if _teacher_outputs_equal(fixed, recomputed):
+        return
+
+    message = "recomputed teacher outputs do not match fixed teacher_outputs"
+    raise MaterializationError(message)
+
+
+def _teacher_outputs_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+        return torch.equal(left, right)
+
+    if isinstance(left, dict) and isinstance(right, dict):
+        if set(left) != set(right):
+            return False
+
+        return all(_teacher_outputs_equal(left[key], right[key]) for key in left)
+
+    if isinstance(left, tuple) and isinstance(right, tuple):
+        if len(left) != len(right):
+            return False
+
+        return all(starmap(_teacher_outputs_equal, zip(left, right, strict=True)))
+
+    return False
+
+
+def _teacher_outputs_pin_cpu(value: Any) -> TensorTree:
+    cpu_value = _teacher_outputs_to_device(value, torch.device("cpu"))
+
+    return tree_map(_pin_cpu_tensor, cpu_value)
+
+
+def _pin_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "cpu":
+        message = "teacher output pinning requires CPU tensors"
+        raise MaterializationError(message)
+
+    try:
+        return tensor.pin_memory()
+    except RuntimeError as error:
+        raise MaterializationError(str(error)) from error
+
+
+def _runtime_vector(
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+    template: TensorTree | None = None,
+    parameter_surface: ParameterSurface | None = None,
+) -> TensorTree:
+    dtype = _dtype_setting(settings, "dtype.vector")
 
     if dtype is None:
+        result = vector
+    else:
+        result = tree_map(lambda tensor: tensor.to(dtype=dtype), vector)
+
+    result = _runtime_vector_residency(result, settings)
+    result = _runtime_vector_layout(
+        result,
+        settings,
+        vector if template is None else template,
+        parameter_surface,
+    )
+
+    return _runtime_tree_contiguity(result, settings)
+
+
+def _runtime_vector_layout(
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+    template: TensorTree,
+    parameter_surface: ParameterSurface | None,
+) -> TensorTree:
+    layout = settings.get("layout.vector")
+
+    if layout is None or layout == "parameter_tree":
         return vector
 
-    return tree_map(lambda tensor: tensor.to(dtype=dtype), vector)
+    if isinstance(vector, torch.Tensor):
+        flat_vector = vector.reshape(-1).contiguous()
+    else:
+        flat_vector = _flatten_vector_like(template, vector).contiguous()
+
+    if layout == "flat_contiguous":
+        return _wrap_flat_vector(template, flat_vector)
+
+    wrapped = _wrap_flat_vector(template, flat_vector)
+    parameter_tree = _parameter_tree_from_tensor_tree(
+        wrapped,
+        f"layout.vector={layout}",
+    )
+
+    return _runtime_grouped_parameter_layout(
+        parameter_tree,
+        settings,
+        "layout.vector",
+        parameter_surface,
+    )
+
+
+def _runtime_vector_residency(
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    residency = settings.get("memory.vector_residency")
+
+    if residency is None:
+        return vector
+
+    return tree_map(
+        lambda tensor: _residency_tensor(
+            tensor,
+            residency,
+            "memory.vector_residency",
+        ),
+        vector,
+    )
+
+
+def _runtime_output(
+    output: TensorTree,
+    settings: Mapping[str, Any],
+    parameter_surface: ParameterSurface | None = None,
+) -> TensorTree:
+    dtype = _dtype_setting(settings, "dtype.output")
+
+    if dtype is not None:
+        output = tree_map(lambda tensor: tensor.to(dtype=dtype), output)
+
+    if _layout_output(settings) == "flat_contiguous":
+        return _flatten_vector(output).contiguous()
+
+    return _runtime_grouped_output_layout(output, settings, parameter_surface)
+
+
+def _standard_output_buffer(execution: StandardExecution) -> TensorTree | None:
+    if execution.candidate.settings.get("memory.output_buffers") != "preallocated":
+        return None
+
+    template = _standard_output_template(execution)
+    runtime_template = _runtime_output(
+        template,
+        execution.candidate.settings,
+        execution.parameter_surface,
+    )
+
+    return tree_map(torch.empty_like, runtime_template)
+
+
+def _composition_output_buffer(
+    settings: Mapping[str, Any],
+    vector: TensorTree,
+) -> TensorTree | None:
+    if settings.get("memory.output_buffers") != "preallocated":
+        return None
+
+    template = _runtime_vector(vector, settings)
+    runtime_template = _runtime_output(template, settings)
+
+    return tree_map(torch.empty_like, runtime_template)
+
+
+def _standard_output_template(execution: StandardExecution) -> TensorTree:
+    kind = execution.operator.kind
+
+    if kind == "jvp":
+        return _jvp_output_template(execution)
+
+    if kind in {
+        "gradient",
+        "vjp",
+        "hvp",
+        "ggnvp",
+        "fisher_vp",
+        "sampled_fisher_vp",
+        "empirical_fisher_vp",
+    }:
+        return execution.params
+
+    if kind in {"metric", "inverse_metric", "composition"}:
+        return execution.vector
+
+    message = f"memory.output_buffers=preallocated lacks output template for {kind}"
+    raise MaterializationError(message)
+
+
+def _jvp_output_template(execution: StandardExecution) -> TensorTree:
+    function = _function_objective(
+        execution.operator,
+        execution.function_objectives,
+    )
+
+    def callback() -> TensorTree:
+        return function(
+            execution.params,
+            execution.buffers,
+            execution.batch,
+            execution.context,
+        )
+
+    return _run_with_backend_settings(
+        execution.candidate.settings,
+        lambda: _run_with_call_grad_mode(execution.candidate.settings, callback),
+    )
+
+
+def _runtime_output_to_buffer(
+    output: TensorTree,
+    buffer: TensorTree | None,
+) -> TensorTree:
+    if buffer is None:
+        return output
+
+    try:
+        return tree_map2(_copy_output_tensor, buffer, output)
+    except (RuntimeError, TypeError) as error:
+        message = "memory.output_buffers=preallocated output tree mismatch"
+        raise MaterializationError(message) from error
+
+
+def _copy_output_tensor(buffer: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+    if buffer.dtype != output.dtype:
+        message = "preallocated output buffer dtype mismatch"
+        raise RuntimeError(message)
+
+    if buffer.device != output.device:
+        message = "preallocated output buffer device mismatch"
+        raise RuntimeError(message)
+
+    buffer.copy_(output)
+
+    return buffer
+
+
+def _accumulation_tensor(
+    tensor: torch.Tensor,
+    settings: Mapping[str, Any],
+) -> torch.Tensor:
+    dtype = _dtype_setting(settings, "dtype.accumulation")
+
+    if dtype is None:
+        return tensor
+
+    return tensor.to(dtype=dtype)
+
+
+def _accumulation_tree(tree: TensorTree, settings: Mapping[str, Any]) -> TensorTree:
+    dtype = _dtype_setting(settings, "dtype.accumulation")
+
+    if dtype is None:
+        return tree
+
+    return tree_map(lambda tensor: tensor.to(dtype=dtype), tree)
 
 
 def _runtime_batch_value(value: Any, dtype: torch.dtype) -> Any:
@@ -2333,13 +10655,130 @@ def _runtime_batch_value(value: Any, dtype: torch.dtype) -> Any:
     return value
 
 
-def _runtime_compute_dtype(settings: Mapping[str, Any]) -> torch.dtype | None:
-    compute_dtype = _dtype_setting(settings, "compute_dtype")
+def _runtime_metric_factor_value(
+    key: str,
+    value: Any,
+    dtype: torch.dtype,
+) -> Any:
+    if key not in METRIC_FACTOR_BATCH_KEYS:
+        return value
+
+    return _runtime_batch_value(value, dtype)
+
+
+def _runtime_metric_factor_residency_value(
+    key: str,
+    value: Any,
+    residency: Any,
+) -> Any:
+    if key not in METRIC_FACTOR_BATCH_KEYS:
+        return value
+
+    return _runtime_metric_factor_residency_tree(value, residency)
+
+
+def _runtime_metric_factor_residency_tree(value: Any, residency: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _residency_tensor(value, residency, "memory.factor_residency")
+
+    if isinstance(value, dict):
+        return {
+            key: _runtime_metric_factor_residency_tree(child, residency)
+            for key, child in value.items()
+        }
+
+    if isinstance(value, tuple):
+        return tuple(
+            _runtime_metric_factor_residency_tree(child, residency) for child in value
+        )
+
+    return value
+
+
+def _runtime_tree_contiguity(
+    tree: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    if not _layout_contiguity_enabled(settings):
+        return tree
+
+    return tree_map(lambda tensor: tensor.contiguous(), tree)
+
+
+def _runtime_named_tensor_contiguity(
+    tree: dict[str, torch.Tensor],
+    settings: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
+    if not _layout_contiguity_enabled(settings):
+        return tree
+
+    return {key: tensor.contiguous() for key, tensor in tree.items()}
+
+
+def _runtime_batch_contiguity(
+    batch: Batch,
+    settings: Mapping[str, Any],
+) -> Batch:
+    if not _layout_contiguity_enabled(settings):
+        return batch
+
+    return {key: _runtime_batch_contiguity_value(value) for key, value in batch.items()}
+
+
+def _runtime_batch_contiguity_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.contiguous()
+
+    if isinstance(value, dict):
+        return {
+            key: _runtime_batch_contiguity_value(child) for key, child in value.items()
+        }
+
+    if isinstance(value, tuple):
+        return tuple(_runtime_batch_contiguity_value(child) for child in value)
+
+    return value
+
+
+def _layout_contiguity_enabled(settings: Mapping[str, Any]) -> bool:
+    value = settings.get("layout.contiguity")
+
+    if value is None or value == "preserve_existing_strides":
+        return False
+
+    if value == "contiguous":
+        return True
+
+    message = f"layout.contiguity is unsupported: {value}"
+    raise MaterializationError(message)
+
+
+def _parameter_dtype(settings: Mapping[str, Any]) -> torch.dtype | None:
+    autodiff_dtype = _dtype_setting(settings, "dtype.autodiff_compute")
+
+    if autodiff_dtype is not None:
+        return autodiff_dtype
+
+    compute_dtype = _dtype_setting(settings, "dtype.model_compute")
 
     if compute_dtype is not None:
         return compute_dtype
 
-    return _dtype_setting(settings, "model_dtype")
+    return _dtype_setting(settings, "dtype.parameter_storage")
+
+
+def _batch_dtype(settings: Mapping[str, Any]) -> torch.dtype | None:
+    autodiff_dtype = _dtype_setting(settings, "dtype.autodiff_compute")
+
+    if autodiff_dtype is not None:
+        return autodiff_dtype
+
+    compute_dtype = _dtype_setting(settings, "dtype.model_compute")
+
+    if compute_dtype is not None:
+        return compute_dtype
+
+    return _dtype_setting(settings, "dtype.intermediate")
 
 
 def _dtype_setting(settings: Mapping[str, Any], key: str) -> torch.dtype | None:
@@ -2352,13 +10791,13 @@ def _dtype_setting(settings: Mapping[str, Any], key: str) -> torch.dtype | None:
         message = f"{key} must be a string"
         raise MaterializationError(message)
 
-    if dtype_name == "bfloat16":
+    if dtype_name == "bf16":
         return torch.bfloat16
 
-    if dtype_name == "float16":
+    if dtype_name == "fp16":
         return torch.float16
 
-    if dtype_name == "float32":
+    if dtype_name == "fp32":
         return torch.float32
 
     message = f"{key} is unsupported by standard runtime: {dtype_name}"
@@ -2370,74 +10809,141 @@ def _run_with_backend_settings(
     callback: Callable[[], Any],
 ) -> Any:
     matmul_precision = _matmul_precision_setting(settings)
-    allow_tf32 = _bool_setting(settings, "allow_tf32")
-    allow_bf16_reduction = _bool_setting(
+    autocast_setting = _autocast_setting(settings)
+    allow_bf16_reduction = _bool_string_setting(
         settings,
-        "allow_bf16_reduced_precision_reduction",
+        "numeric.bf16_reduced_precision_reduction",
+    )
+    allow_fp16_reduction = _bool_string_setting(
+        settings,
+        "numeric.fp16_reduced_precision_reduction",
+    )
+    deterministic_algorithms = _bool_string_setting(
+        settings,
+        "numeric.deterministic_algorithms",
     )
     previous_matmul_precision = torch.get_float32_matmul_precision()
-    previous_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
     previous_allow_bf16_reduction = (
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
     )
+    previous_allow_fp16_reduction = (
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+    )
+    previous_deterministic_algorithms = torch.are_deterministic_algorithms_enabled()
 
     if matmul_precision is not None:
         torch.set_float32_matmul_precision(matmul_precision)
-
-    if allow_tf32 is not None:
-        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
 
     if allow_bf16_reduction is not None:
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
             allow_bf16_reduction
         )
 
+    if allow_fp16_reduction is not None:
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
+            allow_fp16_reduction
+        )
+
+    if deterministic_algorithms is not None:
+        torch.use_deterministic_algorithms(deterministic_algorithms)
+
     try:
-        return callback()
+        if autocast_setting is None:
+            return callback()
+
+        device_type, dtype = autocast_setting
+
+        with torch.autocast(device_type=device_type, dtype=dtype):
+            return callback()
     finally:
         torch.set_float32_matmul_precision(previous_matmul_precision)
-        torch.backends.cuda.matmul.allow_tf32 = previous_allow_tf32
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
             previous_allow_bf16_reduction
         )
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
+            previous_allow_fp16_reduction
+        )
+        torch.use_deterministic_algorithms(previous_deterministic_algorithms)
+
+
+def _run_with_call_grad_mode(
+    settings: Mapping[str, Any],
+    callback: Callable[[], Any],
+) -> Any:
+    value = settings.get("call.grad_mode")
+
+    if value is None:
+        return callback()
+
+    if value == "grad_enabled":
+        with torch.enable_grad():
+            return callback()
+
+    message = f"call.grad_mode is unsupported: {value}"
+    raise MaterializationError(message)
 
 
 def _matmul_precision_setting(settings: Mapping[str, Any]) -> str | None:
-    value = settings.get("matmul_precision")
-
-    if value is None:
-        return None
-
-    if not isinstance(value, str):
-        message = "matmul_precision must be a string"
-        raise MaterializationError(message)
-
-    if value not in {"highest", "high", "medium"}:
-        message = f"matmul_precision is unsupported by standard runtime: {value}"
-        raise MaterializationError(message)
-
-    return value
-
-
-def _bool_setting(settings: Mapping[str, Any], key: str) -> bool | None:
+    key = "numeric.float32_matmul_precision"
     value = settings.get(key)
 
     if value is None:
         return None
 
-    if not isinstance(value, bool):
-        message = f"{key} must be boolean"
+    if not isinstance(value, str):
+        message = f"{key} must be a string"
+        raise MaterializationError(message)
+
+    if value not in {"highest", "high", "medium"}:
+        message = f"{key} is unsupported by standard runtime: {value}"
         raise MaterializationError(message)
 
     return value
 
 
+def _autocast_setting(settings: Mapping[str, Any]) -> tuple[str, torch.dtype] | None:
+    value = settings.get("autocast")
+
+    if value is None or value == "off":
+        return None
+
+    if value == "cuda_fp16":
+        return _cuda_autocast(torch.float16)
+
+    if value == "cuda_bf16":
+        return _cuda_autocast(torch.bfloat16)
+
+    message = f"autocast is unsupported by standard runtime: {value}"
+    raise MaterializationError(message)
+
+
+def _cuda_autocast(dtype: torch.dtype) -> tuple[str, torch.dtype]:
+    if not torch.cuda.is_available():
+        message = "CUDA autocast requires CUDA"
+        raise MaterializationError(message)
+
+    return "cuda", dtype
+
+
+def _bool_string_setting(settings: Mapping[str, Any], key: str) -> bool | None:
+    value = settings.get(key)
+
+    if value is None:
+        return None
+
+    if value == "true":
+        return True
+
+    if value == "false":
+        return False
+
+    message = f"{key} must be true or false"
+    raise MaterializationError(message)
+
+
 def _anchor_candidate(operator: OperatorSpec, candidate: Candidate) -> Candidate:
     path = _anchor_path(operator)
-    settings = _anchor_settings(candidate, path)
-
-    if operator.kind in SINGLE_OPERATOR_PATHS:
-        settings.pop("operator_path", None)
+    settings = _anchor_settings(operator, candidate, path)
 
     return dataclasses.replace(
         candidate,
@@ -2445,23 +10951,115 @@ def _anchor_candidate(operator: OperatorSpec, candidate: Candidate) -> Candidate
     )
 
 
-def _anchor_settings(candidate: Candidate, path: str) -> dict[str, Any]:
+def _anchor_settings(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    path: str,
+) -> dict[str, Any]:
     settings = dict(candidate.settings)
 
     for key in (
         *RUNTIME_DTYPE_SETTINGS,
         *BACKEND_SETTINGS,
+        *SPEC_PATH_KEYS.values(),
+        *SPEC_ADDITIONAL_RUNTIME_SETTINGS,
         *TORCH_FUNC_FIELDS,
-        *FUNCTIONAL_CALL_FIELDS,
-        "vmap_chunk_size",
-        "vmap_batch_in_dims",
+        *LOSS_SCALING_SETTINGS,
+        "vectorization.vmap_chunk_size",
+        "vectorization.in_dims",
     ):
         settings.pop(key, None)
 
-    settings["operator_path"] = path
+    spec_value = _spec_path_value_for_runtime_path(operator.kind, path)
+
+    if spec_value is None:
+        message = f"anchor path has no SPEC mapping: {path}"
+        raise MaterializationError(message)
+
+    settings[SPEC_PATH_KEYS[operator.kind]] = spec_value
+    settings.update(_fisher_anchor_settings(operator, path))
+    settings.update(_sampled_fisher_anchor_settings(operator, candidate, path))
+    settings.update(_ggn_anchor_settings(operator, path))
+
     settings.update(_anchor_admission_settings(path))
 
     return settings
+
+
+def _fisher_anchor_settings(
+    operator: OperatorSpec,
+    path: str,
+) -> dict[str, Any]:
+    if operator.kind != "fisher_vp":
+        return {}
+
+    if path != FISHER_SCORE_GRADIENT_LOOP_PATH:
+        return {}
+
+    return {
+        "fisher.expectation_path": "explicit_full_expectation_score_rows",
+        "fisher.score_grad_path": "torch_autograd_grad_loop",
+    }
+
+
+def _sampled_fisher_anchor_settings(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    path: str,
+) -> dict[str, Any]:
+    if operator.kind != "sampled_fisher_vp":
+        return {}
+
+    if path != SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH:
+        return {}
+
+    sample_source_key = "sampled_fisher.sample_source"
+    exact_check_key = "sampled_fisher.exact_fisher_check"
+    settings = {
+        "sampled_fisher.score_grad_path": "torch_autograd_grad_loop",
+    }
+
+    for key in (sample_source_key, exact_check_key):
+        if key not in candidate.settings:
+            message = f"{key} is required for sampled Fisher anchors"
+            raise MaterializationError(message)
+
+        settings[key] = candidate.settings[key]
+
+    return settings
+
+
+def _ggn_anchor_settings(
+    operator: OperatorSpec,
+    path: str,
+) -> dict[str, Any]:
+    if operator.kind != "ggnvp":
+        return {}
+
+    if path == GGN_DENSE_PATH:
+        return {
+            "ggn.loss_hessian_path": "autodiff_loss_hvp",
+            "ggn.loss_hessian_kernel": "dense_global",
+        }
+
+    if path == GGN_JVP_HESSIAN_VJP_PATH:
+        return {
+            "ggn.loss_hessian_path": "autodiff_loss_hvp",
+            "ggn.loss_hessian_kernel": "dense_global",
+            "ggn.vjp_path": "torch_func_vjp",
+        }
+
+    return {}
+
+
+def _spec_path_value_for_runtime_path(operator_kind: str, path: str) -> str | None:
+    path_map = SPEC_PATH_TO_RUNTIME.get(operator_kind, {})
+
+    for spec_value, runtime_path in path_map.items():
+        if runtime_path == path:
+            return spec_value
+
+    return None
 
 
 def _anchor_admission_settings(path: str) -> dict[str, Any]:
@@ -2472,6 +11070,9 @@ def _anchor_admission_settings(path: str) -> dict[str, Any]:
         return _torch_func_anchor_settings(requires_forward_ad=False)
 
     if path == HVP_JVP_GRAD_PATH:
+        return _torch_func_anchor_settings(requires_forward_ad=True)
+
+    if path == GGN_JVP_HESSIAN_VJP_PATH:
         return _torch_func_anchor_settings(requires_forward_ad=True)
 
     return {}
@@ -2485,7 +11086,7 @@ def _torch_func_anchor_settings(*, requires_forward_ad: bool) -> dict[str, Any]:
         "uses_data_dependent_control_flow": False,
         "uses_item": False,
         "has_dynamic_shape_output": False,
-        "vmap_randomness": "error",
+        "vectorization.randomness": "error",
         "requires_forward_ad": requires_forward_ad,
         "forward_ad_supported": True,
     }
@@ -2506,17 +11107,8 @@ def _anchor_path(operator: OperatorSpec) -> str:
 
 def _fisher_anchor_path(operator: OperatorSpec) -> str:
     distribution = _operator_semantic(operator, "distribution")
-    expectation = _operator_semantic(operator, "expectation")
-    label_policy = _operator_semantic(operator, "label_policy")
 
-    if distribution == "categorical" and label_policy == "model_distribution":
-        if expectation == "exact":
-            return FISHER_CATEGORICAL_EXACT_PATH
-
-        if expectation == "monte_carlo":
-            return FISHER_CATEGORICAL_MC_PATH
-
-    if distribution == "explicit_score_gradients" and expectation == "explicit_rows":
+    if distribution == "explicit_score_gradients":
         return FISHER_SCORE_GRADIENT_LOOP_PATH
 
     message = "standard Fisher anchor does not support declared semantics"
@@ -2544,8 +11136,8 @@ def _require_path(
     raise MaterializationError(message)
 
 
-def _require_single_operator_path(execution: StandardExecution) -> None:
-    path = SINGLE_OPERATOR_PATHS[execution.operator.kind]
+def _require_single_runtime_path(execution: StandardExecution) -> None:
+    path = SINGLE_RUNTIME_PATHS[execution.operator.kind]
 
     _require_path(execution.operator.kind, execution.path, (path,))
 
@@ -2576,6 +11168,54 @@ def _function_objective(
     return objective
 
 
+def _require_metric_representation(
+    operator: OperatorSpec,
+    allowed: tuple[str, ...],
+) -> None:
+    kind = _metric_representation_kind(operator)
+
+    if kind not in allowed:
+        message = f"metric representation kind is not supported by path: {kind}"
+        raise MaterializationError(message)
+
+
+def _metric_representation_kind(operator: OperatorSpec) -> str:
+    representation = _metric_representation(operator)
+    kind = representation.get("kind")
+
+    if not isinstance(kind, str):
+        message = "metric representation kind is required"
+        raise MaterializationError(message)
+
+    return kind
+
+
+def _metric_representation(operator: OperatorSpec) -> Mapping[str, Any]:
+    representation = operator.semantics.get("representation")
+
+    if not isinstance(representation, Mapping):
+        message = "metric representation is required"
+        raise MaterializationError(message)
+
+    return representation
+
+
+def _grad_enabled_params(params: ParameterTree) -> ParameterTree:
+    return {
+        name: tensor.detach().requires_grad_(True) for name, tensor in params.items()
+    }
+
+
+def _parameter_grad_tree(params: ParameterTree) -> TensorTree:
+    return tree_from_leaves(
+        params,
+        tuple(
+            torch.zeros_like(param) if param.grad is None else param.grad.detach()
+            for param in params.values()
+        ),
+    )
+
+
 def _flatten_vector(vector: TensorTree) -> torch.Tensor:
     leaves = tree_leaves(vector)
 
@@ -2586,14 +11226,156 @@ def _flatten_vector(vector: TensorTree) -> torch.Tensor:
     return torch.cat(tuple(leaf.reshape(-1) for leaf in leaves))
 
 
+def _flatten_vector_like(template: TensorTree, vector: TensorTree) -> torch.Tensor:
+    if isinstance(vector, torch.Tensor):
+        return vector.reshape(-1)
+
+    if isinstance(template, torch.Tensor):
+        message = "flat tensor template requires a flat tensor vector"
+        raise MaterializationError(message)
+
+    leaves = _matching_vector_leaves(template, vector)
+
+    return torch.cat(tuple(leaf.reshape(-1) for leaf in leaves))
+
+
 def _matching_vector_leaves(
-    params: ParameterTree, vector: TensorTree
+    params: TensorTree, vector: TensorTree
 ) -> tuple[torch.Tensor, ...]:
     checked = tree_map2(
         lambda param, tangent: tangent.reshape_as(param), params, vector
     )
 
     return tree_leaves(checked)
+
+
+def _wrap_flat_parameter_tree(
+    template: ParameterTree,
+    result: torch.Tensor,
+) -> ParameterTree:
+    leaves = []
+    offset = 0
+
+    for leaf in template.values():
+        width = leaf.numel()
+        leaves.append(result[offset : offset + width].reshape_as(leaf))
+        offset += width
+
+    if offset != result.numel():
+        message = "flat parameter layout length differs from parameter tree"
+        raise MaterializationError(message)
+
+    return dict(zip(template, leaves, strict=True))
+
+
+def _flatten_vector_batch(
+    template: TensorTree,
+    vector: TensorTree,
+    in_dims: Any,
+) -> torch.Tensor:
+    batch_size = _vector_tree_batch_size(vector, in_dims)
+    pieces = []
+    _collect_flat_vector_batch_pieces(
+        template,
+        vector,
+        in_dims,
+        batch_size,
+        pieces,
+    )
+
+    return torch.cat(tuple(pieces), dim=1)
+
+
+def _collect_flat_vector_batch_pieces(
+    template: TensorTree,
+    vector: TensorTree,
+    in_dims: Any,
+    batch_size: int,
+    pieces: list[torch.Tensor],
+) -> None:
+    if isinstance(template, torch.Tensor) and isinstance(vector, torch.Tensor):
+        pieces.append(_flat_vector_batch_piece(template, vector, in_dims, batch_size))
+
+        return
+
+    if _is_tensor_tree_dict(template) and _is_tensor_tree_dict(vector):
+        if not isinstance(in_dims, Mapping) or set(in_dims) != set(template):
+            message = "vectorization.in_dims must match the vector tree"
+            raise MaterializationError(message)
+
+        if set(vector) != set(template):
+            message = "vector tree mapping keys differ from parameters"
+            raise MaterializationError(message)
+
+        for key in template:
+            _collect_flat_vector_batch_pieces(
+                template[key],
+                vector[key],
+                in_dims[key],
+                batch_size,
+                pieces,
+            )
+
+        return
+
+    if _is_tensor_tree_tuple(template) and _is_tensor_tree_tuple(vector):
+        if not isinstance(in_dims, tuple) or len(in_dims) != len(template):
+            message = "vectorization.in_dims must match the vector tree"
+            raise MaterializationError(message)
+
+        if len(vector) != len(template):
+            message = "vector tree sequence length differs from parameters"
+            raise MaterializationError(message)
+
+        for param_leaf, vector_leaf, in_dim in zip(
+            template,
+            vector,
+            in_dims,
+            strict=True,
+        ):
+            _collect_flat_vector_batch_pieces(
+                param_leaf,
+                vector_leaf,
+                in_dim,
+                batch_size,
+                pieces,
+            )
+
+        return
+
+    message = "vector tree structure differs from parameters"
+    raise MaterializationError(message)
+
+
+def _flat_vector_batch_piece(
+    template: torch.Tensor,
+    vector: torch.Tensor,
+    in_dim: Any,
+    batch_size: int,
+) -> torch.Tensor:
+    if in_dim is None:
+        if vector.shape != template.shape:
+            message = "unmapped vector leaf shape differs from parameter leaf"
+            raise MaterializationError(message)
+
+        return vector.reshape(1, -1).expand(batch_size, -1)
+
+    if not isinstance(in_dim, int) or isinstance(in_dim, bool):
+        message = "vectorization.in_dims values must be integers or None"
+        raise MaterializationError(message)
+
+    dim = _normalized_vector_dim(vector, in_dim)
+    unbatched_shape = vector.shape[:dim] + vector.shape[dim + 1 :]
+
+    if unbatched_shape != template.shape:
+        message = "mapped vector leaf shape differs from parameter leaf"
+        raise MaterializationError(message)
+
+    if vector.shape[dim] != batch_size:
+        message = "vectorized vector mapped dimensions differ"
+        raise MaterializationError(message)
+
+    return vector.movedim(dim, 0).reshape(batch_size, -1)
 
 
 def _wrap_flat_vector(template: TensorTree, result: torch.Tensor) -> TensorTree:
@@ -2612,12 +11394,63 @@ def _wrap_flat_vector(template: TensorTree, result: torch.Tensor) -> TensorTree:
     return tree_from_leaves(template, tuple(leaves))
 
 
+def _wrap_flat_vector_batch(template: TensorTree, result: torch.Tensor) -> TensorTree:
+    if result.ndim != MATRIX_DIMS:
+        message = "batched flat vector result must be a matrix"
+        raise MaterializationError(message)
+
+    leaves = []
+    offset = 0
+
+    for leaf in tree_leaves(template):
+        width = leaf.numel()
+        leaves.append(
+            result[:, offset : offset + width].reshape(result.shape[0], *leaf.shape)
+        )
+        offset += width
+
+    if offset != result.shape[1]:
+        message = "batched dense output width differs from parameter tree"
+        raise MaterializationError(message)
+
+    return tree_from_leaves(template, tuple(leaves))
+
+
 def _batch_tensor(batch: Batch, key: str) -> torch.Tensor:
     value = batch.get(key)
 
     if not isinstance(value, torch.Tensor):
         message = f"batch tensor is missing: {key}"
         raise MaterializationError(message)
+
+    return value
+
+
+def _batch_tensor_blocks(batch: Batch, key: str) -> tuple[torch.Tensor, ...]:
+    value = batch.get(key)
+
+    if not isinstance(value, tuple) or not value:
+        message = f"batch tensor blocks are missing: {key}"
+        raise MaterializationError(message)
+
+    row_count = None
+
+    for block in value:
+        if not isinstance(block, torch.Tensor):
+            message = f"batch tensor block must be a tensor: {key}"
+            raise MaterializationError(message)
+
+        if block.ndim != MATRIX_DIMS:
+            message = f"batch tensor block must be two-dimensional: {key}"
+            raise MaterializationError(message)
+
+        _require_finite_tensor(block, key)
+
+        if row_count is None:
+            row_count = block.shape[0]
+        elif block.shape[0] != row_count:
+            message = f"batch tensor blocks must share row count: {key}"
+            raise MaterializationError(message)
 
     return value
 
@@ -2698,10 +11531,13 @@ def _empirical_fisher_normalization(
 
 
 def _require_empirical_fisher_semantics(operator: OperatorSpec) -> None:
-    loss_reduction = _operator_semantic(operator, "loss_reduction")
+    example_loss_reduction = _operator_semantic(operator, "example_loss_reduction")
 
-    if loss_reduction != "per_example":
-        message = f"empirical Fisher loss_reduction is unsupported: {loss_reduction}"
+    if example_loss_reduction != "per_example":
+        message = (
+            "empirical Fisher example_loss_reduction is unsupported: "
+            f"{example_loss_reduction}"
+        )
         raise MaterializationError(message)
 
 
@@ -2709,23 +11545,6 @@ def _fisher_normalization(execution: StandardExecution) -> float:
     denominator = _operator_semantic(execution.operator, "denominator")
 
     if denominator == "num_examples":
-        if execution.path in {
-            FISHER_CATEGORICAL_EXACT_PATH,
-            FISHER_CATEGORICAL_MC_PATH,
-        }:
-            logits = _function_objective(
-                execution.operator,
-                execution.function_objectives,
-            )(
-                execution.params,
-                execution.buffers,
-                execution.batch,
-                execution.context,
-            )
-            logits_matrix = _categorical_logits_matrix(execution.operator, logits)
-
-            return float(logits_matrix.shape[0])
-
         value = execution.batch.get("num_examples")
 
         if not isinstance(value, int | float):
@@ -2748,6 +11567,135 @@ def _fisher_normalization(execution: StandardExecution) -> float:
     raise MaterializationError(message)
 
 
+def _sampled_fisher_normalization(execution: StandardExecution) -> float:
+    denominator = _operator_semantic(execution.operator, "denominator")
+    sample_count = _operator_semantic_positive_int(execution.operator, "sample_count")
+
+    if denominator == "num_examples":
+        value = execution.batch.get("num_examples")
+
+        if not isinstance(value, int | float):
+            message = "num_examples denominator requires batch num_examples"
+            raise MaterializationError(message)
+
+        if float(value) <= 0.0:
+            message = "num_examples denominator must be positive"
+            raise MaterializationError(message)
+
+        return float(value) * float(sample_count)
+
+    if denominator == "one":
+        return 1.0
+
+    if denominator == "batch_normalization":
+        return _normalization(execution.batch, execution.operator)
+
+    message = f"sampled Fisher denominator is unsupported: {denominator}"
+    raise MaterializationError(message)
+
+
+def _check_sampled_fisher_exact_bound(
+    execution: StandardExecution,
+    result: torch.Tensor,
+) -> None:
+    exact_check = execution.candidate.settings.get("sampled_fisher.exact_fisher_check")
+
+    if exact_check == "disabled":
+        return
+
+    if exact_check != "enabled_with_sampling_bound":
+        message = f"sampled_fisher.exact_fisher_check is unsupported: {exact_check}"
+        raise MaterializationError(message)
+
+    bound = _sampled_fisher_sampling_bound(execution.operator)
+    exact = _batch_tensor(execution.batch, "exact_fisher_vp").reshape(-1)
+    _require_finite_tensor(exact, "exact FisherVP reference")
+
+    if exact.numel() != result.numel():
+        message = "exact_fisher_vp must match sampled Fisher result width"
+        raise MaterializationError(message)
+
+    difference = (result.reshape(-1) - exact).norm()
+    exact_norm = exact.norm()
+    floor = torch.tensor(
+        bound["norm_floor"],
+        dtype=exact_norm.dtype,
+        device=exact_norm.device,
+    )
+    relative = difference / torch.maximum(exact_norm, floor)
+    abs_error = float(difference.item())
+    rel_error = float(relative.item())
+
+    if abs_error <= bound["max_abs_diff"] or rel_error <= bound["max_rel_diff"]:
+        return
+
+    message = (
+        "sampled Fisher exact-Fisher comparison exceeded bound: "
+        f"abs={abs_error}, rel={rel_error}"
+    )
+    raise MaterializationError(message)
+
+
+def _sampled_fisher_sampling_bound(operator: OperatorSpec) -> dict[str, float]:
+    raw = operator.semantics.get("sampling_bound")
+
+    if not isinstance(raw, Mapping):
+        message = "sampled Fisher sampling_bound must be a mapping"
+        raise MaterializationError(message)
+
+    if raw.get("kind") != "abs_or_rel":
+        message = "sampled Fisher sampling_bound.kind must be abs_or_rel"
+        raise MaterializationError(message)
+
+    return {
+        "max_abs_diff": _sampling_bound_float(raw, "max_abs_diff"),
+        "max_rel_diff": _sampling_bound_float(raw, "max_rel_diff"),
+        "norm_floor": _sampling_bound_float(raw, "norm_floor"),
+    }
+
+
+def _sampling_bound_float(bound: Mapping[str, Any], key: str) -> float:
+    value = bound.get(key)
+
+    if not isinstance(value, int | float):
+        message = f"sampled Fisher sampling_bound.{key} must be numeric"
+        raise MaterializationError(message)
+
+    result = float(value)
+
+    if result < 0.0:
+        message = f"sampled Fisher sampling_bound.{key} must be nonnegative"
+        raise MaterializationError(message)
+
+    return result
+
+
+def _require_sampled_fisher_semantics(execution: StandardExecution) -> None:
+    operator = execution.operator
+    _operator_semantic_positive_int(operator, "sample_count")
+    row_sample_source = execution.candidate.settings.get("sampled_fisher.sample_source")
+
+    if row_sample_source not in {"fixed_sample_table", "fixed_seed_and_count"}:
+        message = "sampled_fisher.sample_source is required"
+        raise MaterializationError(message)
+
+    exact_check = execution.candidate.settings.get("sampled_fisher.exact_fisher_check")
+
+    if exact_check is None:
+        message = "sampled_fisher.exact_fisher_check is required"
+        raise MaterializationError(message)
+
+    if exact_check not in {"disabled", "enabled_with_sampling_bound"}:
+        message = f"sampled_fisher.exact_fisher_check is unsupported: {exact_check}"
+        raise MaterializationError(message)
+
+    score_reduction = _operator_semantic(operator, "score_reduction")
+
+    if score_reduction != "none":
+        message = f"sampled Fisher score_reduction is unsupported: {score_reduction}"
+        raise MaterializationError(message)
+
+
 def _require_fisher_semantics(
     operator: OperatorSpec,
     required: Mapping[str, str],
@@ -2762,35 +11710,6 @@ def _require_fisher_semantics(
 
 def _require_valid_fisher_semantics(operator: OperatorSpec) -> None:
     distribution = _operator_semantic(operator, "distribution")
-    expectation = _operator_semantic(operator, "expectation")
-
-    if distribution == "categorical" and expectation == "exact":
-        _require_fisher_semantics(
-            operator,
-            {
-                "distribution": "categorical",
-                "label_policy": "model_distribution",
-                "expectation": "exact",
-                "sample_space": "classes",
-                "loss_reduction": "log_prob",
-            },
-        )
-
-        return
-
-    if distribution == "categorical" and expectation == "monte_carlo":
-        _require_fisher_semantics(
-            operator,
-            {
-                "distribution": "categorical",
-                "label_policy": "model_distribution",
-                "expectation": "monte_carlo",
-                "sample_space": "classes",
-                "loss_reduction": "log_prob",
-            },
-        )
-
-        return
 
     if distribution == "explicit_score_gradients":
         _require_explicit_score_fisher_semantics(operator)
@@ -2807,9 +11726,8 @@ def _require_explicit_score_fisher_semantics(operator: OperatorSpec) -> None:
         {
             "distribution": "explicit_score_gradients",
             "label_policy": "explicit_scores",
-            "expectation": "explicit_rows",
             "sample_space": "terms",
-            "loss_reduction": "none",
+            "score_reduction": "none",
         },
     )
 

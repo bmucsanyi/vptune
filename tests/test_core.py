@@ -1,6 +1,8 @@
+import contextlib
 import dataclasses
 import importlib.resources
 import math
+import types
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, override
@@ -17,8 +19,13 @@ from vptune_test_helpers import (
 import vptune as vp
 import vptune.adapters as vpa
 import vptune.ext as vpx
+import vptune.measure as measure_module
 from vptune import autobatch_bridge
-from vptune.checks import validate_thresholds
+from vptune.checks import (
+    numeric_error_bound_measurements,
+    validate_numeric_error_bound,
+    validate_thresholds,
+)
 from vptune.data import FullSizeRecord, Measurement
 from vptune.errors import ReferenceFailedError
 from vptune.identities import (
@@ -36,7 +43,21 @@ from vptune.measure import (
 )
 from vptune.schemas import record_current
 from vptune.select import memory_stable, select_cohort, select_family
-from vptune.tensor_tree import tree_from_leaves, tree_leaves, tree_map, tree_signature
+from vptune.tensor_tree import (
+    tree_add_foreach,
+    tree_dot_foreach,
+    tree_elementwise_div_foreach,
+    tree_elementwise_mul_foreach,
+    tree_from_leaves,
+    tree_l2_norm_foreach,
+    tree_leaves,
+    tree_map,
+    tree_max_abs_foreach,
+    tree_mul_foreach,
+    tree_signature,
+    tree_sub_foreach,
+    tree_zeros_like_foreach,
+)
 
 
 class OneBatchData:
@@ -138,12 +159,13 @@ def cpu_target(timing_policy: vp.TimingPolicy | None = None) -> vp.Target:
     return vp.Target(
         devices=("cpu",),
         accelerator="cpu",
-        allowed_dtypes=("float64", "float32", "bfloat16", "float16"),
+        allowed_dtypes=("float64", "fp32", "bf16", "fp16"),
         allowed_attention_frontends=(),
         allowed_sdpa_kernels=(),
         allowed_sharding_modes=("single_device",),
         timing_policy=policy,
         selection_policy=vp.SelectionPolicy(),
+        search_policy=vp.SearchPolicy(strategy="exhaustive"),
         determinism_policy={},
         environment_capture={"runtime": "test"},
     )
@@ -207,6 +229,872 @@ def test_target_signature_includes_declared_device_identity() -> None:
             "index": None,
         },
     )
+    assert signature["search_policy"] == {
+        "strategy": "exhaustive",
+        "retained_top_count": None,
+        "compile_call_horizons": (),
+        "variance_repeat_count": None,
+    }
+
+
+def test_search_policy_rejects_unknown_strategy() -> None:
+    with pytest.raises(RuntimeError, match="unsupported search strategy"):
+        vp.SearchPolicy(strategy="random")
+
+
+def test_search_policy_requires_balanced_top_count() -> None:
+    with pytest.raises(RuntimeError, match="retained_top_count"):
+        vp.SearchPolicy(strategy="balanced")
+
+
+def test_search_policy_requires_thorough_fields() -> None:
+    with pytest.raises(RuntimeError, match="compile_call_horizons"):
+        vp.SearchPolicy(strategy="thorough", retained_top_count=1)
+
+    with pytest.raises(RuntimeError, match="variance_repeat_count"):
+        vp.SearchPolicy(
+            strategy="thorough",
+            retained_top_count=1,
+            compile_call_horizons=(1,),
+        )
+
+
+def test_tune_rejects_thorough_horizon_mismatch_before_probe() -> None:
+    calls = []
+    model = torch.nn.Linear(1, 1)
+    candidate = vp.Candidate("family", "row", {}, admission_status="passed")
+    target = dataclasses.replace(
+        dataclasses.replace(
+            cpu_target(),
+            selection_policy=vp.SelectionPolicy(compile_call_horizon=3),
+        ),
+        search_policy=vp.SearchPolicy(
+            strategy="thorough",
+            retained_top_count=1,
+            compile_call_horizons=(2,),
+            variance_repeat_count=2,
+        ),
+    )
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        calls.append(("operation", candidate, batch, vector))
+
+        return vpx.constant_operation(torch.tensor([1.0]))
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        calls.append(("reference", candidate, batch, vector))
+
+        return reference_passed()
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            (candidate,),
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.search-policy"},
+        ),
+    )
+
+    with pytest.raises(vp.MaterializationError, match="selection horizon"):
+        vp.tune(problem)
+
+    assert calls == []
+
+
+def test_tune_smoke_strategy_measures_baseline_and_class_c_rows(
+    tmp_path: Path,
+) -> None:
+    calls = []
+    model = torch.nn.Linear(1, 1)
+    candidates = (
+        vp.Candidate("family", "base", {}, admission_status="passed"),
+        vp.Candidate(
+            "family",
+            "hvp-path",
+            {"hvp.path": "reverse_over_reverse"},
+            changed_axes=("hvp.path",),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "gradient-graph",
+            {"gradient.graph_schedule": "build_once"},
+            changed_axes=("gradient.graph_schedule",),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "dtype",
+            {"dtype.model_compute": "fp32"},
+            changed_axes=("dtype.model_compute",),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "attention",
+            {"attention.frontend": "transformers_sdpa"},
+            changed_axes=("attention.frontend",),
+            admission_status="passed",
+        ),
+    )
+    target = dataclasses.replace(
+        cpu_target(
+            vp.TimingPolicy(
+                short_seconds=0.0,
+                medium_seconds=0.0,
+                long_measured_calls=1,
+            )
+        ),
+        search_policy=vp.SearchPolicy(strategy="smoke"),
+    )
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        calls.append(("operation", candidate.candidate_id, batch, vector))
+
+        return vpx.constant_operation(torch.tensor([1.0]))
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        calls.append(("reference", candidate.candidate_id, batch, vector))
+
+        return reference_passed()
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=TwoProbeData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=TwoVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            candidates,
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.search-smoke"},
+        ),
+    )
+    plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0, 2.0, 3.0, 4.0, 5.0)),
+    )
+
+    assert tuple(record.candidate_id for record in plan.full_size_records) == (
+        "base",
+        "hvp-path",
+        "dtype",
+    )
+    assert tuple(
+        row["candidate_id"] for row in saved_candidate_rows(tmp_path, plan)
+    ) == (
+        "attention",
+        "base",
+        "dtype",
+        "gradient-graph",
+        "hvp-path",
+    )
+    assert tuple(call[1] for call in calls) == (
+        "base",
+        "base",
+        "hvp-path",
+        "hvp-path",
+        "dtype",
+        "dtype",
+    )
+    assert all(call[2]["index"] == 0 for call in calls if call[0] == "operation")
+    assert plan.selected_candidate().candidate_id == "base"
+
+
+def test_tune_smoke_strategy_requires_one_admitted_baseline() -> None:
+    model = torch.nn.Linear(1, 1)
+    target = dataclasses.replace(
+        cpu_target(),
+        search_policy=vp.SearchPolicy(strategy="smoke"),
+    )
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert candidate.candidate_id == "hvp-path"
+        assert batch["source"] == "probe"
+        assert isinstance(vector, torch.Tensor)
+
+        return vpx.constant_operation(torch.tensor([1.0]))
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert candidate.candidate_id == "hvp-path"
+        assert batch["source"] == "reference"
+        assert isinstance(vector, torch.Tensor)
+
+        return reference_passed()
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            (
+                vp.Candidate(
+                    "family",
+                    "hvp-path",
+                    {"hvp.path": "reverse_over_reverse"},
+                    changed_axes=("hvp.path",),
+                    admission_status="passed",
+                ),
+            ),
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.search-smoke"},
+        ),
+    )
+
+    with pytest.raises(vp.MaterializationError, match="baseline"):
+        vp.tune(problem)
+
+
+def test_tune_fast_strategy_compiles_near_fastest_eager_rows(
+    tmp_path: Path,
+) -> None:
+    calls = []
+    model = torch.nn.Linear(1, 1)
+    compile_settings = {
+        "compile.enabled": "true",
+        "compile.boundary": "whole_operator",
+        "compile.backend": "inductor",
+        "compile.mode": "default",
+        "compile.fullgraph": "false",
+        "compile.dynamic": None,
+        "compile.compiled_autograd": "false",
+        "compile.options.epilogue_fusion": "false",
+        "compile.options.shape_padding": "false",
+        "compile.cuda_graphs": "false",
+        "compile.cache_state": "warm_cache",
+    }
+    candidates = (
+        vp.Candidate("family", "base", {}, admission_status="passed"),
+        vp.Candidate(
+            "family",
+            "hvp",
+            {"hvp.path": "reverse_over_reverse"},
+            changed_axes=("hvp.path",),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "input",
+            {"input.residency": "gpu"},
+            changed_axes=("input.residency",),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "dtype",
+            {"dtype.model_compute": "fp32"},
+            changed_axes=("dtype.model_compute",),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "compiled-hvp",
+            {"hvp.path": "reverse_over_reverse", **compile_settings},
+            changed_axes=("hvp.path", "compile.enabled"),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "compiled-dtype",
+            {"dtype.model_compute": "fp32", **compile_settings},
+            changed_axes=("dtype.model_compute", "compile.enabled"),
+            admission_status="passed",
+        ),
+    )
+    target = dataclasses.replace(
+        cpu_target(
+            vp.TimingPolicy(
+                short_seconds=0.0,
+                medium_seconds=0.0,
+                long_measured_calls=1,
+            )
+        ),
+        search_policy=vp.SearchPolicy(strategy="fast"),
+    )
+
+    class CompileMetadataCheck:
+        @staticmethod
+        def identity() -> Mapping[str, object]:
+            return {"check": "compile_metadata"}
+
+        @staticmethod
+        def __call__(
+            candidate: vp.Candidate,
+            inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
+            output: vp.TensorTree,
+        ) -> Mapping[str, object]:
+            assert inputs
+            assert output is not None
+
+            if candidate.settings.get("compile.enabled") != "true":
+                return {}
+
+            return {
+                "compile_time_seconds": 0.0,
+                "steady_elapsed_seconds": 0.5,
+                "recompile_count": 0,
+            }
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        calls.append(("operation", candidate.candidate_id, batch, vector))
+
+        return vpx.constant_operation(torch.tensor([1.0]))
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        calls.append(("reference", candidate.candidate_id, batch, vector))
+
+        return reference_passed()
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            candidates,
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.search-fast"},
+            full_size_check=CompileMetadataCheck(),
+        ),
+    )
+    plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 3.0, 3.0, 5.0, 5.0, 6.0, 6.0, 7.0)),
+    )
+
+    assert tuple(record.candidate_id for record in plan.full_size_records) == (
+        "base",
+        "hvp",
+        "dtype",
+        "compiled-dtype",
+    )
+    assert tuple(
+        row["candidate_id"] for row in saved_candidate_rows(tmp_path, plan)
+    ) == (
+        "base",
+        "compiled-dtype",
+        "compiled-hvp",
+        "dtype",
+        "hvp",
+        "input",
+    )
+    assert tuple(call[1] for call in calls) == (
+        "base",
+        "base",
+        "hvp",
+        "hvp",
+        "dtype",
+        "dtype",
+        "compiled-dtype",
+        "compiled-dtype",
+    )
+    assert plan.selected_candidate().candidate_id == "compiled-dtype"
+
+
+def test_tune_balanced_strategy_crosses_retained_group_winners(
+    tmp_path: Path,
+) -> None:
+    calls = []
+    model = torch.nn.Linear(1, 1)
+    compile_settings = {
+        "compile.enabled": "true",
+        "compile.boundary": "whole_operator",
+        "compile.backend": "inductor",
+        "compile.mode": "default",
+        "compile.fullgraph": "false",
+        "compile.dynamic": None,
+        "compile.compiled_autograd": "false",
+        "compile.options.epilogue_fusion": "false",
+        "compile.options.shape_padding": "false",
+        "compile.cuda_graphs": "false",
+        "compile.cache_state": "warm_cache",
+    }
+    candidates = (
+        vp.Candidate("family", "base", {}, admission_status="passed"),
+        vp.Candidate(
+            "family",
+            "hvp-slow",
+            {"hvp.path": "reverse_over_reverse"},
+            changed_axes=("hvp.path",),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "hvp-fast",
+            {"hvp.path": "jvp_grad"},
+            changed_axes=("hvp.path",),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "dtype",
+            {"dtype.model_compute": "fp32"},
+            changed_axes=("dtype.model_compute",),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "compiled-cross",
+            {"hvp.path": "jvp_grad", "dtype.model_compute": "fp32", **compile_settings},
+            changed_axes=(
+                "hvp.path",
+                "dtype.model_compute",
+                "compile.enabled",
+            ),
+            admission_status="passed",
+        ),
+    )
+    target = dataclasses.replace(
+        cpu_target(
+            vp.TimingPolicy(
+                short_seconds=0.0,
+                medium_seconds=0.0,
+                long_measured_calls=1,
+            )
+        ),
+        search_policy=vp.SearchPolicy(strategy="balanced", retained_top_count=1),
+    )
+
+    class CompileMetadataCheck:
+        @staticmethod
+        def identity() -> Mapping[str, object]:
+            return {"check": "balanced_compile_metadata"}
+
+        @staticmethod
+        def __call__(
+            candidate: vp.Candidate,
+            inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
+            output: vp.TensorTree,
+        ) -> Mapping[str, object]:
+            assert inputs
+            assert output is not None
+
+            if candidate.settings.get("compile.enabled") != "true":
+                return {}
+
+            return {
+                "compile_time_seconds": 0.0,
+                "steady_elapsed_seconds": 0.3,
+                "recompile_count": 0,
+            }
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        calls.append(("operation", candidate.candidate_id, batch, vector))
+
+        return vpx.constant_operation(torch.tensor([1.0]))
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        calls.append(("reference", candidate.candidate_id, batch, vector))
+
+        return reference_passed()
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            candidates,
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.search-balanced"},
+            full_size_check=CompileMetadataCheck(),
+        ),
+    )
+    plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((
+            0.0,
+            5.0,
+            5.0,
+            9.0,
+            9.0,
+            10.0,
+            10.0,
+            11.0,
+            11.0,
+            11.8,
+            11.8,
+            13.0,
+        )),
+    )
+
+    assert tuple(record.candidate_id for record in plan.full_size_records) == (
+        "base",
+        "hvp-slow",
+        "hvp-fast",
+        "dtype",
+        "balanced:hvp-fast+dtype",
+        "compiled-cross",
+    )
+    assert {row["candidate_id"] for row in saved_candidate_rows(tmp_path, plan)} == {
+        "base",
+        "hvp-slow",
+        "hvp-fast",
+        "dtype",
+        "compiled-cross",
+        "balanced:hvp-fast+dtype",
+    }
+    assert tuple(call[1] for call in calls) == (
+        "base",
+        "base",
+        "hvp-slow",
+        "hvp-slow",
+        "hvp-fast",
+        "hvp-fast",
+        "dtype",
+        "dtype",
+        "balanced:hvp-fast+dtype",
+        "balanced:hvp-fast+dtype",
+        "compiled-cross",
+        "compiled-cross",
+    )
+    assert plan.selected_candidate().candidate_id == "compiled-cross"
+
+
+def test_tune_thorough_strategy_uses_declared_repeat_count(
+    tmp_path: Path,
+) -> None:
+    calls = []
+    model = torch.nn.Linear(1, 1)
+    candidate = vp.Candidate("family", "base", {}, admission_status="passed")
+    target = dataclasses.replace(
+        dataclasses.replace(
+            cpu_target(
+                vp.TimingPolicy(
+                    short_seconds=0.0,
+                    medium_seconds=0.0,
+                    long_measured_calls=1,
+                )
+            ),
+            selection_policy=vp.SelectionPolicy(compile_call_horizon=3),
+        ),
+        search_policy=vp.SearchPolicy(
+            strategy="thorough",
+            retained_top_count=1,
+            compile_call_horizons=(3,),
+            variance_repeat_count=2,
+        ),
+    )
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        calls.append(("operation", candidate.candidate_id, batch, vector))
+
+        return vpx.constant_operation(torch.tensor([1.0]))
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        calls.append(("reference", candidate.candidate_id, batch, vector))
+
+        return reference_passed()
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            (candidate,),
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.search-thorough"},
+        ),
+    )
+    clock = SequenceClock((0.0, 1.0, 1.0, 2.0, 2.0, 3.0))
+    plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=clock,
+    )
+
+    assert plan.selected_candidate().candidate_id == "base"
+    assert len(plan.records["family"].timing_samples) == 2
+    assert tuple(call[1] for call in calls) == ("base", "base")
+    assert clock.index == 6
+
+
+def test_tune_thorough_strategy_records_compile_horizon_scores(
+    tmp_path: Path,
+) -> None:
+    model = torch.nn.Linear(1, 1)
+    compile_settings = {
+        "compile.enabled": "true",
+        "compile.boundary": "whole_operator",
+        "compile.backend": "inductor",
+        "compile.mode": "default",
+        "compile.fullgraph": "false",
+        "compile.dynamic": None,
+        "compile.compiled_autograd": "false",
+        "compile.options.epilogue_fusion": "false",
+        "compile.options.shape_padding": "false",
+        "compile.cuda_graphs": "false",
+        "compile.cache_state": "warm_cache",
+    }
+    candidate = vp.Candidate(
+        "family",
+        "compiled",
+        compile_settings,
+        changed_axes=("compile.enabled",),
+        admission_status="passed",
+    )
+    target = dataclasses.replace(
+        dataclasses.replace(
+            cpu_target(
+                vp.TimingPolicy(
+                    short_seconds=0.0,
+                    medium_seconds=0.0,
+                    long_measured_calls=1,
+                )
+            ),
+            selection_policy=vp.SelectionPolicy(compile_call_horizon=3),
+        ),
+        search_policy=vp.SearchPolicy(
+            strategy="thorough",
+            retained_top_count=1,
+            compile_call_horizons=(3, 6),
+            variance_repeat_count=2,
+        ),
+    )
+
+    class CompileMetadataCheck:
+        @staticmethod
+        def identity() -> Mapping[str, object]:
+            return {"check": "thorough_compile_metadata"}
+
+        @staticmethod
+        def __call__(
+            candidate: vp.Candidate,
+            inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
+            output: vp.TensorTree,
+        ) -> Mapping[str, object]:
+            assert candidate.candidate_id == "compiled"
+            assert inputs
+            assert output is not None
+
+            return {
+                "compile_time_seconds": 6.0,
+                "steady_elapsed_seconds": 2.0,
+                "recompile_count": 1,
+            }
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert candidate.candidate_id == "compiled"
+        assert batch["source"] == "probe"
+        assert isinstance(vector, torch.Tensor)
+
+        return vpx.constant_operation(torch.tensor([1.0]))
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert candidate.candidate_id == "compiled"
+        assert batch["source"] == "reference"
+        assert isinstance(vector, torch.Tensor)
+
+        return reference_passed()
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            (candidate,),
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.search-thorough-compile-horizons"},
+            full_size_check=CompileMetadataCheck(),
+        ),
+    )
+    plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0, 1.0, 2.0, 2.0, 3.0)),
+    )
+    metadata = plan.records["family"].selection_metadata
+    scores = metadata["compile_amortized_seconds_by_horizon"]
+    assert isinstance(scores, Mapping)
+    assert scores["3"] == pytest.approx(6.0)
+    assert scores["6"] == pytest.approx(4.0)
+
+    saved_records, _ = saved_plan_rows(tmp_path, plan)
+    saved_scores = saved_records[0].selection_metadata[
+        "compile_amortized_seconds_by_horizon"
+    ]
+    assert isinstance(saved_scores, Mapping)
+    assert saved_scores["3"] == pytest.approx(6.0)
+    assert saved_scores["6"] == pytest.approx(4.0)
+
+
+def test_tune_admission_strategy_returns_candidate_table_only(tmp_path: Path) -> None:
+    calls = []
+    model = torch.nn.Linear(1, 1)
+    candidate = vp.Candidate(
+        "family",
+        "row",
+        {"dtype.model_compute": "fp32"},
+        admission_status="passed",
+    )
+    target = dataclasses.replace(
+        cpu_target(),
+        search_policy=vp.SearchPolicy(strategy="admission"),
+    )
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        calls.append(("operation", candidate, batch, vector))
+
+        return vpx.constant_operation(torch.tensor([1.0]))
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        calls.append(("reference", candidate, batch, vector))
+
+        return reference_passed()
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            (candidate,),
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.admission-search"},
+        ),
+    )
+    plan = vp.tune(problem, run_dir=tmp_path)
+
+    assert plan.selected == {}
+    assert plan.records == {}
+    assert plan.candidate_rows == (candidate,)
+    assert plan.full_size_records == ()
+    assert plan.check_records == ()
+    assert calls == []
+    assert saved_candidate_rows(tmp_path, plan)[0]["candidate_id"] == "row"
+    assert not (tmp_path / "references").exists()
+    assert not (tmp_path / "full_size").exists()
+
+    replayed = vpx.plan_from_json(
+        read_record(tmp_path / "summaries" / "tuning.json"),
+        replay_context=replay_context_for_plan(plan),
+        full_size_records=(),
+        check_records=(),
+        candidate_records=saved_candidate_rows(tmp_path, plan),
+        materializers={},
+    )
+
+    assert replayed.selected == {}
+    assert tuple(candidate.signature() for candidate in replayed.candidate_rows) == (
+        candidate.signature(),
+    )
 
 
 def test_root_api_all_matches_public_surface() -> None:
@@ -225,7 +1113,6 @@ def test_root_api_all_matches_public_surface() -> None:
         "MaterializationError",
         "Materializer",
         "Measurement",
-        "MeasurementError",
         "NoPassedCandidateError",
         "ObjectiveContext",
         "OperatorSpec",
@@ -239,6 +1126,7 @@ def test_root_api_all_matches_public_surface() -> None:
         "ReferenceResult",
         "ReplayContext",
         "ScalarObjective",
+        "SearchPolicy",
         "SelectionPolicy",
         "StaleRecordError",
         "Target",
@@ -262,6 +1150,7 @@ def test_root_api_all_matches_public_surface() -> None:
         "materialize",
         "metric",
         "parameter_surface",
+        "sampled_fisher_vp",
         "standard_problem",
         "tune",
         "tune_run",
@@ -274,9 +1163,14 @@ def test_extension_api_all_matches_extension_surface() -> None:
     assert tuple(vpx.__all__) == (
         "STANDARD_THRESHOLDS",
         "AnchorRegistry",
+        "AttentionInputs",
+        "AttentionLocation",
+        "AttentionSemantics",
+        "AttentionSettings",
         "AutobatchDomain",
         "AutobatchFind",
         "AxisDescriptor",
+        "AxisManifest",
         "AxisRegistry",
         "CPUMemoryBackend",
         "CUDAMemoryBackend",
@@ -288,9 +1182,13 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "CohortAssignment",
         "CohortConstraint",
         "CompositionChild",
+        "FullSizeCheck",
         "FullSizeRecord",
         "KFACMetricBlock",
         "KFACMetricOperator",
+        "ManifestAxisDescriptor",
+        "ManifestCandidateAdmitter",
+        "MappingAttentionLocation",
         "MaterializerCallback",
         "Measurement",
         "MemoryBackend",
@@ -302,8 +1200,13 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "admit_forward_ad",
         "admit_functional_call",
         "admit_torch_func",
+        "apply_final_logit_softcap",
+        "apply_softcap",
+        "axis_manifest",
         "candidate_record_from_json",
         "candidate_record_to_json",
+        "check_patched_attention_output_reference",
+        "check_patched_attention_vjp_reference",
         "check_record_current",
         "check_record_from_json",
         "check_record_to_json",
@@ -322,6 +1225,8 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "device_signature",
         "empirical_fisher_vp_dense_anchor",
         "environment_signature",
+        "exact_attention",
+        "execute_attention",
         "finite_difference_hvp",
         "finite_difference_jvp",
         "fisher_vp_dense_anchor",
@@ -339,6 +1244,8 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "plan_from_json",
         "plan_record_current",
         "plan_to_json",
+        "run_attention",
+        "sampled_fisher_vp_dense_anchor",
         "select_fastest_candidate_with_autobatch",
         "selected_plan_validation_summary_current",
         "selected_plan_validation_summary_record",
@@ -377,20 +1284,850 @@ def test_extension_tensor_and_measurement_helpers() -> None:
     assert float(vpx.tree_l2_norm(tree)) == pytest.approx(5.0)
 
 
+def test_tensor_tree_foreach_inventory_matches_python_ops() -> None:
+    left = {
+        "a": torch.tensor([1.0, -2.0], dtype=torch.float64),
+        "b": torch.tensor([3.0], dtype=torch.float64),
+    }
+    right = {
+        "a": torch.tensor([4.0, 5.0], dtype=torch.float64),
+        "b": torch.tensor([-6.0], dtype=torch.float64),
+    }
+    thresholds = {"max_abs_diff": 1e-12, "max_rel_diff": 1e-12}
+
+    assert_tree_close(
+        tree_zeros_like_foreach(left),
+        {
+            "a": torch.zeros(2, dtype=torch.float64),
+            "b": torch.zeros(1, dtype=torch.float64),
+        },
+        thresholds=thresholds,
+    )
+    assert_tree_close(
+        tree_add_foreach(left, right),
+        {
+            "a": torch.tensor([5.0, 3.0], dtype=torch.float64),
+            "b": torch.tensor([-3.0], dtype=torch.float64),
+        },
+        thresholds=thresholds,
+    )
+    assert_tree_close(
+        tree_sub_foreach(left, right),
+        {
+            "a": torch.tensor([-3.0, -7.0], dtype=torch.float64),
+            "b": torch.tensor([9.0], dtype=torch.float64),
+        },
+        thresholds=thresholds,
+    )
+    assert_tree_close(
+        tree_mul_foreach(left, 2.0),
+        {
+            "a": torch.tensor([2.0, -4.0], dtype=torch.float64),
+            "b": torch.tensor([6.0], dtype=torch.float64),
+        },
+        thresholds=thresholds,
+    )
+    assert_tree_close(
+        tree_elementwise_mul_foreach(left, right),
+        {
+            "a": torch.tensor([4.0, -10.0], dtype=torch.float64),
+            "b": torch.tensor([-18.0], dtype=torch.float64),
+        },
+        thresholds=thresholds,
+    )
+    assert_tree_close(
+        tree_elementwise_div_foreach(right, left),
+        {
+            "a": torch.tensor([4.0, -2.5], dtype=torch.float64),
+            "b": torch.tensor([-2.0], dtype=torch.float64),
+        },
+        thresholds=thresholds,
+    )
+
+    assert float(tree_dot_foreach(left, right)) == pytest.approx(-24.0)
+    assert float(tree_max_abs_foreach(right)) == pytest.approx(6.0)
+    assert float(tree_l2_norm_foreach(left)) == pytest.approx(math.sqrt(14.0))
+
+    with pytest.raises(RuntimeError, match="same dtype"):
+        tree_add_foreach(left, {"a": right["a"].float(), "b": right["b"]})
+
+
+def test_axis_manifest_matches_spec_feature_space() -> None:
+    manifest = vpx.axis_manifest()
+    by_key = manifest.by_key()
+    expected_keys = {
+        "activation.offload",
+        "activation.recompute",
+        "attention.custom_kernel_id",
+        "attention.frontend",
+        "attention.mask_formatter_id",
+        "attention.padding",
+        "attention.partition",
+        "attention.sdpa_kernel",
+        "autocast",
+        "batch.data_microbatch_size",
+        "batch.empirical_example_batch_size",
+        "batch.fisher_sample_batch_size",
+        "batch.ggn_batch_size",
+        "batch.hvp_row_batch_size",
+        "call.buffer_mutation",
+        "call.buffers",
+        "call.grad_mode",
+        "call.params",
+        "call.parametrizations",
+        "call.path",
+        "call.return_type",
+        "call.tied_weights",
+        "checkpoint.context_fn",
+        "checkpoint.determinism_check",
+        "checkpoint.early_stop",
+        "checkpoint.preserve_rng_state",
+        "checkpoint.use_reentrant",
+        "chunk.class_block_size_with_exact_global_normalization",
+        "chunk.layer_block_size",
+        "chunk.lm_head_weight_chunk_bytes",
+        "chunk.output_cotangent_block_size",
+        "chunk.parameter_block_size",
+        "chunk.sequence_position_block_size",
+        "chunk.token_block_size",
+        "comm.collective_bucket_size",
+        "comm.overlap",
+        "comm.prefetch",
+        "compile.backend",
+        "compile.boundary",
+        "compile.cache_state",
+        "compile.compiled_autograd",
+        "compile.cuda_graphs",
+        "compile.dynamic",
+        "compile.enabled",
+        "compile.fullgraph",
+        "compile.mode",
+        "compile.options.epilogue_fusion",
+        "compile.options.shape_padding",
+        "composition.child_evaluation",
+        "composition.execution",
+        "composition.validation",
+        "context_parallel.enabled",
+        "context_parallel.rotate_method",
+        "context_parallel.sequence_dim",
+        "distributed.launch",
+        "distributed.local_rank_binding",
+        "distributed.mesh_dim_names",
+        "distributed.mesh_shape",
+        "distributed.process_group_backend",
+        "distributed.strategy",
+        "dtensor.cotangent_placement",
+        "dtensor.logits_placement",
+        "dtensor.output_placement",
+        "dtensor.params_placement",
+        "dtensor.redistribute_schedule",
+        "dtensor.tangent_placement",
+        "dtensor.vector_placement",
+        "dtype.accumulation",
+        "dtype.autodiff_compute",
+        "dtype.intermediate",
+        "dtype.metric_factor",
+        "dtype.model_compute",
+        "dtype.output",
+        "dtype.parameter_storage",
+        "dtype.vector",
+        "empirical_fisher.accumulation",
+        "empirical_fisher.grad_path",
+        "fisher.accumulation",
+        "fisher.expectation_path",
+        "fisher.score_grad_path",
+        "fsdp.dp_mesh_dims",
+        "fsdp.ignored_params",
+        "fsdp.mp_policy.cast_forward_inputs",
+        "fsdp.mp_policy.output_dtype",
+        "fsdp.mp_policy.param_dtype",
+        "fsdp.mp_policy.reduce_dtype",
+        "fsdp.offload_policy",
+        "fsdp.reshard_after_forward",
+        "fsdp.shard_placement_fn",
+        "fsdp.wrap_granularity",
+        "fusion.logits",
+        "fusion.loss",
+        "fusion.mlp",
+        "fusion.norm",
+        "fusion.rope",
+        "ggn.cotangent_reuse",
+        "ggn.jvp_path",
+        "ggn.jvp_reuse",
+        "ggn.loss_hessian_kernel",
+        "ggn.loss_hessian_path",
+        "ggn.vjp_path",
+        "gradient.graph_schedule",
+        "gradient.path",
+        "gradient.value_reuse",
+        "hvp.gradient_reuse",
+        "hvp.graph_schedule",
+        "hvp.path",
+        "hvp.primal_reuse",
+        "input.batch_layout",
+        "input.host_to_device",
+        "input.length_grouping",
+        "input.residency",
+        "inverse_metric.factor_reuse",
+        "inverse_metric.block_schedule",
+        "inverse_metric.iteration_budget",
+        "inverse_metric.preconditioner",
+        "inverse_metric.solve_path",
+        "jvp.linearize_reuse",
+        "jvp.path",
+        "layout.aliasing",
+        "layout.contiguity",
+        "layout.flatten_order",
+        "layout.output",
+        "layout.params",
+        "layout.parametrizations",
+        "layout.vector",
+        "layout.vector_ops",
+        "memory.factor_residency",
+        "memory.intermediate_residency",
+        "memory.jvp_outputs",
+        "memory.output_buffers",
+        "memory.output_cotangents",
+        "memory.primal_outputs",
+        "memory.vector_residency",
+        "metric.accumulation",
+        "metric.block_schedule",
+        "metric.multiply_path",
+        "numeric.bf16_reduced_precision_reduction",
+        "numeric.deterministic_algorithms",
+        "numeric.float32_matmul_precision",
+        "numeric.fp16_reduced_precision_reduction",
+        "numeric.loss_scale",
+        "numeric.loss_scaling",
+        "numeric.loss_unscale_degree",
+        "sampled_fisher.accumulation",
+        "sampled_fisher.exact_fisher_check",
+        "sampled_fisher.sample_source",
+        "sampled_fisher.score_grad_path",
+        "schedule.gradient_accumulation",
+        "schedule.per_example",
+        "schedule.per_token",
+        "sequence_parallel.enabled",
+        "sequence_parallel.norm_modules",
+        "sequence_parallel.output_placement_policy",
+        "teacher_outputs",
+        "tp.embedding",
+        "tp.lm_head",
+        "tp.loss_parallel",
+        "tp.mlp_down",
+        "tp.mlp_up_gate",
+        "tp.output_projection",
+        "tp.plan",
+        "tp.prepare_module_input",
+        "tp.prepare_module_output",
+        "tp.qkv_projection",
+        "vectorization.batch_size",
+        "vectorization.in_dims",
+        "vectorization.mode",
+        "vectorization.randomness",
+        "vectorization.vmap_chunk_size",
+        "vjp.closure_reuse",
+        "vjp.path",
+    }
+    expected_groups = {
+        "activation_memory",
+        "ad_lowering",
+        "attention_dispatch",
+        "compile",
+        "distributed_layout",
+        "fusion",
+        "input_schedule",
+        "inverse_solve",
+        "metric_storage",
+        "numeric_backend",
+    }
+    grouped_keys = tuple(
+        key for keys in manifest.class_c_groups.values() for key in keys
+    )
+
+    assert set(by_key) == expected_keys
+    assert set(manifest.class_c_groups) == expected_groups
+    assert set(grouped_keys) == expected_keys
+    assert len(grouped_keys) == len(expected_keys)
+    assert manifest.merge_rules == (
+        (
+            "attention.partition=packed_tokens merges "
+            "attention_dispatch with input_schedule"
+        ),
+        "compile.boundary=attention_module merges compile with attention_dispatch",
+        "compile.boundary operator part merges compile with ad_lowering",
+        "fusion non-default merges fusion with ad_lowering",
+        "dtensor placement merges distributed_layout with ad_lowering",
+        "fsdp reduce dtype not fp32 merges distributed_layout with numeric_backend",
+        "factorized inverse rows merge inverse_solve with metric_storage",
+    )
+
+    for axis in by_key.values():
+        assert axis.owner_id
+        assert axis.value_domain
+        assert axis.admission_rule_id
+        assert axis.lowering_rule_id or axis.adapter_id
+        assert axis.axis_key in manifest.class_c_groups[axis.class_c_group]
+
+    assert by_key["compile.mode"].value_domain == (None, "default", "max-autotune")
+    assert by_key["attention.frontend"].value_domain == (
+        "transformers_eager",
+        "transformers_sdpa",
+        "transformers_flash_attention_2",
+        "transformers_flash_attention_3",
+        "transformers_flash_attention_4",
+        "transformers_flex_attention",
+        "paged|eager",
+        "paged|sdpa",
+        "paged|flash_attention_2",
+        "paged|flash_attention_3",
+        "paged|flash_attention_4",
+        "registered_transformers_attention",
+        "pytorch_sdpa_direct",
+        "patched_eager",
+        "packed_exact",
+        "blockwise_exact",
+    )
+    assert by_key["metric.multiply_path"].value_domain == (
+        "dense_matmul",
+        "factorized_multiply",
+        "blockwise_multiply",
+        "streaming_multiply",
+    )
+    assert by_key["inverse_metric.solve_path"].value_domain == (
+        "dense_solve",
+        "cholesky_solve",
+        "eigh_solve",
+        "svd_solve",
+        "conjugate_gradient",
+        "factorized_solve",
+        "blockwise_solve",
+        "woodbury_low_rank_solve",
+    )
+    assert by_key["layout.vector_ops"].class_a == ("mostly_independent_after_admission")
+    assert by_key["teacher_outputs"].class_b == "conditionally_independent"
+    assert by_key["dtensor.params_placement"].adapter_id == (
+        "vptune.adapters.distributed"
+    )
+    assert manifest.signature()["manifest_version"] == "1"
+
+
+def manifest_candidate(
+    settings: Mapping[str, object],
+    fixed_fields: Mapping[str, object],
+) -> vp.Candidate:
+    return vpx.axis_manifest().admit(
+        vp.Candidate("family", "row", settings),
+        fixed_fields=fixed_fields,
+    )
+
+
+def assert_manifest_admitted(
+    settings: Mapping[str, object],
+    fixed_fields: Mapping[str, object],
+) -> None:
+    admitted = manifest_candidate(settings, fixed_fields)
+
+    assert admitted.admission_status == "passed"
+    assert admitted.admission_error is None
+
+
+def assert_manifest_rejected(
+    settings: Mapping[str, object],
+    fixed_fields: Mapping[str, object],
+    match: str,
+) -> None:
+    rejected = manifest_candidate(settings, fixed_fields)
+
+    assert rejected.admission_status == "failed"
+    assert rejected.admission_error is not None
+    assert match in rejected.admission_error
+
+
+def reduction_bound_fields() -> dict[str, object]:
+    return {
+        "k": 2,
+        "epsilon": 0.01,
+        "C_op": 1.5,
+        "S_row": 3.0,
+        "output_norm_floor": 1e-6,
+    }
+
+
+def test_manifest_admission_requires_exact_loss_scaling_fields() -> None:
+    assert_manifest_admitted(
+        {
+            "numeric.loss_scaling": "static_scale_with_exact_unscale",
+            "numeric.loss_scale": 8.0,
+            "numeric.loss_unscale_degree": 1,
+        },
+        {},
+    )
+    assert_manifest_rejected(
+        {"numeric.loss_scale": 8.0},
+        {},
+        "numeric.loss_scaling is required",
+    )
+    assert_manifest_rejected(
+        {"numeric.loss_scaling": "none", "numeric.loss_scale": 8.0},
+        {},
+        "forbids",
+    )
+    assert_manifest_rejected(
+        {"numeric.loss_scaling": "static_scale_with_exact_unscale"},
+        {},
+        "numeric.loss_scale is required",
+    )
+    assert_manifest_rejected(
+        {
+            "numeric.loss_scaling": "static_scale_with_exact_unscale",
+            "numeric.loss_scale": 8.0,
+        },
+        {},
+        "numeric.loss_unscale_degree is required",
+    )
+    assert_manifest_rejected(
+        {
+            "numeric.loss_scaling": "static_scale_with_exact_unscale",
+            "numeric.loss_scale": 0.0,
+            "numeric.loss_unscale_degree": 1,
+        },
+        {},
+        "positive float",
+    )
+
+
+def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
+    assert_manifest_admitted(
+        {"metric.multiply_path": "dense_matmul"},
+        {"metric.representation": "dense_matrix"},
+    )
+    assert_manifest_admitted(
+        {
+            "metric.multiply_path": "factorized_multiply",
+            "metric.accumulation": "materialized_blocks",
+        },
+        {"metric.representation": "kfac_factors"},
+    )
+    assert_manifest_admitted(
+        {"inverse_metric.solve_path": "woodbury_low_rank_solve"},
+        {"metric.representation": "low_rank_factors"},
+    )
+    assert_manifest_admitted(
+        {"inverse_metric.solve_path": "cholesky_solve"},
+        {"metric.representation": "dense_matrix", "metric.psd": True},
+    )
+    assert_manifest_admitted(
+        {"inverse_metric.solve_path": "eigh_solve"},
+        {"metric.representation": "dense_matrix", "metric.symmetric": True},
+    )
+    assert_manifest_admitted(
+        {
+            "inverse_metric.solve_path": "conjugate_gradient",
+            "inverse_metric.iteration_budget": 4,
+            "inverse_metric.preconditioner": "none",
+            "metric.multiply_path": "dense_matmul",
+        },
+        {"metric.representation": "dense_matrix"},
+    )
+    assert_manifest_admitted(
+        {
+            "metric.multiply_path": "blockwise_multiply",
+            "metric.block_schedule": "custom_blocks",
+            "metric.accumulation": "materialized_blocks",
+        },
+        {
+            "metric.representation": {
+                "kind": "block_diagonal",
+                "block_schedule": "custom_blocks",
+            }
+        },
+    )
+    assert_manifest_admitted(
+        {
+            "inverse_metric.solve_path": "blockwise_solve",
+            "inverse_metric.block_schedule": "layer_blocks",
+        },
+        {
+            "metric.representation": {
+                "kind": "block_diagonal",
+                "block_schedule": "layer_blocks",
+            }
+        },
+    )
+
+    assert_manifest_rejected(
+        {"metric.multiply_path": "dense_matmul"},
+        {"metric.representation": "kfac_factors"},
+        "dense matrix",
+    )
+    assert_manifest_rejected(
+        {"metric.multiply_path": "factorized_multiply"},
+        {"metric.representation": "dense_matrix"},
+        "requires factors",
+    )
+    assert_manifest_rejected(
+        {"metric.multiply_path": "blockwise_multiply"},
+        {"metric.representation": "kfac_factors"},
+        "requires blocks",
+    )
+    assert_manifest_rejected(
+        {"inverse_metric.solve_path": "dense_solve"},
+        {"metric.representation": "kfac_factors"},
+        "requires dense matrix",
+    )
+    assert_manifest_rejected(
+        {"inverse_metric.solve_path": "cholesky_solve"},
+        {"metric.representation": "dense_matrix"},
+        "requires a PSD metric",
+    )
+    assert_manifest_rejected(
+        {"inverse_metric.solve_path": "eigh_solve"},
+        {"metric.representation": "dense_matrix"},
+        "requires a symmetric metric",
+    )
+    assert_manifest_rejected(
+        {"inverse_metric.solve_path": "woodbury_low_rank_solve"},
+        {"metric.representation": "kfac_factors"},
+        "requires low-rank factors",
+    )
+    assert_manifest_rejected(
+        {
+            "inverse_metric.solve_path": "conjugate_gradient",
+            "inverse_metric.iteration_budget": 4,
+            "inverse_metric.preconditioner": "none",
+        },
+        {"metric.representation": "dense_matrix"},
+        "metric.multiply_path",
+    )
+    assert_manifest_rejected(
+        {
+            "inverse_metric.solve_path": "conjugate_gradient",
+            "metric.multiply_path": "dense_matmul",
+        },
+        {"metric.representation": "dense_matrix"},
+        "iteration_budget",
+    )
+    assert_manifest_rejected(
+        {
+            "inverse_metric.solve_path": "conjugate_gradient",
+            "metric.multiply_path": "dense_matmul",
+            "inverse_metric.iteration_budget": 4,
+        },
+        {"metric.representation": "dense_matrix"},
+        "preconditioner",
+    )
+    assert_manifest_rejected(
+        {
+            "inverse_metric.solve_path": "dense_solve",
+            "inverse_metric.preconditioner": "none",
+        },
+        {"metric.representation": "dense_matrix"},
+        "iterative",
+    )
+    assert_manifest_rejected(
+        {"metric.block_schedule": "layer_blocks"},
+        {"metric.representation": "low_rank_factors"},
+        "requires blocks or KFAC factors",
+    )
+    assert_manifest_rejected(
+        {"metric.block_schedule": "layer_blocks"},
+        {"metric.representation": "block_diagonal"},
+        "representation.block_schedule",
+    )
+    assert_manifest_rejected(
+        {"metric.block_schedule": "layer_blocks"},
+        {
+            "metric.representation": {
+                "kind": "block_diagonal",
+                "block_schedule": "custom_blocks",
+            }
+        },
+        "must match representation.block_schedule",
+    )
+    assert_manifest_rejected(
+        {"inverse_metric.block_schedule": "module_blocks"},
+        {
+            "metric.representation": {
+                "kind": "kfac_factors",
+                "block_schedule": "layer_blocks",
+            }
+        },
+        "must match representation.block_schedule",
+    )
+    assert_manifest_rejected(
+        {"metric.accumulation": "streaming", "metric.multiply_path": "dense_matmul"},
+        {"metric.representation": "dense_matrix"},
+        "non-dense metric paths",
+    )
+    assert_manifest_rejected(
+        {"metric.accumulation": "streaming"},
+        {"metric.representation": "kfac_factors"},
+        "requires metric.multiply_path",
+    )
+    assert_manifest_rejected(
+        {"metric.multiply_path": "factorized_multiply"},
+        {"metric.representation": "kfac_factors"},
+        "metric.accumulation is required",
+    )
+    assert_manifest_rejected(
+        {
+            "metric.multiply_path": "streaming_multiply",
+            "metric.accumulation": "materialized_blocks",
+        },
+        {"metric.representation": "kfac_factors"},
+        "must be streaming",
+    )
+    assert_manifest_rejected(
+        {
+            "metric.multiply_path": "factorized_multiply",
+            "metric.accumulation": "streaming",
+        },
+        {"metric.representation": "kfac_factors"},
+        "must be materialized_blocks",
+    )
+    assert_manifest_rejected(
+        {"dtype.metric_factor": "bf16"},
+        {"metric.representation": "dense_matrix"},
+        "requires a factorized metric path",
+    )
+
+
+def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
+    assert_manifest_admitted(
+        {
+            "attention.sdpa_kernel": "math",
+            "attention.partition": "packed_tokens",
+            "input.batch_layout": "packed_with_inverse_permutation",
+        },
+        {"attention.calls_sdpa": True},
+    )
+    assert_manifest_admitted(
+        {
+            "compile.enabled": "true",
+            "compile.mode": None,
+            "compile.options.epilogue_fusion": "true",
+            "compile.options.shape_padding": "false",
+        },
+        {},
+    )
+    assert_manifest_admitted(
+        {"attention.partition": "segmented_forward_ad", "jvp.path": "forward_ad_dual"},
+        {},
+    )
+    assert_manifest_admitted(
+        {"dtype.accumulation": "bf16"},
+        reduction_bound_fields(),
+    )
+    assert_manifest_admitted(
+        {"sampled_fisher.sample_source": "fixed_seed_and_count"},
+        {
+            "sampled_fisher.sample_count": 4,
+            "sampled_fisher.sample_seed": 123,
+        },
+    )
+    assert_manifest_admitted(
+        {
+            "sampled_fisher.sample_source": "fixed_seed_and_count",
+            "sampled_fisher.exact_fisher_check": "enabled_with_sampling_bound",
+        },
+        {
+            "sampled_fisher.sample_count": 4,
+            "sampled_fisher.sample_seed": 123,
+            "sampled_fisher.sampling_bound": {"kind": "absolute_error"},
+        },
+    )
+    assert_manifest_admitted(
+        {"tp.loss_parallel": "true"},
+        {
+            "tp.exact_cross_shard_normalization": True,
+            "tp.multi_rank_agreement_check": True,
+        },
+    )
+
+    assert_manifest_rejected(
+        {"unknown.axis": "x"},
+        {},
+        "no manifest owner",
+    )
+    assert_manifest_rejected(
+        {"vectorization.batch_size": 0},
+        {},
+        "positive integer",
+    )
+    assert_manifest_rejected(
+        {"attention.sdpa_kernel": "math"},
+        {},
+        "calls PyTorch SDPA",
+    )
+    assert_manifest_rejected(
+        {"attention.sdpa_kernel": "flash_attention"},
+        {"attention.calls_sdpa": True, "attention.effective_runtime_dtype": "fp32"},
+        "requires float16 or bfloat16",
+    )
+    assert_manifest_rejected(
+        {"attention.sdpa_kernel": "priority_list"},
+        {"attention.calls_sdpa": True},
+        "requires backend order",
+    )
+    assert_manifest_rejected(
+        {"schedule.per_token": "packed", "input.batch_layout": "dense_padded"},
+        {},
+        "requires packed or variable-length layout",
+    )
+    assert_manifest_rejected(
+        {
+            "activation.recompute": "none",
+            "checkpoint.early_stop": "true",
+        },
+        {},
+        "checkpoint.early_stop=false",
+    )
+    assert_manifest_rejected(
+        {"activation.offload": "saved_tensor_hooks_cpu"},
+        {},
+        "saved-tensor-hooks path",
+    )
+    assert_manifest_rejected(
+        {
+            "compile.enabled": "false",
+            "compile.mode": "max-autotune",
+        },
+        {},
+        "compile.enabled=false forbids",
+    )
+    assert_manifest_rejected(
+        {
+            "compile.mode": "default",
+            "compile.options.epilogue_fusion": "true",
+        },
+        {},
+        "backend options require compile.mode=None",
+    )
+    assert_manifest_rejected(
+        {
+            "compile.mode": "default",
+            "compile.cuda_graphs": "true",
+        },
+        {},
+        "backend options require compile.mode=None",
+    )
+    assert_manifest_rejected(
+        {
+            "compile.mode": None,
+            "compile.options.epilogue_fusion": "false",
+            "compile.options.shape_padding": "false",
+            "compile.cuda_graphs": "false",
+        },
+        {},
+        "forbid compile.mode=None",
+    )
+    assert_manifest_rejected(
+        {"numeric.float32_matmul_precision": "medium"},
+        {},
+        "missing bound fields",
+    )
+    assert_manifest_rejected(
+        {"sampled_fisher.sample_source": "fixed_sample_table"},
+        {"sampled_fisher.sample_count": 4},
+        "sample table identity",
+    )
+    assert_manifest_rejected(
+        {
+            "sampled_fisher.sample_source": "fixed_seed_and_count",
+            "sampled_fisher.exact_fisher_check": "enabled_with_sampling_bound",
+        },
+        {
+            "sampled_fisher.sample_count": 4,
+            "sampled_fisher.sample_seed": 123,
+        },
+        "sampling-bound formula",
+    )
+    assert_manifest_rejected(
+        {
+            "gradient.value_reuse": "gradient_and_primal_value",
+            "gradient.path": "torch_func_grad",
+        },
+        {},
+        "value-and-gradient path",
+    )
+    assert_manifest_rejected(
+        {
+            "jvp.linearize_reuse": "reuse_at_same_primal",
+            "jvp.path": "torch_func_jvp",
+        },
+        {},
+        "requires torch_func_linearize",
+    )
+    assert_manifest_rejected(
+        {
+            "vjp.closure_reuse": "reuse_vjp_closure_at_same_primal",
+            "vjp.path": "autograd_grad_outputs",
+        },
+        {},
+        "requires torch_func_vjp",
+    )
+    assert_manifest_rejected(
+        {"ggn.jvp_path": "torch_func_jvp"},
+        {},
+        "ggn.vjp_path is required",
+    )
+    assert_manifest_rejected(
+        {"fisher.accumulation": "streaming_dot_accumulate"},
+        {},
+        "fisher.expectation_path is required",
+    )
+    assert_manifest_rejected(
+        {
+            "fisher.expectation_path": "explicit_full_expectation_score_rows",
+            "fisher.accumulation": "streaming_dot_accumulate",
+        },
+        {},
+        "fisher.score_grad_path is required",
+    )
+    assert_manifest_rejected(
+        {
+            "fisher.expectation_path": "explicit_full_expectation_score_rows",
+            "fisher.accumulation": "materialize_score_gradients",
+            "fisher.score_grad_path": "torch_autograd_grad_loop",
+        },
+        {},
+        "not used",
+    )
+    assert_manifest_rejected(
+        {
+            "inverse_metric.solve_path": "dense_solve",
+            "inverse_metric.iteration_budget": 4,
+        },
+        {"metric.representation": "dense_matrix"},
+        "applies only to iterative solves",
+    )
+    assert_manifest_rejected(
+        {"attention.partition": "segmented_forward_ad"},
+        {},
+        "requires forward AD path",
+    )
+    assert_manifest_rejected(
+        {"tp.loss_parallel": "true"},
+        {"tp.exact_cross_shard_normalization": True},
+        "multi-rank agreement check",
+    )
+
+
 def test_cohort_constraint_rejects_unsupported_modes() -> None:
     with pytest.raises(RuntimeError, match="dependency inheritance"):
         vp.CohortConstraint(
             name="bad",
-            settings_keys=("model_dtype",),
-            assignments=({"model_dtype": "float32"},),
+            settings_keys=("dtype.model_compute",),
+            assignments=({"dtype.model_compute": "fp32"},),
             dependency_inheritance="all_families",
         )
 
     with pytest.raises(RuntimeError, match="selection aggregation"):
         vp.CohortConstraint(
             name="bad",
-            settings_keys=("model_dtype",),
-            assignments=({"model_dtype": "float32"},),
+            settings_keys=("dtype.model_compute",),
+            assignments=({"dtype.model_compute": "fp32"},),
             selection_aggregation="mean_elapsed_seconds",
         )
 
@@ -556,6 +2293,7 @@ def test_write_record_rejects_type_specific_missing_fields(tmp_path: Path) -> No
         "generator_id": "plan",
         "generator_version": row["package_version"],
         "selected": {},
+        "candidate_rows": (),
         "records": {},
         "full_size_records": (),
         "check_records": (),
@@ -596,9 +2334,36 @@ def test_stable_hash_changes_on_identity_inputs() -> None:
 
 
 def test_adapter_namespace_exports_adapter_helpers() -> None:
+    assert vpa.apply_context_parallel
+    assert vpa.apply_fsdp2
+    assert vpa.apply_fsdp2_group
+    assert vpa.apply_tensor_parallel
+    assert vpa.build_colwise_parallel
+    assert vpa.build_device_mesh
+    assert vpa.build_dtensor_placement
+    assert vpa.build_fsdp_dp_mesh_dims
+    assert vpa.build_fsdp_mixed_precision_policy
+    assert vpa.build_fsdp_offload_policy
+    assert vpa.build_prepare_module_input
+    assert vpa.build_prepare_module_output
+    assert vpa.build_rowwise_parallel
+    assert vpa.build_sequence_parallel
+    assert vpa.collective_all_gather_into_tensor
+    assert vpa.collective_all_to_all_single
+    assert vpa.collective_reduce_scatter_tensor
+    assert vpa.initialize_process_group
+    assert vpa.named_modules_for_distributed_wrap
+    assert vpa.redistribute_dtensor
+    assert vpa.resolve_process_group_backend
+    assert vpa.run_with_loss_parallel
+    assert vpa.wait_collective
+    assert vpa.distributed_strategy_axis
     assert vpa.RankStatus
     assert vpa.PilotReadiness
     assert vpa.load_transformers_model
+    assert vpa.register_transformers_attention
+    assert vpa.set_transformers_attention_implementation
+    assert vpa.transformers_attention_location
     assert vpa.transformers_attention_axis
     assert vpa.transformers_attn_implementation
 
@@ -632,6 +2397,19 @@ def test_module_identity_records_tied_parameters_and_devices() -> None:
 
     with pytest.raises(RuntimeError):
         vp.parameter_surface(TiedModule(), tied_weights="unknown")
+
+    grouped = vp.parameter_surface(
+        TiedModule(),
+        layer_groups=(("first", "second"),),
+        block_groups=(("first", "second"),),
+    )
+
+    assert grouped.layer_groups == (("first", "second"),)
+    assert grouped.block_groups == (("first", "second"),)
+    assert grouped.signature()["layer_groups"] == (("first", "second"),)
+
+    with pytest.raises(RuntimeError, match="layer_groups"):
+        vp.parameter_surface(TiedModule(), layer_groups=(("first",),))
 
 
 def test_module_identity_records_nested_parametrizations() -> None:
@@ -667,7 +2445,7 @@ def test_module_identity_records_nested_parametrizations() -> None:
 def test_threshold_logic() -> None:
     thresholds = thresholds_for_measurements(
         {"max_abs_diff": 1e-4, "max_rel_diff": 2.0},
-        {"model_dtype": "float16"},
+        {"dtype.model_compute": "fp16"},
     )
 
     assert thresholds["max_abs_diff"] >= 0.25 * float(torch.finfo(torch.float16).eps)
@@ -679,6 +2457,55 @@ def test_threshold_logic() -> None:
 
     with pytest.raises(ReferenceFailedError):
         validate_thresholds({"max_abs_diff": math.nan}, {"max_abs_diff": 1e-4})
+
+    bound_measurements = numeric_error_bound_measurements(
+        {"numeric.float32_matmul_precision": "high"},
+        reduction_bound_fields(),
+        torch.tensor([4.0]),
+    )
+
+    assert bound_measurements["numeric_error_bound_abs"] == pytest.approx(
+        1.5 * (0.02 / 0.98) * 3.0
+    )
+    assert bound_measurements["numeric_error_bound_rel"] == pytest.approx(
+        bound_measurements["numeric_error_bound_abs"] / 4.0
+    )
+    validate_numeric_error_bound(
+        {"max_abs_diff": 0.08, "max_rel_diff": 0.02},
+        {"max_abs_diff": 0.1, "max_rel_diff": 0.1},
+        bound_measurements,
+    )
+
+    with pytest.raises(ReferenceFailedError, match="exceeds derived bound"):
+        validate_numeric_error_bound(
+            {"max_abs_diff": 0.2, "max_rel_diff": 0.2},
+            {"max_abs_diff": 0.5, "max_rel_diff": 0.5},
+            bound_measurements,
+        )
+
+    with pytest.raises(ReferenceFailedError, match="bound exceeds threshold"):
+        validate_numeric_error_bound(
+            {"max_abs_diff": 0.01, "max_rel_diff": 0.01},
+            {"max_abs_diff": 0.01, "max_rel_diff": 0.01},
+            bound_measurements,
+        )
+
+    with pytest.raises(ReferenceFailedError, match="fields are missing"):
+        numeric_error_bound_measurements(
+            {"numeric.float32_matmul_precision": "high"},
+            {},
+            torch.tensor([4.0]),
+        )
+
+    bad_bound_fields = dict(reduction_bound_fields())
+    bad_bound_fields["k"] = 100
+
+    with pytest.raises(ReferenceFailedError, match=r"k [*] epsilon"):
+        numeric_error_bound_measurements(
+            {"numeric.float32_matmul_precision": "high"},
+            bad_bound_fields,
+            torch.tensor([4.0]),
+        )
 
     assert_tree_close(
         torch.tensor([1.0]),
@@ -703,7 +2530,7 @@ def test_threshold_logic() -> None:
     assert_tree_close(
         torch.tensor([1.0], dtype=torch.float32),
         torch.tensor([1.0 + 1e-5], dtype=torch.float32),
-        settings={"model_dtype": "float16"},
+        settings={"dtype.model_compute": "fp16"},
         thresholds={"max_abs_diff": 0.0, "max_rel_diff": 0.0},
     )
 
@@ -1006,6 +2833,141 @@ def test_run_candidate_records_cuda_oom_failures() -> None:
     assert record.memory_samples[0].elapsed_seconds == pytest.approx(3.0)
 
 
+def test_run_candidate_records_compiled_selection_metadata() -> None:
+    candidate = vp.Candidate(
+        "family",
+        "compiled",
+        {
+            "compile.enabled": "true",
+            "compile.cache_state": "cold_compile",
+            "compile.compiled_autograd": "false",
+            "compile.cuda_graphs": "false",
+        },
+    )
+    calls = {"count": 0}
+
+    def operation() -> torch.Tensor:
+        calls["count"] += 1
+
+        return torch.tensor(float(calls["count"]))
+
+    record = run_candidate(
+        candidate,
+        {"case": "compiled-metadata"},
+        operation,
+        timing_policy=vp.TimingPolicy(
+            short_seconds=10.0,
+            short_warmups=0,
+            short_measured_calls=2,
+        ),
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 5.0, 5.0, 7.0, 7.0, 9.0)),
+    )
+
+    assert record.status == "passed"
+    assert record.selection_metadata == {
+        "timing_source": "compiled_single_rank",
+        "steady_elapsed_seconds": 2.0,
+        "compile_time_seconds": 3.0,
+        "recompile_count": 0,
+        "compile_cache_state": "cold_compile",
+        "compile.compiled_autograd": "false",
+        "compile.cuda_graphs": "false",
+    }
+
+
+def test_run_candidate_records_full_size_check_metadata() -> None:
+    candidate = vp.Candidate(
+        "family",
+        "flash",
+        {
+            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.sdpa_kernel": "flash_attention",
+        },
+    )
+
+    def operation() -> torch.Tensor:
+        return torch.tensor([1.0])
+
+    def full_size_check(output: vp.TensorTree) -> Mapping[str, object]:
+        assert isinstance(output, torch.Tensor)
+        torch.testing.assert_close(output, torch.tensor([1.0]))
+
+        return {
+            "full_size_agreement_passed": True,
+            "full_size_agreement_name": "tests.full_size_gate",
+        }
+
+    record = run_candidate(
+        candidate,
+        {"case": "full-size-check"},
+        operation,
+        timing_policy=vp.TimingPolicy(
+            short_seconds=0.0,
+            medium_seconds=0.0,
+            long_warmups=0,
+            long_measured_calls=1,
+        ),
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0)),
+        full_size_check=full_size_check,
+    )
+
+    assert record.status == "passed"
+    assert record.selection_metadata["full_size_agreement_passed"] is True
+    assert record.selection_metadata["full_size_agreement_name"] == (
+        "tests.full_size_gate"
+    )
+
+
+def test_run_candidate_records_measured_recompile_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = vp.Candidate(
+        "family",
+        "compiled",
+        {
+            "compile.enabled": "true",
+            "compile.cache_state": "cold_compile",
+            "compile.compiled_autograd": "false",
+            "compile.cuda_graphs": "false",
+        },
+    )
+    counters = {"stats": {"unique_graphs": 10}}
+    calls = {"count": 0}
+
+    fake_dynamo_utils = types.SimpleNamespace(counters=counters)
+
+    def fake_import_module(name: str) -> object:
+        assert name == "torch._dynamo.utils"
+
+        return fake_dynamo_utils
+
+    def operation() -> torch.Tensor:
+        calls["count"] += 1
+
+        if calls["count"] == 1:
+            counters["stats"]["unique_graphs"] += 3
+
+        return torch.tensor(float(calls["count"]))
+
+    monkeypatch.setattr(measure_module.importlib, "import_module", fake_import_module)
+    record = run_candidate(
+        candidate,
+        {"case": "compiled-recompile-count"},
+        operation,
+        timing_policy=vp.TimingPolicy(
+            short_seconds=10.0,
+            short_warmups=0,
+            short_measured_calls=2,
+        ),
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 5.0, 5.0, 7.0, 7.0, 9.0)),
+    )
+
+    assert record.selection_metadata["recompile_count"] == 2
+
+
 def test_measurement_cleans_memory_backend_after_runtime_failure() -> None:
     class RecordingBackend:
         def __init__(self) -> None:
@@ -1056,6 +3018,7 @@ def _record(
     input_signature: Mapping[str, object],
     status: str = "passed",
     reference_passed: bool = True,
+    selection_metadata: Mapping[str, object] | None = None,
 ) -> FullSizeRecord:
     samples = tuple(
         Measurement(
@@ -1078,11 +3041,34 @@ def _record(
         generator_version=candidate.generator_version,
         timing_samples=samples,
         memory_samples=samples,
+        selection_metadata={}
+        if selection_metadata is None
+        else dict(selection_metadata),
         dependency_identities=dict(candidate.dependency_identities),
         reference_passed=reference_passed,
     )
 
     return record
+
+
+def _with_rank_memory_samples(
+    record: FullSizeRecord,
+    reserved: tuple[float, ...],
+) -> FullSizeRecord:
+    samples = tuple(
+        Measurement(
+            elapsed_seconds=record.timing_samples[0].elapsed_seconds,
+            peak_allocated_mib=memory,
+            peak_reserved_mib=memory,
+            post_allocated_mib=0.0,
+            post_reserved_mib=0.0,
+            rank=rank,
+            device=f"cuda:{rank}",
+        )
+        for rank, memory in enumerate(reserved)
+    )
+
+    return dataclasses.replace(record, memory_samples=samples)
 
 
 def _check_record(
@@ -1322,25 +3308,374 @@ def test_within_family_selection() -> None:
     assert selected == near
 
 
-def test_selection_rejects_unsupported_policy_fields() -> None:
-    candidate = vp.Candidate("family", "row", {})
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {
+            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.sdpa_kernel": "flash_attention",
+        },
+        {
+            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.sdpa_kernel": "priority_list",
+            "attention.sdpa_priority_list": ("flash_attention", "math"),
+        },
+        {"attention.frontend": "transformers_flex_attention"},
+        {
+            "attention.frontend": "packed_exact",
+            "attention.partition": "packed_tokens",
+        },
+        {
+            "attention.frontend": "blockwise_exact",
+            "attention.partition": "blockwise_queries",
+        },
+        {"compile.cuda_graphs": "true"},
+        {"compile.mode": "max-autotune"},
+        {"fusion.loss": "fused_ce"},
+        {"tp.loss_parallel": "true"},
+        {"context_parallel.enabled": "true"},
+    ],
+)
+def test_selection_requires_full_size_agreement(settings: Mapping[str, object]) -> None:
+    signature = {"case": "full-size-gate", "settings": dict(settings)}
+    policy = vp.SelectionPolicy()
+    gated = vp.Candidate(
+        "family",
+        "gated",
+        settings,
+    )
+    fallback = vp.Candidate("family", "fallback", {})
 
-    with pytest.raises(RuntimeError):
+    selected, _ = select_family(
+        (
+            (
+                gated,
+                _record(
+                    gated,
+                    elapsed=(1.0,),
+                    reserved=(1.0,),
+                    input_signature=signature,
+                ),
+            ),
+            (
+                fallback,
+                _record(
+                    fallback,
+                    elapsed=(2.0,),
+                    reserved=(1.0,),
+                    input_signature=signature,
+                ),
+            ),
+        ),
+        input_signature=signature,
+        policy=policy,
+    )
+
+    assert selected == fallback
+
+    selected_with_gate, _ = select_family(
+        (
+            (
+                gated,
+                _record(
+                    gated,
+                    elapsed=(1.0,),
+                    reserved=(1.0,),
+                    input_signature=signature,
+                    selection_metadata={"full_size_agreement_passed": True},
+                ),
+            ),
+            (
+                fallback,
+                _record(
+                    fallback,
+                    elapsed=(2.0,),
+                    reserved=(1.0,),
+                    input_signature=signature,
+                ),
+            ),
+        ),
+        input_signature=signature,
+        policy=policy,
+    )
+
+    assert selected_with_gate == gated
+
+
+def test_selection_scores_compiled_rows_by_call_horizon() -> None:
+    signature = {"case": "compiled-selection"}
+    eager = vp.Candidate("family", "eager", {})
+    compiled = vp.Candidate(
+        "family",
+        "compiled",
+        {"compile.enabled": "true"},
+    )
+    eager_record = _record(
+        eager,
+        elapsed=(4.0,),
+        reserved=(1.0,),
+        input_signature=signature,
+    )
+    compiled_record = _record(
+        compiled,
+        elapsed=(2.0,),
+        reserved=(1.0,),
+        input_signature=signature,
+        selection_metadata={
+            "steady_elapsed_seconds": 2.0,
+            "compile_time_seconds": 30.0,
+            "recompile_count": 0,
+        },
+    )
+    short_horizon = vp.SelectionPolicy(compile_call_horizon=10)
+    long_horizon = vp.SelectionPolicy(compile_call_horizon=30)
+
+    short_selected, _ = select_family(
+        ((eager, eager_record), (compiled, compiled_record)),
+        input_signature=signature,
+        policy=short_horizon,
+    )
+    long_selected, _ = select_family(
+        ((eager, eager_record), (compiled, compiled_record)),
+        input_signature=signature,
+        policy=long_horizon,
+    )
+
+    assert short_selected == eager
+    assert long_selected == compiled
+
+
+def test_selection_scores_distributed_rows_by_global_elapsed_seconds() -> None:
+    signature = {"case": "distributed-selection"}
+    local = vp.Candidate("family", "local", {})
+    distributed = vp.Candidate(
+        "family",
+        "distributed",
+        {"distributed.strategy": "fsdp2"},
+    )
+    selected, _ = select_family(
+        (
+            (
+                local,
+                _record(
+                    local,
+                    elapsed=(2.0,),
+                    reserved=(1.0,),
+                    input_signature=signature,
+                ),
+            ),
+            (
+                distributed,
+                _record(
+                    distributed,
+                    elapsed=(1.0,),
+                    reserved=(1.0,),
+                    input_signature=signature,
+                    selection_metadata={"global_elapsed_seconds": 3.0},
+                ),
+            ),
+        ),
+        input_signature=signature,
+        policy=vp.SelectionPolicy(),
+    )
+
+    assert selected == local
+
+    with pytest.raises(TypeError, match="global_elapsed_seconds"):
         select_family(
             (
                 (
-                    candidate,
+                    distributed,
                     _record(
-                        candidate,
+                        distributed,
                         elapsed=(1.0,),
                         reserved=(1.0,),
-                        input_signature={},
+                        input_signature=signature,
                     ),
                 ),
             ),
-            input_signature={},
-            policy=vp.SelectionPolicy(speed_statistic="mean_elapsed_seconds"),
+            input_signature=signature,
+            policy=vp.SelectionPolicy(),
         )
+
+
+def test_selection_scores_compiled_distributed_rows_by_global_compile_fields() -> None:
+    signature = {"case": "compiled-distributed-selection"}
+    eager = vp.Candidate("family", "eager", {})
+    compiled = vp.Candidate(
+        "family",
+        "compiled",
+        {"compile.enabled": "true", "distributed.strategy": "fsdp2"},
+    )
+    eager_record = _record(
+        eager,
+        elapsed=(4.0,),
+        reserved=(1.0,),
+        input_signature=signature,
+    )
+    compiled_record = _record(
+        compiled,
+        elapsed=(1.0,),
+        reserved=(1.0,),
+        input_signature=signature,
+        selection_metadata={
+            "global_steady_elapsed_seconds": 1.0,
+            "global_compile_time_seconds": 90.0,
+            "recompile_count": 0,
+        },
+    )
+    short_horizon = vp.SelectionPolicy(compile_call_horizon=10)
+    long_horizon = vp.SelectionPolicy(compile_call_horizon=90)
+
+    short_selected, _ = select_family(
+        ((eager, eager_record), (compiled, compiled_record)),
+        input_signature=signature,
+        policy=short_horizon,
+    )
+    long_selected, _ = select_family(
+        ((eager, eager_record), (compiled, compiled_record)),
+        input_signature=signature,
+        policy=long_horizon,
+    )
+
+    assert short_selected == eager
+    assert long_selected == compiled
+
+
+def test_selection_tie_breaks_with_declared_rank_memory_reduction() -> None:
+    signature = {"case": "distributed-memory-selection"}
+    first = vp.Candidate("family", "first", {"distributed.strategy": "fsdp2"})
+    second = vp.Candidate("family", "second", {"distributed.strategy": "fsdp2"})
+    first_record = _with_rank_memory_samples(
+        _record(
+            first,
+            elapsed=(1.0,),
+            reserved=(1.0,),
+            input_signature=signature,
+            selection_metadata={"global_elapsed_seconds": 1.0},
+        ),
+        (60.0, 1.0),
+    )
+    second_record = _with_rank_memory_samples(
+        _record(
+            second,
+            elapsed=(1.0,),
+            reserved=(1.0,),
+            input_signature=signature,
+            selection_metadata={"global_elapsed_seconds": 1.0},
+        ),
+        (40.0, 40.0),
+    )
+    max_selected, _ = select_family(
+        ((first, first_record), (second, second_record)),
+        input_signature=signature,
+        policy=vp.SelectionPolicy(rank_memory_reduction="max_peak_reserved"),
+    )
+    sum_selected, _ = select_family(
+        ((first, first_record), (second, second_record)),
+        input_signature=signature,
+        policy=vp.SelectionPolicy(rank_memory_reduction="sum_peak_reserved"),
+    )
+
+    assert max_selected == second
+    assert sum_selected == first
+
+
+def test_cohort_selection_sums_compiled_row_scores() -> None:
+    signature = {"case": "compiled-cohort"}
+    eager_a = vp.Candidate("a", "eager-a", {})
+    eager_b = vp.Candidate("b", "eager-b", {})
+    compiled_a = vp.Candidate("a", "compiled-a", {"compile.enabled": "true"})
+    compiled_b = vp.Candidate("b", "compiled-b", {"compile.enabled": "true"})
+    policy = vp.SelectionPolicy(compile_call_horizon=30)
+    cohort = select_cohort(
+        (
+            {
+                "a": (
+                    eager_a,
+                    _record(
+                        eager_a,
+                        elapsed=(4.0,),
+                        reserved=(1.0,),
+                        input_signature=signature,
+                    ),
+                ),
+                "b": (
+                    eager_b,
+                    _record(
+                        eager_b,
+                        elapsed=(4.0,),
+                        reserved=(1.0,),
+                        input_signature=signature,
+                    ),
+                ),
+            },
+            {
+                "a": (
+                    compiled_a,
+                    _record(
+                        compiled_a,
+                        elapsed=(2.0,),
+                        reserved=(2.0,),
+                        input_signature=signature,
+                        selection_metadata={
+                            "steady_elapsed_seconds": 2.0,
+                            "compile_time_seconds": 30.0,
+                            "recompile_count": 0,
+                        },
+                    ),
+                ),
+                "b": (
+                    compiled_b,
+                    _record(
+                        compiled_b,
+                        elapsed=(2.0,),
+                        reserved=(2.0,),
+                        input_signature=signature,
+                        selection_metadata={
+                            "steady_elapsed_seconds": 2.0,
+                            "compile_time_seconds": 30.0,
+                            "recompile_count": 0,
+                        },
+                    ),
+                ),
+            },
+        ),
+        families=("a", "b"),
+        policy=policy,
+    )
+
+    assert cohort["a"][0] == compiled_a
+    assert cohort["b"][0] == compiled_b
+
+
+def test_selection_rejects_unsupported_policy_fields() -> None:
+    candidate = vp.Candidate("family", "row", {})
+    policies = (
+        vp.SelectionPolicy(speed_statistic="mean_elapsed_seconds"),
+        vp.SelectionPolicy(compiled_speed_statistic="steady_elapsed_seconds"),
+        vp.SelectionPolicy(distributed_speed_statistic="rank_zero_elapsed_seconds"),
+        vp.SelectionPolicy(rank_memory_reduction="rank_zero_peak_reserved"),
+        vp.SelectionPolicy(accepted_status="passed_only"),
+    )
+
+    for policy in policies:
+        with pytest.raises(RuntimeError):
+            select_family(
+                (
+                    (
+                        candidate,
+                        _record(
+                            candidate,
+                            elapsed=(1.0,),
+                            reserved=(1.0,),
+                            input_signature={},
+                        ),
+                    ),
+                ),
+                input_signature={},
+                policy=policy,
+            )
 
 
 def test_selection_rejects_invalid_rows() -> None:
@@ -1615,32 +3950,33 @@ def test_admission_helpers() -> None:
             "uses_data_dependent_control_flow": False,
             "uses_item": False,
             "has_dynamic_shape_output": False,
-            "vmap_randomness": "error",
+            "vectorization.randomness": "error",
             "requires_forward_ad": False,
             "forward_ad_supported": False,
         })
 
     with pytest.raises(vp.AdmissionError):
         vpx.admit_checkpoint({
-            "use_reentrant": True,
-            "preserve_rng_state": True,
-            "determinism_check": "default",
-            "context_fn": None,
-            "early_stop": True,
-            "moves_to_new_device": False,
-            "uses_global_state": False,
+            "checkpoint.use_reentrant": "true",
+            "checkpoint.preserve_rng_state": "true",
+            "checkpoint.determinism_check": "default",
+            "checkpoint.context_fn": "none",
+            "checkpoint.early_stop": "true",
+            "checkpoint.moves_to_new_device": "false",
+            "checkpoint.uses_global_state": "false",
         })
 
 
 def checkpoint_fields() -> dict[str, object]:
     return {
-        "use_reentrant": False,
-        "preserve_rng_state": True,
-        "determinism_check": "default",
-        "context_fn": None,
-        "early_stop": True,
-        "moves_to_new_device": False,
-        "uses_global_state": False,
+        "activation.offload": "none",
+        "checkpoint.use_reentrant": "false",
+        "checkpoint.preserve_rng_state": "true",
+        "checkpoint.determinism_check": "default",
+        "checkpoint.context_fn": "none",
+        "checkpoint.early_stop": "true",
+        "checkpoint.moves_to_new_device": "false",
+        "checkpoint.uses_global_state": "false",
     }
 
 
@@ -1650,7 +3986,10 @@ def test_checkpoint_operation_preserves_rng_state() -> None:
     candidate = vp.Candidate(
         "family",
         "row",
-        {"checkpoint": "non_reentrant", **checkpoint_fields()},
+        {
+            "activation.recompute": "checkpoint_non_reentrant_by_layer",
+            **checkpoint_fields(),
+        },
         admission_status="passed",
     )
 
@@ -1665,7 +4004,7 @@ def test_checkpoint_operation_preserves_rng_state() -> None:
         candidate,
         function,
         (vector,),
-        policy_key="checkpoint",
+        policy_key="activation.recompute",
     )()
     assert isinstance(output, torch.Tensor)
     output.backward()
@@ -1682,9 +4021,9 @@ def test_checkpoint_operation_can_disable_rng_preservation() -> None:
         "family",
         "row",
         {
-            "checkpoint_policy": "non_reentrant_no_rng_preservation",
+            "activation.recompute": "checkpoint_non_reentrant_by_layer",
             **checkpoint_fields(),
-            "preserve_rng_state": False,
+            "checkpoint.preserve_rng_state": "false",
         },
         admission_status="passed",
     )
@@ -1700,7 +4039,7 @@ def test_checkpoint_operation_can_disable_rng_preservation() -> None:
         candidate,
         function,
         (vector,),
-        policy_key="checkpoint_policy",
+        policy_key="activation.recompute",
     )()
     assert isinstance(output, torch.Tensor)
     output.backward()
@@ -1710,26 +4049,97 @@ def test_checkpoint_operation_can_disable_rng_preservation() -> None:
     assert not torch.equal(values[0], values[1])
 
 
-def test_checkpoint_operation_rejects_no_rng_policy_with_rng_preservation() -> None:
+def test_checkpoint_operation_uses_declared_context_pair() -> None:
+    events = []
     vector = torch.tensor([1.0], requires_grad=True)
     candidate = vp.Candidate(
         "family",
         "row",
         {
-            "checkpoint_policy": "non_reentrant_no_rng_preservation",
+            "activation.recompute": "checkpoint_non_reentrant_by_layer",
             **checkpoint_fields(),
+            "checkpoint.context_fn": "declared_context_pair",
+            "checkpoint.context_fn_callable": lambda: (
+                contextlib.nullcontext(),
+                contextlib.nullcontext(),
+            ),
+        },
+        admission_status="passed",
+    )
+
+    def function(value: torch.Tensor) -> torch.Tensor:
+        events.append("called")
+
+        return value.square().sum()
+
+    output = vpx.checkpoint_operation(
+        candidate,
+        function,
+        (vector,),
+        policy_key="activation.recompute",
+    )()
+    assert isinstance(output, torch.Tensor)
+    output.backward()
+
+    assert events == ["called", "called"]
+
+
+def test_checkpoint_operation_executes_selective_checkpoint_context_pair() -> None:
+    events = []
+    vector = torch.tensor([1.0], requires_grad=True)
+    candidate = vp.Candidate(
+        "family",
+        "row",
+        {
+            "activation.recompute": "checkpoint_selective",
+            **checkpoint_fields(),
+            "checkpoint.context_fn": "declared_context_pair",
+            "checkpoint.context_fn_callable": lambda: (
+                contextlib.nullcontext(),
+                contextlib.nullcontext(),
+            ),
+        },
+        admission_status="passed",
+    )
+
+    def function(value: torch.Tensor) -> torch.Tensor:
+        events.append("called")
+
+        return value.square().sum()
+
+    output = vpx.checkpoint_operation(
+        candidate,
+        function,
+        (vector,),
+        policy_key="activation.recompute",
+    )()
+    assert isinstance(output, torch.Tensor)
+    output.backward()
+
+    assert events == ["called", "called"]
+
+
+def test_checkpoint_operation_rejects_declared_context_without_callable() -> None:
+    vector = torch.tensor([1.0], requires_grad=True)
+    candidate = vp.Candidate(
+        "family",
+        "row",
+        {
+            "activation.recompute": "checkpoint_non_reentrant_by_layer",
+            **checkpoint_fields(),
+            "checkpoint.context_fn": "declared_context_pair",
         },
     )
 
     def function(value: torch.Tensor) -> torch.Tensor:
         return value.square()
 
-    with pytest.raises(vp.AdmissionError, match="preserve_rng_state=False"):
+    with pytest.raises(vp.AdmissionError, match="requires callable"):
         vpx.checkpoint_operation(
             candidate,
             function,
             (vector,),
-            policy_key="checkpoint_policy",
+            policy_key="activation.recompute",
         )()
 
 
@@ -1740,9 +4150,9 @@ def test_checkpoint_operation_rejects_unadmitted_fields_before_execution() -> No
         "family",
         "row",
         {
-            "checkpoint_policy": "non_reentrant_deterministic",
+            "activation.recompute": "checkpoint_non_reentrant_by_layer",
             **checkpoint_fields(),
-            "use_reentrant": True,
+            "checkpoint.use_reentrant": "true",
         },
     )
 
@@ -1756,10 +4166,124 @@ def test_checkpoint_operation_rejects_unadmitted_fields_before_execution() -> No
             candidate,
             function,
             (vector,),
-            policy_key="checkpoint_policy",
+            policy_key="activation.recompute",
         )()
 
     assert calls == []
+
+
+def test_checkpoint_operation_runs_cpu_saved_tensor_hooks() -> None:
+    vector = torch.tensor([2.0], requires_grad=True)
+    candidate = vp.Candidate(
+        "family",
+        "row",
+        {
+            "activation.recompute": "none",
+            "activation.offload": "saved_tensor_hooks_cpu",
+        },
+        admission_status="passed",
+    )
+
+    def function(value: torch.Tensor) -> torch.Tensor:
+        return value.square().sum()
+
+    output = vpx.checkpoint_operation(
+        candidate,
+        function,
+        (vector,),
+        policy_key="activation.recompute",
+    )()
+    assert isinstance(output, torch.Tensor)
+    output.backward()
+
+    assert vector.grad is not None
+    assert torch.equal(vector.grad, torch.tensor([4.0]))
+
+
+def test_checkpoint_operation_runs_custom_saved_tensor_hooks() -> None:
+    events = []
+    vector = torch.tensor([2.0], requires_grad=True)
+
+    def pack_hook(tensor: torch.Tensor) -> torch.Tensor:
+        events.append(("pack", tensor.detach().clone()))
+
+        return tensor.detach().clone()
+
+    def unpack_hook(tensor: torch.Tensor) -> torch.Tensor:
+        events.append(("unpack", tensor.detach().clone()))
+
+        return tensor
+
+    candidate = vp.Candidate(
+        "family",
+        "row",
+        {
+            "activation.recompute": "none",
+            "activation.offload": "custom_saved_tensor_hooks",
+            "activation.pack_hook": pack_hook,
+            "activation.unpack_hook": unpack_hook,
+        },
+        admission_status="passed",
+    )
+
+    def function(value: torch.Tensor) -> torch.Tensor:
+        return value.square().sum()
+
+    output = vpx.checkpoint_operation(
+        candidate,
+        function,
+        (vector,),
+        policy_key="activation.recompute",
+    )()
+    assert isinstance(output, torch.Tensor)
+    output.backward()
+
+    assert tuple(event for event, _ in events) == ("pack", "unpack")
+    assert vector.grad is not None
+    assert torch.equal(vector.grad, torch.tensor([4.0]))
+
+
+def test_checkpoint_operation_rejects_missing_activation_offload() -> None:
+    candidate = vp.Candidate(
+        "family",
+        "row",
+        {"activation.recompute": "none"},
+        admission_status="passed",
+    )
+
+    def function(value: torch.Tensor) -> torch.Tensor:
+        return value
+
+    with pytest.raises(vp.AdmissionError, match=r"activation[.]offload"):
+        vpx.checkpoint_operation(
+            candidate,
+            function,
+            (torch.tensor([1.0]),),
+            policy_key="activation.recompute",
+        )
+
+
+def test_checkpoint_operation_rejects_custom_offload_without_hooks() -> None:
+    candidate = vp.Candidate(
+        "family",
+        "row",
+        {
+            "activation.recompute": "none",
+            "activation.offload": "custom_saved_tensor_hooks",
+        },
+        admission_status="passed",
+    )
+
+    def function(value: torch.Tensor) -> torch.Tensor:
+        return value
+
+    with pytest.raises(vp.AdmissionError, match="pack and unpack"):
+        vpx.checkpoint_operation(
+            candidate,
+            function,
+            (torch.tensor([1.0]),),
+            policy_key="activation.recompute",
+        )()
 
 
 def test_adapter_runtime_executes_checkpoint_without_standard_runtime_support(
@@ -1768,7 +4292,7 @@ def test_adapter_runtime_executes_checkpoint_without_standard_runtime_support(
     model = torch.nn.Linear(1, 1)
     settings = {
         "operator_path": "autograd_grad",
-        "checkpoint": "non_reentrant",
+        "activation.recompute": "checkpoint_non_reentrant_by_layer",
         **checkpoint_fields(),
     }
     candidate = vp.Candidate(
@@ -1793,7 +4317,7 @@ def test_adapter_runtime_executes_checkpoint_without_standard_runtime_support(
             candidate,
             function,
             (vector,),
-            policy_key="checkpoint",
+            policy_key="activation.recompute",
         )
 
     def reference_check(
@@ -1878,8 +4402,6 @@ def test_transformers_attention_admission_axis() -> None:
     )
     axis = vpa.transformers_attention_axis(
         (
-            "pytorch_sdpa_direct",
-            "patched_eager",
             "transformers_eager",
             "transformers_sdpa",
             "transformers_flash_attention_2",
@@ -1896,7 +4418,7 @@ def test_transformers_attention_admission_axis() -> None:
         "flash",
         {
             "attention.frontend": "transformers_flash_attention_2",
-            "model_dtype": "bfloat16",
+            "dtype.model_compute": "bf16",
             "module_mode": "eval",
             "dropout_p": 0.0,
         },
@@ -1906,7 +4428,7 @@ def test_transformers_attention_admission_axis() -> None:
         "float-flash",
         {
             "attention.frontend": "transformers_flash_attention_2",
-            "model_dtype": "float32",
+            "dtype.model_compute": "fp32",
             "module_mode": "eval",
             "dropout_p": 0.0,
         },
@@ -1916,7 +4438,7 @@ def test_transformers_attention_admission_axis() -> None:
         "flash3",
         {
             "attention.frontend": "transformers_flash_attention_3",
-            "model_dtype": "bfloat16",
+            "dtype.model_compute": "bf16",
             "module_mode": "eval",
             "dropout_p": 0.0,
         },
@@ -1926,7 +4448,7 @@ def test_transformers_attention_admission_axis() -> None:
         "flash4",
         {
             "attention.frontend": "transformers_flash_attention_4",
-            "model_dtype": "bfloat16",
+            "dtype.model_compute": "bf16",
             "module_mode": "eval",
             "dropout_p": 0.0,
         },
@@ -1936,7 +4458,7 @@ def test_transformers_attention_admission_axis() -> None:
         "paged-flash",
         {
             "attention.frontend": "paged|flash_attention_4",
-            "model_dtype": "bfloat16",
+            "dtype.model_compute": "bf16",
             "module_mode": "eval",
             "dropout_p": 0.0,
         },
@@ -1956,7 +4478,7 @@ def test_transformers_attention_admission_axis() -> None:
         "family",
         "math",
         {
-            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.frontend": "transformers_sdpa",
             "attention.sdpa_kernel": "math",
             "module_mode": "eval",
             "dropout_p": 0.0,
@@ -1966,7 +4488,7 @@ def test_transformers_attention_admission_axis() -> None:
         "family",
         "math-attentions",
         {
-            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.frontend": "transformers_sdpa",
             "attention.sdpa_kernel": "math",
             "module_mode": "eval",
             "dropout_p": 0.0,
@@ -1977,9 +4499,9 @@ def test_transformers_attention_admission_axis() -> None:
         "family",
         "sdpa-flash",
         {
-            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.frontend": "transformers_sdpa",
             "attention.sdpa_kernel": "flash_attention",
-            "model_dtype": "bfloat16",
+            "dtype.model_compute": "bf16",
             "module_mode": "eval",
             "dropout_p": 0.0,
         },
@@ -1988,9 +4510,9 @@ def test_transformers_attention_admission_axis() -> None:
         "family",
         "float-sdpa-flash",
         {
-            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.frontend": "transformers_sdpa",
             "attention.sdpa_kernel": "flash_attention",
-            "model_dtype": "float32",
+            "dtype.model_compute": "fp32",
             "module_mode": "eval",
             "dropout_p": 0.0,
         },
@@ -1999,10 +4521,10 @@ def test_transformers_attention_admission_axis() -> None:
         "family",
         "priority-sdpa",
         {
-            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.frontend": "transformers_sdpa",
             "attention.sdpa_kernel": "priority_list",
             "attention.sdpa_priority_list": ("flash_attention", "math"),
-            "model_dtype": "bfloat16",
+            "dtype.model_compute": "bf16",
             "module_mode": "eval",
             "dropout_p": 0.0,
         },
@@ -2011,10 +4533,10 @@ def test_transformers_attention_admission_axis() -> None:
         "family",
         "bad-priority-sdpa",
         {
-            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.frontend": "transformers_sdpa",
             "attention.sdpa_kernel": "priority_list",
             "attention.sdpa_priority_list": ("priority_list",),
-            "model_dtype": "bfloat16",
+            "dtype.model_compute": "bf16",
             "module_mode": "eval",
             "dropout_p": 0.0,
         },
@@ -2066,28 +4588,6 @@ def test_transformers_attention_admission_axis() -> None:
             "value_heads": 4,
         },
     )
-    patched = vp.Candidate(
-        "family",
-        "patched",
-        {
-            "attention.frontend": "patched_eager",
-            "module_mode": "eval",
-            "dropout_p": 0.0,
-            "output_attentions": True,
-            "patched_attention_id": "gemma-softcap-eager",
-            "patched_attention_semantics": {"logit_softcap": 30.0},
-        },
-    )
-    untracked_patch = vp.Candidate(
-        "family",
-        "untracked-patch",
-        {
-            "attention.frontend": "patched_eager",
-            "module_mode": "eval",
-            "dropout_p": 0.0,
-        },
-    )
-
     assert axis.admit(flash) == (True, None)
     assert axis.admit(float_flash)[0] is False
     assert axis.admit(flash3) == (True, None)
@@ -2104,8 +4604,6 @@ def test_transformers_attention_admission_axis() -> None:
     assert axis.admit(bad_gqa)[0] is False
     assert axis.admit(valid_gqa) == (True, None)
     assert axis.admit(mismatched_gqa)[0] is False
-    assert axis.admit(patched) == (True, None)
-    assert axis.admit(untracked_patch)[0] is False
     assert axis.signature()["identity"]["softcap"] == {"logit_softcap": 30.0}
 
     no_padding_policy = dataclasses.replace(policy, padding_limit=None)
@@ -2146,7 +4644,7 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
     registry = vpx.AxisRegistry()
 
     def admit_dtype(candidate: vp.Candidate) -> tuple[bool, str | None]:
-        if candidate.settings["dtype"] == "float16":
+        if candidate.settings["dtype"] == "fp16":
             return False, "float16 disabled"
 
         return True, None
@@ -2155,7 +4653,7 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
         vpx.AxisDescriptor(
             "dtype",
             ("dtype",),
-            ("float32", "float16"),
+            ("fp32", "fp16"),
             admission_rule=admit_dtype,
         )
     )
@@ -2165,7 +4663,7 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
 
     candidates = vpx.settings_product(
         "family",
-        {"dtype": ("float32", "float16")},
+        {"dtype": ("fp32", "fp16")},
         generator_id="grid",
         generator_version="1",
     )
@@ -2175,7 +4673,7 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
         batch: Mapping[str, object],
         vector: vp.TensorTree,
     ) -> vp.ReferenceResult:
-        assert candidate.settings["dtype"] == "float32"
+        assert candidate.settings["dtype"] == "fp32"
         assert batch["family"] == "family"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -2188,7 +4686,7 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
         batch: Mapping[str, object],
         vector: vp.TensorTree,
     ) -> vpx.CandidateOperation:
-        assert candidate.settings["dtype"] == "float32"
+        assert candidate.settings["dtype"] == "fp32"
         assert batch["family"] == "family"
         assert batch["source"] == "probe"
         assert isinstance(vector, torch.Tensor)
@@ -2228,7 +4726,7 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
         "family:0",
         "family:1",
     )
-    assert plan.selected["family"].settings == {"dtype": "float32"}
+    assert plan.selected["family"].settings == {"dtype": "fp32"}
     assert plan.full_size_records[1].status == "failed"
     assert plan.full_size_records[1].error_type == "AdmissionError"
 
@@ -2240,6 +4738,106 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
     )
 
     assert registry.admit(invalid).admission_status == "failed"
+
+
+def test_tune_records_runtime_full_size_check_metadata() -> None:
+    class PassingFullSizeCheck:
+        def __init__(self) -> None:
+            self.calls = []
+
+        @staticmethod
+        def identity() -> Mapping[str, object]:
+            return {"full_size_check": "tests.passing"}
+
+        def __call__(
+            self,
+            candidate: vp.Candidate,
+            inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
+            output: vp.TensorTree,
+        ) -> Mapping[str, object]:
+            assert candidate.candidate_id == "flash"
+            assert len(inputs) == 1
+            assert isinstance(output, tuple)
+            self.calls.append(candidate.candidate_id)
+
+            return {"full_size_agreement_passed": True}
+
+    model = torch.nn.Linear(1, 1)
+    candidate = vp.Candidate(
+        "family",
+        "flash",
+        {
+            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.sdpa_kernel": "flash_attention",
+        },
+        admission_status="passed",
+    )
+    full_size_check = PassingFullSizeCheck()
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert candidate.candidate_id == "flash"
+        assert batch["source"] == "reference"
+        assert isinstance(vector, torch.Tensor)
+
+        return reference_passed()
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert candidate.candidate_id == "flash"
+        assert batch["source"] == "probe"
+        assert isinstance(vector, torch.Tensor)
+
+        return vpx.constant_operation(vector)
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.hvp("family", "objective", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=dataclasses.replace(
+            cpu_target(
+                vp.TimingPolicy(
+                    short_seconds=0.0,
+                    medium_seconds=0.0,
+                    long_warmups=0,
+                    long_measured_calls=1,
+                )
+            ),
+            allowed_attention_frontends=("pytorch_sdpa_direct",),
+            allowed_sdpa_kernels=("flash_attention",),
+        ),
+        runtime=vpx.RuntimeConfig(
+            (candidate,),
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"generator": "full-size-check"},
+            full_size_check=full_size_check,
+        ),
+    )
+    plan = vp.tune(
+        problem,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0)),
+    )
+
+    assert full_size_check.calls == ["flash"]
+    assert problem.runtime.identity()["full_size_check"] == {
+        "full_size_check": "tests.passing"
+    }
+    assert plan.selected["family"].candidate_id == "flash"
+    assert (
+        plan.records["family"].selection_metadata["full_size_agreement_passed"] is True
+    )
 
 
 def test_settings_product_expands_registry_multi_key_axis() -> None:
@@ -2278,66 +4876,62 @@ def test_standard_axis_registry_validates_core_axes() -> None:
         "uses_data_dependent_control_flow": False,
         "uses_item": False,
         "has_dynamic_shape_output": False,
-        "vmap_randomness": "error",
+        "vectorization.randomness": "error",
         "requires_forward_ad": True,
         "forward_ad_supported": True,
-    }
-    checkpoint_fields = {
-        "use_reentrant": False,
-        "preserve_rng_state": True,
-        "determinism_check": "default",
-        "context_fn": None,
-        "early_stop": True,
-        "moves_to_new_device": False,
-        "uses_global_state": False,
-    }
-    functional_call_fields = {
-        "parameter_keys": ("weight",),
-        "buffer_keys": ("running",),
-        "tie_weights": True,
-        "strict": False,
-        "parametrization_policy": "active",
-        "mutates_state": False,
-        "mutated_parameter_keys": (),
-        "mutated_buffer_keys": (),
-        "module_mode": "eval",
     }
     candidate = vp.Candidate(
         "family",
         "row",
         {
-            "model_dtype": "bfloat16",
-            "batch_size": 4,
-            "attention.frontend": "pytorch_sdpa_direct",
-            "attention.sdpa_kernel": "math",
-            "sharding": "single_device",
-            "operator_path": "reverse_over_reverse",
-            "allow_tf32": True,
+            "dtype.model_compute": "bf16",
+            "hvp.path": "reverse_over_reverse",
+            "numeric.float32_matmul_precision": "high",
         },
     )
-    bad_budget = vp.Candidate("family", "bad-budget", {"batch_size": 0})
-    bad_flag = vp.Candidate("family", "bad-flag", {"allow_tf32": 1})
-    bad_dtype = vp.Candidate("family", "bad-dtype", {"model_dtype": "float64"})
+    bad_flag = vp.Candidate(
+        "family",
+        "bad-flag",
+        {"numeric.bf16_reduced_precision_reduction": True},
+    )
+    bad_dtype = vp.Candidate("family", "bad-dtype", {"dtype.model_compute": "float64"})
     bad_path = vp.Candidate(
         "family",
         "bad-path",
-        {"operator_path": "reverse_over_forward"},
+        {"hvp.path": "reverse_over_forward"},
     )
     missing_torch_func_fields = vp.Candidate(
         "family",
         "missing-torch-func-fields",
-        {"operator_path": "torch_func_jvp"},
+        {"jvp.path": "torch_func_jvp"},
     )
     valid_torch_func = vp.Candidate(
         "family",
         "valid-torch-func",
-        {"operator_path": "torch_func_jvp", **torch_func_fields},
+        {"jvp.path": "torch_func_jvp", **torch_func_fields},
+    )
+    valid_ggn_linearize = vp.Candidate(
+        "family",
+        "valid-ggn-linearize",
+        {
+            "ggn.jvp_path": "torch_func_linearize",
+            "ggn.vjp_path": "torch_func_vjp",
+            **torch_func_fields,
+        },
+    )
+    missing_ggn_linearize_fields = vp.Candidate(
+        "family",
+        "missing-ggn-linearize-fields",
+        {
+            "ggn.jvp_path": "torch_func_linearize",
+            "ggn.vjp_path": "torch_func_vjp",
+        },
     )
     valid_forward_ad = vp.Candidate(
         "family",
         "valid-forward-ad",
         {
-            "operator_path": "forward_ad_jvp",
+            "jvp.path": "forward_ad_dual",
             "requires_forward_ad": True,
             "forward_ad_supported": True,
         },
@@ -2346,7 +4940,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
         "family",
         "unsupported-forward-ad",
         {
-            "operator_path": "forward_ad_jvp",
+            "jvp.path": "forward_ad_dual",
             "requires_forward_ad": True,
             "forward_ad_supported": False,
         },
@@ -2355,133 +4949,358 @@ def test_standard_axis_registry_validates_core_axes() -> None:
         "family",
         "valid-vmap",
         {
-            "operator_path": "per_example_gradient_vmap",
+            "empirical_fisher.grad_path": "vmap_grad",
             **torch_func_fields,
             "requires_forward_ad": False,
-            "vmap_chunk_size": 2,
-            "vmap_batch_in_dims": {"x": 0, "normalization": None},
+            "schedule.per_example": "vmap",
+            "batch.empirical_example_batch_size": 2,
         },
     )
-    missing_vmap_in_dims = vp.Candidate(
+    valid_sampled_vmap = vp.Candidate(
         "family",
-        "missing-vmap-in-dims",
+        "valid-sampled-vmap",
         {
-            "operator_path": "per_example_gradient_vmap",
+            "sampled_fisher.score_grad_path": "vmap_grad",
             **torch_func_fields,
             "requires_forward_ad": False,
-            "vmap_chunk_size": 2,
+            "schedule.per_example": "vmap",
+            "batch.fisher_sample_batch_size": 2,
+        },
+    )
+    valid_hvp_vmap = vp.Candidate(
+        "family",
+        "valid-hvp-vmap",
+        {
+            "hvp.path": "linearize_grad",
+            **torch_func_fields,
+            "requires_forward_ad": True,
+            "forward_ad_supported": True,
+            "vectorization.mode": "vmap",
+            "vectorization.vmap_chunk_size": 2,
+            "vectorization.in_dims": {"w": 0},
+        },
+    )
+    valid_jvp_vmap = vp.Candidate(
+        "family",
+        "valid-jvp-vmap",
+        {
+            "jvp.path": "torch_func_jvp",
+            **torch_func_fields,
+            "requires_forward_ad": True,
+            "forward_ad_supported": True,
+            "vectorization.mode": "vmap",
+            "vectorization.vmap_chunk_size": 2,
+            "vectorization.in_dims": {"w": 0},
+        },
+    )
+    valid_vjp_vmap = vp.Candidate(
+        "family",
+        "valid-vjp-vmap",
+        {
+            "vjp.path": "torch_func_vjp",
+            **torch_func_fields,
+            "requires_forward_ad": False,
+            "vectorization.mode": "vmap",
+            "vectorization.vmap_chunk_size": 2,
+            "vectorization.in_dims": {"y": 0},
+        },
+    )
+    valid_ggn_vmap = vp.Candidate(
+        "family",
+        "valid-ggn-vmap",
+        {
+            "ggn.jvp_path": "torch_func_jvp",
+            "ggn.vjp_path": "torch_func_vjp",
+            **torch_func_fields,
+            "requires_forward_ad": True,
+            "forward_ad_supported": True,
+            "vectorization.mode": "vmap",
+            "vectorization.vmap_chunk_size": 2,
+            "vectorization.in_dims": {"w": 0},
+        },
+    )
+    valid_fisher_vector_vmap = vp.Candidate(
+        "family",
+        "valid-fisher-vector-vmap",
+        {
+            "fisher.expectation_path": "explicit_full_expectation_score_rows",
+            "fisher.accumulation": "materialize_score_gradients",
+            **torch_func_fields,
+            "requires_forward_ad": False,
+            "forward_ad_supported": False,
+            "vectorization.mode": "vmap",
+            "vectorization.vmap_chunk_size": 2,
+            "vectorization.in_dims": {"w": 0},
+            "vectorization.randomness": "error",
+        },
+    )
+    valid_composition_vmap = vp.Candidate(
+        "family",
+        "valid-composition-vmap",
+        {
+            "composition.execution": "stream_child_outputs",
+            **torch_func_fields,
+            "requires_forward_ad": False,
+            "forward_ad_supported": False,
+            "vectorization.mode": "vmap",
+            "vectorization.vmap_chunk_size": 2,
+            "vectorization.in_dims": {"w": 0},
+            "vectorization.randomness": "error",
+        },
+    )
+    missing_vmap_randomness = vp.Candidate(
+        "family",
+        "missing-vmap-randomness",
+        {
+            "fisher.expectation_path": "explicit_full_expectation_score_rows",
+            "fisher.accumulation": "materialize_score_gradients",
+            "vectorization.mode": "vmap",
+            "vectorization.vmap_chunk_size": 2,
+            "vectorization.in_dims": {"w": 0},
+        },
+    )
+    valid_manual_batch = vp.Candidate(
+        "family",
+        "valid-manual-batch",
+        {
+            "hvp.path": "reverse_over_reverse",
+            "vectorization.mode": "manual_batch",
+            "vectorization.batch_size": 2,
+            "vectorization.in_dims": {"w": 0},
+        },
+    )
+    rejected_ggn_vmap_autograd_vjp = vp.Candidate(
+        "family",
+        "rejected-ggn-vmap-autograd-vjp",
+        {
+            "ggn.jvp_path": "torch_func_jvp",
+            "ggn.vjp_path": "autograd_grad_outputs",
+            **torch_func_fields,
+            "requires_forward_ad": True,
+            "forward_ad_supported": True,
+            "vectorization.mode": "vmap",
+            "vectorization.vmap_chunk_size": 2,
+            "vectorization.in_dims": {"w": 0},
+        },
+    )
+    rejected_forward_ad_jvp_vmap = vp.Candidate(
+        "family",
+        "rejected-forward-ad-jvp-vmap",
+        {
+            "jvp.path": "forward_ad_dual",
+            "requires_forward_ad": True,
+            "forward_ad_supported": True,
+            "vectorization.mode": "vmap",
+            "vectorization.vmap_chunk_size": 2,
+            "vectorization.in_dims": {"w": 0},
+        },
+    )
+    valid_hvp_single_loop = vp.Candidate(
+        "family",
+        "valid-hvp-single-loop",
+        {
+            "hvp.path": "reverse_over_reverse",
+            "vectorization.mode": "single_loop",
+            "vectorization.in_dims": {"w": 0},
+        },
+    )
+    missing_sampled_vmap_schedule = vp.Candidate(
+        "family",
+        "missing-sampled-vmap-schedule",
+        {
+            "sampled_fisher.score_grad_path": "vmap_grad",
+            **torch_func_fields,
+            "requires_forward_ad": False,
+            "batch.fisher_sample_batch_size": 2,
+        },
+    )
+    stray_vmap_in_dims = vp.Candidate(
+        "family",
+        "stray-vmap-in-dims",
+        {
+            "empirical_fisher.grad_path": "vmap_grad",
+            **torch_func_fields,
+            "requires_forward_ad": False,
+            "schedule.per_example": "vmap",
+            "batch.empirical_example_batch_size": 2,
+            "vectorization.in_dims": {"x": 0},
         },
     )
     invalid_vmap_in_dims = vp.Candidate(
         "family",
         "invalid-vmap-in-dims",
         {
-            "operator_path": "per_example_gradient_vmap",
+            "hvp.path": "linearize_grad",
             **torch_func_fields,
-            "requires_forward_ad": False,
-            "vmap_chunk_size": 2,
-            "vmap_batch_in_dims": {"x": "0"},
+            "requires_forward_ad": True,
+            "forward_ad_supported": True,
+            "vectorization.mode": "vmap",
+            "vectorization.vmap_chunk_size": 2,
+            "vectorization.in_dims": {"x": "0"},
         },
     )
     forward_ad_vmap = vp.Candidate(
         "family",
         "forward-ad-vmap",
         {
-            "operator_path": "per_example_gradient_vmap",
+            "empirical_fisher.grad_path": "vmap_grad",
             **torch_func_fields,
-            "vmap_chunk_size": 2,
-            "vmap_batch_in_dims": {"x": 0},
+            "schedule.per_example": "vmap",
+            "batch.empirical_example_batch_size": 2,
         },
     )
-    missing_functional_call_fields = vp.Candidate(
+    missing_vmap_schedule = vp.Candidate(
         "family",
-        "missing-functional-call-fields",
-        {"tie_weights": True},
-    )
-    valid_functional_call = vp.Candidate(
-        "family",
-        "valid-functional-call",
-        functional_call_fields,
-    )
-    missing_mutation_policy = vp.Candidate(
-        "family",
-        "missing-mutation-policy",
-        {**functional_call_fields, "mutates_state": True},
-    )
-    mutating_functional_call = vp.Candidate(
-        "family",
-        "mutating-functional-call",
+        "missing-vmap-schedule",
         {
-            **functional_call_fields,
-            "mutates_state": True,
-            "mutated_buffer_keys": ("running",),
+            "empirical_fisher.grad_path": "vmap_grad",
+            **torch_func_fields,
+            "requires_forward_ad": False,
+            "batch.empirical_example_batch_size": 2,
         },
     )
-    missing_checkpoint_fields = vp.Candidate(
+    valid_manual_per_example = vp.Candidate(
         "family",
-        "missing-checkpoint-fields",
-        {"checkpoint": "non_reentrant"},
-    )
-    valid_checkpoint = vp.Candidate(
-        "family",
-        "valid-checkpoint",
-        {"checkpoint": "non_reentrant", **checkpoint_fields},
-    )
-    reentrant_checkpoint = vp.Candidate(
-        "family",
-        "reentrant-checkpoint",
-        {"checkpoint": "non_reentrant", **checkpoint_fields, "use_reentrant": True},
-    )
-    valid_checkpoint_policy = vp.Candidate(
-        "family",
-        "valid-checkpoint-policy",
+        "valid-manual-per-example",
         {
-            "checkpoint_policy": "non_reentrant_deterministic",
-            **checkpoint_fields,
+            "fisher.score_grad_path": "torch_autograd_grad_loop",
+            "schedule.per_example": "manual_batch",
+            "batch.fisher_sample_batch_size": 2,
         },
     )
-    invalid_no_rng_policy = vp.Candidate(
+    missing_manual_per_example_size = vp.Candidate(
         "family",
-        "invalid-no-rng-policy",
+        "missing-manual-per-example-size",
         {
-            "checkpoint_policy": "non_reentrant_no_rng_preservation",
-            **checkpoint_fields,
+            "sampled_fisher.score_grad_path": "torch_autograd_grad_loop",
+            "schedule.per_example": "manual_batch",
         },
     )
-    valid_no_rng_policy = vp.Candidate(
+    single_loop_vmap = vp.Candidate(
         "family",
-        "valid-no-rng-policy",
+        "single-loop-vmap",
         {
-            "checkpoint_policy": "non_reentrant_no_rng_preservation",
-            **checkpoint_fields,
-            "preserve_rng_state": False,
+            "empirical_fisher.grad_path": "vmap_grad",
+            **torch_func_fields,
+            "requires_forward_ad": False,
+            "schedule.per_example": "vmap",
+            "vectorization.mode": "single_loop",
+            "vectorization.in_dims": {"x": 0, "normalization": None},
+        },
+    )
+    vmap_without_vmap_path = vp.Candidate(
+        "family",
+        "vmap-without-vmap-path",
+        {
+            "empirical_fisher.grad_path": "torch_autograd_grad_loop",
+            "vectorization.mode": "vmap",
+        },
+    )
+    manual_batch = vp.Candidate(
+        "family",
+        "manual-batch",
+        {"vectorization.mode": "manual_batch"},
+    )
+    valid_microbatch_accumulation = vp.Candidate(
+        "family",
+        "valid-microbatch-accumulation",
+        {
+            "gradient.path": "torch_autograd_grad",
+            "schedule.gradient_accumulation": "microbatch_accumulate",
+            "batch.data_microbatch_size": 2,
+        },
+    )
+    missing_microbatch_size = vp.Candidate(
+        "family",
+        "missing-microbatch-size",
+        {
+            "gradient.path": "torch_autograd_grad",
+            "schedule.gradient_accumulation": "microbatch_accumulate",
+        },
+    )
+    stray_microbatch_size = vp.Candidate(
+        "family",
+        "stray-microbatch-size",
+        {"batch.data_microbatch_size": 2},
+    )
+    jvp_microbatch = vp.Candidate(
+        "family",
+        "jvp-microbatch",
+        {
+            "jvp.path": "torch_func_jvp",
+            **torch_func_fields,
+            "requires_forward_ad": True,
+            "forward_ad_supported": True,
+            "schedule.gradient_accumulation": "microbatch_accumulate",
+            "batch.data_microbatch_size": 2,
+        },
+    )
+    hvp_microbatch = vp.Candidate(
+        "family",
+        "hvp-microbatch",
+        {
+            "hvp.path": "reverse_over_reverse",
+            "schedule.gradient_accumulation": "microbatch_accumulate",
+            "batch.data_microbatch_size": 2,
+        },
+    )
+    valid_input_memory_axes = vp.Candidate(
+        "family",
+        "valid-input-memory-axes",
+        {
+            "schedule.per_token": "loop",
+            "input.batch_layout": "dense_padded",
+            "input.length_grouping": "none",
+            "input.host_to_device": "outside_measured_call",
+            "input.residency": "cpu_staged",
+            "teacher_outputs": "precomputed_cpu",
+            "memory.vector_residency": "cpu_staged",
+            "memory.intermediate_residency": "cpu_staged",
+            "memory.factor_residency": "cpu_staged",
+            "memory.output_buffers": "fresh_allocation",
         },
     )
 
     assert registry.admit(candidate).admission_status == "passed"
-    assert registry.admit(bad_budget).admission_status == "failed"
     assert registry.admit(bad_flag).admission_status == "failed"
     assert registry.admit(bad_dtype).admission_status == "failed"
     assert registry.admit(bad_path).admission_status == "failed"
     assert registry.admit(missing_torch_func_fields).admission_status == "failed"
     assert registry.admit(valid_torch_func).admission_status == "passed"
+    assert registry.admit(valid_ggn_linearize).admission_status == "passed"
+    assert registry.admit(missing_ggn_linearize_fields).admission_status == "failed"
     assert registry.admit(valid_forward_ad).admission_status == "passed"
     assert registry.admit(unsupported_forward_ad).admission_status == "failed"
     assert registry.admit(valid_vmap).admission_status == "passed"
-    assert registry.admit(missing_vmap_in_dims).admission_status == "failed"
+    assert registry.admit(valid_sampled_vmap).admission_status == "passed"
+    assert registry.admit(valid_hvp_vmap).admission_status == "passed"
+    assert registry.admit(valid_jvp_vmap).admission_status == "passed"
+    assert registry.admit(valid_vjp_vmap).admission_status == "passed"
+    assert registry.admit(valid_ggn_vmap).admission_status == "passed"
+    assert registry.admit(valid_fisher_vector_vmap).admission_status == "passed"
+    assert registry.admit(valid_composition_vmap).admission_status == "passed"
+    assert registry.admit(missing_vmap_randomness).admission_status == "failed"
+    assert registry.admit(valid_manual_batch).admission_status == "passed"
+    assert registry.admit(rejected_ggn_vmap_autograd_vjp).admission_status == "failed"
+    assert registry.admit(rejected_forward_ad_jvp_vmap).admission_status == "failed"
+    assert registry.admit(valid_hvp_single_loop).admission_status == "passed"
+    assert registry.admit(missing_sampled_vmap_schedule).admission_status == "failed"
+    assert registry.admit(stray_vmap_in_dims).admission_status == "failed"
     assert registry.admit(invalid_vmap_in_dims).admission_status == "failed"
     assert registry.admit(forward_ad_vmap).admission_status == "failed"
-    assert registry.admit(missing_functional_call_fields).admission_status == "failed"
-    assert registry.admit(valid_functional_call).admission_status == "passed"
-    assert registry.admit(missing_mutation_policy).admission_status == "failed"
-    assert registry.admit(mutating_functional_call).admission_status == "passed"
-    assert registry.admit(missing_checkpoint_fields).admission_status == "failed"
-    assert registry.admit(valid_checkpoint).admission_status == "passed"
-    assert registry.admit(reentrant_checkpoint).admission_status == "failed"
-    assert registry.admit(valid_checkpoint_policy).admission_status == "passed"
-    assert registry.admit(invalid_no_rng_policy).admission_status == "failed"
-    assert registry.admit(valid_no_rng_policy).admission_status == "passed"
-    assert registry.axes["model_dtype"].admit(bad_dtype)[0] is False
+    assert registry.admit(missing_vmap_schedule).admission_status == "failed"
+    assert registry.admit(valid_manual_per_example).admission_status == "passed"
+    assert registry.admit(missing_manual_per_example_size).admission_status == "failed"
+    assert registry.admit(single_loop_vmap).admission_status == "passed"
+    assert registry.admit(vmap_without_vmap_path).admission_status == "failed"
+    assert registry.admit(manual_batch).admission_status == "failed"
+    assert registry.admit(valid_microbatch_accumulation).admission_status == "passed"
+    assert registry.admit(missing_microbatch_size).admission_status == "failed"
+    assert registry.admit(stray_microbatch_size).admission_status == "failed"
+    assert registry.admit(jvp_microbatch).admission_status == "passed"
+    assert registry.admit(hvp_microbatch).admission_status == "passed"
+    assert registry.admit(valid_input_memory_axes).admission_status == "passed"
+    assert registry.axes["dtype.model_compute"].admit(bad_dtype)[0] is False
 
     with pytest.raises(vp.AdmissionError):
         vpx.AxisRegistry().register(vpx.AxisDescriptor("bad", ("x",), ()))
@@ -2563,7 +5382,7 @@ def test_target_admission_rejects_disallowed_settings() -> None:
             "family",
             "allowed",
             {
-                "model_dtype": "float32",
+                "dtype.model_compute": "fp32",
                 "attention.frontend": "pytorch_sdpa_direct",
                 "attention.sdpa_kernel": "math",
             },
@@ -2572,14 +5391,14 @@ def test_target_admission_rejects_disallowed_settings() -> None:
         vp.Candidate(
             "family",
             "blocked",
-            {"model_dtype": "bfloat16"},
+            {"dtype.model_compute": "bf16"},
             admission_status="passed",
         ),
         vp.Candidate(
             "family",
             "blocked-frontend",
             {
-                "model_dtype": "float32",
+                "dtype.model_compute": "fp32",
                 "attention.frontend": "transformers_flash_attention_2",
             },
             admission_status="passed",
@@ -2588,7 +5407,7 @@ def test_target_admission_rejects_disallowed_settings() -> None:
             "family",
             "blocked-kernel",
             {
-                "model_dtype": "float32",
+                "dtype.model_compute": "fp32",
                 "attention.frontend": "pytorch_sdpa_direct",
                 "attention.sdpa_kernel": "flash_attention",
             },
@@ -2621,7 +5440,7 @@ def test_target_admission_rejects_disallowed_settings() -> None:
     target = vp.Target(
         devices=("cpu",),
         accelerator="cpu",
-        allowed_dtypes=("float32",),
+        allowed_dtypes=("fp32",),
         allowed_attention_frontends=("pytorch_sdpa_direct",),
         allowed_sdpa_kernels=("math",),
         allowed_sharding_modes=("single_device",),
@@ -2632,6 +5451,7 @@ def test_target_admission_rejects_disallowed_settings() -> None:
             long_measured_calls=1,
         ),
         selection_policy=vp.SelectionPolicy(),
+        search_policy=vp.SearchPolicy(strategy="exhaustive"),
         determinism_policy={},
         environment_capture={"runtime": "test"},
     )
@@ -3798,7 +6618,7 @@ def test_records_round_trip_through_json(tmp_path: Path) -> None:
     candidate = vp.Candidate(
         "family",
         "row",
-        {"dtype": "float32"},
+        {"dtype": "fp32"},
         admission_status="passed",
     )
     record = _record(
@@ -4232,6 +7052,48 @@ def test_plan_replay_recomputes_family_selection() -> None:
         )
 
 
+def test_plan_replay_rejects_missing_full_size_agreement() -> None:
+    input_signature = _input_signature("full-size-gate-replay")
+    candidate = vp.Candidate(
+        "family",
+        "flash",
+        {
+            "attention.frontend": "pytorch_sdpa_direct",
+            "attention.sdpa_kernel": "flash_attention",
+        },
+        admission_status="passed",
+    )
+    record = _current_record(
+        _record(
+            candidate,
+            elapsed=(1.0,),
+            reserved=(1.0,),
+            input_signature=input_signature,
+        )
+    )
+    check = _check_record(candidate, input_signature=input_signature)
+    plan = vp.Plan(
+        selected={"family": candidate},
+        records={"family": record},
+        input_signature=input_signature,
+        policy=vp.SelectionPolicy(),
+        full_size_records=(record,),
+        check_records=(check,),
+        materializers={"family": materialize_candidate},
+        **_identity_kwargs(),
+    )
+
+    with pytest.raises(vp.VPTuneError, match=r"accepted rows|did not pass"):
+        vpx.plan_from_json(
+            vpx.plan_to_json(plan),
+            replay_context=replay_context_for_plan(plan),
+            full_size_records=(record,),
+            check_records=(check,),
+            candidate_records=candidate_records_for_plan(plan),
+            materializers={"family": materialize_candidate},
+        )
+
+
 def test_selected_plan_validation_writes_failed_record(tmp_path: Path) -> None:
     input_signature = _input_signature("validation")
     candidate = vp.Candidate(
@@ -4419,29 +7281,75 @@ def test_operator_constructors_declare_kind_and_aggregation() -> None:
         "metric",
         "retain",
         aggregation="mean",
-        distribution="categorical",
-        label_policy="model_distribution",
-        expectation="exact",
-        sample_space="classes",
-        loss_reduction="log_prob",
-        denominator="num_examples",
-        logits_axis=1,
+        distribution="explicit_score_gradients",
+        label_policy="explicit_scores",
+        sample_space="terms",
+        score_reduction="none",
+        denominator="batch_normalization",
     )
 
     assert fisher.kind == "fisher_vp"
-    assert fisher.semantics["distribution"] == "categorical"
+    assert fisher.semantics["distribution"] == "explicit_score_gradients"
+    assert fisher.semantics["score_reduction"] == "none"
     assert fisher.batch_inputs == {"reference": (), "operation": ()}
+    with pytest.raises(vp.MaterializationError, match="GGNVP"):
+        vp.fisher_vp(
+            "metric",
+            "retain",
+            aggregation="mean",
+            distribution="categorical",
+            label_policy="model_distribution",
+            sample_space="classes",
+            score_reduction="none",
+            denominator="num_examples",
+        )
+
+    sampled = vp.sampled_fisher_vp(
+        "metric",
+        "retain",
+        aggregation="mean",
+        distribution="explicit_score_gradients",
+        label_policy="sampled_labels",
+        sample_count=8,
+        sampling_bound={"gamma": 0.25},
+        score_reduction="none",
+        denominator="num_examples",
+    )
+
+    assert sampled.kind == "sampled_fisher_vp"
+    assert sampled.semantics == {
+        "distribution": "explicit_score_gradients",
+        "label_policy": "sampled_labels",
+        "sample_count": 8,
+        "sampling_bound": {"gamma": 0.25},
+        "score_reduction": "none",
+        "denominator": "num_examples",
+    }
+    assert sampled.batch_inputs == {"reference": (), "operation": ()}
+    with pytest.raises(vp.MaterializationError, match="sample_count"):
+        vp.sampled_fisher_vp(
+            "metric",
+            "retain",
+            aggregation="mean",
+            distribution="explicit_score_gradients",
+            label_policy="sampled_labels",
+            sample_count=0,
+            sampling_bound={"gamma": 0.25},
+            score_reduction="none",
+            denominator="num_examples",
+        )
+
     empirical = vp.empirical_fisher_vp(
         "metric",
         "retain",
         aggregation="mean",
-        loss_reduction="per_example",
+        example_loss_reduction="per_example",
         denominator="num_examples",
     )
 
     assert empirical.kind == "empirical_fisher_vp"
     assert empirical.semantics == {
-        "loss_reduction": "per_example",
+        "example_loss_reduction": "per_example",
         "denominator": "num_examples",
     }
     assert empirical.batch_inputs == {"reference": (), "operation": ()}
@@ -4470,27 +7378,60 @@ def test_operator_constructors_declare_kind_and_aggregation() -> None:
     assert vp.gradient("grad", "loss", aggregation="sum").kind == "gradient"
     jvp = vp.jvp("jvp", "function", aggregation="none")
     vjp = vp.vjp("vjp", "function", aggregation="none")
-    metric = vp.metric("metric", "retain", aggregation="mean")
-    inverse_metric = vp.inverse_metric("inverse_metric", "retain", aggregation="mean")
+    dense_representation = {"kind": "dense_matrix"}
+    metric = vp.metric(
+        "metric",
+        "retain",
+        aggregation="mean",
+        representation=dense_representation,
+    )
+    inverse_metric = vp.inverse_metric(
+        "inverse_metric",
+        "retain",
+        aggregation="mean",
+        representation=dense_representation,
+        damping=0.0,
+    )
 
     assert jvp.kind == "jvp"
     assert jvp.batch_inputs == {"reference": (), "operation": ()}
     assert vjp.kind == "vjp"
     assert vjp.batch_inputs == {"reference": ("tangent_vector",), "operation": ()}
     assert metric.kind == "metric"
+    assert metric.semantics == {"representation": dense_representation}
     assert metric.batch_inputs == {
-        "reference": ("metric",),
-        "operation": ("metric",),
+        "reference": ("metric_matrix",),
+        "operation": ("metric_matrix",),
     }
     assert inverse_metric.kind == "inverse_metric"
-    assert inverse_metric.batch_inputs == {
-        "reference": ("metric",),
-        "operation": ("metric",),
+    assert inverse_metric.semantics == {
+        "damping": 0.0,
+        "representation": dense_representation,
     }
-    assert (
-        vp.composition("compose", "hvp_after_metric", aggregation="none").kind
-        == "composition"
+    assert inverse_metric.batch_inputs == {
+        "reference": ("metric_matrix",),
+        "operation": ("metric_matrix",),
+    }
+    with pytest.raises(vp.MaterializationError, match="damping"):
+        vp.inverse_metric(
+            "inverse_metric",
+            "retain",
+            aggregation="mean",
+            representation=dense_representation,
+            damping=-1.0,
+        )
+    composition = vp.composition(
+        "compose",
+        "hvp_after_metric",
+        aggregation="none",
+        children=("metric", "hvp"),
     )
+    assert composition.kind == "composition"
+    assert composition.semantics == {"children": ("metric", "hvp")}
+    assert vp.Family("compose", composition).dependencies == ("metric", "hvp")
+
+    with pytest.raises(vp.MaterializationError, match="derived from children"):
+        vp.Family("compose", composition, dependencies=("metric",))
 
 
 def test_tune_run_preflight_errors_do_not_write_summary(tmp_path: Path) -> None:
@@ -5230,13 +8171,13 @@ def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
                     vp.Candidate(
                         "a",
                         "a-float16",
-                        {"model_dtype": "float16"},
+                        {"dtype.model_compute": "fp16"},
                         admission_status="passed",
                     ),
                     vp.Candidate(
                         "a",
                         "a-float32",
-                        {"model_dtype": "float32"},
+                        {"dtype.model_compute": "fp32"},
                         admission_status="passed",
                     ),
                 ),
@@ -5248,13 +8189,13 @@ def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
                     vp.Candidate(
                         "b",
                         "b-float16",
-                        {"model_dtype": "float16"},
+                        {"dtype.model_compute": "fp16"},
                         admission_status="passed",
                     ),
                     vp.Candidate(
                         "b",
                         "b-float32",
-                        {"model_dtype": "float32"},
+                        {"dtype.model_compute": "fp32"},
                         admission_status="passed",
                     ),
                 ),
@@ -5263,10 +8204,10 @@ def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
         cohort_constraints=(
             vp.CohortConstraint(
                 name="dtype",
-                settings_keys=("model_dtype",),
+                settings_keys=("dtype.model_compute",),
                 assignments=(
-                    {"model_dtype": "float16"},
-                    {"model_dtype": "float32"},
+                    {"dtype.model_compute": "fp16"},
+                    {"dtype.model_compute": "fp32"},
                 ),
             ),
         ),
@@ -5283,7 +8224,7 @@ def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
     assert plan.selected["a"].candidate_id == "a-float32"
     assert plan.selected["b"].candidate_id == "b-float32"
     assert plan.cohort_assignment is not None
-    assert plan.cohort_assignment.values == {"model_dtype": "float32"}
+    assert plan.cohort_assignment.values == {"dtype.model_compute": "fp32"}
 
 
 def test_tune_run_uses_generic_multi_key_cohort_constraint(tmp_path: Path) -> None:

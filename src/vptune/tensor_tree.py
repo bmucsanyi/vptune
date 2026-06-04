@@ -1,5 +1,6 @@
 """Tensor-tree utilities."""
 
+from collections.abc import Sequence
 from typing import Any, TypeGuard
 
 import torch
@@ -159,9 +160,32 @@ def tree_zeros_like(tree: TensorTree) -> TensorTree:
     return tree_map(torch.zeros_like, tree)
 
 
+def tree_zeros_like_foreach(tree: TensorTree) -> TensorTree:
+    """Return a zero tree using PyTorch foreach kernels."""
+    leaves = tree_leaves(tree)
+    results = [leaf.clone() for leaf in leaves]
+
+    for _, group in _foreach_groups(tuple(results)):
+        _torch_foreach("_foreach_zero_")(group)
+
+    return tree_from_leaves(tree, tuple(results))
+
+
 def tree_add(left: TensorTree, right: TensorTree) -> TensorTree:
     """Return tree-wise sum."""
     return tree_map2(torch.add, left, right)
+
+
+def tree_add_foreach(left: TensorTree, right: TensorTree) -> TensorTree:
+    """Return tree-wise sum using PyTorch foreach kernels."""
+    left_leaves, right_leaves = _matching_leaf_pairs(left, right)
+
+    return _binary_foreach_tree(
+        _torch_foreach("_foreach_add"),
+        left,
+        left_leaves,
+        right_leaves,
+    )
 
 
 def tree_sub(left: TensorTree, right: TensorTree) -> TensorTree:
@@ -169,9 +193,69 @@ def tree_sub(left: TensorTree, right: TensorTree) -> TensorTree:
     return tree_map2(torch.sub, left, right)
 
 
+def tree_sub_foreach(left: TensorTree, right: TensorTree) -> TensorTree:
+    """Return tree-wise difference using PyTorch foreach kernels."""
+    left_leaves, right_leaves = _matching_leaf_pairs(left, right)
+
+    return _binary_foreach_tree(
+        _torch_foreach("_foreach_sub"),
+        left,
+        left_leaves,
+        right_leaves,
+    )
+
+
 def tree_mul(tree: TensorTree, scalar: float) -> TensorTree:
     """Return a tree scaled by a scalar."""
     return tree_map(lambda tensor: tensor * scalar, tree)
+
+
+def tree_mul_foreach(tree: TensorTree, scalar: float) -> TensorTree:
+    """Return a tree scaled by a scalar using PyTorch foreach kernels."""
+    leaves = tree_leaves(tree)
+    results = list(leaves)
+
+    for indices, group in _foreach_groups(leaves):
+        values = _torch_foreach("_foreach_mul")(group, scalar)
+        _write_foreach_results(results, indices, values)
+
+    return tree_from_leaves(tree, tuple(results))
+
+
+def tree_add_scalar_foreach(tree: TensorTree, scalar: float) -> TensorTree:
+    """Return a tree with a scalar added to every leaf using foreach kernels."""
+    leaves = tree_leaves(tree)
+    results = list(leaves)
+
+    for indices, group in _foreach_groups(leaves):
+        values = _torch_foreach("_foreach_add")(group, scalar)
+        _write_foreach_results(results, indices, values)
+
+    return tree_from_leaves(tree, tuple(results))
+
+
+def tree_elementwise_mul_foreach(left: TensorTree, right: TensorTree) -> TensorTree:
+    """Return tree-wise product using PyTorch foreach kernels."""
+    left_leaves, right_leaves = _matching_leaf_pairs(left, right)
+
+    return _binary_foreach_tree(
+        _torch_foreach("_foreach_mul"),
+        left,
+        left_leaves,
+        right_leaves,
+    )
+
+
+def tree_elementwise_div_foreach(left: TensorTree, right: TensorTree) -> TensorTree:
+    """Return tree-wise quotient using PyTorch foreach kernels."""
+    left_leaves, right_leaves = _matching_leaf_pairs(left, right)
+
+    return _binary_foreach_tree(
+        _torch_foreach("_foreach_div"),
+        left,
+        left_leaves,
+        right_leaves,
+    )
 
 
 def tree_dot(left: TensorTree, right: TensorTree) -> torch.Tensor:
@@ -194,6 +278,22 @@ def tree_dot(left: TensorTree, right: TensorTree) -> torch.Tensor:
     return total
 
 
+def tree_dot_foreach(left: TensorTree, right: TensorTree) -> torch.Tensor:
+    """Return dot product using foreach elementwise products."""
+    products = tree_elementwise_mul_foreach(left, right)
+    leaves = tree_leaves(products)
+
+    if not leaves:
+        return torch.tensor(0.0)
+
+    total = leaves[0].reshape(-1).sum()
+
+    for value in leaves[1:]:
+        total = total + value.reshape(-1).sum()
+
+    return total
+
+
 def tree_max_abs(tree: TensorTree) -> torch.Tensor:
     """Return max absolute value across leaves."""
     leaves = tree_leaves(tree)
@@ -210,9 +310,35 @@ def tree_max_abs(tree: TensorTree) -> torch.Tensor:
     return result
 
 
+def tree_max_abs_foreach(tree: TensorTree) -> torch.Tensor:
+    """Return max absolute value across leaves using foreach abs."""
+    leaves = tree_leaves(tree)
+
+    if not leaves:
+        return torch.tensor(0.0)
+
+    values = list(leaves)
+
+    for indices, group in _foreach_groups(leaves):
+        absolutes = _torch_foreach("_foreach_abs")(group)
+        _write_foreach_results(values, indices, absolutes)
+
+    result = values[0].detach().max()
+
+    for value in values[1:]:
+        result = torch.maximum(result, value.detach().max())
+
+    return result
+
+
 def tree_l2_norm(tree: TensorTree) -> torch.Tensor:
     """Return L2 norm across leaves."""
     return torch.sqrt(tree_dot(tree, tree))
+
+
+def tree_l2_norm_foreach(tree: TensorTree) -> torch.Tensor:
+    """Return L2 norm across leaves using foreach dot."""
+    return torch.sqrt(tree_dot_foreach(tree, tree))
 
 
 def tree_signature(tree: TensorTree) -> dict[str, Any]:
@@ -245,3 +371,93 @@ def tree_signature(tree: TensorTree) -> dict[str, Any]:
 
     message = f"unsupported tensor tree leaf: {type(tree).__name__}"
     raise TypeError(message)
+
+
+def _matching_leaf_pairs(
+    left: TensorTree,
+    right: TensorTree,
+) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+    checked_left = tree_map2(lambda lval, _: lval, left, right)
+    checked_right = tree_map2(lambda _, rval: rval, left, right)
+
+    return tree_leaves(checked_left), tree_leaves(checked_right)
+
+
+def _foreach_groups(
+    leaves: tuple[torch.Tensor, ...],
+) -> tuple[tuple[tuple[int, ...], tuple[torch.Tensor, ...]], ...]:
+    groups = {}
+
+    for index, leaf in enumerate(leaves):
+        key = (leaf.device, leaf.dtype)
+
+        if key not in groups:
+            groups[key] = ([], [])
+
+        groups[key][0].append(index)
+        groups[key][1].append(leaf)
+
+    return tuple((tuple(indices), tuple(group)) for indices, group in groups.values())
+
+
+def _foreach_binary_groups(
+    left_leaves: tuple[torch.Tensor, ...],
+    right_leaves: tuple[torch.Tensor, ...],
+) -> tuple[
+    tuple[tuple[int, ...], tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]], ...
+]:
+    groups = {}
+
+    for index, (left, right) in enumerate(zip(left_leaves, right_leaves, strict=True)):
+        if left.device != right.device:
+            message = "foreach tensor pairs must be on the same device"
+            raise RuntimeError(message)
+
+        if left.dtype != right.dtype:
+            message = "foreach tensor pairs must have the same dtype"
+            raise RuntimeError(message)
+
+        key = (left.device, left.dtype)
+
+        if key not in groups:
+            groups[key] = ([], [], [])
+
+        groups[key][0].append(index)
+        groups[key][1].append(left)
+        groups[key][2].append(right)
+
+    return tuple(
+        (tuple(indices), tuple(left_group), tuple(right_group))
+        for indices, left_group, right_group in groups.values()
+    )
+
+
+def _binary_foreach_tree(
+    operation: Any,
+    template: TensorTree,
+    left_leaves: tuple[torch.Tensor, ...],
+    right_leaves: tuple[torch.Tensor, ...],
+) -> TensorTree:
+    results = list(left_leaves)
+
+    for indices, left_group, right_group in _foreach_binary_groups(
+        left_leaves,
+        right_leaves,
+    ):
+        values = operation(left_group, right_group)
+        _write_foreach_results(results, indices, values)
+
+    return tree_from_leaves(template, tuple(results))
+
+
+def _write_foreach_results(
+    results: list[torch.Tensor],
+    indices: tuple[int, ...],
+    values: Sequence[torch.Tensor],
+) -> None:
+    for index, value in zip(indices, values, strict=True):
+        results[index] = value
+
+
+def _torch_foreach(name: str) -> Any:
+    return getattr(torch, name)

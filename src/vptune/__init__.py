@@ -24,6 +24,7 @@ from vptune.data import (
     ReferenceResult,
     ReplayContext,
     ScalarObjective,
+    SearchPolicy,
     SelectionPolicy,
     Target,
     TensorTree,
@@ -35,7 +36,6 @@ from vptune.data import (
 from vptune.errors import (
     AdmissionError,
     MaterializationError,
-    MeasurementError,
     NoPassedCandidateError,
     ReferenceFailedError,
     StaleRecordError,
@@ -51,6 +51,7 @@ from vptune.operators import (
     inverse_metric,
     jvp,
     metric,
+    sampled_fisher_vp,
     vjp,
 )
 from vptune.run import (
@@ -80,7 +81,6 @@ __all__ = [
     "MaterializationError",
     "Materializer",
     "Measurement",
-    "MeasurementError",
     "NoPassedCandidateError",
     "ObjectiveContext",
     "OperatorSpec",
@@ -94,6 +94,7 @@ __all__ = [
     "ReferenceResult",
     "ReplayContext",
     "ScalarObjective",
+    "SearchPolicy",
     "SelectionPolicy",
     "StaleRecordError",
     "Target",
@@ -117,6 +118,7 @@ __all__ = [
     "materialize",
     "metric",
     "parameter_surface",
+    "sampled_fisher_vp",
     "standard_problem",
     "tune",
     "tune_run",

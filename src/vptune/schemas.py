@@ -26,6 +26,9 @@ from vptune.identities import (
     to_json_value,
 )
 from vptune.selection_core import (
+    ACCEPTED_STATUS,
+    COMPILED_SPEED_STATISTIC,
+    full_size_agreement_satisfied,
     memory_stable,
     select_accepted_family,
     select_complete_cohort,
@@ -77,6 +80,7 @@ REQUIRED_TYPE_FIELDS = {
 }
 REQUIRED_PLAN_SUMMARY_FIELDS = (
     "selected",
+    "candidate_rows",
     "records",
     "full_size_records",
     "check_records",
@@ -312,16 +316,45 @@ def _validate_replay_selection_policy(policy: SelectionPolicy) -> None:
         message = f"unsupported speed statistic: {policy.speed_statistic}"
         raise VPTuneError(message)
 
+    if policy.compiled_speed_statistic != COMPILED_SPEED_STATISTIC:
+        message = (
+            f"unsupported compiled speed statistic: {policy.compiled_speed_statistic}"
+        )
+        raise VPTuneError(message)
+
+    if policy.distributed_speed_statistic != "global_elapsed_seconds":
+        message = (
+            "unsupported distributed speed statistic: "
+            f"{policy.distributed_speed_statistic}"
+        )
+        raise VPTuneError(message)
+
+    if policy.rank_memory_reduction not in {
+        "max_peak_allocated",
+        "max_peak_reserved",
+        "sum_peak_reserved",
+    }:
+        message = f"unsupported rank memory reduction: {policy.rank_memory_reduction}"
+        raise VPTuneError(message)
+
     if policy.tie_breaker != "min_peak_reserved_mib":
         message = f"unsupported tie breaker: {policy.tie_breaker}"
         raise VPTuneError(message)
 
-    if policy.cohort_speed_statistic != "sum_median_elapsed_seconds":
+    if policy.cohort_speed_statistic != "sum_selection_score_seconds":
         message = f"unsupported cohort speed statistic: {policy.cohort_speed_statistic}"
         raise VPTuneError(message)
 
     if policy.cohort_tie_breaker != "sum_peak_reserved_mib":
         message = f"unsupported cohort tie breaker: {policy.cohort_tie_breaker}"
+        raise VPTuneError(message)
+
+    if policy.accepted_status != ACCEPTED_STATUS:
+        message = f"unsupported accepted status: {policy.accepted_status}"
+        raise VPTuneError(message)
+
+    if policy.compile_call_horizon <= 0:
+        message = "compile_call_horizon must be positive"
         raise VPTuneError(message)
 
 
@@ -846,6 +879,7 @@ def plan_record_current(record: Mapping[str, Any], plan: Plan) -> bool:
         "input_signature",
         "candidate_settings",
         "selected",
+        "candidate_rows",
         "records",
         "full_size_records",
         "check_records",
@@ -1010,7 +1044,11 @@ def _validate_reference_linkage(
         checks_by_key.setdefault(_row_candidate_key(check), []).append(check)
 
     for record in full_size_records:
-        if record.status != "passed" or not record.reference_passed:
+        if (
+            record.status != "passed"
+            or not record.reference_passed
+            or not full_size_agreement_satisfied(record)
+        ):
             continue
 
         if not any(
@@ -1232,6 +1270,7 @@ def _replay_select_family(
         if record.status == "passed"
         and record.reference_passed
         and to_json_value(record.input_signature) == to_json_value(input_signature)
+        and full_size_agreement_satisfied(record)
         and memory_stable(record)
     )
 
@@ -1318,7 +1357,11 @@ def _validate_selected_record(
         message = f"plan replay selected record generator version differs: {family}"
         raise StaleRecordError(message)
 
-    if selected_record.status != "passed" or not selected_record.reference_passed:
+    if (
+        selected_record.status != "passed"
+        or not selected_record.reference_passed
+        or not full_size_agreement_satisfied(selected_record)
+    ):
         message = f"plan replay selected record did not pass: {family}"
         raise VPTuneError(message)
 
@@ -1456,8 +1499,15 @@ def _validate_candidate_records(
     full_size_records: Sequence[FullSizeRecord],
     check_records: Sequence[CheckRecord],
     candidate_records: Sequence[Mapping[str, Any]],
+    summary_candidate_rows: Sequence[Mapping[str, Any]],
 ) -> dict[str, Candidate]:
     by_key = _candidate_records_by_key(candidate_records)
+    expected_by_key = {
+        _candidate_record_key(candidate_from_signature(dict(candidate_record))): (
+            candidate_record
+        )
+        for candidate_record in summary_candidate_rows
+    }
     full_size_by_key = {
         _result_candidate_key(record): record for record in full_size_records
     }
@@ -1472,7 +1522,11 @@ def _validate_candidate_records(
         message = "plan replay has duplicate full-size candidate identities"
         raise VPTuneError(message)
 
-    if set(by_key) != set(full_size_by_key) | check_keys:
+    if set(by_key) != set(expected_by_key):
+        message = "plan replay candidate rows differ from plan summary"
+        raise VPTuneError(message)
+
+    if not set(full_size_by_key) | check_keys <= set(expected_by_key):
         message = "plan replay candidate rows differ from result rows"
         raise VPTuneError(message)
 
@@ -1480,6 +1534,9 @@ def _validate_candidate_records(
         full_size_record = full_size_by_key.get(key)
 
         if full_size_record is None:
+            if key not in checks_by_key:
+                continue
+
             _validate_candidate_against_checks(
                 row_candidate,
                 row,
@@ -1607,6 +1664,7 @@ def _assignment_records(
         if (
             record.status == "passed"
             and record.reference_passed
+            and full_size_agreement_satisfied(record)
             and memory_stable(record)
         ):
             pairs.append((candidate, record))
@@ -1734,6 +1792,9 @@ def _validate_recomputed_cohort_selection(
     cohort_assignment: CohortAssignment | None,
     cohort_constraints: tuple[CohortConstraint, ...],
 ) -> None:
+    if not selected_records:
+        return
+
     family_names = tuple(selected_records)
     ordered_families = _replay_family_order(family_names, dependencies_by_family)
     cohorts = []
@@ -1816,6 +1877,13 @@ def _selected_candidates_from_record(record: Mapping[str, Any]) -> dict[str, Can
     }
 
 
+def _candidate_rows_from_record(record: Mapping[str, Any]) -> tuple[Candidate, ...]:
+    return tuple(
+        candidate_from_signature(dict(candidate_record))
+        for candidate_record in tuple(record["candidate_rows"])
+    )
+
+
 def _replay_rows(
     record: Mapping[str, Any],
     full_size_records: Sequence[FullSizeRecord],
@@ -1863,6 +1931,7 @@ def _replayed_plan(
     selected_records: Mapping[str, FullSizeRecord],
     rows: _ReplayRows,
     materializers: Mapping[str, Materializer],
+    candidate_rows: tuple[Candidate, ...],
     validation_identity: _ValidationReplayIdentity,
     dependencies_by_family: Mapping[str, tuple[str, ...]],
     cohort_assignment: CohortAssignment | None,
@@ -1874,6 +1943,7 @@ def _replayed_plan(
         records=dict(selected_records),
         input_signature=dict(replay_context.input_signature),
         policy=replay_context.selection_policy,
+        candidate_rows=candidate_rows,
         full_size_records=rows.ordered_full_size,
         check_records=rows.ordered_checks,
         validation_records=rows.ordered_validation,
@@ -2000,6 +2070,11 @@ def plan_from_json(
         rows.ordered_full_size,
         rows.ordered_checks,
         candidate_records,
+        tuple(record["candidate_rows"]),
+    )
+    candidate_rows = tuple(
+        candidates_by_key[_candidate_record_key(candidate)]
+        for candidate in _candidate_rows_from_record(record)
     )
     dependencies_by_family = _dependencies_from_record(record)
     validation_identity = _validation_replay_identity(record, replay_context)
@@ -2031,6 +2106,7 @@ def plan_from_json(
         selected_records,
         rows,
         materializers,
+        candidate_rows,
         validation_identity,
         dependencies_by_family,
         cohort_assignment,

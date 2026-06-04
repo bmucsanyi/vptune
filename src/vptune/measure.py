@@ -1,5 +1,6 @@
 """Candidate measurement."""
 
+import importlib
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
@@ -312,20 +313,36 @@ def run_candidate(
     clock: Callable[[], float] = time.perf_counter,
     clear_gradients: Callable[[], None] | None = None,
     reference_passed: bool = True,
+    full_size_check: Callable[[TensorTree], Mapping[str, Any]] | None = None,
 ) -> FullSizeRecord:
     """Run and record one full-size candidate.
 
     Returns:
         Passed or failed full-size record.
     """
+    compile_counter_before = _compile_counter(candidate)
+
     try:
-        samples, output, _ = measure_operation(
+        samples, output, probe_samples = measure_operation(
             operation,
             timing_policy=timing_policy,
             memory_backend=memory_backend,
             clock=clock,
             clear_gradients=clear_gradients,
         )
+        selection_metadata = _selection_metadata(
+            candidate,
+            samples,
+            probe_samples,
+            compile_counter_before=compile_counter_before,
+            compile_counter_after=_compile_counter(candidate),
+        )
+
+        if full_size_check is not None:
+            selection_metadata = {
+                **selection_metadata,
+                **dict(full_size_check(output)),
+            }
     except OperationMeasurementError as error:
         return failed_record(
             candidate,
@@ -363,10 +380,94 @@ def run_candidate(
         timing_samples=samples,
         memory_samples=samples,
         output_signature=tree_signature(output),
+        selection_metadata=selection_metadata,
         dependency_identities=dict(candidate.dependency_identities),
         cohort_assignment=dict(candidate.cohort_assignment),
         reference_passed=reference_passed,
     )
+
+
+def _selection_metadata(
+    candidate: Candidate,
+    samples: tuple[Measurement, ...],
+    probe_samples: tuple[Measurement, ...],
+    *,
+    compile_counter_before: int | None,
+    compile_counter_after: int | None,
+) -> dict[str, Any]:
+    if candidate.settings.get("compile.enabled") != "true":
+        return {"timing_source": "eager_single_rank"}
+
+    steady_elapsed = _median_elapsed(samples)
+    compile_time = _compile_time_seconds(candidate, steady_elapsed, probe_samples)
+
+    return {
+        "timing_source": "compiled_single_rank",
+        "steady_elapsed_seconds": steady_elapsed,
+        "compile_time_seconds": compile_time,
+        "recompile_count": _recompile_count(
+            compile_counter_before,
+            compile_counter_after,
+        ),
+        "compile_cache_state": candidate.settings.get("compile.cache_state"),
+        "compile.compiled_autograd": candidate.settings.get(
+            "compile.compiled_autograd"
+        ),
+        "compile.cuda_graphs": candidate.settings.get("compile.cuda_graphs"),
+    }
+
+
+def _compile_time_seconds(
+    candidate: Candidate,
+    steady_elapsed: float,
+    probe_samples: tuple[Measurement, ...],
+) -> float:
+    if candidate.settings.get("compile.cache_state") != "cold_compile":
+        return 0.0
+
+    probe_elapsed = _median_elapsed(probe_samples)
+    compile_time = probe_elapsed - steady_elapsed
+
+    if compile_time <= 0.0:
+        return 0.0
+
+    return compile_time
+
+
+def _compile_counter(candidate: Candidate) -> int | None:
+    if candidate.settings.get("compile.enabled") != "true":
+        return None
+
+    dynamo_utils = importlib.import_module("torch._dynamo.utils")
+
+    return int(dynamo_utils.counters["stats"]["unique_graphs"])
+
+
+def _recompile_count(before: int | None, after: int | None) -> int:
+    if before is None or after is None:
+        return 0
+
+    graph_delta = after - before
+
+    if graph_delta <= 1:
+        return 0
+
+    return graph_delta - 1
+
+
+def _median_elapsed(samples: tuple[Measurement, ...]) -> float:
+    values = sorted(sample.elapsed_seconds for sample in samples)
+
+    if not values:
+        message = "selection metadata has no timing samples"
+        raise RuntimeError(message)
+
+    midpoint = len(values) // 2
+
+    if len(values) % 2 == 1:
+        return values[midpoint]
+
+    return 0.5 * (values[midpoint - 1] + values[midpoint])
 
 
 def failed_record(

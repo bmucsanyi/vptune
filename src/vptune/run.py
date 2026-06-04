@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from vptune.autobatch_bridge import find_autobatch_value
-from vptune.candidates import topological_families
+from vptune.candidates import AxisManifest, axis_manifest, topological_families
 from vptune.cohorts import candidate_matches_assignment, cohort_assignments
 from vptune.data import (
     AutobatchDomain,
@@ -38,6 +38,7 @@ from vptune.data import (
     ScalarObjective,
     SelectionPolicy,
     Target,
+    TimingPolicy,
     TuningRun,
     VectorProvider,
 )
@@ -65,13 +66,22 @@ from vptune.schemas import (
     selected_plan_validation_input_signature,
     selected_plan_validation_summary_record,
 )
-from vptune.select import record_accepted, select_cohort, select_family
+from vptune.select import (
+    record_accepted,
+    record_matches_candidate,
+    select_cohort,
+    select_family,
+)
+from vptune.selection_core import selection_memory_mib, selection_score_seconds
 from vptune.tensor_tree import TensorTree, tree_signature
 
 DTYPE_SETTING_KEYS = (
-    "model_dtype",
-    "compute_dtype",
-    "accumulation_dtype",
+    "dtype.parameter_storage",
+    "dtype.model_compute",
+    "dtype.vector",
+    "dtype.intermediate",
+    "dtype.output",
+    "dtype.metric_factor",
     "storage_dtype",
 )
 
@@ -94,13 +104,21 @@ class _RunProblemIndex:
 @dataclasses.dataclass(frozen=True, slots=True)
 class _AssignmentResult:
     state: _RunCohortState | None
+    candidate_rows: tuple[Candidate, ...]
     full_size_records: tuple[FullSizeRecord, ...]
     check_records: tuple[CheckRecord, ...]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class _PrerequisiteRows:
+    candidates: tuple[Candidate, ...]
+    full_size_records: tuple[FullSizeRecord, ...]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class _ProbeResult:
     candidates: tuple[Candidate, ...]
+    candidate_rows: tuple[Candidate, ...]
     full_size_records: tuple[FullSizeRecord, ...]
     check_records: tuple[CheckRecord, ...]
     input_signature: dict[str, Any]
@@ -114,12 +132,14 @@ class _AutobatchProbeState:
     candidate: Candidate
     samples: list[Measurement] = dataclasses.field(default_factory=list)
     output_signature: Mapping[str, Any] | None = None
+    selection_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     error_type: str | None = None
     error: str | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _ReferenceOutcome:
+    candidates: tuple[Candidate, ...]
     check_records: tuple[CheckRecord, ...]
     full_size_record: FullSizeRecord | None
     passed: bool
@@ -127,7 +147,15 @@ class _ReferenceOutcome:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _AutobatchReferenceRows:
+    candidates: tuple[Candidate, ...]
     passed_values: tuple[int, ...]
+    full_size_records: tuple[FullSizeRecord, ...]
+    check_records: tuple[CheckRecord, ...]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _CandidateProbeRows:
+    candidate_rows: tuple[Candidate, ...]
     full_size_records: tuple[FullSizeRecord, ...]
     check_records: tuple[CheckRecord, ...]
 
@@ -312,7 +340,11 @@ def _target_admission_error(candidate: Candidate, target: Target) -> str | None:
             "attention frontend",
         ),
         ("attention.sdpa_kernel", target.allowed_sdpa_kernels, "SDPA kernel"),
-        ("sharding", target.allowed_sharding_modes, "sharding mode"),
+        (
+            "distributed.strategy",
+            target.allowed_sharding_modes,
+            "distributed strategy",
+        ),
     ):
         error = _allowed_target_string_error(
             candidate.settings,
@@ -428,6 +460,22 @@ def _measured_operation(
         return tuple(candidate_operation() for candidate_operation in operations)
 
     return operation
+
+
+def _full_size_check(
+    runtime: RuntimeConfig,
+    candidate: Candidate,
+    inputs: tuple[tuple[Batch, TensorTree], ...],
+) -> Callable[[TensorTree], Mapping[str, Any]] | None:
+    full_size_check = runtime.full_size_check
+
+    if full_size_check is None:
+        return None
+
+    def check(output: TensorTree) -> Mapping[str, Any]:
+        return full_size_check(candidate, inputs, output)
+
+    return check
 
 
 def _check_record(
@@ -574,6 +622,7 @@ def _passed_full_size_record_from_samples(
         timing_samples=samples,
         memory_samples=samples,
         output_signature=dict(state.output_signature),
+        selection_metadata=dict(state.selection_metadata),
         dependency_identities=dict(candidate.dependency_identities),
         cohort_assignment=dict(candidate.cohort_assignment),
         reference_passed=True,
@@ -722,6 +771,26 @@ def tune(
         memory_backend=memory_backend,
         clock=clock,
     )
+    if problem.target.search_policy.strategy == "admission":
+        plan = Plan(
+            selected={},
+            records={},
+            input_signature=probe.input_signature,
+            policy=problem.target.selection_policy,
+            candidate_rows=probe.candidate_rows,
+            target_identity=problem.target.signature(),
+            runtime_identities={problem.operator.family: probe.runtime_identity},
+            adapter_identities={
+                problem.operator.family: dict(problem.adapter_identity)
+            },
+            run_dir=run_dir,
+        )
+
+        if run_dir is not None:
+            _write_summary(run_dir, plan)
+
+        return plan
+
     selected, selected_record = _select_probe_result(
         probe,
         input_signature=probe.input_signature,
@@ -733,6 +802,7 @@ def tune(
         records={problem.operator.family: selected_record},
         input_signature=probe.input_signature,
         policy=problem.target.selection_policy,
+        candidate_rows=probe.candidate_rows,
         full_size_records=probe.full_size_records,
         check_records=probe.check_records,
         materializers={problem.operator.family: probe.materializer},
@@ -763,8 +833,10 @@ def autotune(
     candidates: Mapping[str, Mapping[str, Any]],
     thresholds: Mapping[str, float],
     objective_signature: Mapping[str, Any],
+    numeric_bound_fields: Mapping[str, Any] | None = None,
     scalar_objectives: Mapping[str, ScalarObjective] | None = None,
     function_objectives: Mapping[str, FunctionObjective] | None = None,
+    teacher_objective: FunctionObjective | None = None,
     run_dir: Path | None = None,
     memory_backend: MemoryBackend | None = None,
     clock: Callable[[], float] = time.perf_counter,
@@ -785,9 +857,11 @@ def autotune(
         target=target,
         candidates=candidates,
         thresholds=thresholds,
+        numeric_bound_fields=numeric_bound_fields,
         objective_signature=objective_signature,
         scalar_objectives=scalar_objectives,
         function_objectives=function_objectives,
+        teacher_objective=teacher_objective,
     )
 
     return tune(
@@ -836,6 +910,700 @@ def _select_probe_result(
     return candidate, record
 
 
+def _require_exhaustive_search(target: Target) -> None:
+    if target.search_policy.strategy == "exhaustive":
+        return
+
+    message = (
+        "search strategy requires a strategy-specific result shape: "
+        f"{target.search_policy.strategy}"
+    )
+    raise MaterializationError(message)
+
+
+def _measured_candidates_for_search(
+    candidates: tuple[Candidate, ...],
+    target: Target,
+) -> tuple[Candidate, ...]:
+    strategy = target.search_policy.strategy
+
+    if strategy == "exhaustive":
+        return candidates
+
+    if strategy == "smoke":
+        return _smoke_candidate_rows(candidates)
+
+    message = (
+        "search strategy requires a strategy-specific result shape: "
+        f"{target.search_policy.strategy}"
+    )
+    raise MaterializationError(message)
+
+
+def _smoke_candidate_rows(candidates: tuple[Candidate, ...]) -> tuple[Candidate, ...]:
+    passed_baselines = tuple(
+        candidate
+        for candidate in candidates
+        if not candidate.changed_axes and candidate.admission_status == "passed"
+    )
+
+    if len(passed_baselines) != 1:
+        message = (
+            "smoke search requires exactly one admitted baseline row "
+            "with no changed axes"
+        )
+        raise MaterializationError(message)
+
+    manifest = axis_manifest()
+    selected = [passed_baselines[0]]
+    seen_groups = set()
+
+    for candidate in candidates:
+        if not candidate.changed_axes or candidate.admission_status != "passed":
+            continue
+
+        group_key = _candidate_class_c_groups(candidate, manifest)
+
+        if group_key in seen_groups:
+            continue
+
+        seen_groups.add(group_key)
+        selected.append(candidate)
+
+    return tuple(selected)
+
+
+def _candidate_class_c_groups(
+    candidate: Candidate,
+    manifest: AxisManifest,
+) -> tuple[str, ...]:
+    by_key = manifest.by_key()
+    groups = []
+
+    for axis_key in candidate.changed_axes:
+        axis = by_key.get(axis_key)
+
+        if axis is None:
+            message = (
+                f"smoke search changed axis has no Class C manifest group: {axis_key}"
+            )
+            raise MaterializationError(message)
+
+        groups.append(axis.class_c_group)
+
+    return tuple(sorted(set(groups)))
+
+
+def _admission_probe_result(
+    problem: Problem,
+    *,
+    run_dir: Path | None,
+    memory_backend: MemoryBackend | None,
+) -> _ProbeResult:
+    runtime = _runtime(problem)
+    candidates = tuple(
+        _admit_target(candidate, problem.target)
+        for candidate in _candidate_rows(runtime)
+    )
+    backend = _memory_backend(problem.target.devices, memory_backend)
+    input_signature = _input_signature(problem, backend)
+
+    if run_dir is not None:
+        for candidate in candidates:
+            _write_candidate(run_dir, input_signature, candidate)
+
+    return _ProbeResult(
+        candidates=candidates,
+        candidate_rows=candidates,
+        full_size_records=(),
+        check_records=(),
+        input_signature=input_signature,
+        materializer=runtime.materializer,
+        runtime_identity=runtime.identity(),
+    )
+
+
+def _probe_candidate_rows(
+    *,
+    runtime: RuntimeConfig,
+    candidates: tuple[Candidate, ...],
+    reference_batch: Batch,
+    reference_vector: TensorTree,
+    probe_inputs: tuple[tuple[Batch, TensorTree], ...],
+    input_signature: dict[str, Any],
+    timing_policy: TimingPolicy,
+    selection_policy: SelectionPolicy,
+    compile_call_horizons: tuple[int, ...],
+    memory_backend: MemoryBackend,
+    clock: Callable[[], float],
+    run_dir: Path | None,
+) -> _CandidateProbeRows:
+    candidate_rows = []
+    records = []
+    check_records = []
+
+    for candidate in candidates:
+        outcome = _reference_outcome(
+            runtime,
+            candidate,
+            reference_batch,
+            reference_vector,
+            input_signature,
+            run_dir,
+        )
+        candidate_rows.extend(outcome.candidates)
+        check_records.extend(outcome.check_records)
+        if run_dir is not None:
+            for check_record in outcome.check_records:
+                _write_check(run_dir, check_record)
+
+        if outcome.full_size_record is not None:
+            records.append(outcome.full_size_record)
+            if run_dir is not None:
+                _write_full_size(run_dir, records[-1])
+
+            continue
+
+        operation = _measured_operation(runtime, candidate, probe_inputs)
+        record = run_candidate(
+            candidate,
+            input_signature,
+            operation,
+            timing_policy=timing_policy,
+            memory_backend=memory_backend,
+            clock=clock,
+            reference_passed=True,
+            full_size_check=_full_size_check(runtime, candidate, probe_inputs),
+        )
+        record = _record_with_compile_horizon_scores(
+            record,
+            selection_policy,
+            compile_call_horizons,
+        )
+        records.append(record)
+        if run_dir is not None:
+            _write_full_size(run_dir, records[-1])
+
+    return _CandidateProbeRows(
+        candidate_rows=tuple(candidate_rows),
+        full_size_records=tuple(records),
+        check_records=tuple(check_records),
+    )
+
+
+def _record_with_compile_horizon_scores(
+    record: FullSizeRecord,
+    policy: SelectionPolicy,
+    compile_call_horizons: tuple[int, ...],
+) -> FullSizeRecord:
+    if not compile_call_horizons:
+        return record
+
+    if record.status != "passed":
+        return record
+
+    if record.candidate_settings.get("compile.enabled") != "true":
+        return record
+
+    scores = {
+        str(horizon): selection_score_seconds(
+            record,
+            dataclasses.replace(policy, compile_call_horizon=horizon),
+        )
+        for horizon in compile_call_horizons
+    }
+
+    return dataclasses.replace(
+        record,
+        selection_metadata={
+            **dict(record.selection_metadata),
+            "compile_amortized_seconds_by_horizon": scores,
+        },
+    )
+
+
+def _probe_fast_candidate_rows(
+    *,
+    runtime: RuntimeConfig,
+    candidates: tuple[Candidate, ...],
+    reference_batch: Batch,
+    reference_vector: TensorTree,
+    probe_inputs: tuple[tuple[Batch, TensorTree], ...],
+    input_signature: dict[str, Any],
+    timing_policy: TimingPolicy,
+    selection_policy: SelectionPolicy,
+    memory_backend: MemoryBackend,
+    clock: Callable[[], float],
+    run_dir: Path | None,
+) -> tuple[tuple[Candidate, ...], _CandidateProbeRows]:
+    eager_candidates = _fast_eager_candidate_rows(candidates)
+    eager_rows = _probe_candidate_rows(
+        runtime=runtime,
+        candidates=eager_candidates,
+        reference_batch=reference_batch,
+        reference_vector=reference_vector,
+        probe_inputs=probe_inputs,
+        input_signature=input_signature,
+        timing_policy=timing_policy,
+        selection_policy=selection_policy,
+        compile_call_horizons=(),
+        memory_backend=memory_backend,
+        clock=clock,
+        run_dir=run_dir,
+    )
+    top_eager = _near_fastest_candidates(
+        eager_candidates,
+        eager_rows.full_size_records,
+        input_signature=input_signature,
+        policy=selection_policy,
+    )
+    compile_candidates = _fast_compile_candidate_rows(candidates, top_eager)
+    compile_rows = _probe_candidate_rows(
+        runtime=runtime,
+        candidates=compile_candidates,
+        reference_batch=reference_batch,
+        reference_vector=reference_vector,
+        probe_inputs=probe_inputs,
+        input_signature=input_signature,
+        timing_policy=timing_policy,
+        selection_policy=selection_policy,
+        compile_call_horizons=(),
+        memory_backend=memory_backend,
+        clock=clock,
+        run_dir=run_dir,
+    )
+
+    return (
+        (*eager_candidates, *compile_candidates),
+        _CandidateProbeRows(
+            candidate_rows=(*eager_rows.candidate_rows, *compile_rows.candidate_rows),
+            full_size_records=(
+                *eager_rows.full_size_records,
+                *compile_rows.full_size_records,
+            ),
+            check_records=(*eager_rows.check_records, *compile_rows.check_records),
+        ),
+    )
+
+
+def _probe_balanced_candidate_rows(
+    *,
+    runtime: RuntimeConfig,
+    candidates: tuple[Candidate, ...],
+    reference_batch: Batch,
+    reference_vector: TensorTree,
+    probe_inputs: tuple[tuple[Batch, TensorTree], ...],
+    input_signature: dict[str, Any],
+    timing_policy: TimingPolicy,
+    selection_policy: SelectionPolicy,
+    retained_top_count: int | None,
+    memory_backend: MemoryBackend,
+    clock: Callable[[], float],
+    run_dir: Path | None,
+) -> tuple[tuple[Candidate, ...], _CandidateProbeRows]:
+    if retained_top_count is None:
+        message = "balanced search requires retained_top_count"
+        raise MaterializationError(message)
+
+    baseline = _single_admitted_baseline(candidates, strategy="balanced")
+    grouped = _balanced_group_candidates(candidates)
+    group_candidates = (
+        baseline,
+        *tuple(itertools.chain.from_iterable(grouped.values())),
+    )
+    group_rows = _probe_candidate_rows(
+        runtime=runtime,
+        candidates=group_candidates,
+        reference_batch=reference_batch,
+        reference_vector=reference_vector,
+        probe_inputs=probe_inputs,
+        input_signature=input_signature,
+        timing_policy=timing_policy,
+        selection_policy=selection_policy,
+        compile_call_horizons=(),
+        memory_backend=memory_backend,
+        clock=clock,
+        run_dir=run_dir,
+    )
+    retained = _balanced_retained_candidates(
+        grouped,
+        group_candidates,
+        group_rows.full_size_records,
+        input_signature=input_signature,
+        policy=selection_policy,
+        retained_top_count=retained_top_count,
+    )
+    cross_candidates = _balanced_cross_candidate_rows(baseline, retained)
+    synthetic_cross = tuple(
+        candidate
+        for candidate in cross_candidates
+        if candidate.generator_id == "balanced"
+    )
+
+    if run_dir is not None:
+        for candidate in synthetic_cross:
+            _write_candidate(run_dir, input_signature, candidate)
+
+    cross_rows = _probe_candidate_rows(
+        runtime=runtime,
+        candidates=cross_candidates,
+        reference_batch=reference_batch,
+        reference_vector=reference_vector,
+        probe_inputs=probe_inputs,
+        input_signature=input_signature,
+        timing_policy=timing_policy,
+        selection_policy=selection_policy,
+        compile_call_horizons=(),
+        memory_backend=memory_backend,
+        clock=clock,
+        run_dir=run_dir,
+    )
+    top_cross = _near_fastest_candidates(
+        cross_candidates,
+        cross_rows.full_size_records,
+        input_signature=input_signature,
+        policy=selection_policy,
+    )
+    compile_candidates = _fast_compile_candidate_rows(candidates, top_cross)
+    compile_rows = _probe_candidate_rows(
+        runtime=runtime,
+        candidates=compile_candidates,
+        reference_batch=reference_batch,
+        reference_vector=reference_vector,
+        probe_inputs=probe_inputs,
+        input_signature=input_signature,
+        timing_policy=timing_policy,
+        selection_policy=selection_policy,
+        compile_call_horizons=(),
+        memory_backend=memory_backend,
+        clock=clock,
+        run_dir=run_dir,
+    )
+
+    return (
+        (*group_candidates, *cross_candidates, *compile_candidates),
+        _CandidateProbeRows(
+            candidate_rows=(
+                *synthetic_cross,
+                *group_rows.candidate_rows,
+                *cross_rows.candidate_rows,
+                *compile_rows.candidate_rows,
+            ),
+            full_size_records=(
+                *group_rows.full_size_records,
+                *cross_rows.full_size_records,
+                *compile_rows.full_size_records,
+            ),
+            check_records=(
+                *group_rows.check_records,
+                *cross_rows.check_records,
+                *compile_rows.check_records,
+            ),
+        ),
+    )
+
+
+def _balanced_group_candidates(
+    candidates: tuple[Candidate, ...],
+) -> dict[tuple[str, ...], tuple[Candidate, ...]]:
+    groups = {}
+    manifest = axis_manifest()
+
+    for candidate in candidates:
+        if (
+            candidate.admission_status != "passed"
+            or not candidate.changed_axes
+            or candidate.settings.get("compile.enabled") == "true"
+        ):
+            continue
+
+        _validate_balanced_delta(candidate)
+        group_key = _candidate_class_c_groups(candidate, manifest)
+        groups.setdefault(group_key, []).append(candidate)
+
+    return {group: tuple(rows) for group, rows in groups.items()}
+
+
+def _validate_balanced_delta(candidate: Candidate) -> None:
+    changed = set(candidate.changed_axes)
+    extra = tuple(key for key in candidate.settings if key not in changed)
+
+    if extra:
+        message = (
+            "balanced search group rows must put every setting key in changed_axes: "
+            f"{candidate.candidate_id}"
+        )
+        raise MaterializationError(message)
+
+
+def _balanced_retained_candidates(
+    grouped: Mapping[tuple[str, ...], tuple[Candidate, ...]],
+    measured_candidates: tuple[Candidate, ...],
+    records: tuple[FullSizeRecord, ...],
+    *,
+    input_signature: Mapping[str, object],
+    policy: SelectionPolicy,
+    retained_top_count: int,
+) -> dict[tuple[str, ...], tuple[Candidate, ...]]:
+    accepted = {
+        candidate.candidate_id: (candidate, record)
+        for candidate, record in zip(measured_candidates, records, strict=True)
+        if record_matches_candidate(candidate, record)
+        and record_accepted(record, input_signature)
+    }
+    retained = {}
+
+    for group_key, group_candidates in grouped.items():
+        group_accepted = tuple(
+            accepted[candidate.candidate_id]
+            for candidate in group_candidates
+            if candidate.candidate_id in accepted
+        )
+        ordered = tuple(
+            candidate
+            for candidate, _ in sorted(
+                group_accepted,
+                key=lambda item: (
+                    selection_score_seconds(item[1], policy),
+                    selection_memory_mib(item[1], policy),
+                ),
+            )
+        )
+        retained[group_key] = ordered[:retained_top_count]
+
+    return retained
+
+
+def _balanced_cross_candidate_rows(
+    baseline: Candidate,
+    retained: Mapping[tuple[str, ...], tuple[Candidate, ...]],
+) -> tuple[Candidate, ...]:
+    retained_groups = tuple(rows for rows in retained.values() if rows)
+
+    if not retained_groups:
+        return (baseline,)
+
+    crossed = []
+
+    for combination in itertools.product(*retained_groups):
+        if len(combination) == 1:
+            crossed.append(combination[0])
+            continue
+
+        crossed.append(_balanced_cross_candidate(baseline, combination))
+
+    return tuple(crossed)
+
+
+def _balanced_cross_candidate(
+    baseline: Candidate,
+    combination: tuple[Candidate, ...],
+) -> Candidate:
+    settings = dict(baseline.settings)
+    changed_axes = []
+
+    for candidate in combination:
+        _validate_cross_context(baseline, candidate)
+        settings.update(candidate.settings)
+        changed_axes.extend(candidate.changed_axes)
+
+    candidate_ids = tuple(candidate.candidate_id for candidate in combination)
+
+    return Candidate(
+        family=baseline.family,
+        candidate_id=f"balanced:{'+'.join(candidate_ids)}",
+        settings=settings,
+        changed_axes=tuple(dict.fromkeys(changed_axes)),
+        dependency_identities=dict(baseline.dependency_identities),
+        cohort_assignment=dict(baseline.cohort_assignment),
+        admission_status="passed",
+        generator_id="balanced",
+        migration_source_id="+".join(candidate_ids),
+    )
+
+
+def _validate_cross_context(baseline: Candidate, candidate: Candidate) -> None:
+    if candidate.family != baseline.family:
+        message = "balanced cross row family differs from baseline"
+        raise MaterializationError(message)
+
+    if candidate.dependency_identities != baseline.dependency_identities:
+        message = "balanced cross row dependency identities differ from baseline"
+        raise MaterializationError(message)
+
+    if candidate.cohort_assignment != baseline.cohort_assignment:
+        message = "balanced cross row cohort assignment differs from baseline"
+        raise MaterializationError(message)
+
+
+def _fast_eager_candidate_rows(
+    candidates: tuple[Candidate, ...],
+) -> tuple[Candidate, ...]:
+    _single_admitted_baseline(candidates, strategy="fast")
+
+    return tuple(
+        candidate for candidate in candidates if _fast_eager_candidate(candidate)
+    )
+
+
+def _single_admitted_baseline(
+    candidates: tuple[Candidate, ...],
+    *,
+    strategy: str,
+) -> Candidate:
+    passed_baselines = tuple(
+        candidate
+        for candidate in candidates
+        if not candidate.changed_axes and candidate.admission_status == "passed"
+    )
+
+    if len(passed_baselines) != 1:
+        message = (
+            f"{strategy} search requires exactly one admitted baseline row "
+            "with no changed axes"
+        )
+        raise MaterializationError(message)
+
+    return passed_baselines[0]
+
+
+def _fast_eager_candidate(candidate: Candidate) -> bool:
+    if candidate.admission_status != "passed":
+        return False
+
+    if candidate.settings.get("compile.enabled") == "true":
+        return False
+
+    if not candidate.changed_axes:
+        return True
+
+    return all(
+        _fast_eager_axis_allowed(axis, candidate) for axis in candidate.changed_axes
+    )
+
+
+def _fast_eager_axis_allowed(axis_key: str, candidate: Candidate) -> bool:
+    if axis_key == "compile.enabled":
+        return candidate.settings.get("compile.enabled") == "false"
+
+    if axis_key.startswith("compile."):
+        return False
+
+    prefix = axis_key.split(".", 1)[0]
+
+    return prefix in {
+        "gradient",
+        "jvp",
+        "vjp",
+        "hvp",
+        "ggn",
+        "fisher",
+        "sampled_fisher",
+        "empirical_fisher",
+        "composition",
+        "vectorization",
+        "dtype",
+        "attention",
+    }
+
+
+def _near_fastest_candidates(
+    candidates: tuple[Candidate, ...],
+    records: tuple[FullSizeRecord, ...],
+    *,
+    input_signature: Mapping[str, object],
+    policy: SelectionPolicy,
+) -> tuple[Candidate, ...]:
+    accepted = tuple(
+        (candidate, record)
+        for candidate, record in zip(candidates, records, strict=True)
+        if record_matches_candidate(candidate, record)
+        and record_accepted(record, input_signature)
+    )
+
+    if not accepted:
+        return ()
+
+    fastest = min(selection_score_seconds(record, policy) for _, record in accepted)
+
+    return tuple(
+        candidate
+        for candidate, record in accepted
+        if selection_score_seconds(record, policy)
+        <= fastest * policy.near_fastest_multiplier
+    )
+
+
+def _fast_compile_candidate_rows(
+    candidates: tuple[Candidate, ...],
+    top_eager: tuple[Candidate, ...],
+) -> tuple[Candidate, ...]:
+    top_settings = {
+        canonical_json(_settings_without_compile(candidate.settings))
+        for candidate in top_eager
+    }
+
+    if not top_settings:
+        return ()
+
+    return tuple(
+        candidate
+        for candidate in candidates
+        if candidate.admission_status == "passed"
+        and candidate.settings.get("compile.enabled") == "true"
+        and canonical_json(_settings_without_compile(candidate.settings))
+        in top_settings
+    )
+
+
+def _settings_without_compile(settings: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in settings.items()
+        if not key.startswith("compile.") and key != "memory.output_buffers"
+    }
+
+
+def _timing_policy_for_search(target: Target) -> TimingPolicy:
+    if target.search_policy.strategy != "thorough":
+        return target.timing_policy
+
+    repeat_count = target.search_policy.variance_repeat_count
+
+    if repeat_count is None:
+        message = "thorough search requires variance_repeat_count"
+        raise MaterializationError(message)
+
+    return dataclasses.replace(
+        target.timing_policy,
+        short_measured_calls=max(
+            target.timing_policy.short_measured_calls,
+            repeat_count,
+        ),
+        medium_measured_calls=max(
+            target.timing_policy.medium_measured_calls,
+            repeat_count,
+        ),
+        long_measured_calls=max(
+            target.timing_policy.long_measured_calls,
+            repeat_count,
+        ),
+    )
+
+
+def _validate_thorough_horizon(target: Target) -> None:
+    if target.search_policy.strategy != "thorough":
+        return
+
+    horizon = target.selection_policy.compile_call_horizon
+
+    if horizon in target.search_policy.compile_call_horizons:
+        return
+
+    message = "thorough search selection horizon must be declared"
+    raise MaterializationError(message)
+
+
 def _probe_problem(
     problem: Problem,
     *,
@@ -843,10 +1611,19 @@ def _probe_problem(
     memory_backend: MemoryBackend | None,
     clock: Callable[[], float],
 ) -> _ProbeResult:
+    if problem.target.search_policy.strategy == "admission":
+        return _admission_probe_result(
+            problem,
+            run_dir=run_dir,
+            memory_backend=memory_backend,
+        )
+
     runtime = _runtime(problem)
     domain = _single_autobatch_domain(runtime)
 
     if domain is not None:
+        _require_exhaustive_search(problem.target)
+
         return _probe_problem_with_autobatch(
             problem,
             domain,
@@ -861,55 +1638,90 @@ def _probe_problem(
     )
     reference_batch, reference_vector = _reference_input(problem)
     probe_inputs = _probe_inputs(problem)
+    if problem.target.search_policy.strategy == "smoke":
+        probe_inputs = probe_inputs[:1]
 
+    _validate_thorough_horizon(problem.target)
     backend = _memory_backend(problem.target.devices, memory_backend)
     input_signature = _input_signature(problem, backend)
-    records = []
-    check_records = []
+    timing_policy = _timing_policy_for_search(problem.target)
+    candidate_rows = list(candidates)
 
-    for candidate in candidates:
-        if run_dir is not None:
+    if run_dir is not None:
+        for candidate in candidates:
             _write_candidate(run_dir, input_signature, candidate)
 
-        outcome = _reference_outcome(
-            runtime,
-            candidate,
-            reference_batch,
-            reference_vector,
-            input_signature,
-            run_dir,
+    if problem.target.search_policy.strategy == "fast":
+        measured_candidates, probed = _probe_fast_candidate_rows(
+            runtime=runtime,
+            candidates=candidates,
+            reference_batch=reference_batch,
+            reference_vector=reference_vector,
+            probe_inputs=probe_inputs,
+            input_signature=input_signature,
+            timing_policy=timing_policy,
+            selection_policy=problem.target.selection_policy,
+            memory_backend=backend,
+            clock=clock,
+            run_dir=run_dir,
         )
-        check_records.extend(outcome.check_records)
-        if run_dir is not None:
-            for check_record in outcome.check_records:
-                _write_check(run_dir, check_record)
-
-        if outcome.full_size_record is not None:
-            records.append(outcome.full_size_record)
-            if run_dir is not None:
-                _write_full_size(run_dir, records[-1])
-
-            continue
-
-        operation = _measured_operation(runtime, candidate, probe_inputs)
-        records.append(
-            run_candidate(
-                candidate,
-                input_signature,
-                operation,
-                timing_policy=problem.target.timing_policy,
-                memory_backend=backend,
-                clock=clock,
-                reference_passed=True,
-            )
+    elif problem.target.search_policy.strategy == "balanced":
+        measured_candidates, probed = _probe_balanced_candidate_rows(
+            runtime=runtime,
+            candidates=candidates,
+            reference_batch=reference_batch,
+            reference_vector=reference_vector,
+            probe_inputs=probe_inputs,
+            input_signature=input_signature,
+            timing_policy=timing_policy,
+            selection_policy=problem.target.selection_policy,
+            retained_top_count=problem.target.search_policy.retained_top_count,
+            memory_backend=backend,
+            clock=clock,
+            run_dir=run_dir,
         )
-        if run_dir is not None:
-            _write_full_size(run_dir, records[-1])
+    elif problem.target.search_policy.strategy == "thorough":
+        measured_candidates = candidates
+        probed = _probe_candidate_rows(
+            runtime=runtime,
+            candidates=measured_candidates,
+            reference_batch=reference_batch,
+            reference_vector=reference_vector,
+            probe_inputs=probe_inputs,
+            input_signature=input_signature,
+            timing_policy=timing_policy,
+            selection_policy=problem.target.selection_policy,
+            compile_call_horizons=problem.target.search_policy.compile_call_horizons,
+            memory_backend=backend,
+            clock=clock,
+            run_dir=run_dir,
+        )
+    else:
+        measured_candidates = _measured_candidates_for_search(
+            candidates, problem.target
+        )
+        probed = _probe_candidate_rows(
+            runtime=runtime,
+            candidates=measured_candidates,
+            reference_batch=reference_batch,
+            reference_vector=reference_vector,
+            probe_inputs=probe_inputs,
+            input_signature=input_signature,
+            timing_policy=timing_policy,
+            selection_policy=problem.target.selection_policy,
+            compile_call_horizons=(),
+            memory_backend=backend,
+            clock=clock,
+            run_dir=run_dir,
+        )
+
+    candidate_rows.extend(probed.candidate_rows)
 
     return _ProbeResult(
-        candidates=candidates,
-        full_size_records=tuple(records),
-        check_records=tuple(check_records),
+        candidates=measured_candidates,
+        candidate_rows=tuple(candidate_rows),
+        full_size_records=probed.full_size_records,
+        check_records=probed.check_records,
         input_signature=input_signature,
         materializer=runtime.materializer,
         runtime_identity=runtime.identity(),
@@ -948,6 +1760,7 @@ def _probe_problem_with_autobatch(
     )
     records.extend(reference_rows.full_size_records)
     check_records.extend(reference_rows.check_records)
+    candidate_rows = (*candidates, *reference_rows.candidates)
 
     states = {
         value: _AutobatchProbeState(value_to_candidate[value])
@@ -990,6 +1803,7 @@ def _probe_problem_with_autobatch(
             record = dataclasses.replace(
                 record,
                 selection_metadata={
+                    **dict(record.selection_metadata),
                     "source": "autobatch",
                     "selected": True,
                     "axis_name": domain.axis_name,
@@ -1004,6 +1818,7 @@ def _probe_problem_with_autobatch(
 
     return _ProbeResult(
         candidates=candidates,
+        candidate_rows=candidate_rows,
         full_size_records=tuple(records),
         check_records=tuple(check_records),
         input_signature=input_signature,
@@ -1022,6 +1837,7 @@ def _autobatch_reference_rows(
     run_dir: Path | None,
 ) -> _AutobatchReferenceRows:
     reference_batch, reference_vector = _reference_input(problem)
+    candidates = []
     passed_values = []
     records = []
     check_records = []
@@ -1040,6 +1856,7 @@ def _autobatch_reference_rows(
             input_signature,
             run_dir,
         )
+        candidates.extend(outcome.candidates)
         check_records.extend(outcome.check_records)
         if run_dir is not None:
             for check_record in outcome.check_records:
@@ -1054,6 +1871,7 @@ def _autobatch_reference_rows(
             passed_values.append(value)
 
     return _AutobatchReferenceRows(
+        candidates=tuple(candidates),
         passed_values=tuple(passed_values),
         full_size_records=tuple(records),
         check_records=tuple(check_records),
@@ -1074,6 +1892,7 @@ def _reference_outcome(
         )
 
         return _ReferenceOutcome(
+            candidates=(),
             check_records=(
                 _failed_check_record(
                     candidate,
@@ -1100,6 +1919,7 @@ def _reference_outcome(
         )
     except RuntimeError as error:
         return _ReferenceOutcome(
+            candidates=(),
             check_records=(
                 _failed_check_record(
                     candidate,
@@ -1119,9 +1939,14 @@ def _reference_outcome(
         )
 
     reference_result = _with_parent_input_signature(reference_result, input_signature)
+    child_candidates = tuple(
+        child_candidate
+        for child_candidate, _ in _child_reference_candidates(reference_result)
+    )
     _write_child_reference_candidates(run_dir, reference_result)
 
     return _ReferenceOutcome(
+        candidates=child_candidates,
         check_records=_check_records(candidate, input_signature, reference_result),
         full_size_record=None,
         passed=True,
@@ -1162,6 +1987,18 @@ def _probe_autobatch_value(
 
     state.samples.extend(samples)
     state.output_signature = tree_signature(output)
+    check = _full_size_check(runtime, state.candidate, probe_inputs)
+
+    try:
+        if check is not None:
+            state.selection_metadata = {
+                **dict(state.selection_metadata),
+                **dict(check(output)),
+            }
+    except RuntimeError as error:
+        state.error_type = type(error).__name__
+        state.error = str(error)
+        raise
 
 
 def _problem_for_assignment(
@@ -1206,7 +2043,7 @@ def _prerequisite_failed_records(
     constraints: tuple[CohortConstraint, ...],
     family_names: tuple[str, ...],
     run_dir: Path,
-) -> tuple[FullSizeRecord, ...]:
+) -> _PrerequisiteRows:
     available_dependencies = tuple(
         dependency for dependency in family.dependencies if dependency in selected
     )
@@ -1230,12 +2067,14 @@ def _prerequisite_failed_records(
 def _write_prerequisite_failed_records(
     problem: Problem,
     run_dir: Path,
-) -> tuple[FullSizeRecord, ...]:
+) -> _PrerequisiteRows:
     input_signature = problem.input_signature()
+    candidates = []
     records = []
 
     for candidate in _candidate_rows(_runtime(problem)):
         admitted = _admit_target(candidate, problem.target)
+        candidates.append(admitted)
         _write_candidate(run_dir, input_signature, admitted)
         record = failed_record(
             admitted,
@@ -1247,7 +2086,10 @@ def _write_prerequisite_failed_records(
         records.append(record)
         _write_full_size(run_dir, record)
 
-    return tuple(records)
+    return _PrerequisiteRows(
+        candidates=tuple(candidates),
+        full_size_records=tuple(records),
+    )
 
 
 def _tune_cohort_assignment(
@@ -1265,6 +2107,7 @@ def _tune_cohort_assignment(
     selected = {}
     records = {}
     materializers = {}
+    candidate_rows = ()
     full_size_records = ()
     check_records = ()
     input_signature: dict[str, Any] = {
@@ -1274,20 +2117,19 @@ def _tune_cohort_assignment(
 
     for family in ordered_families:
         if any(dependency not in selected for dependency in family.dependencies):
-            full_size_records = (
-                *full_size_records,
-                *_prerequisite_failed_records(
-                    problem=problems_by_family[family.name],
-                    family=family,
-                    assignment=assignment,
-                    selected=selected,
-                    records=records,
-                    materializers=materializers,
-                    constraints=run.cohort_constraints,
-                    family_names=family_names,
-                    run_dir=run_dir,
-                ),
+            prerequisite = _prerequisite_failed_records(
+                problem=problems_by_family[family.name],
+                family=family,
+                assignment=assignment,
+                selected=selected,
+                records=records,
+                materializers=materializers,
+                constraints=run.cohort_constraints,
+                family_names=family_names,
+                run_dir=run_dir,
             )
+            candidate_rows = (*candidate_rows, *prerequisite.candidates)
+            full_size_records = (*full_size_records, *prerequisite.full_size_records)
             continue
 
         problem = problems_by_family[family.name]
@@ -1296,15 +2138,14 @@ def _tune_cohort_assignment(
             message = f"family operator differs from problem operator: {family.name}"
             raise MaterializationError(message)
 
-        problem_with_dependencies = _with_dependency_identities(
-            problem,
-            family.dependencies,
-            selected,
-            records,
-            materializers,
-        )
         problem_for_assignment = _problem_for_assignment(
-            problem_with_dependencies,
+            _with_dependency_identities(
+                problem,
+                family.dependencies,
+                selected,
+                records,
+                materializers,
+            ),
             assignment,
             run.cohort_constraints,
             family_names,
@@ -1324,6 +2165,7 @@ def _tune_cohort_assignment(
                 clock=clock,
             )
             probe_cache[probe_key] = probe
+            candidate_rows = (*candidate_rows, *probe.candidate_rows)
             full_size_records = (*full_size_records, *probe.full_size_records)
             check_records = (*check_records, *probe.check_records)
 
@@ -1347,6 +2189,7 @@ def _tune_cohort_assignment(
     if set(selected) != set(family_names):
         return _AssignmentResult(
             state=None,
+            candidate_rows=candidate_rows,
             full_size_records=full_size_records,
             check_records=check_records,
         )
@@ -1364,6 +2207,7 @@ def _tune_cohort_assignment(
             input_signature=input_signature,
             materializers=materializers,
         ),
+        candidate_rows=candidate_rows,
         full_size_records=full_size_records,
         check_records=check_records,
     )
@@ -1404,7 +2248,16 @@ def tune_run(
     index = _run_problem_index(run, run_dir)
     _validate_run_validators(run, index.family_names)
 
+    if run.target.search_policy.strategy == "admission":
+        return _tune_run_admission(
+            run=run,
+            index=index,
+            run_dir=run_dir,
+            memory_backend=memory_backend,
+        )
+
     cohort_states = []
+    candidate_rows = ()
     full_size_records = ()
     check_records = ()
     probe_cache = {}
@@ -1422,6 +2275,7 @@ def tune_run(
             probe_cache=probe_cache,
         )
         full_size_records = (*full_size_records, *result.full_size_records)
+        candidate_rows = (*candidate_rows, *result.candidate_rows)
         check_records = (*check_records, *result.check_records)
 
         if result.state is not None:
@@ -1451,6 +2305,7 @@ def tune_run(
         records=records,
         input_signature=input_signature,
         policy=run.target.selection_policy,
+        candidate_rows=candidate_rows,
         full_size_records=full_size_records,
         check_records=check_records,
         materializers=materializers,
@@ -1484,6 +2339,60 @@ def tune_run(
             validation_records=validate_plan(plan, run.validators, run_dir=run_dir),
         )
         _write_summary(run_dir, plan)
+
+    return plan
+
+
+def _tune_run_admission(
+    *,
+    run: TuningRun,
+    index: _RunProblemIndex,
+    run_dir: Path,
+    memory_backend: MemoryBackend | None,
+) -> Plan:
+    candidate_rows = ()
+    input_signature: dict[str, Any] = {
+        "run_id": run.run_id,
+        "search_strategy": "admission",
+    }
+
+    for assignment in cohort_assignments(run.cohort_constraints, index.family_names):
+        for family in index.ordered_families:
+            problem = _problem_for_assignment(
+                index.problems_by_family[family.name],
+                assignment,
+                run.cohort_constraints,
+                index.family_names,
+            )
+            probe = _admission_probe_result(
+                problem,
+                run_dir=run_dir,
+                memory_backend=memory_backend,
+            )
+            candidate_rows = (*candidate_rows, *probe.candidate_rows)
+            input_signature[f"{assignment.assignment_id}:{family.name}"] = dict(
+                probe.input_signature
+            )
+
+    plan = Plan(
+        selected={},
+        records={},
+        input_signature=input_signature,
+        policy=run.target.selection_policy,
+        candidate_rows=candidate_rows,
+        target_identity=run.target.signature(),
+        runtime_identities={
+            family: index.problems_by_family[family].runtime.identity()
+            for family in index.family_names
+        },
+        adapter_identities={
+            family: dict(index.problems_by_family[family].adapter_identity)
+            for family in index.family_names
+        },
+        run_dir=run_dir,
+    )
+
+    _write_summary(run_dir, plan)
 
     return plan
 
