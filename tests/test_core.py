@@ -1405,6 +1405,8 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "admit_torch_func",
         "apply_final_logit_softcap",
         "apply_softcap",
+        "attention_operation_factory",
+        "attention_reference_check",
         "attention_settings_from_candidate",
         "axis_table",
         "candidate_record_from_json",

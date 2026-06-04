@@ -72,6 +72,23 @@ def attention_settings(
     )
 
 
+def attention_location() -> vpat.MappingAttentionLocation:
+    return vpat.MappingAttentionLocation(
+        semantics=attention_semantics(),
+        query_key="query",
+        key_key="key",
+        value_key="value",
+        output_key="out",
+        mask_key=None,
+        inverse_permutation_key=None,
+        query_block_size_key="query_block_size",
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
+        enable_gqa=False,
+    )
+
+
 def test_core_attention_axis_admits_executable_frontends() -> None:
     registry = vpx.AxisRegistry()
     registry.register(vpat.core_attention_axis())
@@ -167,6 +184,38 @@ def test_attention_settings_from_candidate_records_priority_order() -> None:
         "partition": "full",
         "padding": "dense_padded",
     }
+
+
+def test_attention_operation_factory_and_reference_check_execute_core_row() -> None:
+    inputs = attention_inputs()
+    batch = {
+        "query": inputs.query,
+        "key": inputs.key,
+        "value": inputs.value,
+        "query_block_size": 2,
+    }
+    candidate = vp.Candidate(
+        "attention",
+        "blockwise",
+        {
+            "attention.frontend": "blockwise_exact",
+            "attention.partition": "blockwise_queries",
+            "attention.padding": "dense_padded",
+        },
+    )
+    location = attention_location()
+    factory = vpat.attention_operation_factory(location)
+    reference_check = vpat.attention_reference_check(
+        location,
+        thresholds={"max_abs_diff": 1e-6, "max_rel_diff": 1e-6},
+    )
+    output = factory(candidate, batch, {})()
+    result = reference_check(candidate, batch, {})
+    expected = vpat.exact_attention(inputs)
+
+    torch.testing.assert_close(attention_output_tensor(output), expected)
+    assert result.name == "core_attention_reference"
+    assert result.measurements["max_abs_diff"] == pytest.approx(0.0)
 
 
 def test_pytorch_sdpa_direct_matches_exact_attention() -> None:

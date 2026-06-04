@@ -12,7 +12,14 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from vptune.candidates import AxisDescriptor
 from vptune.checks import tree_error_measurements, validate_thresholds
-from vptune.data import Candidate
+from vptune.data import (
+    Batch,
+    Candidate,
+    CandidateOperation,
+    OperationFactory,
+    ReferenceCheck,
+    ReferenceResult,
+)
 from vptune.errors import AdmissionError
 from vptune.tensor_tree import TensorTree
 
@@ -269,6 +276,71 @@ def attention_settings_from_candidate(settings: Mapping[str, Any]) -> AttentionS
     _validate_attention_settings(attention_settings)
 
     return attention_settings
+
+
+def attention_operation_factory(location: AttentionLocation) -> OperationFactory:
+    """Return an operation factory for package-owned attention execution."""
+
+    def factory(
+        candidate: Candidate,
+        batch: Batch,
+        vector: TensorTree,
+    ) -> CandidateOperation:
+        del vector
+        settings = attention_settings_from_candidate(candidate.settings)
+
+        def operation() -> TensorTree:
+            return execute_attention(location, batch, settings)
+
+        return operation
+
+    return factory
+
+
+def attention_reference_check(
+    location: AttentionLocation,
+    *,
+    thresholds: Mapping[str, float],
+) -> ReferenceCheck:
+    """Return an exact-attention reference check for package-owned attention rows."""
+
+    def check(
+        candidate: Candidate,
+        batch: Batch,
+        vector: TensorTree,
+    ) -> ReferenceResult:
+        del vector
+        settings = attention_settings_from_candidate(candidate.settings)
+        candidate_output = execute_attention(location, batch, settings)
+        reference_output = _attention_reference_output(location, batch, settings)
+        measurements = tree_error_measurements(candidate_output, reference_output)
+        validate_thresholds(measurements, thresholds)
+
+        return ReferenceResult(
+            name="core_attention_reference",
+            thresholds=dict(thresholds),
+            measurements=measurements,
+        )
+
+    return check
+
+
+def _attention_reference_output(
+    location: AttentionLocation,
+    batch: Batch,
+    settings: AttentionSettings,
+) -> TensorTree:
+    inputs = location.inputs(batch)
+    output = exact_attention(inputs)
+
+    if settings.partition == "packed_tokens":
+        if inputs.inverse_permutation is None:
+            message = "packed attention reference requires inverse token permutation"
+            raise AdmissionError(message)
+
+        output = output.index_select(-2, inputs.inverse_permutation)
+
+    return location.output(output, batch)
 
 
 def execute_attention(
