@@ -5476,6 +5476,16 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "memory.output_buffers": "fresh_allocation",
         },
     )
+    valid_compile_boundary = vp.Candidate(
+        "family",
+        "valid-compile-boundary",
+        {"compile.boundary": "metric_multiply"},
+    )
+    invalid_compile_boundary = vp.Candidate(
+        "family",
+        "invalid-compile-boundary",
+        {"compile.boundary": "unknown_boundary"},
+    )
 
     assert registry.admit(candidate).admission_status == "passed"
     assert registry.admit(bad_flag).admission_status == "failed"
@@ -5516,6 +5526,8 @@ def test_standard_axis_registry_validates_core_axes() -> None:
     assert registry.admit(jvp_microbatch).admission_status == "passed"
     assert registry.admit(hvp_microbatch).admission_status == "passed"
     assert registry.admit(valid_input_memory_axes).admission_status == "passed"
+    assert registry.admit(valid_compile_boundary).admission_status == "passed"
+    assert registry.admit(invalid_compile_boundary).admission_status == "failed"
     assert registry.axes["dtype.model_compute"].admit(bad_dtype)[0] is False
 
     with pytest.raises(vp.AdmissionError):

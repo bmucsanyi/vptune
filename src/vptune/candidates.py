@@ -225,6 +225,28 @@ INTEGER_TUPLE_DOMAIN = ("positive_integer_tuple_domain",)
 POSITIVE_FLOAT_DOMAIN = ("positive_float_domain",)
 DECLARED_DOMAIN = ("declared",)
 REGISTERED_DOMAIN = ("registered",)
+COMPILE_BOUNDARY_VALUES = (
+    "model_forward",
+    "transformer_block",
+    "attention_module",
+    "loss_closure",
+    "gradient_closure",
+    "jvp_closure",
+    "vjp_closure",
+    "hvp_single_vector",
+    "hvp_batched_vectors",
+    "ggn_jvp",
+    "ggn_loss_hessian_product",
+    "ggn_vjp",
+    "ggn_full_product",
+    "fisher_score_grad",
+    "sampled_fisher_score_grad",
+    "empirical_fisher_example_grad",
+    "metric_multiply",
+    "inverse_metric_solve",
+    "composition_child",
+    "whole_operator",
+)
 BACKEND_OPTION_KEYS = (
     "compile.options.epilogue_fusion",
     "compile.options.shape_padding",
@@ -696,28 +718,7 @@ def _axis_table_axis_domains() -> tuple[tuple[str, tuple[Any, ...]], ...]:
         ("compile.enabled", ("false", "true")),
         (
             "compile.boundary",
-            (
-                "model_forward",
-                "transformer_block",
-                "attention_module",
-                "loss_closure",
-                "gradient_closure",
-                "jvp_closure",
-                "vjp_closure",
-                "hvp_single_vector",
-                "hvp_batched_vectors",
-                "ggn_jvp",
-                "ggn_loss_hessian_product",
-                "ggn_vjp",
-                "ggn_full_product",
-                "fisher_score_grad",
-                "sampled_fisher_score_grad",
-                "empirical_fisher_example_grad",
-                "metric_multiply",
-                "inverse_metric_solve",
-                "composition_child",
-                "whole_operator",
-            ),
+            COMPILE_BOUNDARY_VALUES,
         ),
         ("compile.backend", ("inductor", "registered_backend")),
         ("compile.mode", (None, "default", "max-autotune")),
@@ -3124,7 +3125,7 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
         AxisDescriptor(
             "compile.boundary",
             ("compile.boundary",),
-            ("whole_operator",),
+            COMPILE_BOUNDARY_VALUES,
         ),
         AxisDescriptor("compile.backend", ("compile.backend",), ("inductor",)),
         AxisDescriptor(
