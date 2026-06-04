@@ -5486,6 +5486,25 @@ def test_standard_axis_registry_validates_core_axes() -> None:
         "invalid-compile-boundary",
         {"compile.boundary": "unknown_boundary"},
     )
+    valid_chunk_axes = vp.Candidate(
+        "family",
+        "valid-chunk-axes",
+        {
+            "batch.hvp_row_batch_size": 2,
+            "batch.ggn_batch_size": 3,
+            "chunk.token_block_size": 4,
+            "chunk.sequence_position_block_size": 5,
+            "chunk.output_cotangent_block_size": 6,
+            "chunk.parameter_block_size": 7,
+            "chunk.layer_block_size": 8,
+            "chunk.lm_head_weight_chunk_bytes": 9,
+        },
+    )
+    invalid_chunk_axis = vp.Candidate(
+        "family",
+        "invalid-chunk-axis",
+        {"chunk.token_block_size": 0},
+    )
 
     assert registry.admit(candidate).admission_status == "passed"
     assert registry.admit(bad_flag).admission_status == "failed"
@@ -5528,6 +5547,8 @@ def test_standard_axis_registry_validates_core_axes() -> None:
     assert registry.admit(valid_input_memory_axes).admission_status == "passed"
     assert registry.admit(valid_compile_boundary).admission_status == "passed"
     assert registry.admit(invalid_compile_boundary).admission_status == "failed"
+    assert registry.admit(valid_chunk_axes).admission_status == "passed"
+    assert registry.admit(invalid_chunk_axis).admission_status == "failed"
     assert registry.axes["dtype.model_compute"].admit(bad_dtype)[0] is False
 
     with pytest.raises(vp.AdmissionError):

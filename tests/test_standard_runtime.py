@@ -7121,6 +7121,27 @@ def test_standard_runtime_rejects_input_schedule_rows_without_binding(
         )
 
 
+def test_standard_runtime_rejects_unlowered_chunk_axis() -> None:
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+    )
+
+    with pytest.raises(vp.MaterializationError, match="unsupported"):
+        factory(
+            vp.Candidate(
+                "gradient",
+                "chunk-row",
+                {**gradient_settings(), "chunk.token_block_size": 2},
+                admission_status="passed",
+            ),
+            {"scale": torch.tensor(1.0, dtype=torch.float64)},
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+        )
+
+
 @pytest.mark.parametrize(
     ("settings_override", "message"),
     [

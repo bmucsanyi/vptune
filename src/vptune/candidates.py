@@ -3057,6 +3057,18 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             admission_rule=_gradient_accumulation_axis(),
         ),
         AxisDescriptor(
+            "batch.hvp_row_batch_size",
+            ("batch.hvp_row_batch_size",),
+            (),
+            admission_rule=_positive_int_axis("batch.hvp_row_batch_size"),
+        ),
+        AxisDescriptor(
+            "batch.ggn_batch_size",
+            ("batch.ggn_batch_size",),
+            (),
+            admission_rule=_positive_int_axis("batch.ggn_batch_size"),
+        ),
+        AxisDescriptor(
             "batch.fisher_sample_batch_size",
             ("batch.fisher_sample_batch_size",),
             (),
@@ -3082,6 +3094,18 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
         ),
         AxisDescriptor(
             "schedule.per_token", ("schedule.per_token",), ("loop", "packed")
+        ),
+        AxisDescriptor(
+            "chunk.token_block_size",
+            ("chunk.token_block_size",),
+            (),
+            admission_rule=_positive_int_axis("chunk.token_block_size"),
+        ),
+        AxisDescriptor(
+            "chunk.sequence_position_block_size",
+            ("chunk.sequence_position_block_size",),
+            (),
+            admission_rule=_positive_int_axis("chunk.sequence_position_block_size"),
         ),
         AxisDescriptor(
             "input.batch_layout",
@@ -3140,6 +3164,30 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             admission_rule=_positive_int_axis(
                 "chunk.class_block_size_with_exact_global_normalization",
             ),
+        ),
+        AxisDescriptor(
+            "chunk.output_cotangent_block_size",
+            ("chunk.output_cotangent_block_size",),
+            (),
+            admission_rule=_positive_int_axis("chunk.output_cotangent_block_size"),
+        ),
+        AxisDescriptor(
+            "chunk.parameter_block_size",
+            ("chunk.parameter_block_size",),
+            (),
+            admission_rule=_positive_int_axis("chunk.parameter_block_size"),
+        ),
+        AxisDescriptor(
+            "chunk.layer_block_size",
+            ("chunk.layer_block_size",),
+            (),
+            admission_rule=_positive_int_axis("chunk.layer_block_size"),
+        ),
+        AxisDescriptor(
+            "chunk.lm_head_weight_chunk_bytes",
+            ("chunk.lm_head_weight_chunk_bytes",),
+            (),
+            admission_rule=_positive_int_axis("chunk.lm_head_weight_chunk_bytes"),
         ),
         AxisDescriptor("compile.enabled", ("compile.enabled",), ("false", "true")),
         AxisDescriptor(
