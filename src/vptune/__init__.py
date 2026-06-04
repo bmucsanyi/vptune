@@ -36,6 +36,7 @@ from vptune.data import (
 from vptune.errors import (
     AdmissionError,
     MaterializationError,
+    MeasurementError,
     NoPassedCandidateError,
     ReferenceFailedError,
     StaleRecordError,
@@ -81,6 +82,7 @@ __all__ = [
     "MaterializationError",
     "Materializer",
     "Measurement",
+    "MeasurementError",
     "NoPassedCandidateError",
     "ObjectiveContext",
     "OperatorSpec",

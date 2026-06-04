@@ -21,5 +21,9 @@ class StaleRecordError(VPTuneError):
     """Raised when a saved record does not match the current run."""
 
 
+class MeasurementError(VPTuneError):
+    """Raised when measurement cannot produce a usable row."""
+
+
 class MaterializationError(VPTuneError):
     """Raised when a selected plan cannot be materialized."""

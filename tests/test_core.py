@@ -30,6 +30,7 @@ from vptune.data import FullSizeRecord, Measurement
 from vptune.errors import ReferenceFailedError
 from vptune.identities import (
     canonical_json,
+    cuda_driver_version,
     module_identity,
     stable_hash,
     to_json_value,
@@ -217,6 +218,24 @@ def test_environment_signature_captures_runtime_identity(
         "mps",
         "env",
     }
+
+
+def test_cuda_driver_version_is_none_when_runtime_does_not_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CUDARTWithoutDriverVersion:
+        pass
+
+    def fake_cudart() -> CUDARTWithoutDriverVersion:
+        return CUDARTWithoutDriverVersion()
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "cudart",
+        fake_cudart,
+    )
+
+    assert cuda_driver_version() is None
 
 
 def test_target_signature_includes_declared_device_identity() -> None:
@@ -1113,6 +1132,7 @@ def test_root_api_all_matches_public_surface() -> None:
         "MaterializationError",
         "Materializer",
         "Measurement",
+        "MeasurementError",
         "NoPassedCandidateError",
         "ObjectiveContext",
         "OperatorSpec",
@@ -1157,6 +1177,7 @@ def test_root_api_all_matches_public_surface() -> None:
         "validate_plan",
         "vjp",
     )
+    assert issubclass(vp.MeasurementError, vp.VPTuneError)
 
 
 def test_extension_api_all_matches_extension_surface() -> None:
@@ -1170,8 +1191,10 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "AutobatchDomain",
         "AutobatchFind",
         "AxisDescriptor",
-        "AxisManifest",
         "AxisRegistry",
+        "AxisTable",
+        "AxisTableAdmitter",
+        "AxisTableDescriptor",
         "CPUMemoryBackend",
         "CUDAMemoryBackend",
         "CallableMaterializer",
@@ -1186,8 +1209,6 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "FullSizeRecord",
         "KFACMetricBlock",
         "KFACMetricOperator",
-        "ManifestAxisDescriptor",
-        "ManifestCandidateAdmitter",
         "MappingAttentionLocation",
         "MaterializerCallback",
         "Measurement",
@@ -1202,7 +1223,7 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "admit_torch_func",
         "apply_final_logit_softcap",
         "apply_softcap",
-        "axis_manifest",
+        "axis_table",
         "candidate_record_from_json",
         "candidate_record_to_json",
         "check_patched_attention_output_reference",
@@ -1352,9 +1373,9 @@ def test_tensor_tree_foreach_inventory_matches_python_ops() -> None:
         tree_add_foreach(left, {"a": right["a"].float(), "b": right["b"]})
 
 
-def test_axis_manifest_matches_spec_feature_space() -> None:
-    manifest = vpx.axis_manifest()
-    by_key = manifest.by_key()
+def test_axis_table_matches_spec_feature_space() -> None:
+    axis_table = vpx.axis_table()
+    by_key = axis_table.by_key()
     expected_keys = {
         "activation.offload",
         "activation.recompute",
@@ -1542,14 +1563,14 @@ def test_axis_manifest_matches_spec_feature_space() -> None:
         "numeric_backend",
     }
     grouped_keys = tuple(
-        key for keys in manifest.class_c_groups.values() for key in keys
+        key for keys in axis_table.class_c_groups.values() for key in keys
     )
 
     assert set(by_key) == expected_keys
-    assert set(manifest.class_c_groups) == expected_groups
+    assert set(axis_table.class_c_groups) == expected_groups
     assert set(grouped_keys) == expected_keys
     assert len(grouped_keys) == len(expected_keys)
-    assert manifest.merge_rules == (
+    assert axis_table.merge_rules == (
         (
             "attention.partition=packed_tokens merges "
             "attention_dispatch with input_schedule"
@@ -1567,7 +1588,7 @@ def test_axis_manifest_matches_spec_feature_space() -> None:
         assert axis.value_domain
         assert axis.admission_rule_id
         assert axis.lowering_rule_id or axis.adapter_id
-        assert axis.axis_key in manifest.class_c_groups[axis.class_c_group]
+        assert axis.axis_key in axis_table.class_c_groups[axis.class_c_group]
 
     assert by_key["compile.mode"].value_domain == (None, "default", "max-autotune")
     assert by_key["attention.frontend"].value_domain == (
@@ -1609,35 +1630,35 @@ def test_axis_manifest_matches_spec_feature_space() -> None:
     assert by_key["dtensor.params_placement"].adapter_id == (
         "vptune.adapters.distributed"
     )
-    assert manifest.signature()["manifest_version"] == "1"
+    assert axis_table.signature()["axis_table_version"] == "1"
 
 
-def manifest_candidate(
+def axis_table_candidate(
     settings: Mapping[str, object],
     fixed_fields: Mapping[str, object],
 ) -> vp.Candidate:
-    return vpx.axis_manifest().admit(
+    return vpx.axis_table().admit(
         vp.Candidate("family", "row", settings),
         fixed_fields=fixed_fields,
     )
 
 
-def assert_manifest_admitted(
+def assert_axis_table_admitted(
     settings: Mapping[str, object],
     fixed_fields: Mapping[str, object],
 ) -> None:
-    admitted = manifest_candidate(settings, fixed_fields)
+    admitted = axis_table_candidate(settings, fixed_fields)
 
     assert admitted.admission_status == "passed"
     assert admitted.admission_error is None
 
 
-def assert_manifest_rejected(
+def assert_axis_table_rejected(
     settings: Mapping[str, object],
     fixed_fields: Mapping[str, object],
     match: str,
 ) -> None:
-    rejected = manifest_candidate(settings, fixed_fields)
+    rejected = axis_table_candidate(settings, fixed_fields)
 
     assert rejected.admission_status == "failed"
     assert rejected.admission_error is not None
@@ -1654,8 +1675,8 @@ def reduction_bound_fields() -> dict[str, object]:
     }
 
 
-def test_manifest_admission_requires_exact_loss_scaling_fields() -> None:
-    assert_manifest_admitted(
+def test_axis_table_admission_requires_exact_loss_scaling_fields() -> None:
+    assert_axis_table_admitted(
         {
             "numeric.loss_scaling": "static_scale_with_exact_unscale",
             "numeric.loss_scale": 8.0,
@@ -1663,22 +1684,22 @@ def test_manifest_admission_requires_exact_loss_scaling_fields() -> None:
         },
         {},
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"numeric.loss_scale": 8.0},
         {},
         "numeric.loss_scaling is required",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"numeric.loss_scaling": "none", "numeric.loss_scale": 8.0},
         {},
         "forbids",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"numeric.loss_scaling": "static_scale_with_exact_unscale"},
         {},
         "numeric.loss_scale is required",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "numeric.loss_scaling": "static_scale_with_exact_unscale",
             "numeric.loss_scale": 8.0,
@@ -1686,7 +1707,7 @@ def test_manifest_admission_requires_exact_loss_scaling_fields() -> None:
         {},
         "numeric.loss_unscale_degree is required",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "numeric.loss_scaling": "static_scale_with_exact_unscale",
             "numeric.loss_scale": 0.0,
@@ -1697,31 +1718,31 @@ def test_manifest_admission_requires_exact_loss_scaling_fields() -> None:
     )
 
 
-def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
-    assert_manifest_admitted(
+def test_axis_table_admission_rejects_metric_representation_mismatches() -> None:
+    assert_axis_table_admitted(
         {"metric.multiply_path": "dense_matmul"},
         {"metric.representation": "dense_matrix"},
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {
             "metric.multiply_path": "factorized_multiply",
             "metric.accumulation": "materialized_blocks",
         },
         {"metric.representation": "kfac_factors"},
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {"inverse_metric.solve_path": "woodbury_low_rank_solve"},
         {"metric.representation": "low_rank_factors"},
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {"inverse_metric.solve_path": "cholesky_solve"},
         {"metric.representation": "dense_matrix", "metric.psd": True},
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {"inverse_metric.solve_path": "eigh_solve"},
         {"metric.representation": "dense_matrix", "metric.symmetric": True},
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {
             "inverse_metric.solve_path": "conjugate_gradient",
             "inverse_metric.iteration_budget": 4,
@@ -1730,7 +1751,7 @@ def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
         },
         {"metric.representation": "dense_matrix"},
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {
             "metric.multiply_path": "blockwise_multiply",
             "metric.block_schedule": "custom_blocks",
@@ -1743,7 +1764,7 @@ def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
             }
         },
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {
             "inverse_metric.solve_path": "blockwise_solve",
             "inverse_metric.block_schedule": "layer_blocks",
@@ -1756,42 +1777,42 @@ def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
         },
     )
 
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"metric.multiply_path": "dense_matmul"},
         {"metric.representation": "kfac_factors"},
         "dense matrix",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"metric.multiply_path": "factorized_multiply"},
         {"metric.representation": "dense_matrix"},
         "requires factors",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"metric.multiply_path": "blockwise_multiply"},
         {"metric.representation": "kfac_factors"},
         "requires blocks",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"inverse_metric.solve_path": "dense_solve"},
         {"metric.representation": "kfac_factors"},
         "requires dense matrix",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"inverse_metric.solve_path": "cholesky_solve"},
         {"metric.representation": "dense_matrix"},
         "requires a PSD metric",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"inverse_metric.solve_path": "eigh_solve"},
         {"metric.representation": "dense_matrix"},
         "requires a symmetric metric",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"inverse_metric.solve_path": "woodbury_low_rank_solve"},
         {"metric.representation": "kfac_factors"},
         "requires low-rank factors",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "inverse_metric.solve_path": "conjugate_gradient",
             "inverse_metric.iteration_budget": 4,
@@ -1800,7 +1821,7 @@ def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
         {"metric.representation": "dense_matrix"},
         "metric.multiply_path",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "inverse_metric.solve_path": "conjugate_gradient",
             "metric.multiply_path": "dense_matmul",
@@ -1808,7 +1829,7 @@ def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
         {"metric.representation": "dense_matrix"},
         "iteration_budget",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "inverse_metric.solve_path": "conjugate_gradient",
             "metric.multiply_path": "dense_matmul",
@@ -1817,7 +1838,7 @@ def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
         {"metric.representation": "dense_matrix"},
         "preconditioner",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "inverse_metric.solve_path": "dense_solve",
             "inverse_metric.preconditioner": "none",
@@ -1825,17 +1846,17 @@ def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
         {"metric.representation": "dense_matrix"},
         "iterative",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"metric.block_schedule": "layer_blocks"},
         {"metric.representation": "low_rank_factors"},
         "requires blocks or KFAC factors",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"metric.block_schedule": "layer_blocks"},
         {"metric.representation": "block_diagonal"},
         "representation.block_schedule",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"metric.block_schedule": "layer_blocks"},
         {
             "metric.representation": {
@@ -1845,7 +1866,7 @@ def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
         },
         "must match representation.block_schedule",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"inverse_metric.block_schedule": "module_blocks"},
         {
             "metric.representation": {
@@ -1855,22 +1876,22 @@ def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
         },
         "must match representation.block_schedule",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"metric.accumulation": "streaming", "metric.multiply_path": "dense_matmul"},
         {"metric.representation": "dense_matrix"},
         "non-dense metric paths",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"metric.accumulation": "streaming"},
         {"metric.representation": "kfac_factors"},
         "requires metric.multiply_path",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"metric.multiply_path": "factorized_multiply"},
         {"metric.representation": "kfac_factors"},
         "metric.accumulation is required",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "metric.multiply_path": "streaming_multiply",
             "metric.accumulation": "materialized_blocks",
@@ -1878,7 +1899,7 @@ def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
         {"metric.representation": "kfac_factors"},
         "must be streaming",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "metric.multiply_path": "factorized_multiply",
             "metric.accumulation": "streaming",
@@ -1886,15 +1907,15 @@ def test_manifest_admission_rejects_metric_representation_mismatches() -> None:
         {"metric.representation": "kfac_factors"},
         "must be materialized_blocks",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"dtype.metric_factor": "bf16"},
         {"metric.representation": "dense_matrix"},
         "requires a factorized metric path",
     )
 
 
-def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
-    assert_manifest_admitted(
+def test_axis_table_admission_rejects_cross_axis_contradictions() -> None:
+    assert_axis_table_admitted(
         {
             "attention.sdpa_kernel": "math",
             "attention.partition": "packed_tokens",
@@ -1902,7 +1923,7 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         },
         {"attention.calls_sdpa": True},
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {
             "compile.enabled": "true",
             "compile.mode": None,
@@ -1911,22 +1932,22 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         },
         {},
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {"attention.partition": "segmented_forward_ad", "jvp.path": "forward_ad_dual"},
         {},
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {"dtype.accumulation": "bf16"},
         reduction_bound_fields(),
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {"sampled_fisher.sample_source": "fixed_seed_and_count"},
         {
             "sampled_fisher.sample_count": 4,
             "sampled_fisher.sample_seed": 123,
         },
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {
             "sampled_fisher.sample_source": "fixed_seed_and_count",
             "sampled_fisher.exact_fisher_check": "enabled_with_sampling_bound",
@@ -1937,7 +1958,7 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
             "sampled_fisher.sampling_bound": {"kind": "absolute_error"},
         },
     )
-    assert_manifest_admitted(
+    assert_axis_table_admitted(
         {"tp.loss_parallel": "true"},
         {
             "tp.exact_cross_shard_normalization": True,
@@ -1945,37 +1966,37 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         },
     )
 
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"unknown.axis": "x"},
         {},
-        "no manifest owner",
+        "no axis table owner",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"vectorization.batch_size": 0},
         {},
         "positive integer",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"attention.sdpa_kernel": "math"},
         {},
         "calls PyTorch SDPA",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"attention.sdpa_kernel": "flash_attention"},
         {"attention.calls_sdpa": True, "attention.effective_runtime_dtype": "fp32"},
         "requires float16 or bfloat16",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"attention.sdpa_kernel": "priority_list"},
         {"attention.calls_sdpa": True},
         "requires backend order",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"schedule.per_token": "packed", "input.batch_layout": "dense_padded"},
         {},
         "requires packed or variable-length layout",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "activation.recompute": "none",
             "checkpoint.early_stop": "true",
@@ -1983,12 +2004,12 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         {},
         "checkpoint.early_stop=false",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"activation.offload": "saved_tensor_hooks_cpu"},
         {},
         "saved-tensor-hooks path",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "compile.enabled": "false",
             "compile.mode": "max-autotune",
@@ -1996,7 +2017,7 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         {},
         "compile.enabled=false forbids",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "compile.mode": "default",
             "compile.options.epilogue_fusion": "true",
@@ -2004,7 +2025,7 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         {},
         "backend options require compile.mode=None",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "compile.mode": "default",
             "compile.cuda_graphs": "true",
@@ -2012,7 +2033,7 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         {},
         "backend options require compile.mode=None",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "compile.mode": None,
             "compile.options.epilogue_fusion": "false",
@@ -2022,17 +2043,17 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         {},
         "forbid compile.mode=None",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"numeric.float32_matmul_precision": "medium"},
         {},
         "missing bound fields",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"sampled_fisher.sample_source": "fixed_sample_table"},
         {"sampled_fisher.sample_count": 4},
         "sample table identity",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "sampled_fisher.sample_source": "fixed_seed_and_count",
             "sampled_fisher.exact_fisher_check": "enabled_with_sampling_bound",
@@ -2043,7 +2064,7 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         },
         "sampling-bound formula",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "gradient.value_reuse": "gradient_and_primal_value",
             "gradient.path": "torch_func_grad",
@@ -2051,7 +2072,7 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         {},
         "value-and-gradient path",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "jvp.linearize_reuse": "reuse_at_same_primal",
             "jvp.path": "torch_func_jvp",
@@ -2059,7 +2080,7 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         {},
         "requires torch_func_linearize",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "vjp.closure_reuse": "reuse_vjp_closure_at_same_primal",
             "vjp.path": "autograd_grad_outputs",
@@ -2067,17 +2088,17 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         {},
         "requires torch_func_vjp",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"ggn.jvp_path": "torch_func_jvp"},
         {},
         "ggn.vjp_path is required",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"fisher.accumulation": "streaming_dot_accumulate"},
         {},
         "fisher.expectation_path is required",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "fisher.expectation_path": "explicit_full_expectation_score_rows",
             "fisher.accumulation": "streaming_dot_accumulate",
@@ -2085,7 +2106,7 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         {},
         "fisher.score_grad_path is required",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "fisher.expectation_path": "explicit_full_expectation_score_rows",
             "fisher.accumulation": "materialize_score_gradients",
@@ -2094,7 +2115,7 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         {},
         "not used",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {
             "inverse_metric.solve_path": "dense_solve",
             "inverse_metric.iteration_budget": 4,
@@ -2102,12 +2123,12 @@ def test_manifest_admission_rejects_cross_axis_contradictions() -> None:
         {"metric.representation": "dense_matrix"},
         "applies only to iterative solves",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"attention.partition": "segmented_forward_ad"},
         {},
         "requires forward AD path",
     )
-    assert_manifest_rejected(
+    assert_axis_table_rejected(
         {"tp.loss_parallel": "true"},
         {"tp.exact_cross_shard_normalization": True},
         "multi-rank agreement check",
@@ -2358,6 +2379,7 @@ def test_adapter_namespace_exports_adapter_helpers() -> None:
     assert vpa.run_with_loss_parallel
     assert vpa.wait_collective
     assert vpa.distributed_strategy_axis
+    assert vpa.RankCompileTiming
     assert vpa.RankStatus
     assert vpa.PilotReadiness
     assert vpa.load_transformers_model
@@ -2410,6 +2432,14 @@ def test_module_identity_records_tied_parameters_and_devices() -> None:
 
     with pytest.raises(RuntimeError, match="layer_groups"):
         vp.parameter_surface(TiedModule(), layer_groups=(("first",),))
+
+    with pytest.raises(RuntimeError, match="parametrization_policy"):
+        vp.ParameterSurface(
+            names=("first",),
+            shapes=((2,),),
+            trainable=(True,),
+            parametrization_policy="disabled",
+        )
 
 
 def test_module_identity_records_nested_parametrizations() -> None:
@@ -3004,9 +3034,14 @@ def test_measurement_cleans_memory_backend_after_runtime_failure() -> None:
         message = "failed measurement"
         raise RuntimeError(message)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(vp.MeasurementError) as error_info:
         measure_once(operation, memory_backend=backend)
 
+    error = error_info.value
+
+    assert isinstance(error, measure_module.OperationMeasurementError)
+    assert error.error_type == "RuntimeError"
+    assert error.samples[0].device == "cpu"
     assert backend.cleanup_calls == 2
 
 
@@ -5524,6 +5559,112 @@ def test_autobatch_bridge_selects_candidate_by_positive_index_domain() -> None:
     assert calls == ["second"]
 
 
+AUTOBATCH_FAILURE_SIGNALS = (
+    "backend_rejection",
+    "oom",
+    "reference_failure",
+    "runtime_failure",
+)
+
+
+def make_autobatch_domain(
+    *,
+    min_value: int = 1,
+    max_value: int = 4,
+    initial_value: int = 1,
+    growth: str = "doubling",
+    values: tuple[int, ...] = (1, 2, 4),
+    settings_by_value: Mapping[int, Mapping[str, object]] | None = None,
+    objective: str = "fastest_passing",
+    failure_signals: tuple[str, ...] = AUTOBATCH_FAILURE_SIGNALS,
+    termination: str = "exhausted_declared_values",
+) -> vpx.AutobatchDomain:
+    selected_settings = (
+        {value: {"batch_size": value} for value in values}
+        if settings_by_value is None
+        else settings_by_value
+    )
+
+    return vpx.AutobatchDomain(
+        axis_name="batch_size",
+        min_value=min_value,
+        max_value=max_value,
+        initial_value=initial_value,
+        growth=growth,
+        values=values,
+        settings_by_value=selected_settings,
+        value_to_settings_id="tests.batch_size_settings",
+        admission_identity={"case": "test"},
+        objective=objective,
+        failure_signals=failure_signals,
+        termination=termination,
+        warmup_steps=0,
+        measure_steps=1,
+        devices=(0,),
+        cache_key_payload={"case": "autobatch-domain"},
+    )
+
+
+def test_autobatch_domain_signature_records_finite_search_shape() -> None:
+    domain = make_autobatch_domain()
+    signature = domain.signature()
+
+    assert signature["min_value"] == 1
+    assert signature["max_value"] == 4
+    assert signature["initial_value"] == 1
+    assert signature["growth"] == "doubling"
+    assert signature["objective"] == "fastest_passing"
+    assert signature["failure_signals"] == AUTOBATCH_FAILURE_SIGNALS
+    assert signature["termination"] == "exhausted_declared_values"
+    assert signature["values"] == (1, 2, 4)
+    assert signature["settings_by_value"] == {
+        "1": {"batch_size": 1},
+        "2": {"batch_size": 2},
+        "4": {"batch_size": 4},
+    }
+
+
+def test_autobatch_domain_accepts_all_growth_rules() -> None:
+    doubling = make_autobatch_domain(growth="doubling", values=(1, 2, 4))
+    linear = make_autobatch_domain(
+        growth="linear_step",
+        values=(1, 3, 5),
+        max_value=5,
+    )
+    declared = make_autobatch_domain(
+        growth="declared_sequence",
+        values=(1, 3, 8),
+        max_value=8,
+    )
+
+    assert doubling.signature()["growth"] == "doubling"
+    assert linear.signature()["growth"] == "linear_step"
+    assert declared.signature()["growth"] == "declared_sequence"
+
+
+def test_autobatch_domain_rejects_invalid_finite_search_shape() -> None:
+    with pytest.raises(RuntimeError, match="strictly increasing"):
+        make_autobatch_domain(values=(1, 1, 2))
+
+    with pytest.raises(RuntimeError, match="doubling"):
+        make_autobatch_domain(values=(1, 3, 4))
+
+    with pytest.raises(RuntimeError, match="initial_value"):
+        make_autobatch_domain(initial_value=2)
+
+    with pytest.raises(RuntimeError, match="settings_by_value"):
+        make_autobatch_domain(settings_by_value={1: {"batch_size": 1}})
+
+    with pytest.raises(RuntimeError, match="objective"):
+        make_autobatch_domain(objective="fastest_step")
+
+    with pytest.raises(RuntimeError, match="bracketed_failure_frontier"):
+        make_autobatch_domain(
+            objective="largest_passing",
+            termination="exhausted_declared_values",
+        )
+
+
 def test_tune_delegates_autobatch_domain_to_autobatch_find(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5613,6 +5754,10 @@ def test_tune_delegates_autobatch_domain_to_autobatch_find(
             (
                 vpx.AutobatchDomain(
                     axis_name="batch_size",
+                    min_value=1,
+                    max_value=2,
+                    initial_value=1,
+                    growth="linear_step",
                     values=(1, 2),
                     settings_by_value={
                         1: {"batch_size": 1},
@@ -5620,7 +5765,14 @@ def test_tune_delegates_autobatch_domain_to_autobatch_find(
                     },
                     value_to_settings_id="tests.batch_size_settings",
                     admission_identity={"case": "test"},
-                    goal="fastest_step",
+                    objective="fastest_passing",
+                    failure_signals=(
+                        "backend_rejection",
+                        "oom",
+                        "reference_failure",
+                        "runtime_failure",
+                    ),
+                    termination="exhausted_declared_values",
                     warmup_steps=0,
                     measure_steps=1,
                     devices=(0,),
@@ -5643,6 +5795,128 @@ def test_tune_delegates_autobatch_domain_to_autobatch_find(
     assert calls == ["base|batch_size=1", "base|batch_size=2"]
     assert plan.selected["family"].candidate_id == "base|batch_size=2"
     assert plan.selected["family"].settings["batch_size"] == 2
+
+
+def test_autobatch_domain_filters_reference_failures_before_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probed = []
+    find_values = []
+    model = torch.nn.Linear(1, 1)
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert batch["source"] == "reference"
+        assert isinstance(vector, torch.Tensor)
+
+        if candidate.settings["batch_size"] == 1:
+            message = "reference rejected value"
+            raise vp.ReferenceFailedError(message)
+
+        return reference_passed()
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert batch["source"] == "probe"
+        assert isinstance(vector, torch.Tensor)
+
+        def operation() -> torch.Tensor:
+            probed.append(candidate.settings["batch_size"])
+
+            return vector * float(candidate.settings["batch_size"])
+
+        return operation
+
+    def fake_find(
+        probe: Callable[[int], None],
+        *,
+        values: Sequence[int],
+        goal: autobatch.Goal,
+        cache_key: Hashable,
+        warmup_steps: int,
+        measure_steps: int,
+        devices: list[int],
+    ) -> int:
+        assert goal == autobatch.Goal.largest_safe()
+        assert isinstance(cache_key, tuple)
+        assert warmup_steps == 0
+        assert measure_steps == 1
+        assert devices == [0]
+        find_values.append(tuple(values))
+        probe(2)
+
+        return 2
+
+    monkeypatch.setattr(autobatch_bridge.autobatch, "find", fake_find)
+    target = cpu_target(
+        vp.TimingPolicy(
+            short_seconds=0.0,
+            medium_seconds=0.0,
+            long_warmups=0,
+            long_measured_calls=1,
+        )
+    )
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "objective", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            (vp.Candidate("family", "base", {}, admission_status="passed"),),
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"generator": "autobatch-domain"},
+            (
+                vpx.AutobatchDomain(
+                    axis_name="batch_size",
+                    min_value=1,
+                    max_value=2,
+                    initial_value=1,
+                    growth="linear_step",
+                    values=(1, 2),
+                    settings_by_value={
+                        1: {"batch_size": 1},
+                        2: {"batch_size": 2},
+                    },
+                    value_to_settings_id="tests.batch_size_settings",
+                    admission_identity={"case": "test"},
+                    objective="largest_passing",
+                    failure_signals=AUTOBATCH_FAILURE_SIGNALS,
+                    termination="bracketed_failure_frontier",
+                    warmup_steps=0,
+                    measure_steps=1,
+                    devices=(0,),
+                    cache_key_payload={"case": "autobatch-domain"},
+                ),
+            ),
+        ),
+    )
+    plan = vp.tune(
+        problem,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 2.0)),
+    )
+
+    failed = {
+        record.candidate_id: record
+        for record in plan.full_size_records
+        if record.status == "failed"
+    }
+
+    assert find_values == [(2,)]
+    assert probed == [2]
+    assert plan.selected["family"].candidate_id == "base|batch_size=2"
+    assert failed["base|batch_size=1"].error_type == "ReferenceFailedError"
 
 
 def test_plan_replay_preserves_autobatch_selected_value(
@@ -5722,6 +5996,10 @@ def test_plan_replay_preserves_autobatch_selected_value(
             (
                 vpx.AutobatchDomain(
                     axis_name="batch_size",
+                    min_value=1,
+                    max_value=2,
+                    initial_value=1,
+                    growth="linear_step",
                     values=(1, 2),
                     settings_by_value={
                         1: {"batch_size": 1},
@@ -5729,7 +6007,14 @@ def test_plan_replay_preserves_autobatch_selected_value(
                     },
                     value_to_settings_id="tests.batch_size_settings",
                     admission_identity={"case": "test"},
-                    goal="largest_safe",
+                    objective="largest_passing",
+                    failure_signals=(
+                        "backend_rejection",
+                        "oom",
+                        "reference_failure",
+                        "runtime_failure",
+                    ),
+                    termination="bracketed_failure_frontier",
                     warmup_steps=0,
                     measure_steps=1,
                     devices=(0,),

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from vptune.autobatch_bridge import find_autobatch_value
-from vptune.candidates import AxisManifest, axis_manifest, topological_families
+from vptune.candidates import AxisTable, axis_table, topological_families
 from vptune.cohorts import candidate_matches_assignment, cohort_assignments
 from vptune.data import (
     AutobatchDomain,
@@ -954,7 +954,7 @@ def _smoke_candidate_rows(candidates: tuple[Candidate, ...]) -> tuple[Candidate,
         )
         raise MaterializationError(message)
 
-    manifest = axis_manifest()
+    table = axis_table()
     selected = [passed_baselines[0]]
     seen_groups = set()
 
@@ -962,7 +962,7 @@ def _smoke_candidate_rows(candidates: tuple[Candidate, ...]) -> tuple[Candidate,
         if not candidate.changed_axes or candidate.admission_status != "passed":
             continue
 
-        group_key = _candidate_class_c_groups(candidate, manifest)
+        group_key = _candidate_class_c_groups(candidate, table)
 
         if group_key in seen_groups:
             continue
@@ -975,9 +975,9 @@ def _smoke_candidate_rows(candidates: tuple[Candidate, ...]) -> tuple[Candidate,
 
 def _candidate_class_c_groups(
     candidate: Candidate,
-    manifest: AxisManifest,
+    axis_table: AxisTable,
 ) -> tuple[str, ...]:
-    by_key = manifest.by_key()
+    by_key = axis_table.by_key()
     groups = []
 
     for axis_key in candidate.changed_axes:
@@ -985,7 +985,7 @@ def _candidate_class_c_groups(
 
         if axis is None:
             message = (
-                f"smoke search changed axis has no Class C manifest group: {axis_key}"
+                f"smoke search changed axis has no Class C axis table group: {axis_key}"
             )
             raise MaterializationError(message)
 
@@ -1307,7 +1307,7 @@ def _balanced_group_candidates(
     candidates: tuple[Candidate, ...],
 ) -> dict[tuple[str, ...], tuple[Candidate, ...]]:
     groups = {}
-    manifest = axis_manifest()
+    table = axis_table()
 
     for candidate in candidates:
         if (
@@ -1318,7 +1318,7 @@ def _balanced_group_candidates(
             continue
 
         _validate_balanced_delta(candidate)
-        group_key = _candidate_class_c_groups(candidate, manifest)
+        group_key = _candidate_class_c_groups(candidate, table)
         groups.setdefault(group_key, []).append(candidate)
 
     return {group: tuple(rows) for group, rows in groups.items()}
@@ -1778,7 +1778,7 @@ def _probe_problem_with_autobatch(
                 clock,
             ),
             values=reference_rows.passed_values,
-            goal=domain.goal,
+            objective=domain.objective,
             cache_key=_autobatch_cache_key(problem, domain, input_signature),
             warmup_steps=domain.warmup_steps,
             measure_steps=domain.measure_steps,
@@ -1808,7 +1808,7 @@ def _probe_problem_with_autobatch(
                     "selected": True,
                     "axis_name": domain.axis_name,
                     "value": value,
-                    "goal": domain.goal,
+                    "objective": domain.objective,
                 },
             )
 

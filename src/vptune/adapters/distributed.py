@@ -576,6 +576,20 @@ class RankSelectedSettings:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class RankCompileTiming:
+    """Compile timing reported by one distributed rank."""
+
+    rank: int
+    compile_time_seconds: float
+    steady_elapsed_seconds: float
+    recompile_count: int
+
+    def to_record(self) -> dict[str, Any]:
+        """Return JSON-compatible compile timing."""
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class DistributedAdmissionPolicy:
     """Admission identity for distributed candidates."""
 
@@ -1064,6 +1078,7 @@ def distributed_record(
     rank_memory_samples: Sequence[Measurement],
     rank_selected_settings: Sequence[RankSelectedSettings],
     global_parameter_surface: Mapping[str, Any],
+    rank_compile_timings: Sequence[RankCompileTiming] = (),
 ) -> dict[str, Any]:
     """Return a distributed row record payload."""
     _require_distributed_identity(identity)
@@ -1075,6 +1090,11 @@ def distributed_record(
     )
     selected_settings = require_rank_selected_settings_agree(rank_selected_settings)
     global_status = reduce_rank_statuses(rank_statuses)
+    selection_metadata = _distributed_selection_metadata(
+        selected_settings,
+        rank_memory_samples,
+        rank_compile_timings,
+    )
 
     return {
         "identity": dict(identity),
@@ -1105,7 +1125,64 @@ def distributed_record(
         "rank_selected_settings": tuple(
             report.to_record() for report in rank_selected_settings
         ),
+        "selection_metadata": selection_metadata,
+        "rank_compile_timings": tuple(
+            timing.to_record() for timing in rank_compile_timings
+        ),
     }
+
+
+def _distributed_selection_metadata(
+    selected_settings: Mapping[str, Any],
+    rank_memory_samples: Sequence[Measurement],
+    rank_compile_timings: Sequence[RankCompileTiming],
+) -> dict[str, Any]:
+    metadata = {
+        "global_elapsed_seconds": max(
+            sample.elapsed_seconds for sample in rank_memory_samples
+        ),
+    }
+    compiled = selected_settings.get("compile.enabled") == "true"
+
+    if compiled:
+        _require_compile_timing_rank_set(rank_memory_samples, rank_compile_timings)
+        metadata.update({
+            "global_compile_time_seconds": max(
+                timing.compile_time_seconds for timing in rank_compile_timings
+            ),
+            "global_steady_elapsed_seconds": max(
+                timing.steady_elapsed_seconds for timing in rank_compile_timings
+            ),
+            "recompile_count": max(
+                timing.recompile_count for timing in rank_compile_timings
+            ),
+        })
+
+        return metadata
+
+    if rank_compile_timings:
+        message = "rank compile timings apply only to compiled distributed rows"
+        raise MaterializationError(message)
+
+    return metadata
+
+
+def _require_compile_timing_rank_set(
+    rank_memory_samples: Sequence[Measurement],
+    rank_compile_timings: Sequence[RankCompileTiming],
+) -> None:
+    memory_ranks = _rank_set(
+        tuple(sample.rank for sample in rank_memory_samples),
+        "memory",
+    )
+    compile_ranks = _rank_set(
+        tuple(timing.rank for timing in rank_compile_timings),
+        "compile timing",
+    )
+
+    if memory_ranks != compile_ranks:
+        message = "distributed compile timing ranks differ from memory ranks"
+        raise MaterializationError(message)
 
 
 def _require_matching_rank_sets(

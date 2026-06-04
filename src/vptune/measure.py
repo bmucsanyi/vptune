@@ -8,6 +8,7 @@ from typing import Any, Protocol
 import torch
 
 from vptune.data import Candidate, FullSizeRecord, Measurement, TimingPolicy
+from vptune.errors import MeasurementError
 from vptune.tensor_tree import TensorTree, tree_detach, tree_signature
 
 
@@ -154,7 +155,7 @@ def default_memory_backend(devices: Sequence[str]) -> MemoryBackend:
     return CPUMemoryBackend()
 
 
-class OperationMeasurementError(RuntimeError):
+class OperationMeasurementError(MeasurementError):
     """Operation failure with samples from the measured region."""
 
     def __init__(

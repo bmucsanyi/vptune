@@ -26,25 +26,19 @@ class AutobatchFind(Protocol):
         """Run Autobatch search and return the selected value."""
 
 
-def autobatch_goal(name: str) -> autobatch.Goal:
-    """Return the Autobatch goal named by a domain.
+def autobatch_goal(objective: str) -> autobatch.Goal:
+    """Return the Autobatch goal selected by a domain objective.
 
     Raises:
         MaterializationError: If the goal name has no supported Autobatch mapping.
     """
-    if name == "largest_safe":
+    if objective == "largest_passing":
         return autobatch.Goal.largest_safe()
 
-    if name == "smallest_safe":
-        return autobatch.Goal.smallest_safe()
-
-    if name == "fastest_step":
+    if objective == "fastest_passing":
         return autobatch.Goal.fastest_step()
 
-    if name == "best_value_rate":
-        return autobatch.Goal.best_value_rate()
-
-    message = f"autobatch goal is unsupported by this domain: {name}"
+    message = f"autobatch objective is unsupported by this domain: {objective}"
     raise MaterializationError(message)
 
 
@@ -52,7 +46,7 @@ def find_autobatch_value(
     probe: Callable[[int], None],
     *,
     values: Sequence[int],
-    goal: str,
+    objective: str,
     cache_key: Hashable,
     warmup_steps: int,
     measure_steps: int,
@@ -69,7 +63,7 @@ def find_autobatch_value(
     return selected_find(
         probe,
         values=values,
-        goal=autobatch_goal(goal),
+        goal=autobatch_goal(objective),
         cache_key=cache_key,
         warmup_steps=warmup_steps,
         measure_steps=measure_steps,
@@ -104,7 +98,7 @@ def select_fastest_candidate_with_autobatch(
     selected_value = find_autobatch_value(
         probe,
         values=values,
-        goal="fastest_step",
+        objective="fastest_passing",
         cache_key=cache_key,
         warmup_steps=warmup_steps,
         measure_steps=measure_steps,

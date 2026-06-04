@@ -1,6 +1,7 @@
 """Core data objects."""
 
 import dataclasses
+import itertools
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -18,6 +19,7 @@ from vptune.tensor_tree import TensorTree
 SCHEMA_VERSION = 1
 PACKAGE_VERSION = "0.0.1"
 MIN_VARIANCE_REPEAT_COUNT = 2
+MIN_LINEAR_DOMAIN_VALUES = 3
 
 
 Batch = Mapping[str, Any]
@@ -211,27 +213,63 @@ class AutobatchDomain:
     """Explicit Autobatch-backed axis domain."""
 
     axis_name: str
+    min_value: int
+    max_value: int
+    initial_value: int
+    growth: str
     values: tuple[int, ...]
     settings_by_value: Mapping[int, Mapping[str, Any]]
     value_to_settings_id: str
     admission_identity: Mapping[str, Any]
-    goal: str
+    objective: str
+    failure_signals: tuple[str, ...]
+    termination: str
     warmup_steps: int
     measure_steps: int
     devices: tuple[int, ...]
     cache_key_payload: Mapping[str, Any]
 
+    def __post_init__(self) -> None:
+        """Validate the finite integer domain."""
+        _require_nonempty_string(self.axis_name, "axis_name")
+        _require_positive_integer(self.min_value, "min_value")
+        _require_positive_integer(self.max_value, "max_value")
+        _require_positive_integer(self.initial_value, "initial_value")
+        _require_autobatch_growth(self.growth)
+        _require_autobatch_objective(self.objective)
+        _require_autobatch_failure_signals(self.failure_signals)
+        _require_autobatch_termination(self.termination)
+        _require_autobatch_objective_termination(self.objective, self.termination)
+        _require_autobatch_values(
+            self.values,
+            min_value=self.min_value,
+            max_value=self.max_value,
+            initial_value=self.initial_value,
+            growth=self.growth,
+        )
+        _require_autobatch_settings(self.values, self.settings_by_value)
+        _require_nonempty_string(self.value_to_settings_id, "value_to_settings_id")
+        _require_nonnegative_integer(self.warmup_steps, "warmup_steps")
+        _require_positive_integer(self.measure_steps, "measure_steps")
+        _require_autobatch_devices(self.devices)
+
     def signature(self) -> dict[str, Any]:
         """Return stable domain identity."""
         return {
             "axis_name": self.axis_name,
+            "min_value": self.min_value,
+            "max_value": self.max_value,
+            "initial_value": self.initial_value,
+            "growth": self.growth,
             "values": self.values,
             "settings_by_value": {
                 str(value): dict(self.settings_by_value[value]) for value in self.values
             },
             "value_to_settings_id": self.value_to_settings_id,
             "admission_identity": dict(self.admission_identity),
-            "goal": self.goal,
+            "objective": self.objective,
+            "failure_signals": self.failure_signals,
+            "termination": self.termination,
             "warmup_steps": self.warmup_steps,
             "measure_steps": self.measure_steps,
             "devices": self.devices,
@@ -249,6 +287,161 @@ class AutobatchDomain:
             raise RuntimeError(message)
 
         return dict(self.settings_by_value[value])
+
+
+def _require_nonempty_string(value: str, field: str) -> None:
+    if not isinstance(value, str) or not value:
+        message = f"AutobatchDomain {field} must be a nonempty string"
+        raise RuntimeError(message)
+
+
+def _require_positive_integer(value: int, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        message = f"AutobatchDomain {field} must be a positive integer"
+        raise RuntimeError(message)
+
+
+def _require_nonnegative_integer(value: int, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        message = f"AutobatchDomain {field} must be a nonnegative integer"
+        raise RuntimeError(message)
+
+
+def _require_autobatch_growth(growth: str) -> None:
+    if growth not in {"doubling", "linear_step", "declared_sequence"}:
+        message = f"AutobatchDomain growth is unsupported: {growth}"
+        raise RuntimeError(message)
+
+
+def _require_autobatch_objective(objective: str) -> None:
+    if objective not in {"largest_passing", "fastest_passing"}:
+        message = f"AutobatchDomain objective is unsupported: {objective}"
+        raise RuntimeError(message)
+
+
+def _require_autobatch_failure_signals(signals: tuple[str, ...]) -> None:
+    expected = (
+        "backend_rejection",
+        "oom",
+        "reference_failure",
+        "runtime_failure",
+    )
+
+    if signals != expected:
+        message = "AutobatchDomain failure_signals must match the supported signals"
+        raise RuntimeError(message)
+
+
+def _require_autobatch_termination(termination: str) -> None:
+    if termination not in {"exhausted_declared_values", "bracketed_failure_frontier"}:
+        message = f"AutobatchDomain termination is unsupported: {termination}"
+        raise RuntimeError(message)
+
+
+def _require_autobatch_objective_termination(
+    objective: str,
+    termination: str,
+) -> None:
+    if objective == "fastest_passing" and termination != "exhausted_declared_values":
+        message = "fastest_passing requires exhausted_declared_values termination"
+        raise RuntimeError(message)
+
+    if objective == "largest_passing" and termination != "bracketed_failure_frontier":
+        message = "largest_passing requires bracketed_failure_frontier termination"
+        raise RuntimeError(message)
+
+
+def _require_autobatch_values(
+    values: tuple[int, ...],
+    *,
+    min_value: int,
+    max_value: int,
+    initial_value: int,
+    growth: str,
+) -> None:
+    if not values:
+        message = "AutobatchDomain values must be nonempty"
+        raise RuntimeError(message)
+
+    previous = None
+
+    for value in values:
+        _require_positive_integer(value, "values item")
+
+        if previous is not None and value <= previous:
+            message = "AutobatchDomain values must be strictly increasing"
+            raise RuntimeError(message)
+
+        previous = value
+
+    if values[0] != min_value:
+        message = "AutobatchDomain min_value must match the first value"
+        raise RuntimeError(message)
+
+    if values[0] != initial_value:
+        message = "AutobatchDomain initial_value must match the first value"
+        raise RuntimeError(message)
+
+    if values[-1] != max_value:
+        message = "AutobatchDomain max_value must match the last value"
+        raise RuntimeError(message)
+
+    if growth == "doubling":
+        _require_doubling_values(values)
+    elif growth == "linear_step":
+        _require_linear_values(values)
+
+
+def _require_doubling_values(values: tuple[int, ...]) -> None:
+    for left, right in itertools.pairwise(values):
+        if right != left * 2:
+            message = "AutobatchDomain doubling values must double each step"
+            raise RuntimeError(message)
+
+
+def _require_linear_values(values: tuple[int, ...]) -> None:
+    if len(values) < MIN_LINEAR_DOMAIN_VALUES:
+        return
+
+    step = values[1] - values[0]
+
+    for left, right in itertools.pairwise(values[1:]):
+        if right - left != step:
+            message = "AutobatchDomain linear_step values must use one step size"
+            raise RuntimeError(message)
+
+
+def _require_autobatch_settings(
+    values: tuple[int, ...],
+    settings_by_value: Mapping[int, Mapping[str, Any]],
+) -> None:
+    if set(settings_by_value) != set(values):
+        message = "AutobatchDomain settings_by_value must cover every value"
+        raise RuntimeError(message)
+
+    for value in values:
+        settings = settings_by_value[value]
+
+        if not settings:
+            message = f"AutobatchDomain value has empty settings: {value}"
+            raise RuntimeError(message)
+
+
+def _require_autobatch_devices(devices: tuple[int, ...]) -> None:
+    if not devices:
+        message = "AutobatchDomain devices must be nonempty"
+        raise RuntimeError(message)
+
+    seen = set()
+
+    for device in devices:
+        _require_nonnegative_integer(device, "devices item")
+
+        if device in seen:
+            message = "AutobatchDomain devices must not contain duplicates"
+            raise RuntimeError(message)
+
+        seen.add(device)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -514,7 +707,15 @@ class ParameterSurface:
     block_groups: tuple[tuple[str, ...], ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate declared layout groups."""
+        """Validate declared parameter-surface fields.
+
+        Raises:
+            RuntimeError: If a declared policy or group is invalid.
+        """
+        if self.parametrization_policy != "active":
+            message = "parametrization_policy must be active"
+            raise RuntimeError(message)
+
         _validate_parameter_groups(self.names, self.layer_groups, "layer_groups")
         _validate_parameter_groups(self.names, self.block_groups, "block_groups")
 

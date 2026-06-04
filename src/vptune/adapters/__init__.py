@@ -2,6 +2,7 @@
 
 from vptune.adapters.distributed import (
     DistributedAdmissionPolicy,
+    RankCompileTiming,
     RankSelectedSettings,
     RankStatus,
     admit_distributed_candidate,
@@ -78,6 +79,7 @@ __all__ = [
     "PILOT_ACCEPTANCE_FAMILIES",
     "DistributedAdmissionPolicy",
     "PilotReadiness",
+    "RankCompileTiming",
     "RankSelectedSettings",
     "RankStatus",
     "TransformersAttentionPolicy",

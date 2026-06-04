@@ -10,9 +10,11 @@ from typing import Any, TypeGuard
 import torch
 
 from vptune.admission import (
+    FUNCTIONAL_CALL_FIELDS,
     TORCH_FUNC_FIELDS,
     admit_checkpoint,
     admit_forward_ad,
+    admit_functional_call,
     admit_torch_func,
 )
 from vptune.anchors import (
@@ -344,6 +346,7 @@ SUPPORTED_STANDARD_SETTINGS = (
     *SPEC_ADDITIONAL_RUNTIME_SETTINGS,
     *BACKEND_SETTINGS,
     *LOSS_SCALING_SETTINGS,
+    *FUNCTIONAL_CALL_FIELDS,
     *TORCH_FUNC_FIELDS,
     "vectorization.vmap_chunk_size",
     "vectorization.in_dims",
@@ -1419,7 +1422,13 @@ def _first_order_reference_measurements(
         )
 
         def tensor_function(active_params: ParameterTree) -> TensorTree:
-            return function(active_params, buffers, batch, context)
+            output = function(active_params, buffers, batch, context)
+
+            return _checked_function_output(
+                candidate.settings,
+                output,
+                "function objective output",
+            )
 
         finite_difference = finite_difference_jvp(tensor_function, params, vector)
         errors = _layout_aware_tree_error_measurements(
@@ -1443,7 +1452,13 @@ def _first_order_reference_measurements(
         )
 
         def tensor_function(active_params: ParameterTree) -> TensorTree:
-            return function(active_params, buffers, batch, context)
+            output = function(active_params, buffers, batch, context)
+
+            return _checked_function_output(
+                candidate.settings,
+                output,
+                "function objective output",
+            )
 
         return {
             "inner_abs_diff": float(
@@ -1913,8 +1928,10 @@ def _low_rank_metric_multiply(
     vector: TensorTree,
     settings: Mapping[str, Any],
 ) -> TensorTree:
-    flat_vector = _flatten_vector(vector)
+    flat_vector = _runtime_intermediate_tensor(_flatten_vector(vector), settings)
     basis, diagonal = _low_rank_factors(batch, vector)
+    basis = _runtime_intermediate_tensor(basis, settings)
+    diagonal = _runtime_intermediate_tensor(diagonal, settings)
     basis_projection = _matmul_runtime(settings, basis.T, flat_vector)
     result = (
         _accumulation_tensor(diagonal, settings)
@@ -2422,7 +2439,10 @@ def standard_operation_factory(
                     candidate.settings,
                     lambda: _runtime_output_to_buffer(
                         _runtime_output(
-                            _run_standard_operation(operation_execution),
+                            _run_with_buffer_mutation_check(
+                                operation_execution,
+                                lambda: _run_standard_operation(operation_execution),
+                            ),
                             candidate.settings,
                             parameter_surface,
                         ),
@@ -3242,7 +3262,32 @@ def _compile_backend(settings: Mapping[str, Any]) -> str:
         message = "compile.backend is required"
         raise MaterializationError(message)
 
-    return value
+    if value == "inductor":
+        return value
+
+    if value == "registered_backend":
+        message = "compile.backend requires a concrete PyTorch compiler backend id"
+        raise MaterializationError(message)
+
+    if _is_registered_compile_backend(value):
+        return value
+
+    message = f"compile.backend is not registered with PyTorch: {value}"
+    raise MaterializationError(message)
+
+
+def _is_registered_compile_backend(value: str) -> bool:
+    compiler = getattr(torch, "compiler", None)
+
+    if compiler is None:
+        return False
+
+    list_backends = getattr(compiler, "list_backends", None)
+
+    if not callable(list_backends):
+        return False
+
+    return value in set(list_backends())
 
 
 def _compile_mode(settings: Mapping[str, Any]) -> str | None:
@@ -3946,9 +3991,16 @@ def _scaled_function_objectives(
         batch: Batch,
         context: ObjectiveContext,
     ) -> TensorTree:
+        output = objective(params, buffers, batch, context)
+        output = _checked_function_output(
+            execution.candidate.settings,
+            output,
+            "function objective output",
+        )
+
         return tree_map(
             lambda tensor: tensor * scale,
-            objective(params, buffers, batch, context),
+            output,
         )
 
     objectives[objective_id] = scaled
@@ -4386,12 +4438,7 @@ def _jvp_tensor_function(
     function = _function_objective(execution.operator, execution.function_objectives)
 
     def tensor_function(active_params: ParameterTree) -> TensorTree:
-        return function(
-            active_params,
-            execution.buffers,
-            execution.batch,
-            execution.context,
-        )
+        return _call_function_objective(execution, function, active_params)
 
     return tensor_function
 
@@ -4508,12 +4555,7 @@ def _vjp_tensor_function(
     function = _function_objective(execution.operator, execution.function_objectives)
 
     def tensor_function(active_params: ParameterTree) -> TensorTree:
-        return function(
-            active_params,
-            execution.buffers,
-            execution.batch,
-            execution.context,
-        )
+        return _call_function_objective(execution, function, active_params)
 
     return tensor_function
 
@@ -5044,12 +5086,7 @@ def _run_ggnvp_single_vector(execution: StandardExecution) -> TensorTree:
             name: active
             for (name, _), active in zip(parameter_items, active_leaves, strict=True)
         }
-        output = function(
-            active_params,
-            execution.buffers,
-            execution.batch,
-            execution.context,
-        )
+        output = _call_function_objective(execution, function, active_params)
 
         if not isinstance(output, torch.Tensor):
             message = "dense GGNVP requires tensor function output"
@@ -5212,12 +5249,7 @@ def _ggn_tensor_function(
     function = _function_objective(execution.operator, execution.function_objectives)
 
     def tensor_function(active_params: ParameterTree) -> TensorTree:
-        return function(
-            active_params,
-            execution.buffers,
-            execution.batch,
-            execution.context,
-        )
+        return _call_function_objective(execution, function, active_params)
 
     return tensor_function
 
@@ -6403,12 +6435,7 @@ def _per_example_gradient_matrix(execution: StandardExecution) -> torch.Tensor:
         active_params = {
             name: leaf for (name, _), leaf in zip(parameter_items, leaves, strict=True)
         }
-        output = function(
-            active_params,
-            execution.buffers,
-            execution.batch,
-            execution.context,
-        )
+        output = _call_function_objective(execution, function, active_params)
 
         if not isinstance(output, torch.Tensor):
             message = "per-example gradient loop requires tensor objective output"
@@ -6534,12 +6561,7 @@ def _per_example_terms(
     active_params: ParameterTree,
     execution: StandardExecution,
 ) -> torch.Tensor:
-    output = function(
-        active_params,
-        execution.buffers,
-        execution.batch,
-        execution.context,
-    )
+    output = _call_function_objective(execution, function, active_params)
 
     if not isinstance(output, torch.Tensor):
         message = "per-example gradient path requires tensor objective output"
@@ -6573,11 +6595,11 @@ def _per_example_gradient_matrix_vmap(execution: StandardExecution) -> torch.Ten
         active_params: ParameterTree,
         single_tensor_batch: Batch,
     ) -> torch.Tensor:
-        output = function(
+        output = _call_function_objective(
+            execution,
+            function,
             active_params,
-            execution.buffers,
             single_tensor_batch,
-            execution.context,
         )
 
         if not isinstance(output, torch.Tensor):
@@ -8923,6 +8945,12 @@ def _require_recomputed_teacher_objective(
 
 
 def _require_call_runtime_settings(settings: Mapping[str, Any]) -> None:
+    if any(key in settings for key in FUNCTIONAL_CALL_FIELDS):
+        try:
+            admit_functional_call(settings)
+        except AdmissionError as error:
+            raise MaterializationError(str(error)) from error
+
     call_core_keys = ("call.path", "call.params", "call.buffers")
 
     if any(key in settings for key in call_core_keys):
@@ -8964,7 +8992,9 @@ def _require_call_runtime_settings(settings: Mapping[str, Any]) -> None:
 
     buffer_mutation = settings.get("call.buffer_mutation")
 
-    if buffer_mutation not in {None, "forbidden"}:
+    if buffer_mutation == "declared_and_restored":
+        _require_declared_state_restore_settings(settings)
+    elif buffer_mutation not in {None, "forbidden"}:
         message = f"call.buffer_mutation requires model-call binding: {buffer_mutation}"
         raise MaterializationError(message)
 
@@ -8972,6 +9002,25 @@ def _require_call_runtime_settings(settings: Mapping[str, Any]) -> None:
 
     if return_type not in {None, "raw_tensor_tree"}:
         message = f"call.return_type requires output-field binding: {return_type}"
+        raise MaterializationError(message)
+
+
+def _require_declared_state_restore_settings(settings: Mapping[str, Any]) -> None:
+    if (
+        settings.get("call.path") != "functional_call"
+        or settings.get("call.params") != "explicit_params"
+        or settings.get("call.buffers") != "explicit_buffers"
+    ):
+        message = "declared state restoration requires explicit functional-call inputs"
+        raise MaterializationError(message)
+
+    try:
+        admit_functional_call(settings)
+    except AdmissionError as error:
+        raise MaterializationError(str(error)) from error
+
+    if settings["mutates_state"] is not True:
+        message = "declared state restoration requires mutates_state=True"
         raise MaterializationError(message)
 
 
@@ -9658,6 +9707,8 @@ def _tree_dot_runtime(
     left: TensorTree,
     right: TensorTree,
 ) -> torch.Tensor:
+    left = _runtime_intermediate_tree(left, settings)
+    right = _runtime_intermediate_tree(right, settings)
     left = _accumulation_tree(left, settings)
     right = _accumulation_tree(right, settings)
 
@@ -9672,6 +9723,8 @@ def _tree_add_runtime(
     left: TensorTree,
     right: TensorTree,
 ) -> TensorTree:
+    left = _runtime_intermediate_tree(left, settings)
+    right = _runtime_intermediate_tree(right, settings)
     left = _accumulation_tree(left, settings)
     right = _accumulation_tree(right, settings)
 
@@ -9686,6 +9739,9 @@ def _dot_runtime(
     left: torch.Tensor,
     right: torch.Tensor,
 ) -> torch.Tensor:
+    left = _runtime_intermediate_tensor(left, settings)
+    right = _runtime_intermediate_tensor(right, settings)
+
     return torch.dot(
         _accumulation_tensor(left, settings),
         _accumulation_tensor(right, settings),
@@ -9697,6 +9753,8 @@ def _batched_dot_runtime(
     left: torch.Tensor,
     right: torch.Tensor,
 ) -> torch.Tensor:
+    left = _runtime_intermediate_tensor(left, settings)
+    right = _runtime_intermediate_tensor(right, settings)
     left_accumulation = _accumulation_tensor(left, settings)
     right_accumulation = _accumulation_tensor(right, settings)
 
@@ -9708,6 +9766,9 @@ def _matmul_runtime(
     left: torch.Tensor,
     right: torch.Tensor,
 ) -> torch.Tensor:
+    left = _runtime_intermediate_tensor(left, settings)
+    right = _runtime_intermediate_tensor(right, settings)
+
     return _accumulation_tensor(left, settings) @ _accumulation_tensor(
         right,
         settings,
@@ -9719,6 +9780,8 @@ def _tree_scale_runtime(
     tree: TensorTree,
     scale: float,
 ) -> TensorTree:
+    tree = _runtime_intermediate_tree(tree, settings)
+
     if _layout_vector_ops(settings) == "foreach":
         return tree_mul_foreach(tree, scale)
 
@@ -9730,6 +9793,9 @@ def _tree_elementwise_mul_runtime(
     left: TensorTree,
     right: TensorTree,
 ) -> TensorTree:
+    left = _runtime_intermediate_tree(left, settings)
+    right = _runtime_intermediate_tree(right, settings)
+
     if _layout_vector_ops(settings) == "foreach":
         return tree_elementwise_mul_foreach(left, right)
 
@@ -9741,6 +9807,9 @@ def _tree_elementwise_div_runtime(
     left: TensorTree,
     right: TensorTree,
 ) -> TensorTree:
+    left = _runtime_intermediate_tree(left, settings)
+    right = _runtime_intermediate_tree(right, settings)
+
     if _layout_vector_ops(settings) == "foreach":
         return tree_elementwise_div_foreach(left, right)
 
@@ -9752,10 +9821,31 @@ def _tree_add_scalar_runtime(
     tree: TensorTree,
     scalar: float,
 ) -> TensorTree:
+    tree = _runtime_intermediate_tree(tree, settings)
+
     if _layout_vector_ops(settings) == "foreach":
         return tree_add_scalar_foreach(tree, scalar)
 
     return tree_map(lambda tensor: tensor + scalar, tree)
+
+
+def _runtime_intermediate_tree(
+    tree: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    return tree_map(lambda tensor: _runtime_intermediate_tensor(tensor, settings), tree)
+
+
+def _runtime_intermediate_tensor(
+    tensor: torch.Tensor,
+    settings: Mapping[str, Any],
+) -> torch.Tensor:
+    dtype = _dtype_setting(settings, "dtype.intermediate")
+
+    if dtype is None or not tensor.is_floating_point():
+        return tensor
+
+    return tensor.to(dtype=dtype)
 
 
 def _require_ggn_vjp_path_settings(
@@ -9957,21 +10047,21 @@ def _runtime_params(
     settings: Mapping[str, Any],
     parameter_surface: ParameterSurface | None,
 ) -> ParameterTree:
+    _require_parameter_surface_runtime_settings(parameter_surface, settings)
     dtype = _parameter_dtype(settings)
-
-    if dtype is None:
-        result = _runtime_named_tensor_contiguity(params, settings)
-    else:
-        result = _runtime_named_tensor_contiguity(
-            {key: tensor.to(dtype=dtype) for key, tensor in params.items()},
-            settings,
-        )
+    result = _runtime_named_tensor_dtype(params, dtype)
+    result = _runtime_named_tensor_contiguity(result, settings)
 
     if settings.get("layout.params") == "flat_contiguous":
+        _require_alias_safe_parameter_layout(result, settings)
+
         return _wrap_flat_parameter_tree(
             result,
             _flatten_vector(result).contiguous(),
         )
+
+    if settings.get("layout.params") in {"per_layer_flat", "per_block_flat"}:
+        _require_alias_safe_parameter_layout(result, settings)
 
     return _runtime_grouped_parameter_layout(
         result,
@@ -10484,6 +10574,79 @@ def _runtime_vector_layout(
     )
 
 
+def _runtime_named_tensor_dtype(
+    tree: dict[str, torch.Tensor],
+    dtype: torch.dtype | None,
+) -> dict[str, torch.Tensor]:
+    if dtype is None:
+        return tree
+
+    return _runtime_named_tensor_map_preserve_alias(
+        tree,
+        lambda tensor: tensor.to(dtype=dtype),
+    )
+
+
+def _runtime_named_tensor_map_preserve_alias(
+    tree: dict[str, torch.Tensor],
+    function: Callable[[torch.Tensor], torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    mapped = {}
+    result = {}
+
+    for key, tensor in tree.items():
+        alias_key = id(tensor)
+
+        if alias_key not in mapped:
+            mapped[alias_key] = function(tensor)
+
+        result[key] = mapped[alias_key]
+
+    return result
+
+
+def _require_alias_safe_parameter_layout(
+    params: ParameterTree,
+    settings: Mapping[str, Any],
+) -> None:
+    if not _preserves_parameter_aliases(settings):
+        return
+
+    if not _has_parameter_aliases(params):
+        return
+
+    message = "non-tree parameter layout cannot preserve tied parameter aliases"
+    raise MaterializationError(message)
+
+
+def _require_parameter_surface_runtime_settings(
+    parameter_surface: ParameterSurface | None,
+    settings: Mapping[str, Any],
+) -> None:
+    if parameter_surface is None:
+        return
+
+    if (
+        _preserves_parameter_aliases(settings)
+        and parameter_surface.tied_weights_policy != "preserve"
+    ):
+        message = "tied-weight preservation requires preserved parameter surface"
+        raise MaterializationError(message)
+
+
+def _preserves_parameter_aliases(settings: Mapping[str, Any]) -> bool:
+    return (
+        settings.get("call.tied_weights") == "preserve_alias_groups"
+        or settings.get("layout.aliasing") == "preserve_tied_weight_aliases"
+    )
+
+
+def _has_parameter_aliases(params: ParameterTree) -> bool:
+    ids = tuple(id(tensor) for tensor in params.values())
+
+    return len(ids) != len(set(ids))
+
+
 def _runtime_vector_residency(
     vector: TensorTree,
     settings: Mapping[str, Any],
@@ -10577,12 +10740,7 @@ def _jvp_output_template(execution: StandardExecution) -> TensorTree:
     )
 
     def callback() -> TensorTree:
-        return function(
-            execution.params,
-            execution.buffers,
-            execution.batch,
-            execution.context,
-        )
+        return _call_function_objective(execution, function, execution.params)
 
     return _run_with_backend_settings(
         execution.candidate.settings,
@@ -10712,7 +10870,10 @@ def _runtime_named_tensor_contiguity(
     if not _layout_contiguity_enabled(settings):
         return tree
 
-    return {key: tensor.contiguous() for key, tensor in tree.items()}
+    return _runtime_named_tensor_map_preserve_alias(
+        tree,
+        lambda tensor: tensor.contiguous(),
+    )
 
 
 def _runtime_batch_contiguity(
@@ -10883,6 +11044,107 @@ def _run_with_call_grad_mode(
     raise MaterializationError(message)
 
 
+def _run_with_buffer_mutation_check(
+    execution: StandardExecution,
+    callback: CandidateOperation,
+) -> TensorTree:
+    mode = execution.candidate.settings.get("call.buffer_mutation")
+
+    if mode is None:
+        return callback()
+
+    if mode == "declared_and_restored":
+        return _run_with_declared_state_restore(execution, callback)
+
+    if mode != "forbidden":
+        message = f"call.buffer_mutation is unsupported: {mode}"
+        raise MaterializationError(message)
+
+    before = _buffer_snapshot(execution.buffers)
+    result = callback()
+    _require_buffers_unchanged(before, execution.buffers)
+
+    return result
+
+
+def _run_with_declared_state_restore(
+    execution: StandardExecution,
+    callback: CandidateOperation,
+) -> TensorTree:
+    settings = execution.candidate.settings
+    parameter_snapshot = _declared_tensor_snapshot(
+        execution.params,
+        settings["mutated_parameter_keys"],
+        "parameter",
+    )
+    buffer_snapshot = _declared_tensor_snapshot(
+        execution.buffers,
+        settings["mutated_buffer_keys"],
+        "buffer",
+    )
+
+    try:
+        return callback()
+    finally:
+        _restore_declared_tensors(execution.params, parameter_snapshot)
+        _restore_declared_tensors(execution.buffers, buffer_snapshot)
+
+
+def _declared_tensor_snapshot(
+    values: dict[str, torch.Tensor],
+    keys: tuple[str, ...],
+    label: str,
+) -> dict[str, torch.Tensor]:
+    snapshot = {}
+
+    for key in keys:
+        if key not in values:
+            message = f"declared mutated {label} is missing: {key}"
+            raise MaterializationError(message)
+
+        snapshot[key] = values[key].detach().clone()
+
+    return snapshot
+
+
+def _restore_declared_tensors(
+    values: dict[str, torch.Tensor],
+    snapshot: dict[str, torch.Tensor],
+) -> None:
+    with torch.no_grad():
+        for key, tensor in snapshot.items():
+            values[key].copy_(tensor)
+
+
+def _buffer_snapshot(buffers: BufferTree) -> BufferTree:
+    return {key: tensor.detach().clone() for key, tensor in buffers.items()}
+
+
+def _require_buffers_unchanged(before: BufferTree, after: BufferTree) -> None:
+    if set(before) != set(after):
+        message = "call.buffer_mutation=forbidden detected changed buffer keys"
+        raise MaterializationError(message)
+
+    for key, before_tensor in before.items():
+        after_tensor = after[key]
+
+        if before_tensor.shape != after_tensor.shape:
+            message = f"call.buffer_mutation=forbidden changed buffer shape: {key}"
+            raise MaterializationError(message)
+
+        if before_tensor.dtype != after_tensor.dtype:
+            message = f"call.buffer_mutation=forbidden changed buffer dtype: {key}"
+            raise MaterializationError(message)
+
+        if before_tensor.device != after_tensor.device:
+            message = f"call.buffer_mutation=forbidden changed buffer device: {key}"
+            raise MaterializationError(message)
+
+        if not torch.equal(before_tensor, after_tensor):
+            message = f"call.buffer_mutation=forbidden changed buffer value: {key}"
+            raise MaterializationError(message)
+
+
 def _matmul_precision_setting(settings: Mapping[str, Any]) -> str | None:
     key = "numeric.float32_matmul_precision"
     value = settings.get(key)
@@ -10963,6 +11225,7 @@ def _anchor_settings(
         *BACKEND_SETTINGS,
         *SPEC_PATH_KEYS.values(),
         *SPEC_ADDITIONAL_RUNTIME_SETTINGS,
+        *FUNCTIONAL_CALL_FIELDS,
         *TORCH_FUNC_FIELDS,
         *LOSS_SCALING_SETTINGS,
         "vectorization.vmap_chunk_size",
@@ -11166,6 +11429,57 @@ def _function_objective(
         raise MaterializationError(message)
 
     return objective
+
+
+def _call_function_objective(
+    execution: StandardExecution,
+    function: FunctionObjective,
+    params: ParameterTree,
+    batch: Batch | None = None,
+) -> TensorTree:
+    active_batch = execution.batch if batch is None else batch
+    output = function(params, execution.buffers, active_batch, execution.context)
+
+    return _checked_function_output(
+        execution.candidate.settings,
+        output,
+        "function objective output",
+    )
+
+
+def _checked_function_output(
+    settings: Mapping[str, Any],
+    output: object,
+    name: str,
+) -> TensorTree:
+    if settings.get("call.return_type") != "raw_tensor_tree":
+        if not _is_raw_tensor_tree(output):
+            message = f"{name} must be a tensor tree"
+            raise MaterializationError(message)
+
+        return output
+
+    if not _is_raw_tensor_tree(output):
+        message = f"{name} must be a raw tensor tree"
+        raise MaterializationError(message)
+
+    return output
+
+
+def _is_raw_tensor_tree(output: object) -> TypeGuard[TensorTree]:
+    if isinstance(output, torch.Tensor):
+        return True
+
+    if isinstance(output, tuple):
+        return all(_is_raw_tensor_tree(value) for value in output)
+
+    if isinstance(output, dict):
+        return all(
+            isinstance(key, str) and _is_raw_tensor_tree(value)
+            for key, value in output.items()
+        )
+
+    return False
 
 
 def _require_metric_representation(

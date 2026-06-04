@@ -390,6 +390,61 @@ def quadratic_scalar(
     return batch["scale"] * params["w"].pow(2).sum()
 
 
+def mutating_buffer_scalar(
+    params: vp.ParameterTree,
+    buffers: vp.BufferTree,
+    batch: vp.Batch,
+    context: vp.ObjectiveContext,
+) -> torch.Tensor:
+    assert batch == {}
+    assert context.family == "gradient"
+    buffers["b"].add_(1.0)
+
+    return (params["w"] * buffers["b"]).sum()
+
+
+def failing_mutating_buffer_scalar(
+    params: vp.ParameterTree,
+    buffers: vp.BufferTree,
+    batch: vp.Batch,
+    context: vp.ObjectiveContext,
+) -> torch.Tensor:
+    assert params["w"] is not None
+    assert batch == {}
+    assert context.family == "gradient"
+    buffers["b"].add_(1.0)
+    message = "declared mutation failure"
+
+    raise RuntimeError(message)
+
+
+def declared_restored_functional_call_settings(
+    *,
+    mutates_state: bool = True,
+    mutated_parameter_keys: tuple[str, ...] = (),
+    mutated_buffer_keys: tuple[str, ...] = ("b",),
+) -> dict[str, object]:
+    return {
+        "call.path": "functional_call",
+        "call.params": "explicit_params",
+        "call.buffers": "explicit_buffers",
+        "call.tied_weights": "preserve_alias_groups",
+        "call.parametrizations": "preserve_parametrizations",
+        "call.buffer_mutation": "declared_and_restored",
+        "call.grad_mode": "grad_enabled",
+        "call.return_type": "raw_tensor_tree",
+        "parameter_keys": ("w",),
+        "buffer_keys": ("b",),
+        "tie_weights": True,
+        "strict": False,
+        "parametrization_policy": "active",
+        "mutates_state": mutates_state,
+        "mutated_parameter_keys": mutated_parameter_keys,
+        "mutated_buffer_keys": mutated_buffer_keys,
+        "module_mode": "eval",
+    }
+
+
 def square_function(
     params: vp.ParameterTree,
     buffers: vp.BufferTree,
@@ -721,6 +776,36 @@ def compile_settings(
         "compile.cuda_graphs": cuda_graphs,
         "compile.cache_state": cache_state,
     }
+
+
+def test_compile_backend_accepts_concrete_registered_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runtime_module.torch.compiler,
+        "list_backends",
+        lambda: ["custom_backend"],
+    )
+
+    assert (
+        runtime_module._compile_backend({"compile.backend": "custom_backend"})
+        == "custom_backend"
+    )
+
+
+@pytest.mark.parametrize(
+    ("backend", "message"),
+    [
+        ("registered_backend", "concrete PyTorch compiler backend id"),
+        ("missing_backend", "not registered"),
+    ],
+)
+def test_compile_backend_rejects_non_concrete_or_unregistered_backend(
+    backend: str,
+    message: str,
+) -> None:
+    with pytest.raises(vp.MaterializationError, match=message):
+        runtime_module._compile_backend({"compile.backend": backend})
 
 
 def loss_scaling_settings(*, degree: int, scale: float = 8.0) -> dict[str, object]:
@@ -2514,7 +2599,7 @@ def test_standard_operation_factory_enforces_direct_admission_fields() -> None:
             vector,
         )()
 
-    with pytest.raises(vp.MaterializationError, match="unsupported"):
+    with pytest.raises(vp.MaterializationError, match="missing fields"):
         gradient_factory(
             vp.Candidate(
                 "gradient",
@@ -5416,10 +5501,10 @@ def test_standard_runtime_executes_metric_factor_dtype_axis() -> None:
     )()
     result_tensor = tree_leaves(result)[0]
 
-    assert result_tensor.dtype == torch.float32
-    assert torch.allclose(
+    assert result_tensor.dtype == torch.bfloat16
+    torch.testing.assert_close(
         result_tensor,
-        torch.tensor([-0.25, -6.25]),
+        torch.tensor([-0.25, -6.25], dtype=torch.bfloat16),
     )
 
 
@@ -5503,7 +5588,7 @@ def test_standard_runtime_executes_gpu_vector_residency() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for memory.vector_residency=gpu")
 
-    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
+    params = {"w": torch.tensor([2.0], dtype=torch.float64, device="cuda")}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
         vp.hvp("hvp", "loss", aggregation="sum"),
@@ -6158,10 +6243,9 @@ def test_standard_runtime_executes_layout_params_and_output_per_layer_flat() -> 
         "b": torch.tensor([1.0, 1.0], dtype=torch.float64),
         "c": torch.tensor([1.0], dtype=torch.float64),
     }
-    observed = []
 
-    def storage_id(tensor: torch.Tensor) -> int:
-        return tensor.untyped_storage().data_ptr()
+    def storage_id(tensor: torch.Tensor) -> object:
+        return tensor.untyped_storage()._cdata
 
     def scalar(
         params: vp.ParameterTree,
@@ -6172,11 +6256,6 @@ def test_standard_runtime_executes_layout_params_and_output_per_layer_flat() -> 
         assert buffers == {}
         assert batch == {}
         assert context.family == "gradient"
-        observed.append((
-            storage_id(params["a"]),
-            storage_id(params["b"]),
-            storage_id(params["c"]),
-        ))
 
         return 0.5 * (
             params["a"].pow(2).sum()
@@ -6207,8 +6286,6 @@ def test_standard_runtime_executes_layout_params_and_output_per_layer_flat() -> 
     )()
     result_map = tensor_mapping(result)
 
-    assert observed[0][0] == observed[0][1]
-    assert observed[0][0] != observed[0][2]
     assert storage_id(result_map["a"]) == storage_id(result_map["b"])
     assert storage_id(result_map["a"]) != storage_id(result_map["c"])
     torch.testing.assert_close(result_map["a"], params["a"])
@@ -6267,11 +6344,131 @@ def test_standard_runtime_executes_layout_vector_per_layer_flat() -> None:
     )
 
 
+def test_standard_runtime_executes_layout_params_and_output_per_block_flat() -> None:
+    params = {
+        "a": torch.tensor([2.0], dtype=torch.float64),
+        "b": torch.tensor([3.0, 4.0], dtype=torch.float64),
+        "c": torch.tensor([5.0], dtype=torch.float64),
+    }
+    parameter_surface = vp.ParameterSurface(
+        names=("a", "b", "c"),
+        shapes=((1,), (2,), (1,)),
+        trainable=(True, True, True),
+        block_groups=(("a",), ("b", "c")),
+    )
+    vector = {
+        "a": torch.tensor([1.0], dtype=torch.float64),
+        "b": torch.tensor([1.0, 1.0], dtype=torch.float64),
+        "c": torch.tensor([1.0], dtype=torch.float64),
+    }
+
+    def storage_id(tensor: torch.Tensor) -> object:
+        return tensor.untyped_storage()._cdata
+
+    def scalar(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert batch == {}
+        assert context.family == "gradient"
+
+        return 0.5 * (
+            params["a"].pow(2).sum()
+            + params["b"].pow(2).sum()
+            + params["c"].pow(2).sum()
+        )
+
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        parameter_surface=parameter_surface,
+        scalar_objectives={"loss": scalar},
+    )
+    result = factory(
+        vp.Candidate(
+            "gradient",
+            "per-block",
+            {
+                **gradient_settings(),
+                "layout.params": "per_block_flat",
+                "layout.output": "per_block_flat",
+            },
+            admission_status="passed",
+        ),
+        {},
+        vector,
+    )()
+    result_map = tensor_mapping(result)
+
+    assert storage_id(result_map["a"]) != storage_id(result_map["b"])
+    assert storage_id(result_map["b"]) == storage_id(result_map["c"])
+    torch.testing.assert_close(result_map["a"], params["a"])
+    torch.testing.assert_close(result_map["b"], params["b"])
+    torch.testing.assert_close(result_map["c"], params["c"])
+
+
+def test_standard_runtime_executes_layout_vector_per_block_flat() -> None:
+    params = {
+        "a": torch.tensor([0.0], dtype=torch.float64),
+        "b": torch.tensor([0.0, 0.0], dtype=torch.float64),
+        "c": torch.tensor([0.0], dtype=torch.float64),
+    }
+    parameter_surface = vp.ParameterSurface(
+        names=("a", "b", "c"),
+        shapes=((1,), (2,), (1,)),
+        trainable=(True, True, True),
+        block_groups=(("a",), ("b", "c")),
+    )
+    vector = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
+    factory = vpx.standard_operation_factory(
+        vp.metric(
+            "metric",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+        parameter_surface=parameter_surface,
+    )
+    result = factory(
+        vp.Candidate(
+            "metric",
+            "per-block-vector",
+            {
+                **metric_settings("dense_matmul"),
+                "layout.vector": "per_block_flat",
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": torch.eye(4, dtype=torch.float64)},
+        vector,
+    )()
+    result_map = tensor_mapping(result)
+
+    torch.testing.assert_close(
+        result_map["a"], torch.tensor([1.0], dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        result_map["b"],
+        torch.tensor([2.0, 3.0], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        result_map["c"], torch.tensor([4.0], dtype=torch.float64)
+    )
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [
         ("layout.params", "per_layer_flat"),
         ("layout.vector", "per_layer_flat"),
+        ("layout.params", "per_block_flat"),
+        ("layout.vector", "per_block_flat"),
     ],
 )
 def test_standard_runtime_rejects_non_tree_input_layout_without_reconstruction(
@@ -6287,7 +6484,9 @@ def test_standard_runtime_rejects_non_tree_input_layout_without_reconstruction(
         scalar_objectives={"loss": quadratic_scalar},
     )
 
-    with pytest.raises(vp.MaterializationError, match="declared layer_groups"):
+    group_label = "layer_groups" if value == "per_layer_flat" else "block_groups"
+
+    with pytest.raises(vp.MaterializationError, match=f"declared {group_label}"):
         factory(
             vp.Candidate(
                 "gradient",
@@ -6354,6 +6553,57 @@ def test_standard_runtime_executes_layout_params_flat_contiguous() -> None:
     assert observed == [(True, True)]
     torch.testing.assert_close(tree_leaves(result)[0], params["a"])
     torch.testing.assert_close(tree_leaves(result)[1], params["b"])
+
+
+def test_standard_runtime_preserves_tied_parameter_aliases_during_dtype_cast() -> None:
+    shared = torch.tensor([2.0], dtype=torch.float64)
+    params = {"a": shared, "b": shared}
+    settings = {
+        **gradient_settings(),
+        "dtype.parameter_storage": "fp32",
+        "call.tied_weights": "preserve_alias_groups",
+    }
+
+    runtime_params = runtime_module._runtime_params(params, settings, None)
+
+    assert runtime_params["a"] is runtime_params["b"]
+    assert runtime_params["a"].dtype == torch.float32
+
+
+def test_standard_runtime_rejects_flat_params_when_tied_aliases_must_preserve() -> None:
+    shared = torch.tensor([2.0], dtype=torch.float64)
+    params = {"a": shared, "b": shared}
+
+    with pytest.raises(vp.MaterializationError, match="tied parameter aliases"):
+        runtime_module._runtime_params(
+            params,
+            {
+                **gradient_settings(),
+                "layout.params": "flat_contiguous",
+                "layout.aliasing": "preserve_tied_weight_aliases",
+            },
+            None,
+        )
+
+
+def test_standard_runtime_rejects_alias_preservation_on_deduplicated_surface() -> None:
+    params = {"a": torch.tensor([2.0], dtype=torch.float64)}
+    parameter_surface = vp.ParameterSurface(
+        names=("a",),
+        shapes=((1,),),
+        trainable=(True,),
+        tied_weights_policy="deduplicate",
+    )
+
+    with pytest.raises(vp.MaterializationError, match="preserved parameter surface"):
+        runtime_module._runtime_params(
+            params,
+            {
+                **gradient_settings(),
+                "call.tied_weights": "preserve_alias_groups",
+            },
+            parameter_surface,
+        )
 
 
 @pytest.mark.parametrize(
@@ -6512,6 +6762,174 @@ def test_standard_runtime_executes_explicit_functional_call_settings() -> None:
     )
 
 
+def test_standard_runtime_rejects_non_tree_raw_function_output() -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+
+    def tensor_function(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> Any:
+        assert isinstance(params["w"], torch.Tensor)
+        assert buffers == {}
+        assert batch == {}
+        assert context.family == "jvp"
+
+        return object()
+
+    factory = vpx.standard_operation_factory(
+        vp.jvp("jvp", "function", aggregation="sum"),
+        params=params,
+        buffers={},
+        function_objectives={"function": tensor_function},
+    )
+
+    with pytest.raises(vp.MaterializationError, match="raw tensor tree"):
+        factory(
+            vp.Candidate(
+                "jvp",
+                "non-tree-output",
+                {
+                    **jvp_settings("torch_func_jvp"),
+                    "call.return_type": "raw_tensor_tree",
+                    **torch_func_settings(requires_forward_ad=True),
+                },
+                admission_status="passed",
+            ),
+            {},
+            vector,
+        )()
+
+
+def test_standard_runtime_rejects_forbidden_functional_buffer_mutation() -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
+    buffers = {"b": torch.tensor([3.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+
+    def scalar(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert batch == {}
+        assert context.family == "gradient"
+        buffers["b"].add_(1.0)
+
+        return (params["w"] * buffers["b"]).sum()
+
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers=buffers,
+        scalar_objectives={"loss": scalar},
+    )
+
+    with pytest.raises(vp.MaterializationError, match="changed buffer value: b"):
+        factory(
+            vp.Candidate(
+                "gradient",
+                "forbidden-buffer-mutation",
+                {
+                    **gradient_settings(),
+                    "call.path": "functional_call",
+                    "call.params": "explicit_params",
+                    "call.buffers": "explicit_buffers",
+                    "call.buffer_mutation": "forbidden",
+                },
+                admission_status="passed",
+            ),
+            {},
+            vector,
+        )()
+
+
+def test_standard_runtime_restores_declared_functional_buffer_mutation() -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
+    buffers = {"b": torch.tensor([3.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers=buffers,
+        scalar_objectives={"loss": mutating_buffer_scalar},
+    )
+    result = factory(
+        vp.Candidate(
+            "gradient",
+            "declared-restored-buffer-mutation",
+            {
+                **gradient_settings(),
+                **declared_restored_functional_call_settings(),
+            },
+            admission_status="passed",
+        ),
+        {},
+        vector,
+    )()
+
+    assert torch.equal(buffers["b"], torch.tensor([3.0], dtype=torch.float64))
+    assert torch.equal(tree_leaves(result)[0], torch.tensor([4.0], dtype=torch.float64))
+
+
+def test_standard_runtime_restores_declared_buffer_mutation_after_error() -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
+    buffers = {"b": torch.tensor([3.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers=buffers,
+        scalar_objectives={"loss": failing_mutating_buffer_scalar},
+    )
+
+    with pytest.raises(RuntimeError, match="declared mutation failure"):
+        factory(
+            vp.Candidate(
+                "gradient",
+                "declared-restored-buffer-mutation-error",
+                {
+                    **gradient_settings(),
+                    **declared_restored_functional_call_settings(),
+                },
+                admission_status="passed",
+            ),
+            {},
+            vector,
+        )()
+
+    assert torch.equal(buffers["b"], torch.tensor([3.0], dtype=torch.float64))
+
+
+def test_standard_runtime_rejects_restore_mode_without_declared_mutation() -> None:
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={"b": torch.tensor([3.0], dtype=torch.float64)},
+        scalar_objectives={"loss": quadratic_scalar},
+    )
+
+    with pytest.raises(vp.MaterializationError, match="mutates_state=True"):
+        factory(
+            vp.Candidate(
+                "gradient",
+                "restore-without-mutates-state",
+                {
+                    **gradient_settings(),
+                    **declared_restored_functional_call_settings(
+                        mutates_state=False,
+                        mutated_buffer_keys=(),
+                    ),
+                },
+                admission_status="passed",
+            ),
+            {},
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+        )
+
+
 @pytest.mark.parametrize(
     ("settings_override", "message"),
     [
@@ -6540,7 +6958,10 @@ def test_standard_runtime_executes_explicit_functional_call_settings() -> None:
             },
             "model-call binding",
         ),
-        ({"call.buffer_mutation": "declared_and_restored"}, "model-call binding"),
+        (
+            {"call.buffer_mutation": "declared_and_restored"},
+            "explicit functional-call inputs",
+        ),
         (
             {"call.return_type": "model_output_object_with_declared_fields"},
             "output-field binding",
@@ -11605,6 +12026,9 @@ def test_standard_runtime_rejects_mismatched_recomputed_teacher_outputs() -> Non
 
 
 def test_standard_runtime_rejects_cuda_autocast_without_cuda() -> None:
+    if torch.cuda.is_available():
+        pytest.skip("CUDA is available")
+
     factory = vpx.standard_operation_factory(
         vp.metric(
             "metric",
@@ -12104,10 +12528,11 @@ def test_standard_runtime_compiles_gradient_closure_boundary_only(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
@@ -12188,10 +12613,11 @@ def test_standard_runtime_compiles_gradient_loss_closure_boundary_only(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module.torch.autograd, "grad", recording_grad)
@@ -12268,10 +12694,11 @@ def test_standard_runtime_compiles_jvp_closure_boundary_only(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     def function(
         params: vp.ParameterTree,
@@ -12357,10 +12784,11 @@ def test_standard_runtime_compiles_vjp_closure_boundary_only(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     def function(
         params: vp.ParameterTree,
@@ -12480,10 +12908,11 @@ def test_standard_runtime_compiles_hvp_boundary_only(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", boundary, compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
@@ -12558,10 +12987,11 @@ def test_standard_runtime_compiles_hvp_loss_closure_boundary_only(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module.torch.autograd, "grad", recording_grad)
@@ -12639,10 +13069,11 @@ def test_standard_runtime_compiles_ggn_full_product_boundary_only(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
@@ -12740,10 +13171,11 @@ def test_standard_runtime_compiles_ggn_jvp_boundary_only(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(
@@ -12843,10 +13275,11 @@ def test_standard_runtime_compiles_ggn_loss_product_boundary_only(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_run_ggnvp_vjp", recording_vjp)
@@ -13018,10 +13451,11 @@ def test_standard_runtime_compiles_ggn_vjp_boundary_only(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(
@@ -13187,10 +13621,11 @@ def test_standard_runtime_compiles_score_matrix_boundary_only(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", boundary, compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(
@@ -13474,10 +13909,11 @@ def test_standard_operation_builds_runtime_inputs_before_call(
     def runtime_params(
         params: vp.ParameterTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None,
     ) -> vp.ParameterTree:
         events.append("params")
 
-        return original_params(params, settings, None)
+        return original_params(params, settings, parameter_surface)
 
     def runtime_buffers(
         buffers: vp.BufferTree,
@@ -13505,10 +13941,11 @@ def test_standard_operation_builds_runtime_inputs_before_call(
         vector: vp.TensorTree,
         settings: Mapping[str, object],
         template: vp.TensorTree | None = None,
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append("vector")
 
-        return original_vector(vector, settings, template)
+        return original_vector(vector, settings, template, parameter_surface)
 
     def scalar(
         params: vp.ParameterTree,
@@ -14306,10 +14743,11 @@ def test_composition_child_compile_boundary_compiles_each_child(
     def recording_runtime_output(
         output: vp.TensorTree,
         settings: Mapping[str, object],
+        parameter_surface: vp.ParameterSurface | None = None,
     ) -> vp.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
-        return original_runtime_output(output, settings)
+        return original_runtime_output(output, settings, parameter_surface)
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)

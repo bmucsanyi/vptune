@@ -22,8 +22,8 @@ AdmissionRule = Callable[[Candidate], tuple[bool, str | None]]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class ManifestAxisDescriptor:
-    """One axis entry in the SPEC-level sweep manifest."""
+class AxisTableDescriptor:
+    """One sweep axis entry from the fixed docs."""
 
     axis_key: str
     owner_id: str
@@ -38,7 +38,7 @@ class ManifestAxisDescriptor:
     merge_rules: tuple[str, ...] = ()
 
     def signature(self) -> dict[str, Any]:
-        """Return stable manifest-axis identity.
+        """Return stable axis identity.
 
         Returns:
             Serializable axis identity.
@@ -59,17 +59,17 @@ class ManifestAxisDescriptor:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class AxisManifest:
-    """SPEC-level axis manifest."""
+class AxisTable:
+    """Complete sweep axis table."""
 
     package_version: str
-    manifest_version: str
-    axes: tuple[ManifestAxisDescriptor, ...]
+    axis_table_version: str
+    axes: tuple[AxisTableDescriptor, ...]
     class_c_groups: Mapping[str, tuple[str, ...]]
     merge_rules: tuple[str, ...]
 
-    def by_key(self) -> dict[str, ManifestAxisDescriptor]:
-        """Return manifest axes keyed by setting key.
+    def by_key(self) -> dict[str, AxisTableDescriptor]:
+        """Return axes keyed by setting key.
 
         Returns:
             Mapping from axis key to descriptor.
@@ -77,14 +77,14 @@ class AxisManifest:
         return {axis.axis_key: axis for axis in self.axes}
 
     def signature(self) -> dict[str, Any]:
-        """Return stable manifest identity.
+        """Return stable axis table identity.
 
         Returns:
-            Serializable manifest identity.
+            Serializable axis table identity.
         """
         return {
             "package_version": self.package_version,
-            "manifest_version": self.manifest_version,
+            "axis_table_version": self.axis_table_version,
             "axes": tuple(axis.signature() for axis in self.axes),
             "class_c_groups": dict(sorted(self.class_c_groups.items())),
             "merge_rules": self.merge_rules,
@@ -96,7 +96,7 @@ class AxisManifest:
         *,
         fixed_fields: Mapping[str, Any],
     ) -> Candidate:
-        """Return candidate with manifest admission status set.
+        """Return candidate with axis table admission status set.
 
         Returns:
             Candidate with updated admission status.
@@ -118,7 +118,7 @@ class AxisManifest:
         *,
         fixed_fields: Mapping[str, Any],
     ) -> str | None:
-        """Return the first manifest admission error.
+        """Return the first axis table admission error.
 
         Returns:
             Failure reason, or None when admitted.
@@ -129,31 +129,31 @@ class AxisManifest:
             axis = by_key.get(key)
 
             if axis is None:
-                return f"candidate setting key has no manifest owner: {key}"
+                return f"candidate setting key has no axis table owner: {key}"
 
-            value_error = _manifest_value_error(axis, value)
+            value_error = _axis_table_value_error(axis, value)
 
             if value_error is not None:
                 return value_error
 
-        return _manifest_cross_rule_error(candidate.settings, fixed_fields)
+        return _axis_table_cross_rule_error(candidate.settings, fixed_fields)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class ManifestCandidateAdmitter:
-    """Candidate admitter backed by the SPEC-level manifest."""
+class AxisTableAdmitter:
+    """Candidate admitter backed by the axis table."""
 
-    manifest: AxisManifest
+    axis_table: AxisTable
     fixed_fields: Mapping[str, Any]
 
     def admit(self, candidate: Candidate) -> Candidate:
         """Return candidate with admission status set."""
-        return self.manifest.admit(candidate, fixed_fields=self.fixed_fields)
+        return self.axis_table.admit(candidate, fixed_fields=self.fixed_fields)
 
     def signature(self) -> dict[str, Any]:
         """Return stable admission identity."""
         return {
-            "manifest": self.manifest.signature(),
+            "axis_table": self.axis_table.signature(),
             "fixed_fields": dict(self.fixed_fields),
         }
 
@@ -210,7 +210,7 @@ FACTORIZED_INVERSE_MERGE_RULE = (
     "factorized inverse rows merge inverse_solve with metric_storage"
 )
 
-MANIFEST_MERGE_RULES = (
+AXIS_TABLE_MERGE_RULES = (
     PACKED_ATTENTION_MERGE_RULE,
     ATTENTION_COMPILE_MERGE_RULE,
     OPERATOR_COMPILE_MERGE_RULE,
@@ -386,13 +386,13 @@ OPERATOR_PREFIX = {
 }
 
 
-def axis_manifest() -> AxisManifest:
-    """Return the SPEC-level axis manifest.
+def axis_table() -> AxisTable:
+    """Return the complete sweep axis table.
 
     Returns:
-        Complete axis manifest for candidate generation and admission.
+        Complete axis table for candidate generation and admission.
     """
-    axes = tuple(starmap(_manifest_axis, _manifest_axis_domains()))
+    axes = tuple(starmap(_axis_table_axis, _axis_table_axis_domains()))
     groups = {}
 
     for axis in axes:
@@ -400,22 +400,22 @@ def axis_manifest() -> AxisManifest:
 
     class_c_groups = {name: tuple(keys) for name, keys in sorted(groups.items())}
 
-    return AxisManifest(
+    return AxisTable(
         package_version="0.0.1",
-        manifest_version="1",
+        axis_table_version="1",
         axes=axes,
         class_c_groups=class_c_groups,
-        merge_rules=MANIFEST_MERGE_RULES,
+        merge_rules=AXIS_TABLE_MERGE_RULES,
     )
 
 
-def _manifest_axis(
+def _axis_table_axis(
     axis_key: str,
     value_domain: tuple[Any, ...],
-) -> ManifestAxisDescriptor:
+) -> AxisTableDescriptor:
     class_c_group = _class_c_group(axis_key)
 
-    return ManifestAxisDescriptor(
+    return AxisTableDescriptor(
         axis_key=axis_key,
         owner_id=_owner_id(axis_key),
         value_domain=value_domain,
@@ -430,7 +430,7 @@ def _manifest_axis(
     )
 
 
-def _manifest_axis_domains() -> tuple[tuple[str, tuple[Any, ...]], ...]:
+def _axis_table_axis_domains() -> tuple[tuple[str, tuple[Any, ...]], ...]:
     return (
         (
             "gradient.path",
@@ -860,7 +860,7 @@ def _owner_id(axis_key: str) -> str:
     if prefix_owner is not None:
         return prefix_owner
 
-    message = f"manifest axis has no owner: {axis_key}"
+    message = f"axis table axis has no owner: {axis_key}"
     raise AdmissionError(message)
 
 
@@ -886,7 +886,7 @@ def _class_c_group(axis_key: str) -> str:
     if prefix_group is not None:
         return prefix_group
 
-    message = f"manifest axis has no Class C group: {axis_key}"
+    message = f"axis table axis has no Class C group: {axis_key}"
     raise AdmissionError(message)
 
 
@@ -969,8 +969,8 @@ def _adapter_id(axis_key: str) -> str:
     return ""
 
 
-def _manifest_value_error(
-    axis: ManifestAxisDescriptor,
+def _axis_table_value_error(
+    axis: AxisTableDescriptor,
     value: Any,
 ) -> str | None:
     validators = (
@@ -1030,7 +1030,7 @@ def _registered_value_error(axis_key: str, value: Any) -> str | None:
     return None
 
 
-def _manifest_cross_rule_error(
+def _axis_table_cross_rule_error(
     settings: Mapping[str, Any],
     fixed_fields: Mapping[str, Any],
 ) -> str | None:

@@ -10,6 +10,7 @@ from vptune import (
 )
 from vptune.adapters.distributed import (
     DistributedAdmissionPolicy,
+    RankCompileTiming,
     RankSelectedSettings,
     RankStatus,
     admit_distributed_candidate,
@@ -1499,7 +1500,184 @@ def test_distributed_record_contains_memory_surface_and_settings() -> None:
         "names": ("weight",),
         "shapes": ((2, 2),),
     }
+    assert record["selection_metadata"] == {
+        "global_elapsed_seconds": pytest.approx(1.2)
+    }
+    assert record["rank_compile_timings"] == ()
     assert record["rank_memory_samples"][1]["device"] == "cuda:1"
+
+
+def test_distributed_record_contains_compiled_selection_metadata() -> None:
+    record = distributed_record(
+        identity=valid_distributed_identity(),
+        expected_rank_count=2,
+        rank_statuses=(
+            RankStatus(rank=0, status="passed", device="cuda:0"),
+            RankStatus(rank=1, status="passed", device="cuda:1"),
+        ),
+        rank_memory_samples=(
+            Measurement(
+                elapsed_seconds=1.0,
+                peak_allocated_mib=11.0,
+                peak_reserved_mib=19.0,
+                post_allocated_mib=3.0,
+                post_reserved_mib=4.0,
+                rank=0,
+                device="cuda:0",
+            ),
+            Measurement(
+                elapsed_seconds=1.2,
+                peak_allocated_mib=13.0,
+                peak_reserved_mib=23.0,
+                post_allocated_mib=5.0,
+                post_reserved_mib=6.0,
+                rank=1,
+                device="cuda:1",
+            ),
+        ),
+        rank_selected_settings=(
+            RankSelectedSettings(
+                rank=0,
+                settings={
+                    "compile.enabled": "true",
+                    "distributed.strategy": "fsdp2",
+                },
+            ),
+            RankSelectedSettings(
+                rank=1,
+                settings={
+                    "compile.enabled": "true",
+                    "distributed.strategy": "fsdp2",
+                },
+            ),
+        ),
+        global_parameter_surface={"names": ("weight",), "shapes": ((2, 2),)},
+        rank_compile_timings=(
+            RankCompileTiming(
+                rank=0,
+                compile_time_seconds=9.0,
+                steady_elapsed_seconds=0.8,
+                recompile_count=1,
+            ),
+            RankCompileTiming(
+                rank=1,
+                compile_time_seconds=12.0,
+                steady_elapsed_seconds=0.7,
+                recompile_count=2,
+            ),
+        ),
+    )
+
+    assert record["selection_metadata"] == {
+        "global_elapsed_seconds": pytest.approx(1.2),
+        "global_compile_time_seconds": pytest.approx(12.0),
+        "global_steady_elapsed_seconds": pytest.approx(0.8),
+        "recompile_count": 2,
+    }
+    assert record["rank_compile_timings"][1]["rank"] == 1
+
+
+def test_distributed_record_rejects_bad_compile_timing_rank_sets() -> None:
+    with pytest.raises(MaterializationError, match="compile timing ranks"):
+        distributed_record(
+            identity=valid_distributed_identity(),
+            expected_rank_count=1,
+            rank_statuses=(RankStatus(rank=0, status="passed", device="cuda:0"),),
+            rank_memory_samples=(
+                Measurement(
+                    elapsed_seconds=1.0,
+                    peak_allocated_mib=1.0,
+                    peak_reserved_mib=1.0,
+                    post_allocated_mib=0.0,
+                    post_reserved_mib=0.0,
+                    rank=0,
+                    device="cuda:0",
+                ),
+            ),
+            rank_selected_settings=(
+                RankSelectedSettings(
+                    rank=0,
+                    settings={
+                        "compile.enabled": "true",
+                        "distributed.strategy": "fsdp2",
+                    },
+                ),
+            ),
+            global_parameter_surface={},
+            rank_compile_timings=(
+                RankCompileTiming(
+                    rank=1,
+                    compile_time_seconds=1.0,
+                    steady_elapsed_seconds=1.0,
+                    recompile_count=0,
+                ),
+            ),
+        )
+
+
+def test_distributed_record_rejects_compile_timing_on_eager_rows() -> None:
+    with pytest.raises(MaterializationError, match="compiled distributed rows"):
+        distributed_record(
+            identity=valid_distributed_identity(),
+            expected_rank_count=1,
+            rank_statuses=(RankStatus(rank=0, status="passed", device="cuda:0"),),
+            rank_memory_samples=(
+                Measurement(
+                    elapsed_seconds=1.0,
+                    peak_allocated_mib=1.0,
+                    peak_reserved_mib=1.0,
+                    post_allocated_mib=0.0,
+                    post_reserved_mib=0.0,
+                    rank=0,
+                    device="cuda:0",
+                ),
+            ),
+            rank_selected_settings=(
+                RankSelectedSettings(
+                    rank=0,
+                    settings={"distributed.strategy": "fsdp2"},
+                ),
+            ),
+            global_parameter_surface={},
+            rank_compile_timings=(
+                RankCompileTiming(
+                    rank=0,
+                    compile_time_seconds=1.0,
+                    steady_elapsed_seconds=1.0,
+                    recompile_count=0,
+                ),
+            ),
+        )
+
+
+def test_distributed_record_requires_compile_timing_for_compiled_rows() -> None:
+    with pytest.raises(MaterializationError, match="compile timing"):
+        distributed_record(
+            identity=valid_distributed_identity(),
+            expected_rank_count=1,
+            rank_statuses=(RankStatus(rank=0, status="passed", device="cuda:0"),),
+            rank_memory_samples=(
+                Measurement(
+                    elapsed_seconds=1.0,
+                    peak_allocated_mib=1.0,
+                    peak_reserved_mib=1.0,
+                    post_allocated_mib=0.0,
+                    post_reserved_mib=0.0,
+                    rank=0,
+                    device="cuda:0",
+                ),
+            ),
+            rank_selected_settings=(
+                RankSelectedSettings(
+                    rank=0,
+                    settings={
+                        "compile.enabled": "true",
+                        "distributed.strategy": "fsdp2",
+                    },
+                ),
+            ),
+            global_parameter_surface={},
+        )
 
 
 def test_distributed_record_requires_matching_rank_sets() -> None:

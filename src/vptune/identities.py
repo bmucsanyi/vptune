@@ -242,7 +242,12 @@ def cuda_driver_version() -> Any:
     Raises:
         RuntimeError: If the CUDA runtime reports a failed driver-version query.
     """
-    version = torch.cuda.cudart().cudaDriverGetVersion()
+    driver_version = getattr(torch.cuda.cudart(), "cudaDriverGetVersion", None)
+
+    if driver_version is None:
+        return None
+
+    version = driver_version()
 
     if isinstance(version, tuple):
         error_code, driver_version = version
