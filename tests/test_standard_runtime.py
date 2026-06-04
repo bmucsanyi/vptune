@@ -8,6 +8,7 @@ import torch
 from torch._dynamo import config as torch_dynamo_config
 
 import vptune as vp
+import vptune.checkpoint as checkpoint_module
 import vptune.ext as vpx
 import vptune.runtime as runtime_module
 from vptune.io import read_record
@@ -11385,6 +11386,71 @@ def test_standard_runtime_executes_custom_saved_tensor_hooks() -> None:
 
     assert tuple(event for event, _ in events) == ("pack", "unpack")
     assert torch.equal(result_map["w"], torch.tensor([4.0], dtype=torch.float64))
+
+
+def test_standard_runtime_executes_cpu_saved_tensor_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64, requires_grad=True)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+    events = []
+    original_pack = checkpoint_module._cpu_pack_hook
+    original_unpack = checkpoint_module._cpu_unpack_hook
+
+    def scalar(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert batch == {"scale": 1.0}
+        assert context.family == "gradient"
+
+        return params["w"].pow(3).sum()
+
+    def recording_pack(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.device]:
+        events.append(("pack", tensor.device.type, tensor.detach().clone()))
+
+        return original_pack(tensor)
+
+    def recording_unpack(packed: tuple[torch.Tensor, torch.device]) -> torch.Tensor:
+        tensor, device = packed
+        events.append(("unpack", tensor.device.type, device.type))
+
+        return original_unpack(packed)
+
+    monkeypatch.setattr(checkpoint_module, "_cpu_pack_hook", recording_pack)
+    monkeypatch.setattr(checkpoint_module, "_cpu_unpack_hook", recording_unpack)
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        scalar_objectives={"loss": scalar},
+    )
+    result = factory(
+        vp.Candidate(
+            "gradient",
+            "cpu-saved-hooks",
+            {
+                **gradient_settings(),
+                "activation.recompute": "none",
+                "activation.offload": "saved_tensor_hooks_cpu",
+            },
+            admission_status="passed",
+        ),
+        {"scale": 1.0},
+        vector,
+    )()
+    result_map = tensor_mapping(result)
+
+    assert tuple(event[0] for event in events) == ("pack", "unpack")
+    assert events[0][1] == "cpu"
+    assert events[1][1:] == ("cpu", "cpu")
+    torch.testing.assert_close(
+        result_map["w"],
+        torch.tensor([12.0], dtype=torch.float64),
+    )
 
 
 def test_reference_check_rejects_custom_saved_tensor_hooks_that_change_values() -> None:

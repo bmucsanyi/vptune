@@ -154,6 +154,13 @@ class _AutobatchReferenceRows:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class _BalancedGroupRows:
+    retained: tuple[Candidate, ...]
+    candidate_rows: tuple[Candidate, ...]
+    check_records: tuple[CheckRecord, ...]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class _CandidateProbeRows:
     candidate_rows: tuple[Candidate, ...]
     full_size_records: tuple[FullSizeRecord, ...]
@@ -1207,13 +1214,9 @@ def _probe_balanced_candidate_rows(
 
     baseline = _single_admitted_baseline(candidates, strategy="balanced")
     grouped = _balanced_group_candidates(candidates)
-    group_candidates = (
-        baseline,
-        *tuple(itertools.chain.from_iterable(grouped.values())),
-    )
-    group_rows = _probe_candidate_rows(
+    baseline_rows = _probe_candidate_rows(
         runtime=runtime,
-        candidates=group_candidates,
+        candidates=(baseline,),
         reference_batch=reference_batch,
         reference_vector=reference_vector,
         probe_inputs=probe_inputs,
@@ -1225,14 +1228,29 @@ def _probe_balanced_candidate_rows(
         clock=clock,
         run_dir=run_dir,
     )
-    retained = _balanced_retained_candidates(
-        grouped,
-        group_candidates,
-        group_rows.full_size_records,
-        input_signature=input_signature,
-        policy=selection_policy,
-        retained_top_count=retained_top_count,
-    )
+    retained = {}
+    group_candidate_rows = []
+    group_check_records = []
+
+    for group_key, group_candidates in grouped.items():
+        group_rows = _probe_balanced_group_rows(
+            runtime=runtime,
+            candidates=group_candidates,
+            reference_batch=reference_batch,
+            reference_vector=reference_vector,
+            probe_inputs=probe_inputs,
+            input_signature=input_signature,
+            timing_policy=timing_policy,
+            selection_policy=selection_policy,
+            retained_top_count=retained_top_count,
+            memory_backend=memory_backend,
+            clock=clock,
+            run_dir=run_dir,
+        )
+        retained[group_key] = group_rows.retained
+        group_candidate_rows.extend(group_rows.candidate_rows)
+        group_check_records.extend(group_rows.check_records)
+
     cross_candidates = _balanced_cross_candidate_rows(baseline, retained)
     synthetic_cross = tuple(
         candidate
@@ -1281,25 +1299,220 @@ def _probe_balanced_candidate_rows(
     )
 
     return (
-        (*group_candidates, *cross_candidates, *compile_candidates),
+        (baseline, *cross_candidates, *compile_candidates),
         _CandidateProbeRows(
             candidate_rows=(
+                *baseline_rows.candidate_rows,
+                *group_candidate_rows,
                 *synthetic_cross,
-                *group_rows.candidate_rows,
                 *cross_rows.candidate_rows,
                 *compile_rows.candidate_rows,
             ),
             full_size_records=(
-                *group_rows.full_size_records,
+                *baseline_rows.full_size_records,
                 *cross_rows.full_size_records,
                 *compile_rows.full_size_records,
             ),
             check_records=(
-                *group_rows.check_records,
+                *baseline_rows.check_records,
+                *group_check_records,
                 *cross_rows.check_records,
                 *compile_rows.check_records,
             ),
         ),
+    )
+
+
+def _probe_balanced_group_rows(
+    *,
+    runtime: RuntimeConfig,
+    candidates: tuple[Candidate, ...],
+    reference_batch: Batch,
+    reference_vector: TensorTree,
+    probe_inputs: tuple[tuple[Batch, TensorTree], ...],
+    input_signature: dict[str, Any],
+    timing_policy: TimingPolicy,
+    selection_policy: SelectionPolicy,
+    retained_top_count: int,
+    memory_backend: MemoryBackend,
+    clock: Callable[[], float],
+    run_dir: Path | None,
+) -> _BalancedGroupRows:
+    if not probe_inputs:
+        message = "balanced search requires at least one full-size probe input"
+        raise MaterializationError(message)
+
+    active = []
+    candidate_rows = []
+    check_records = []
+    records_by_id = {}
+
+    for candidate in candidates:
+        outcome = _reference_outcome(
+            runtime,
+            candidate,
+            reference_batch,
+            reference_vector,
+            input_signature,
+            run_dir,
+        )
+        candidate_rows.extend(outcome.candidates)
+        check_records.extend(outcome.check_records)
+
+        if run_dir is not None:
+            for check_record in outcome.check_records:
+                _write_check(run_dir, check_record)
+
+        if outcome.full_size_record is not None:
+            records_by_id[candidate.candidate_id] = outcome.full_size_record
+        elif outcome.passed:
+            active.append(candidate)
+
+    for stage_index, probe_input in enumerate(probe_inputs, start=1):
+        if not active:
+            break
+
+        stage_records = []
+
+        for candidate in active:
+            operation = _measured_operation(runtime, candidate, (probe_input,))
+            record = run_candidate(
+                candidate,
+                input_signature,
+                operation,
+                timing_policy=timing_policy,
+                memory_backend=memory_backend,
+                clock=clock,
+                reference_passed=True,
+                full_size_check=_full_size_check(runtime, candidate, (probe_input,)),
+            )
+            record = _balanced_accumulated_record(
+                records_by_id.get(candidate.candidate_id),
+                record,
+                stage_index,
+            )
+            records_by_id[candidate.candidate_id] = record
+            stage_records.append((candidate, record))
+
+        active = list(
+            _balanced_stage_survivors(
+                tuple(stage_records),
+                input_signature=input_signature,
+                policy=selection_policy,
+                retained_top_count=retained_top_count,
+            )
+        )
+
+        if len(active) <= retained_top_count:
+            break
+
+    retained = _balanced_top_candidates(
+        tuple(active),
+        records_by_id,
+        input_signature=input_signature,
+        policy=selection_policy,
+        retained_top_count=retained_top_count,
+    )
+
+    return _BalancedGroupRows(
+        retained=retained,
+        candidate_rows=tuple(candidate_rows),
+        check_records=tuple(check_records),
+    )
+
+
+def _balanced_accumulated_record(
+    previous: FullSizeRecord | None,
+    current: FullSizeRecord,
+    stage_count: int,
+) -> FullSizeRecord:
+    if previous is None:
+        record = current
+    else:
+        record = dataclasses.replace(
+            current,
+            timing_samples=(
+                *previous.timing_samples,
+                *current.timing_samples,
+            ),
+            memory_samples=(
+                *previous.memory_samples,
+                *current.memory_samples,
+            ),
+        )
+
+    return dataclasses.replace(
+        record,
+        selection_metadata={
+            **dict(record.selection_metadata),
+            "balanced_group_stage_count": stage_count,
+        },
+    )
+
+
+def _balanced_stage_survivors(
+    records: tuple[tuple[Candidate, FullSizeRecord], ...],
+    *,
+    input_signature: Mapping[str, object],
+    policy: SelectionPolicy,
+    retained_top_count: int,
+) -> tuple[Candidate, ...]:
+    accepted = _balanced_accepted(records, input_signature=input_signature)
+
+    if not accepted:
+        return ()
+
+    ordered = _balanced_ordered_candidates(accepted, policy=policy)
+    keep_count = max(retained_top_count, (len(ordered) + 1) // 2)
+
+    return tuple(candidate for candidate, _ in ordered[:keep_count])
+
+
+def _balanced_top_candidates(
+    candidates: tuple[Candidate, ...],
+    records_by_id: Mapping[str, FullSizeRecord],
+    *,
+    input_signature: Mapping[str, object],
+    policy: SelectionPolicy,
+    retained_top_count: int,
+) -> tuple[Candidate, ...]:
+    records = tuple(
+        (candidate, records_by_id[candidate.candidate_id])
+        for candidate in candidates
+        if candidate.candidate_id in records_by_id
+    )
+    accepted = _balanced_accepted(records, input_signature=input_signature)
+    ordered = _balanced_ordered_candidates(accepted, policy=policy)
+
+    return tuple(candidate for candidate, _ in ordered[:retained_top_count])
+
+
+def _balanced_accepted(
+    records: tuple[tuple[Candidate, FullSizeRecord], ...],
+    *,
+    input_signature: Mapping[str, object],
+) -> tuple[tuple[Candidate, FullSizeRecord], ...]:
+    return tuple(
+        (candidate, record)
+        for candidate, record in records
+        if record_matches_candidate(candidate, record)
+        and record_accepted(record, input_signature)
+    )
+
+
+def _balanced_ordered_candidates(
+    records: tuple[tuple[Candidate, FullSizeRecord], ...],
+    *,
+    policy: SelectionPolicy,
+) -> tuple[tuple[Candidate, FullSizeRecord], ...]:
+    return tuple(
+        sorted(
+            records,
+            key=lambda item: (
+                selection_score_seconds(item[1], policy),
+                selection_memory_mib(item[1], policy),
+            ),
+        )
     )
 
 
@@ -1334,44 +1547,6 @@ def _validate_balanced_delta(candidate: Candidate) -> None:
             f"{candidate.candidate_id}"
         )
         raise MaterializationError(message)
-
-
-def _balanced_retained_candidates(
-    grouped: Mapping[tuple[str, ...], tuple[Candidate, ...]],
-    measured_candidates: tuple[Candidate, ...],
-    records: tuple[FullSizeRecord, ...],
-    *,
-    input_signature: Mapping[str, object],
-    policy: SelectionPolicy,
-    retained_top_count: int,
-) -> dict[tuple[str, ...], tuple[Candidate, ...]]:
-    accepted = {
-        candidate.candidate_id: (candidate, record)
-        for candidate, record in zip(measured_candidates, records, strict=True)
-        if record_matches_candidate(candidate, record)
-        and record_accepted(record, input_signature)
-    }
-    retained = {}
-
-    for group_key, group_candidates in grouped.items():
-        group_accepted = tuple(
-            accepted[candidate.candidate_id]
-            for candidate in group_candidates
-            if candidate.candidate_id in accepted
-        )
-        ordered = tuple(
-            candidate
-            for candidate, _ in sorted(
-                group_accepted,
-                key=lambda item: (
-                    selection_score_seconds(item[1], policy),
-                    selection_memory_mib(item[1], policy),
-                ),
-            )
-        )
-        retained[group_key] = ordered[:retained_top_count]
-
-    return retained
 
 
 def _balanced_cross_candidate_rows(

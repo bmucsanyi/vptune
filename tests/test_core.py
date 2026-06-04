@@ -813,9 +813,6 @@ def test_tune_balanced_strategy_crosses_retained_group_winners(
 
     assert tuple(record.candidate_id for record in plan.full_size_records) == (
         "base",
-        "hvp-slow",
-        "hvp-fast",
-        "dtype",
         "balanced:hvp-fast+dtype",
         "compiled-cross",
     )
@@ -831,8 +828,8 @@ def test_tune_balanced_strategy_crosses_retained_group_winners(
         "base",
         "base",
         "hvp-slow",
-        "hvp-slow",
         "hvp-fast",
+        "hvp-slow",
         "hvp-fast",
         "dtype",
         "dtype",
@@ -842,6 +839,123 @@ def test_tune_balanced_strategy_crosses_retained_group_winners(
         "compiled-cross",
     )
     assert plan.selected_candidate().candidate_id == "compiled-cross"
+
+
+def test_tune_balanced_strategy_halves_group_rows_by_probe_stage(
+    tmp_path: Path,
+) -> None:
+    calls = []
+    model = torch.nn.Linear(1, 1)
+    candidates = (
+        vp.Candidate("family", "base", {}, admission_status="passed"),
+        vp.Candidate(
+            "family",
+            "hvp-slow",
+            {"hvp.path": "reverse_over_reverse"},
+            changed_axes=("hvp.path",),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "hvp-middle",
+            {"hvp.path": "jvp_grad"},
+            changed_axes=("hvp.path",),
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "hvp-fast",
+            {"hvp.path": "autograd_functional_hvp"},
+            changed_axes=("hvp.path",),
+            admission_status="passed",
+        ),
+    )
+    target = dataclasses.replace(
+        cpu_target(
+            vp.TimingPolicy(
+                short_seconds=0.0,
+                medium_seconds=0.0,
+                long_measured_calls=1,
+            )
+        ),
+        search_policy=vp.SearchPolicy(strategy="balanced", retained_top_count=1),
+    )
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert isinstance(vector, torch.Tensor)
+        calls.append(("operation", candidate.candidate_id, batch["index"]))
+
+        return vpx.constant_operation(torch.tensor([1.0]))
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert batch["source"] == "reference"
+        assert isinstance(vector, torch.Tensor)
+        calls.append(("reference", candidate.candidate_id, None))
+
+        return reference_passed()
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=TwoProbeData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=TwoVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            candidates,
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.search-balanced-halving"},
+        ),
+    )
+    plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((
+            0.0,
+            10.0,
+            10.0,
+            20.0,
+            20.0,
+            23.0,
+            23.0,
+            24.0,
+            24.0,
+            25.0,
+            25.0,
+            30.0,
+            30.0,
+            31.0,
+        )),
+    )
+
+    assert tuple(record.candidate_id for record in plan.full_size_records) == (
+        "base",
+        "hvp-fast",
+    )
+    assert plan.selected_candidate().candidate_id == "hvp-fast"
+    assert tuple(
+        call for call in calls if call[0] == "operation" and call[1] != "base"
+    ) == (
+        ("operation", "hvp-slow", 0),
+        ("operation", "hvp-middle", 0),
+        ("operation", "hvp-fast", 0),
+        ("operation", "hvp-fast", 1),
+        ("operation", "hvp-middle", 1),
+        ("operation", "hvp-fast", 0),
+        ("operation", "hvp-fast", 1),
+    )
 
 
 def test_tune_thorough_strategy_uses_declared_repeat_count(
