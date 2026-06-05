@@ -9546,6 +9546,23 @@ def test_tune_run_uses_family_dag_order(tmp_path: Path) -> None:
     assert vpx.plan_record_current(vpx.plan_to_json(replayed), plan)
     assert vpx.plan_record_current(vpx.plan_to_json(loaded_run), plan)
 
+    saved_paths = tuple(
+        sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*.json"))
+    )
+    second_plan = vp.tune_run(
+        run,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock(()),
+    )
+
+    assert calls == ["a", "b"]
+    assert vpx.plan_record_current(vpx.plan_to_json(second_plan), plan)
+    assert (
+        tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*.json")))
+        == saved_paths
+    )
+
     stale_dependency_identity = dict(expected_dependency_identity)
     stale_dependency_identity["full_size_row"] = {
         **dict(expected_dependency_identity["full_size_row"]),
