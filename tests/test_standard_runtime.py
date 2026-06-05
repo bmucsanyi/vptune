@@ -5308,21 +5308,6 @@ def test_fisher_score_grad_path_is_required_only_for_streaming_rows() -> None:
 
 
 def test_fisher_vp_rejects_categorical_and_requires_score_reduction() -> None:
-    params = {"w": torch.tensor([1.0], dtype=torch.float64)}
-    vector = {"w": torch.tensor([0.5], dtype=torch.float64)}
-
-    def scores(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> torch.Tensor:
-        assert buffers == {}
-        assert batch["x"] is not None
-        assert context.family == "fisher"
-
-        return params["w"][0] * batch["x"].reshape(-1)
-
     with pytest.raises(vp.MaterializationError, match="GGNVP"):
         vp.fisher_vp(
             "fisher",
@@ -5335,37 +5320,17 @@ def test_fisher_vp_rejects_categorical_and_requires_score_reduction() -> None:
             denominator="num_examples",
         )
 
-    invalid_explicit = vp.fisher_vp(
-        "fisher",
-        "scores",
-        aggregation="mean_per_example",
-        distribution="explicit_score_gradients",
-        label_policy="explicit_scores",
-        sample_space="terms",
-        score_reduction="log_prob",
-        denominator="batch_normalization",
-    )
-    explicit_factory = vpx.standard_operation_factory(
-        invalid_explicit,
-        params=params,
-        buffers={},
-        function_objectives={"scores": scores},
-    )
-
     with pytest.raises(vp.MaterializationError, match="score_reduction"):
-        explicit_factory(
-            vp.Candidate(
-                "fisher",
-                "row",
-                fisher_settings("streaming_dot_accumulate"),
-                admission_status="passed",
-            ),
-            {
-                "x": torch.tensor([1.0], dtype=torch.float64),
-                "normalization": 1.0,
-            },
-            vector,
-        )()
+        vp.fisher_vp(
+            "fisher",
+            "scores",
+            aggregation="mean_per_example",
+            distribution="explicit_score_gradients",
+            label_policy="explicit_scores",
+            sample_space="terms",
+            score_reduction="log_prob",
+            denominator="batch_normalization",
+        )
 
 
 def test_inverse_metric_reference_check_records_inverse_residual() -> None:

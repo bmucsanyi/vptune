@@ -6,6 +6,16 @@ from typing import Any
 from vptune.data import OperatorSpec
 from vptune.errors import MaterializationError
 
+AGGREGATIONS = ("sum", "mean", "mean_per_example", "none")
+GGN_LOSS_GEOMETRIES = ("psd_metric", "linear_map")
+FISHER_DISTRIBUTIONS = ("explicit_score_gradients",)
+FISHER_LABEL_POLICIES = ("explicit_scores",)
+SAMPLED_FISHER_LABEL_POLICIES = ("sampled_labels",)
+FISHER_SAMPLE_SPACES = ("terms",)
+FISHER_SCORE_REDUCTIONS = ("none",)
+FISHER_DENOMINATORS = ("one", "num_examples", "batch_normalization")
+EMPIRICAL_FISHER_EXAMPLE_LOSS_REDUCTIONS = ("per_example",)
+
 
 def gradient(
     family: str,
@@ -16,6 +26,8 @@ def gradient(
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
     """Return a gradient operator spec."""
+    _require_value(aggregation, AGGREGATIONS, "aggregation")
+
     return OperatorSpec(
         family,
         "gradient",
@@ -35,6 +47,8 @@ def jvp(
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
     """Return a JVP operator spec."""
+    _require_value(aggregation, AGGREGATIONS, "aggregation")
+
     return OperatorSpec(
         family,
         "jvp",
@@ -55,6 +69,8 @@ def vjp(
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
     """Return a VJP operator spec."""
+    _require_value(aggregation, AGGREGATIONS, "aggregation")
+
     return OperatorSpec(
         family,
         "vjp",
@@ -75,6 +91,8 @@ def hvp(
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
     """Return an HVP operator spec."""
+    _require_value(aggregation, AGGREGATIONS, "aggregation")
+
     return OperatorSpec(
         family,
         "hvp",
@@ -96,6 +114,9 @@ def ggnvp(
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
     """Return a GGNVP operator spec."""
+    _require_value(aggregation, AGGREGATIONS, "aggregation")
+    _require_value(loss_geometry, GGN_LOSS_GEOMETRIES, "loss_geometry")
+
     if loss_geometry == "psd_metric":
         batch_inputs = {
             "reference": ("loss_hessian", "symmetry_vector"),
@@ -137,9 +158,17 @@ def fisher_vp(
     Raises:
         MaterializationError: If exact categorical Fisher is requested.
     """
+    _require_value(aggregation, AGGREGATIONS, "aggregation")
+
     if distribution == "categorical":
         message = "exact categorical Fisher is represented by GGNVP"
         raise MaterializationError(message)
+
+    _require_value(distribution, FISHER_DISTRIBUTIONS, "distribution")
+    _require_value(label_policy, FISHER_LABEL_POLICIES, "label_policy")
+    _require_value(sample_space, FISHER_SAMPLE_SPACES, "sample_space")
+    _require_value(score_reduction, FISHER_SCORE_REDUCTIONS, "score_reduction")
+    _require_value(denominator, FISHER_DENOMINATORS, "denominator")
 
     raw_semantics = {
         "distribution": distribution,
@@ -184,7 +213,13 @@ def sampled_fisher_vp(
     Raises:
         MaterializationError: If sample count is invalid.
     """
-    if sample_count <= 0:
+    _require_value(aggregation, AGGREGATIONS, "aggregation")
+    _require_value(distribution, FISHER_DISTRIBUTIONS, "distribution")
+    _require_value(label_policy, SAMPLED_FISHER_LABEL_POLICIES, "label_policy")
+    _require_value(score_reduction, FISHER_SCORE_REDUCTIONS, "score_reduction")
+    _require_value(denominator, FISHER_DENOMINATORS, "denominator")
+
+    if isinstance(sample_count, bool) or sample_count <= 0:
         message = "sampled Fisher sample_count must be positive"
         raise MaterializationError(message)
 
@@ -225,6 +260,14 @@ def empirical_fisher_vp(
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
     """Return an empirical FisherVP operator spec."""
+    _require_value(aggregation, AGGREGATIONS, "aggregation")
+    _require_value(
+        example_loss_reduction,
+        EMPIRICAL_FISHER_EXAMPLE_LOSS_REDUCTIONS,
+        "example_loss_reduction",
+    )
+    _require_value(denominator, FISHER_DENOMINATORS, "denominator")
+
     semantics = {
         "example_loss_reduction": example_loss_reduction,
         "denominator": denominator,
@@ -252,6 +295,7 @@ def metric(
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
     """Return a metric operator spec."""
+    _require_value(aggregation, AGGREGATIONS, "aggregation")
     representation_fields = _metric_representation_inputs(representation)
 
     return OperatorSpec(
@@ -284,6 +328,8 @@ def inverse_metric(
     Raises:
         MaterializationError: If damping is negative.
     """
+    _require_value(aggregation, AGGREGATIONS, "aggregation")
+
     if damping < 0.0:
         message = "inverse metric damping must be nonnegative"
         raise MaterializationError(message)
@@ -340,6 +386,7 @@ def composition(
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
     """Return a composed operator spec."""
+    _require_value(aggregation, AGGREGATIONS, "aggregation")
     child_order = _composition_children(children)
 
     return OperatorSpec(
@@ -370,3 +417,9 @@ def _composition_children(children: Sequence[str]) -> tuple[str, ...]:
         raise MaterializationError(message)
 
     return child_order
+
+
+def _require_value(value: str, allowed: Sequence[str], field: str) -> None:
+    if value not in allowed:
+        message = f"{field} is unsupported: {value}"
+        raise MaterializationError(message)

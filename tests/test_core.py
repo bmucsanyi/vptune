@@ -8811,6 +8811,87 @@ def test_operator_constructors_declare_kind_and_aggregation() -> None:
         vp.Family("compose", composition, dependencies=("metric",))
 
 
+def test_operator_constructors_reject_unknown_semantic_values() -> None:
+    with pytest.raises(vp.MaterializationError, match="aggregation"):
+        vp.gradient("grad", "loss", aggregation="summ")
+
+    with pytest.raises(vp.MaterializationError, match="loss_geometry"):
+        vp.ggnvp(
+            "ggn",
+            "model_output",
+            aggregation="sum",
+            loss_geometry="psd_mteric",
+        )
+
+    with pytest.raises(vp.MaterializationError, match="distribution"):
+        vp.fisher_vp(
+            "fisher",
+            "scores",
+            aggregation="mean",
+            distribution="explicit_scores_gradient",
+            label_policy="explicit_scores",
+            sample_space="terms",
+            score_reduction="none",
+            denominator="num_examples",
+        )
+
+    with pytest.raises(vp.MaterializationError, match="label_policy"):
+        vp.fisher_vp(
+            "fisher",
+            "scores",
+            aggregation="mean",
+            distribution="explicit_score_gradients",
+            label_policy="sampled_labels",
+            sample_space="terms",
+            score_reduction="none",
+            denominator="num_examples",
+        )
+
+    with pytest.raises(vp.MaterializationError, match="sample_space"):
+        vp.fisher_vp(
+            "fisher",
+            "scores",
+            aggregation="mean",
+            distribution="explicit_score_gradients",
+            label_policy="explicit_scores",
+            sample_space="classes",
+            score_reduction="none",
+            denominator="num_examples",
+        )
+
+    with pytest.raises(vp.MaterializationError, match="score_reduction"):
+        vp.sampled_fisher_vp(
+            "sampled",
+            "scores",
+            aggregation="mean",
+            distribution="explicit_score_gradients",
+            label_policy="sampled_labels",
+            sample_count=1,
+            sample_source="fixed_seed_and_count",
+            sampling_bound={"gamma": 0.25},
+            score_reduction="mean",
+            denominator="num_examples",
+        )
+
+    with pytest.raises(vp.MaterializationError, match="denominator"):
+        vp.empirical_fisher_vp(
+            "empirical",
+            "loss",
+            aggregation="mean",
+            example_loss_reduction="per_example",
+            denominator="batch",
+        )
+
+    with pytest.raises(vp.MaterializationError, match="example_loss_reduction"):
+        vp.empirical_fisher_vp(
+            "empirical",
+            "loss",
+            aggregation="mean",
+            example_loss_reduction="mean_loss",
+            denominator="num_examples",
+        )
+
+
 def test_tune_run_preflight_errors_do_not_write_summary(tmp_path: Path) -> None:
     target = cpu_target()
     model = torch.nn.Linear(1, 1)
