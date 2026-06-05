@@ -7621,6 +7621,173 @@ def test_reference_failed_rows_are_rechecked_on_next_tune(tmp_path: Path) -> Non
     assert passed_full_size["status"] == "passed"
 
 
+def test_tune_reuses_current_run_dir_rows_on_next_tune(tmp_path: Path) -> None:
+    model = torch.nn.Linear(1, 1)
+    candidate = vp.Candidate("family", "row", {}, admission_status="passed")
+    calls = {"reference": 0, "operation": 0}
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert candidate.candidate_id == "row"
+        assert batch["source"] == "reference"
+        assert isinstance(vector, torch.Tensor)
+        calls["reference"] += 1
+
+        return reference_passed()
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert candidate.candidate_id == "row"
+        assert batch["source"] == "probe"
+        assert isinstance(vector, torch.Tensor)
+
+        def operation() -> torch.Tensor:
+            calls["operation"] += 1
+
+            return vector
+
+        return operation
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=cpu_target(
+            vp.TimingPolicy(
+                short_seconds=0.0,
+                medium_seconds=0.0,
+                long_warmups=0,
+                long_measured_calls=1,
+            )
+        ),
+        runtime=vpx.RuntimeConfig(
+            (candidate,),
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"generator": "resume"},
+        ),
+    )
+
+    first_plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0)),
+    )
+    second_plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock(()),
+    )
+
+    assert calls == {"reference": 1, "operation": 1}
+    assert first_plan.selected_candidate().candidate_id == "row"
+    assert second_plan.selected_candidate().candidate_id == "row"
+    assert not (
+        tmp_path / "references" / "family" / "row" / "tree_close-000001.json"
+    ).exists()
+    assert not (
+        tmp_path / "full_size" / "family" / "row" / "result-000001.json"
+    ).exists()
+
+
+def test_tune_reruns_when_saved_candidate_settings_differ(tmp_path: Path) -> None:
+    model = torch.nn.Linear(1, 1)
+    calls = {"reference": 0, "operation": 0}
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert candidate.candidate_id == "row"
+        assert batch["source"] == "reference"
+        assert isinstance(vector, torch.Tensor)
+        calls["reference"] += 1
+
+        return reference_passed()
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert candidate.candidate_id == "row"
+        assert batch["source"] == "probe"
+        assert isinstance(vector, torch.Tensor)
+
+        def operation() -> torch.Tensor:
+            calls["operation"] += 1
+
+            return vector
+
+        return operation
+
+    def problem_for(scale: float) -> vp.Problem:
+        candidate = vp.Candidate(
+            "family",
+            "row",
+            {"scale": scale},
+            admission_status="passed",
+        )
+
+        return vp.Problem(
+            model=model,
+            params=vp.parameter_surface(model),
+            data=OneBatchData(),
+            operator=vp.gradient("family", "loss", aggregation="sum"),
+            vectors=OneVectorProvider(),
+            target=cpu_target(
+                vp.TimingPolicy(
+                    short_seconds=0.0,
+                    medium_seconds=0.0,
+                    long_warmups=0,
+                    long_measured_calls=1,
+                )
+            ),
+            runtime=vpx.RuntimeConfig(
+                (candidate,),
+                operation_factory,
+                reference_check,
+                materialize_candidate,
+                None,
+                {"generator": "resume-stale"},
+            ),
+        )
+
+    first_plan = vp.tune(
+        problem_for(1.0),
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0)),
+    )
+    second_plan = vp.tune(
+        problem_for(2.0),
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((1.0, 3.0)),
+    )
+
+    assert calls == {"reference": 2, "operation": 2}
+    assert first_plan.selected_candidate().settings == {"scale": 1.0}
+    assert second_plan.selected_candidate().settings == {"scale": 2.0}
+    assert (
+        tmp_path / "references" / "family" / "row" / "tree_close-000001.json"
+    ).exists()
+    assert (tmp_path / "full_size" / "family" / "row" / "result-000001.json").exists()
+
+
 def test_tune_records_reference_runtime_failures() -> None:
     model = torch.nn.Linear(1, 1)
     candidates = (

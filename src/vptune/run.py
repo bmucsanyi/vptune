@@ -60,6 +60,7 @@ from vptune.measure import (
 from vptune.runtime import deferred_runtime_finite_checks, standard_problem
 from vptune.schemas import (
     candidate_from_signature,
+    candidate_record_from_json,
     candidate_record_to_json,
     check_record_from_json,
     check_record_to_json,
@@ -147,6 +148,15 @@ class _ReferenceOutcome:
     check_records: tuple[CheckRecord, ...]
     full_size_record: FullSizeRecord | None
     passed: bool
+    cached: bool = False
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _RunDirCache:
+    candidates_by_input_key: Mapping[str, tuple[Candidate, ...]]
+    checks_by_row_key: Mapping[str, CheckRecord]
+    check_records: tuple[CheckRecord, ...]
+    full_size_records: tuple[FullSizeRecord, ...]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -976,7 +986,8 @@ def _write_unique_record(path: Path, payload: dict[str, Any]) -> None:
     try:
         write_record_exclusive(path, payload)
     except FileExistsError:
-        pass
+        if _record_payload_matches(path, payload):
+            return
     else:
         return
 
@@ -986,13 +997,235 @@ def _write_unique_record(path: Path, payload: dict[str, Any]) -> None:
         try:
             write_record_exclusive(candidate_path, payload)
         except FileExistsError:
-            pass
+            if _record_payload_matches(candidate_path, payload):
+                return
         else:
             return
 
 
+def _record_payload_matches(path: Path, payload: dict[str, Any]) -> bool:
+    return canonical_json(read_record(path)) == canonical_json(payload)
+
+
 def _write_summary(run_dir: Path, plan: Plan) -> None:
     write_record(run_dir / "summaries" / "tuning.json", plan_to_json(plan))
+
+
+def _run_dir_cache(run_dir: Path | None) -> _RunDirCache:
+    if run_dir is None:
+        return _RunDirCache({}, {}, (), ())
+
+    check_records = tuple(
+        check_record_from_json(read_record(path))
+        for path in sorted((run_dir / "references").rglob("*.json"))
+    )
+    full_size_records = tuple(
+        full_size_record_from_json(read_record(path))
+        for path in sorted((run_dir / "full_size").rglob("*.json"))
+    )
+    candidates_by_input_key = {}
+
+    for path in sorted((run_dir / "candidates").rglob("*.json")):
+        record = read_record(path)
+        candidate = candidate_record_from_json(record)
+        key = _candidate_input_key(candidate, dict(record["input_signature"]))
+        candidates_by_input_key.setdefault(key, []).append(candidate)
+
+    checks_by_row_key = {
+        canonical_json(record.row_key()): record for record in check_records
+    }
+
+    return _RunDirCache(
+        {key: tuple(rows) for key, rows in candidates_by_input_key.items()},
+        checks_by_row_key,
+        check_records,
+        full_size_records,
+    )
+
+
+def _candidate_input_key(
+    candidate: Candidate,
+    input_signature: Mapping[str, Any],
+) -> str:
+    return canonical_json({
+        "family": candidate.family,
+        "candidate_id": candidate.candidate_id,
+        "input_signature": dict(input_signature),
+        "settings": dict(candidate.settings),
+        "dependency_identities": {
+            family: dict(identity)
+            for family, identity in sorted(candidate.dependency_identities.items())
+        },
+        "cohort_assignment": dict(candidate.cohort_assignment),
+        "generator_id": candidate.generator_id,
+        "generator_version": candidate.generator_version,
+    })
+
+
+def _check_matches_candidate(
+    candidate: Candidate,
+    record: CheckRecord,
+    input_signature: Mapping[str, Any],
+) -> bool:
+    return (
+        record.status == "passed"
+        and record.family == candidate.family
+        and record.candidate_id == candidate.candidate_id
+        and canonical_json(record.input_signature) == canonical_json(input_signature)
+        and canonical_json(record.candidate_settings)
+        == canonical_json(candidate.settings)
+        and canonical_json(record.dependency_identities)
+        == canonical_json(candidate.dependency_identities)
+        and canonical_json(record.cohort_assignment)
+        == canonical_json(candidate.cohort_assignment)
+        and record.generator_id == candidate.generator_id
+        and record.generator_version == candidate.generator_version
+    )
+
+
+def _cached_reference_outcome(
+    run_cache: _RunDirCache,
+    candidate: Candidate,
+    input_signature: dict[str, Any],
+    *,
+    include_full_size: bool,
+) -> _ReferenceOutcome | None:
+    parent_records = tuple(
+        record
+        for record in run_cache.check_records
+        if _check_matches_candidate(candidate, record, input_signature)
+    )
+
+    if not parent_records:
+        return None
+
+    parent_record = parent_records[-1]
+    child_rows = _cached_child_reference_rows(run_cache, parent_record)
+
+    if child_rows is None:
+        return None
+
+    full_size_record = None
+
+    if include_full_size:
+        full_size_record = _cached_full_size_record(
+            run_cache,
+            candidate,
+            input_signature,
+        )
+
+    return _ReferenceOutcome(
+        candidates=child_rows[0],
+        check_records=(*child_rows[1], parent_record),
+        full_size_record=full_size_record,
+        passed=True,
+        cached=True,
+    )
+
+
+def _cached_child_reference_rows(
+    run_cache: _RunDirCache,
+    parent_record: CheckRecord,
+) -> tuple[tuple[Candidate, ...], tuple[CheckRecord, ...]] | None:
+    descriptors = parent_record.measurements.get("child_reference_rows", ())
+
+    if not isinstance(descriptors, tuple | list):
+        return None
+
+    candidates = []
+    check_records = []
+
+    for descriptor in descriptors:
+        child = _cached_child_reference_descriptor(run_cache, descriptor)
+
+        if child is None:
+            return None
+
+        child_candidate, child_record = child
+        child_rows = _cached_child_reference_rows(run_cache, child_record)
+
+        if child_rows is None:
+            return None
+
+        candidates.append(child_candidate)
+        candidates.extend(child_rows[0])
+        check_records.extend(child_rows[1])
+        check_records.append(child_record)
+
+    return tuple(candidates), tuple(check_records)
+
+
+def _cached_child_reference_descriptor(
+    run_cache: _RunDirCache,
+    descriptor: object,
+) -> tuple[Candidate, CheckRecord] | None:
+    match descriptor:
+        case {"row": dict() as row_key}:
+            pass
+        case _:
+            return None
+
+    child_record = run_cache.checks_by_row_key.get(canonical_json(row_key))
+
+    if child_record is None or child_record.status != "passed":
+        return None
+
+    child_candidate = _cached_candidate_for_check(run_cache, child_record)
+
+    if child_candidate is None:
+        return None
+
+    return child_candidate, child_record
+
+
+def _cached_candidate_for_check(
+    run_cache: _RunDirCache,
+    record: CheckRecord,
+) -> Candidate | None:
+    candidate = Candidate(
+        family=record.family,
+        candidate_id=record.candidate_id,
+        settings=dict(record.candidate_settings),
+        dependency_identities={
+            family: dict(identity)
+            for family, identity in record.dependency_identities.items()
+        },
+        cohort_assignment=dict(record.cohort_assignment),
+        admission_status="passed",
+        generator_id=record.generator_id,
+        generator_version=record.generator_version,
+    )
+    key = _candidate_input_key(candidate, record.input_signature)
+    candidates = run_cache.candidates_by_input_key.get(key, ())
+
+    if not candidates:
+        return None
+
+    return candidates[-1]
+
+
+def _cached_full_size_record(
+    run_cache: _RunDirCache,
+    candidate: Candidate,
+    input_signature: Mapping[str, Any],
+) -> FullSizeRecord | None:
+    records = tuple(
+        record
+        for record in run_cache.full_size_records
+        if record.reference_passed
+        and record_matches_candidate(candidate, record)
+        and canonical_json(record.input_signature) == canonical_json(input_signature)
+    )
+
+    if not records:
+        return None
+
+    passed_records = tuple(record for record in records if record.status == "passed")
+
+    if passed_records:
+        return passed_records[-1]
+
+    return records[-1]
 
 
 def _dependency_identity(
@@ -1383,6 +1616,7 @@ def _probe_candidate_rows(
     memory_backend: MemoryBackend,
     clock: Callable[[], float],
     run_dir: Path | None,
+    run_cache: _RunDirCache,
 ) -> _CandidateProbeRows:
     candidate_rows = []
     records = []
@@ -1396,16 +1630,18 @@ def _probe_candidate_rows(
             reference_vector,
             input_signature,
             run_dir,
+            run_cache,
+            include_full_size=True,
         )
         candidate_rows.extend(outcome.candidates)
         check_records.extend(outcome.check_records)
-        if run_dir is not None:
+        if run_dir is not None and not outcome.cached:
             for check_record in outcome.check_records:
                 _write_check(run_dir, check_record)
 
         if outcome.full_size_record is not None:
             records.append(outcome.full_size_record)
-            if run_dir is not None:
+            if run_dir is not None and not outcome.cached:
                 _write_full_size(run_dir, records[-1])
 
             continue
@@ -1481,6 +1717,7 @@ def _probe_fast_candidate_rows(
     memory_backend: MemoryBackend,
     clock: Callable[[], float],
     run_dir: Path | None,
+    run_cache: _RunDirCache,
 ) -> tuple[tuple[Candidate, ...], _CandidateProbeRows]:
     eager_candidates = _fast_eager_candidate_rows(candidates)
     eager_rows = _probe_candidate_rows(
@@ -1496,6 +1733,7 @@ def _probe_fast_candidate_rows(
         memory_backend=memory_backend,
         clock=clock,
         run_dir=run_dir,
+        run_cache=run_cache,
     )
     top_eager = _near_fastest_candidates(
         eager_candidates,
@@ -1517,6 +1755,7 @@ def _probe_fast_candidate_rows(
         memory_backend=memory_backend,
         clock=clock,
         run_dir=run_dir,
+        run_cache=run_cache,
     )
 
     return (
@@ -1547,6 +1786,7 @@ def _probe_balanced_candidate_rows(
     memory_backend: MemoryBackend,
     clock: Callable[[], float],
     run_dir: Path | None,
+    run_cache: _RunDirCache,
 ) -> tuple[tuple[Candidate, ...], _CandidateProbeRows]:
     if retained_top_count is None:
         message = "balanced search requires retained_top_count"
@@ -1567,6 +1807,7 @@ def _probe_balanced_candidate_rows(
         memory_backend=memory_backend,
         clock=clock,
         run_dir=run_dir,
+        run_cache=run_cache,
     )
     retained = {}
     group_candidate_rows = []
@@ -1586,6 +1827,7 @@ def _probe_balanced_candidate_rows(
             memory_backend=memory_backend,
             clock=clock,
             run_dir=run_dir,
+            run_cache=run_cache,
         )
         retained[group_key] = group_rows.retained
         group_candidate_rows.extend(group_rows.candidate_rows)
@@ -1615,6 +1857,7 @@ def _probe_balanced_candidate_rows(
         memory_backend=memory_backend,
         clock=clock,
         run_dir=run_dir,
+        run_cache=run_cache,
     )
     top_cross = _near_fastest_candidates(
         cross_candidates,
@@ -1636,6 +1879,7 @@ def _probe_balanced_candidate_rows(
         memory_backend=memory_backend,
         clock=clock,
         run_dir=run_dir,
+        run_cache=run_cache,
     )
 
     return (
@@ -1678,6 +1922,7 @@ def _probe_thorough_candidate_rows(
     memory_backend: MemoryBackend,
     clock: Callable[[], float],
     run_dir: Path | None,
+    run_cache: _RunDirCache,
 ) -> tuple[tuple[Candidate, ...], _CandidateProbeRows]:
     balanced_candidates, balanced_rows = _probe_balanced_candidate_rows(
         runtime=runtime,
@@ -1693,6 +1938,7 @@ def _probe_thorough_candidate_rows(
         memory_backend=memory_backend,
         clock=clock,
         run_dir=run_dir,
+        run_cache=run_cache,
     )
     top_balanced = _near_fastest_candidates(
         balanced_candidates,
@@ -1718,6 +1964,7 @@ def _probe_thorough_candidate_rows(
         memory_backend=memory_backend,
         clock=clock,
         run_dir=run_dir,
+        run_cache=run_cache,
     )
 
     return (
@@ -1804,6 +2051,7 @@ def _probe_balanced_group_rows(
     memory_backend: MemoryBackend,
     clock: Callable[[], float],
     run_dir: Path | None,
+    run_cache: _RunDirCache,
 ) -> _BalancedGroupRows:
     if not probe_inputs:
         message = "balanced search requires at least one full-size probe input"
@@ -1822,11 +2070,13 @@ def _probe_balanced_group_rows(
             reference_vector,
             input_signature,
             run_dir,
+            run_cache,
+            include_full_size=True,
         )
         candidate_rows.extend(outcome.candidates)
         check_records.extend(outcome.check_records)
 
-        if run_dir is not None:
+        if run_dir is not None and not outcome.cached:
             for check_record in outcome.check_records:
                 _write_check(run_dir, check_record)
 
@@ -1859,6 +2109,9 @@ def _probe_balanced_group_rows(
             )
             records_by_id[candidate.candidate_id] = record
             stage_records.append((candidate, record))
+
+            if run_dir is not None:
+                _write_full_size(run_dir, record)
 
         active = list(
             _balanced_stage_survivors(
@@ -2277,6 +2530,7 @@ def _probe_problem(
     backend = _memory_backend(problem.target.devices, memory_backend)
     input_signature = _input_signature(problem, backend)
     timing_policy = _timing_policy_for_search(problem.target)
+    run_cache = _run_dir_cache(run_dir)
     candidate_rows = list(candidates)
 
     if run_dir is not None:
@@ -2296,6 +2550,7 @@ def _probe_problem(
             memory_backend=backend,
             clock=clock,
             run_dir=run_dir,
+            run_cache=run_cache,
         )
     elif problem.target.search_policy.strategy == "balanced":
         measured_candidates, probed = _probe_balanced_candidate_rows(
@@ -2312,6 +2567,7 @@ def _probe_problem(
             memory_backend=backend,
             clock=clock,
             run_dir=run_dir,
+            run_cache=run_cache,
         )
     elif problem.target.search_policy.strategy == "thorough":
         measured_candidates, probed = _probe_thorough_candidate_rows(
@@ -2328,6 +2584,7 @@ def _probe_problem(
             memory_backend=backend,
             clock=clock,
             run_dir=run_dir,
+            run_cache=run_cache,
         )
     else:
         measured_candidates = _measured_candidates_for_search(
@@ -2346,6 +2603,7 @@ def _probe_problem(
             memory_backend=backend,
             clock=clock,
             run_dir=run_dir,
+            run_cache=run_cache,
         )
 
     candidate_rows.extend(probed.candidate_rows)
@@ -2377,6 +2635,7 @@ def _probe_problem_with_autobatch(
     probe_inputs = _probe_inputs(problem)
     backend = _memory_backend(problem.target.devices, memory_backend)
     input_signature = _input_signature(problem, backend)
+    run_cache = _run_dir_cache(run_dir)
     check_records = []
     records = []
     value_to_candidate = {
@@ -2390,10 +2649,10 @@ def _probe_problem_with_autobatch(
         value_to_candidate,
         input_signature,
         run_dir,
+        run_cache,
     )
     records.extend(reference_rows.full_size_records)
     check_records.extend(reference_rows.check_records)
-    candidate_rows = (*candidates, *reference_rows.candidates)
 
     states = {
         value: _AutobatchProbeState(value_to_candidate[value])
@@ -2451,7 +2710,7 @@ def _probe_problem_with_autobatch(
 
     return _ProbeResult(
         candidates=candidates,
-        candidate_rows=candidate_rows,
+        candidate_rows=(*candidates, *reference_rows.candidates),
         full_size_records=tuple(records),
         check_records=tuple(check_records),
         input_signature=input_signature,
@@ -2468,6 +2727,7 @@ def _autobatch_reference_rows(
     value_to_candidate: Mapping[int, Candidate],
     input_signature: dict[str, Any],
     run_dir: Path | None,
+    run_cache: _RunDirCache,
 ) -> _AutobatchReferenceRows:
     reference_batch, reference_vector = _reference_input(problem)
     candidates = []
@@ -2488,16 +2748,18 @@ def _autobatch_reference_rows(
             reference_vector,
             input_signature,
             run_dir,
+            run_cache,
+            include_full_size=False,
         )
         candidates.extend(outcome.candidates)
         check_records.extend(outcome.check_records)
-        if run_dir is not None:
+        if run_dir is not None and not outcome.cached:
             for check_record in outcome.check_records:
                 _write_check(run_dir, check_record)
 
         if outcome.full_size_record is not None:
             records.append(outcome.full_size_record)
-            if run_dir is not None:
+            if run_dir is not None and not outcome.cached:
                 _write_full_size(run_dir, outcome.full_size_record)
 
         if outcome.passed:
@@ -2518,6 +2780,9 @@ def _reference_outcome(
     reference_vector: TensorTree,
     input_signature: dict[str, Any],
     run_dir: Path | None,
+    run_cache: _RunDirCache,
+    *,
+    include_full_size: bool,
 ) -> _ReferenceOutcome:
     if candidate.admission_status == "failed":
         error = candidate.admission_error or (
@@ -2543,6 +2808,16 @@ def _reference_outcome(
             ),
             passed=False,
         )
+
+    cached_outcome = _cached_reference_outcome(
+        run_cache,
+        candidate,
+        input_signature,
+        include_full_size=include_full_size,
+    )
+
+    if cached_outcome is not None:
+        return cached_outcome
 
     try:
         reference_result = runtime.reference_check(
