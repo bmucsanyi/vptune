@@ -1,7 +1,7 @@
 import contextlib
 import dataclasses
 import math
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
 import pytest
@@ -10,6 +10,7 @@ import torch
 import vptune as vp
 import vptune.attention as vpat
 import vptune.ext as vpx
+import vptune.runtime as runtime_module
 from vptune.errors import AdmissionError, ReferenceFailedError
 
 
@@ -295,6 +296,123 @@ def test_attention_operation_uses_candidate_sequence_block_size() -> None:
     expected = vpat.exact_attention(inputs)
 
     torch.testing.assert_close(attention_output_tensor(output), expected)
+
+
+def test_attention_operation_compiles_attention_module_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+
+    def fake_compile(
+        operation: Callable[[], vp.TensorTree],
+        *,
+        backend: str,
+        mode: str | None,
+        fullgraph: bool,
+        dynamic: bool | None,
+        options: Mapping[str, bool] | None,
+    ) -> Callable[[], vp.TensorTree]:
+        events.append({
+            "backend": backend,
+            "mode": mode,
+            "fullgraph": fullgraph,
+            "dynamic": dynamic,
+            "options": options,
+        })
+
+        def compiled() -> vp.TensorTree:
+            events.append({"compiled_attention": True})
+
+            return operation()
+
+        return compiled
+
+    monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
+    location = attention_location()
+    batch = {
+        "query": attention_inputs().query,
+        "key": attention_inputs().key,
+        "value": attention_inputs().value,
+        "query_block_size": 2,
+    }
+    factory = vpat.attention_operation_factory(location)
+    operation = factory(
+        vp.Candidate(
+            "attention",
+            "compiled-attention",
+            {
+                "attention.frontend": "pytorch_sdpa_direct",
+                "attention.sdpa_kernel": "math",
+                "attention.partition": "full",
+                "attention.padding": "dense_padded",
+                "compile.enabled": "true",
+                "compile.boundary": "attention_module",
+                "compile.backend": "inductor",
+                "compile.mode": "default",
+                "compile.fullgraph": "false",
+                "compile.dynamic": None,
+                "compile.compiled_autograd": "false",
+                "compile.options.epilogue_fusion": "false",
+                "compile.options.shape_padding": "false",
+                "compile.cuda_graphs": "false",
+                "compile.cache_state": "cold_compile",
+            },
+            admission_status="passed",
+        ),
+        batch,
+        {},
+    )
+
+    assert events == [
+        {
+            "backend": "inductor",
+            "mode": "default",
+            "fullgraph": False,
+            "dynamic": None,
+            "options": None,
+        }
+    ]
+    output = attention_output_tensor(operation())
+    expected = vpat.exact_attention(attention_inputs())
+
+    assert events[-1] == {"compiled_attention": True}
+    torch.testing.assert_close(output, expected)
+
+
+def test_attention_operation_rejects_other_compile_boundaries() -> None:
+    factory = vpat.attention_operation_factory(attention_location())
+
+    with pytest.raises(vp.MaterializationError, match="model_forward"):
+        factory(
+            vp.Candidate(
+                "attention",
+                "bad-compile",
+                {
+                    "attention.frontend": "pytorch_sdpa_direct",
+                    "attention.sdpa_kernel": "math",
+                    "attention.partition": "full",
+                    "attention.padding": "dense_padded",
+                    "compile.enabled": "true",
+                    "compile.boundary": "model_forward",
+                    "compile.backend": "inductor",
+                    "compile.mode": "default",
+                    "compile.fullgraph": "false",
+                    "compile.dynamic": None,
+                    "compile.compiled_autograd": "false",
+                    "compile.options.epilogue_fusion": "false",
+                    "compile.options.shape_padding": "false",
+                    "compile.cuda_graphs": "false",
+                    "compile.cache_state": "cold_compile",
+                },
+                admission_status="passed",
+            ),
+            {
+                "query": attention_inputs().query,
+                "key": attention_inputs().key,
+                "value": attention_inputs().value,
+            },
+            {},
+        )
 
 
 def test_attention_rejects_conflicting_query_block_sizes() -> None:

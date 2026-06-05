@@ -2682,6 +2682,7 @@ class StandardExecution:
     checkpoint_contexts: CheckpointContextFns = dataclasses.field(default_factory=dict)
     intermediate_transform: IntermediateTransform | None = None
     compiled_inner: CandidateOperation | None = None
+    compiled_model_forward: Callable[[Batch], object] | None = None
     compiled_scalar_function: Callable[[ParameterTree], torch.Tensor] | None = None
     compiled_score_matrix: Callable[[], torch.Tensor] | None = None
     compiled_ggn_loss_product: Callable[[TensorTree, TensorTree], TensorTree] | None = (
@@ -2891,8 +2892,19 @@ def _prepare_enabled_compile_boundary_execution(
     settings: Mapping[str, Any],
     boundary: str,
 ) -> StandardExecution:
-    if boundary == "loss_closure":
-        return _prepare_loss_closure_compile_boundary(execution, settings)
+    special_builder = {
+        "model_forward": lambda: _prepare_model_forward_compile_boundary(
+            execution,
+            settings,
+        ),
+        "loss_closure": lambda: _prepare_loss_closure_compile_boundary(
+            execution,
+            settings,
+        ),
+    }.get(boundary)
+
+    if special_builder is not None:
+        return special_builder()
 
     inner_builders = {
         ("gradient", "gradient_closure"): lambda: _run_gradient_by_path(execution),
@@ -2969,10 +2981,10 @@ def _prepare_enabled_compile_boundary_execution(
 
     vjp_builder = ggn_vjp_builders.get((execution.operator.kind, boundary))
 
-    if vjp_builder is None:
-        return execution
+    if vjp_builder is not None:
+        return _prepare_ggn_vjp_compile_boundary(execution, settings, vjp_builder)
 
-    return _prepare_ggn_vjp_compile_boundary(execution, settings, vjp_builder)
+    return execution
 
 
 def _require_compiled_execution(
@@ -2996,6 +3008,41 @@ def _prepare_inner_compile_boundary(
     return dataclasses.replace(
         execution,
         compiled_inner=compiled_inner,
+    )
+
+
+def _prepare_model_forward_compile_boundary(
+    execution: StandardExecution,
+    settings: Mapping[str, Any],
+) -> StandardExecution:
+    _require_compiled_execution(execution, settings)
+
+    if execution.module is None or execution.module_call is None:
+        message = "compile.boundary=model_forward requires module_call"
+        raise MaterializationError(message)
+
+    module = execution.module
+    module_call = execution.module_call
+
+    def model_forward(batch: Batch) -> object:
+        return _invoke_stateful_module(
+            module,
+            module_call,
+            batch,
+        )
+
+    compiled_model_forward = _compiled_model_forward(settings, model_forward)
+
+    if settings.get("compile.cache_state") == "warm_cache":
+        _call_compiled_model_forward(
+            execution,
+            compiled_model_forward,
+            execution.params,
+        )
+
+    return dataclasses.replace(
+        execution,
+        compiled_model_forward=compiled_model_forward,
     )
 
 
@@ -3325,6 +3372,9 @@ def _compile_boundary_runs_inside_operator(
     operator_kind: str,
     settings: Mapping[str, Any],
 ) -> bool:
+    if settings.get("compile.boundary") == "model_forward":
+        return True
+
     return (operator_kind, settings.get("compile.boundary")) in {
         ("gradient", "loss_closure"),
         ("gradient", "gradient_closure"),
@@ -3428,6 +3478,40 @@ def _compiled_tensor_operation(
         compiled_operation()
 
     return compiled_operation
+
+
+def _compiled_model_forward(
+    settings: Mapping[str, Any],
+    operation: Callable[[Batch], object],
+) -> Callable[[Batch], object]:
+    compiled_autograd = _compile_bool(settings, "compile.compiled_autograd")
+
+    def build_compiled() -> Callable[[Batch], object]:
+        return torch.compile(
+            operation,
+            backend=_compile_backend(settings),
+            mode=_compile_mode(settings),
+            fullgraph=_compile_bool(settings, "compile.fullgraph"),
+            dynamic=_compile_optional_bool(settings, "compile.dynamic"),
+            options=_compile_options(settings),
+        )
+
+    if compiled_autograd:
+        with _compiled_autograd_patch():
+            compiled = build_compiled()
+    else:
+        compiled = build_compiled()
+
+    def compiled_function(batch: Batch) -> object:
+        if compiled_autograd:
+            with _compiled_autograd_patch():
+                return compiled(batch)
+
+        return compiled(batch)
+
+    _validate_compile_cache_state(settings)
+
+    return compiled_function
 
 
 def _compiled_scalar_function(
@@ -3578,11 +3662,10 @@ def _compile_boundary_supported(
     boundary: str,
     settings: Mapping[str, Any],
 ) -> bool:
-    if boundary == "whole_operator":
-        return True
+    direct = _direct_compile_boundary_supported(operator_kind, boundary, settings)
 
-    if boundary == "loss_closure":
-        return operator_kind in {"gradient", "hvp"}
+    if direct is not None:
+        return direct
 
     if operator_kind == "hvp":
         return _hvp_compile_boundary_supported(boundary, settings)
@@ -3611,6 +3694,23 @@ def _compile_boundary_supported(
     }
 
     return boundaries.get(operator_kind) == boundary
+
+
+def _direct_compile_boundary_supported(
+    operator_kind: str,
+    boundary: str,
+    settings: Mapping[str, Any],
+) -> bool | None:
+    if boundary == "whole_operator":
+        return True
+
+    if boundary == "model_forward":
+        return settings.get("call.path") == "stateful_module"
+
+    if boundary == "loss_closure":
+        return operator_kind in {"gradient", "hvp"}
+
+    return None
 
 
 def _hvp_compile_boundary_supported(
@@ -11006,11 +11106,14 @@ def _call_stateful_module(
     slots = _replace_module_state(execution.module, model_params, model_buffers)
 
     try:
-        output = _invoke_stateful_module(
-            execution.module,
-            execution.module_call,
-            model_batch,
-        )
+        if execution.compiled_model_forward is None:
+            output = _invoke_stateful_module(
+                execution.module,
+                execution.module_call,
+                model_batch,
+            )
+        else:
+            output = execution.compiled_model_forward(model_batch)
     finally:
         _restore_module_state(slots)
 
@@ -11033,6 +11136,27 @@ def _stateful_model_batch(
     settings: Mapping[str, Any],
 ) -> Batch:
     return _model_compute_batch(batch, settings)
+
+
+def _call_compiled_model_forward(
+    execution: StandardExecution,
+    compiled_model_forward: Callable[[Batch], object],
+    active_params: ParameterTree,
+) -> object:
+    if execution.module is None:
+        message = "compile.boundary=model_forward requires module"
+        raise MaterializationError(message)
+
+    settings = execution.candidate.settings
+    model_params = _stateful_model_tree(active_params, settings)
+    model_buffers = _stateful_model_tree(execution.buffers, settings)
+    model_batch = _stateful_model_batch(execution.batch, settings)
+    slots = _replace_module_state(execution.module, model_params, model_buffers)
+
+    try:
+        return compiled_model_forward(model_batch)
+    finally:
+        _restore_module_state(slots)
 
 
 def _model_compute_tree(

@@ -14573,6 +14573,75 @@ def test_standard_runtime_compiles_whole_operator(
     assert events[-1] == {"compiled_call": True}
 
 
+def test_standard_runtime_compiles_stateful_model_forward_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = StatefulScalarModule()
+    events = []
+
+    def fake_compile(
+        operation: Callable[[vp.Batch], object],
+        *,
+        backend: str,
+        mode: str | None,
+        fullgraph: bool,
+        dynamic: bool | None,
+        options: Mapping[str, bool] | None,
+    ) -> Callable[[vp.Batch], object]:
+        events.append({
+            "backend": backend,
+            "mode": mode,
+            "fullgraph": fullgraph,
+            "dynamic": dynamic,
+            "options": options,
+        })
+
+        def compiled(batch: vp.Batch) -> object:
+            events.append({"compiled_model_forward": tuple(batch)})
+
+            return operation(batch)
+
+        return compiled
+
+    monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=dict(module.named_parameters()),
+        buffers=dict(module.named_buffers()),
+        module=module,
+        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+    )
+    operation = factory(
+        vp.Candidate(
+            "gradient",
+            "compiled-model-forward",
+            {
+                **gradient_settings(),
+                **stateful_module_call_settings(),
+                **compile_settings(boundary="model_forward"),
+            },
+            admission_status="passed",
+        ),
+        {"scale": torch.tensor([4.0], dtype=torch.float64)},
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )
+
+    assert events == [
+        {
+            "backend": "inductor",
+            "mode": "default",
+            "fullgraph": False,
+            "dynamic": None,
+            "options": None,
+        }
+    ]
+    torch.testing.assert_close(
+        tensor_mapping(operation())["w"],
+        torch.tensor([4.0], dtype=torch.float64),
+    )
+    assert events[-1] == {"compiled_model_forward": ("scale",)}
+
+
 def test_standard_runtime_runs_real_torch_compile_whole_operator() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     matrix = torch.eye(2, dtype=torch.float64)

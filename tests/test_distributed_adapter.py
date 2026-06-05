@@ -122,8 +122,10 @@ class RecordingRankReporter:
 def distributed_policy(
     *,
     hook_entry_policy: str = "root-forward",
+    fsdp_wrap_granularity: tuple[str, ...] = ("root", "transformer_block"),
     output_layout: str = "rowwise",
     offload: str = "none",
+    context_rotate_method: tuple[str, ...] = ("all_gather",),
 ) -> DistributedAdmissionPolicy:
     return DistributedAdmissionPolicy(
         candidate_generator_version="1",
@@ -136,7 +138,7 @@ def distributed_policy(
         communication={"backend": "nccl"},
         fsdp2={
             "allowed_fsdp.hook_entry_policy": (hook_entry_policy,),
-            "allowed_fsdp.wrap_granularity": ("root", "transformer_block"),
+            "allowed_fsdp.wrap_granularity": fsdp_wrap_granularity,
             "allowed_fsdp.forward_prefetch": ("disabled", "next-forward"),
             "allowed_fsdp.backward_prefetch": ("disabled", "backward-pre"),
             "allowed_fsdp.reshard_after_forward": ("true", "false"),
@@ -178,7 +180,7 @@ def distributed_policy(
         },
         context_parallel={
             "allowed_context_parallel.enabled": ("true",),
-            "allowed_context_parallel.rotate_method": ("all_gather",),
+            "allowed_context_parallel.rotate_method": context_rotate_method,
             "allowed_context_parallel.sequence_dim": (1,),
         },
     )
@@ -2238,6 +2240,27 @@ def test_distributed_strategy_applier_lowers_fsdp2_row_settings() -> None:
     assert fully_shard_call["shard_placement_fn"]
 
 
+def test_distributed_strategy_applier_lowers_fsdp2_block_group_wrap() -> None:
+    events = []
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+    settings = {
+        **valid_fsdp_settings(),
+        **distributed_base_settings(),
+        "fsdp.hook_entry_points": ("0.forward",),
+        "fsdp.wrap_granularity": "block_group",
+    }
+    candidate = Candidate("gradient", "fsdp-block-group", settings)
+    policy = distributed_policy(fsdp_wrap_granularity=("block_group",))
+    applier = distributed_strategy_applier(distributed_bindings(events))
+
+    assert admit_distributed_candidate(candidate, policy=policy) == (True, None)
+    result = applier(model, candidate)
+
+    assert isinstance(result, torch.nn.Module)
+    fully_shard_call = next(event for event in events if event["kind"] == "fully_shard")
+    assert fully_shard_call["target"] == [model[0]]
+
+
 def test_distributed_strategy_applier_lowers_cuda_local_rank_binding() -> None:
     events = []
     model = torch.nn.Sequential(torch.nn.Linear(2, 2))
@@ -2299,6 +2322,28 @@ def test_distributed_strategy_applier_lowers_context_parallel_row_settings() -> 
     assert qkv_style[1]["input_layouts"] == "replicate"
     assert qkv_style[1]["output_layouts"] == "replicate"
     assert prepare_style[1]["input_kwarg_layouts"] == {"mask": "replicate"}
+
+
+def test_distributed_strategy_applier_lowers_context_parallel_all_to_all() -> None:
+    events = []
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    settings = {
+        **valid_context_parallel_settings(),
+        **distributed_base_settings(),
+        "context_parallel.rotate_method": "all_to_all",
+    }
+    candidate = Candidate("gradient", "context-all-to-all", settings)
+    policy = distributed_policy(context_rotate_method=("all_to_all",))
+    applier = distributed_strategy_applier(distributed_bindings(events))
+
+    assert admit_distributed_candidate(candidate, policy=policy) == (True, None)
+    result = applier(model, candidate)
+
+    assert result is model
+    context_call = next(
+        event for event in events if event["kind"] == "context_parallel"
+    )
+    assert context_call["rotate_method"] == "all_to_all"
 
 
 def test_distributed_strategy_applier_lowers_reduce_scatter_overlap() -> None:

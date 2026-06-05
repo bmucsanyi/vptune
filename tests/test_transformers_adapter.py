@@ -1,6 +1,6 @@
 import contextlib
 import dataclasses
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 
 import pytest
 import torch
@@ -410,6 +410,169 @@ def test_transformers_sdpa_warm_compile_enters_declared_kernel_context(
         tensor_dict(output)["w"],
         torch.tensor([4.0], dtype=torch.float64),
     )
+
+
+@pytest.mark.parametrize(
+    ("boundary", "block_paths", "attention_paths"),
+    [
+        ("transformer_block", ("block",), ()),
+        ("attention_module", (), ("block",)),
+    ],
+)
+def test_transformers_operation_factory_compiles_declared_submodule_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    block_paths: tuple[str, ...],
+    attention_paths: tuple[str, ...],
+) -> None:
+    events = []
+
+    class TinyBlock(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.tensor([2.0], dtype=torch.float64))
+
+        def forward(self, scale: torch.Tensor) -> torch.Tensor:
+            events.append("block_forward")
+
+            return self.w * scale
+
+    class TinyBlockModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block = TinyBlock()
+            self.attention_values = []
+
+        def set_attn_implementation(self, attn_implementation: str) -> None:
+            self.attention_values.append(attn_implementation)
+
+        def forward(self, scale: torch.Tensor) -> torch.Tensor:
+            return self.block(scale).sum()
+
+    def fake_compile(
+        forward: Callable[..., object],
+        *,
+        backend: str,
+        mode: str | None,
+        fullgraph: bool,
+        dynamic: bool | None,
+        options: Mapping[str, bool] | None,
+    ) -> Callable[..., object]:
+        events.append({
+            "backend": backend,
+            "mode": mode,
+            "fullgraph": fullgraph,
+            "dynamic": dynamic,
+            "options": options,
+        })
+
+        def compiled(*args: object, **kwargs: object) -> object:
+            events.append("compiled_forward")
+
+            return forward(*args, **kwargs)
+
+        return compiled
+
+    monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
+    model = TinyBlockModel()
+    factory = vpa.transformers_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        transformer_block_paths=block_paths,
+        attention_module_paths=attention_paths,
+    )
+    operation = factory(
+        vp.Candidate(
+            "gradient",
+            "compiled-submodule",
+            {
+                **stateful_transformers_settings(),
+                "compile.enabled": "true",
+                "compile.boundary": boundary,
+                "compile.backend": "inductor",
+                "compile.mode": "default",
+                "compile.fullgraph": "false",
+                "compile.dynamic": None,
+                "compile.compiled_autograd": "false",
+                "compile.options.epilogue_fusion": "false",
+                "compile.options.shape_padding": "false",
+                "compile.cuda_graphs": "false",
+                "compile.cache_state": "cold_compile",
+            },
+            admission_status="passed",
+        ),
+        {"scale": torch.tensor([4.0], dtype=torch.float64)},
+        {"block.w": torch.tensor([1.0], dtype=torch.float64)},
+    )
+
+    assert events == [
+        {
+            "backend": "inductor",
+            "mode": "default",
+            "fullgraph": False,
+            "dynamic": None,
+            "options": None,
+        }
+    ]
+    output = operation()
+
+    assert events == [
+        {
+            "backend": "inductor",
+            "mode": "default",
+            "fullgraph": False,
+            "dynamic": None,
+            "options": None,
+        },
+        "compiled_forward",
+        "block_forward",
+    ]
+    assert "forward" not in model.block.__dict__
+    torch.testing.assert_close(
+        tensor_dict(output)["block.w"],
+        torch.tensor([4.0], dtype=torch.float64),
+    )
+
+
+def test_transformers_operation_factory_rejects_compile_boundary_without_paths() -> (
+    None
+):
+    model = TinyTransformersScalarModule()
+    factory = vpa.transformers_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+    )
+
+    with pytest.raises(vp.MaterializationError, match="declared module paths"):
+        factory(
+            vp.Candidate(
+                "gradient",
+                "missing-paths",
+                {
+                    **stateful_transformers_settings(),
+                    "compile.enabled": "true",
+                    "compile.boundary": "transformer_block",
+                    "compile.backend": "inductor",
+                    "compile.mode": "default",
+                    "compile.fullgraph": "false",
+                    "compile.dynamic": None,
+                    "compile.compiled_autograd": "false",
+                    "compile.options.epilogue_fusion": "false",
+                    "compile.options.shape_padding": "false",
+                    "compile.cuda_graphs": "false",
+                    "compile.cache_state": "cold_compile",
+                },
+                admission_status="passed",
+            ),
+            {"scale": torch.tensor([4.0], dtype=torch.float64)},
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+        )
 
 
 def test_transformers_reference_check_runs_independent_anchor() -> None:

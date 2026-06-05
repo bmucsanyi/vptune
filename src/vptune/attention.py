@@ -20,7 +20,8 @@ from vptune.data import (
     ReferenceCheck,
     ReferenceResult,
 )
-from vptune.errors import AdmissionError
+from vptune.errors import AdmissionError, MaterializationError
+from vptune.runtime import _compiled_operation as _compile_candidate_operation
 from vptune.tensor_tree import TensorTree
 
 SDPA_BACKENDS = {
@@ -299,9 +300,31 @@ def attention_operation_factory(location: AttentionLocation) -> OperationFactory
         def operation() -> TensorTree:
             return execute_attention(location, batch, settings)
 
-        return operation
+        return _attention_compile_operation(candidate.settings, operation)
 
     return factory
+
+
+def _attention_compile_operation(
+    settings: Mapping[str, Any],
+    operation: CandidateOperation,
+) -> CandidateOperation:
+    enabled = settings.get("compile.enabled")
+
+    if enabled is None or enabled == "false":
+        return operation
+
+    if enabled != "true":
+        message = f"compile.enabled is unsupported: {enabled}"
+        raise MaterializationError(message)
+
+    boundary = settings.get("compile.boundary")
+
+    if boundary not in {"attention_module", "whole_operator"}:
+        message = f"compile.boundary={boundary} is not lowered for attention"
+        raise MaterializationError(message)
+
+    return _compile_candidate_operation(settings, operation)
 
 
 def attention_reference_check(

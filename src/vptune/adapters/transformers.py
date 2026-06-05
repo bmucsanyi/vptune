@@ -46,7 +46,17 @@ from vptune.data import (
 )
 from vptune.errors import AdmissionError, MaterializationError
 from vptune.identities import module_identity
-from vptune.runtime import standard_operation_factory, standard_reference_check
+from vptune.runtime import (
+    _compile_backend,
+    _compile_bool,
+    _compile_mode,
+    _compile_optional_bool,
+    _compile_options,
+    _compiled_autograd_patch,
+    _validate_compile_cache_state,
+    standard_operation_factory,
+    standard_reference_check,
+)
 from vptune.tensor_tree import tree_signature
 
 EAGER_ATTENTION_FRONTENDS = (
@@ -120,6 +130,27 @@ TRANSFORMERS_RUNTIME_SETTINGS = (
     "key_heads",
     "value_heads",
 )
+COMPILE_RUNTIME_SETTINGS = (
+    "compile.enabled",
+    "compile.boundary",
+    "compile.backend",
+    "compile.mode",
+    "compile.fullgraph",
+    "compile.dynamic",
+    "compile.compiled_autograd",
+    "compile.options.epilogue_fusion",
+    "compile.options.shape_padding",
+    "compile.cuda_graphs",
+    "compile.cache_state",
+)
+TRANSFORMERS_ADAPTER_COMPILE_BOUNDARIES = ("transformer_block", "attention_module")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ForwardPatch:
+    module: torch.nn.Module
+    original_forward: Callable[..., Any] | None
+    compiled_forward: Callable[..., Any]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -334,6 +365,8 @@ def transformers_operation_factory(
     scalar_objectives: Mapping[str, ScalarObjective] | None = None,
     function_objectives: Mapping[str, FunctionObjective] | None = None,
     attention_custom_kernel_id: str | None = None,
+    transformer_block_paths: Sequence[str] = (),
+    attention_module_paths: Sequence[str] = (),
 ) -> OperationFactory:
     """Return a Transformers-backed standard operation factory."""
     standard_factory = standard_operation_factory(
@@ -357,11 +390,29 @@ def transformers_operation_factory(
             candidate,
             attention_custom_kernel_id=attention_custom_kernel_id,
         )
+        standard_candidate = _standard_candidate(candidate)
+        forward_patches = _transformers_forward_patches(
+            model,
+            candidate.settings,
+            transformer_block_paths=transformer_block_paths,
+            attention_module_paths=attention_module_paths,
+        )
+
         with _transformers_sdpa_kernel_context(candidate.settings):
-            operation = standard_factory(_standard_candidate(candidate), batch, vector)
+            operation = standard_factory(standard_candidate, batch, vector)
+
+        if _transformers_compile_cache_state(candidate.settings) == "warm_cache":
+            with (
+                _installed_transformers_forward_patches(forward_patches),
+                _transformers_sdpa_kernel_context(candidate.settings),
+            ):
+                operation()
 
         def transformers_operation() -> TensorTree:
-            with _transformers_sdpa_kernel_context(candidate.settings):
+            with (
+                _installed_transformers_forward_patches(forward_patches),
+                _transformers_sdpa_kernel_context(candidate.settings),
+            ):
                 return operation()
 
         return transformers_operation
@@ -382,6 +433,8 @@ def transformers_reference_check(
     scalar_objectives: Mapping[str, ScalarObjective] | None = None,
     function_objectives: Mapping[str, FunctionObjective] | None = None,
     attention_custom_kernel_id: str | None = None,
+    transformer_block_paths: Sequence[str] = (),
+    attention_module_paths: Sequence[str] = (),
 ) -> ReferenceCheck:
     """Return a Transformers-backed standard reference check."""
     standard_check = standard_reference_check(
@@ -408,8 +461,20 @@ def transformers_reference_check(
             attention_custom_kernel_id=attention_custom_kernel_id,
         )
 
-        with _transformers_sdpa_kernel_context(candidate.settings):
-            return standard_check(_standard_candidate(candidate), batch, vector)
+        standard_candidate = _standard_candidate(candidate)
+
+        forward_patches = _transformers_forward_patches(
+            model,
+            candidate.settings,
+            transformer_block_paths=transformer_block_paths,
+            attention_module_paths=attention_module_paths,
+        )
+
+        with (
+            _installed_transformers_forward_patches(forward_patches),
+            _transformers_sdpa_kernel_context(candidate.settings),
+        ):
+            return standard_check(standard_candidate, batch, vector)
 
     return check
 
@@ -568,6 +633,8 @@ def transformers_runtime_config(
     scalar_objectives: Mapping[str, ScalarObjective] | None = None,
     function_objectives: Mapping[str, FunctionObjective] | None = None,
     attention_custom_kernel_id: str | None = None,
+    transformer_block_paths: Sequence[str] = (),
+    attention_module_paths: Sequence[str] = (),
 ) -> RuntimeConfig:
     """Return a runtime config for Transformers-backed standard operators."""
     operation_factory = transformers_operation_factory(
@@ -580,6 +647,8 @@ def transformers_runtime_config(
         scalar_objectives=scalar_objectives,
         function_objectives=function_objectives,
         attention_custom_kernel_id=attention_custom_kernel_id,
+        transformer_block_paths=transformer_block_paths,
+        attention_module_paths=attention_module_paths,
     )
     reference_check = transformers_reference_check(
         operator,
@@ -593,6 +662,8 @@ def transformers_runtime_config(
         scalar_objectives=scalar_objectives,
         function_objectives=function_objectives,
         attention_custom_kernel_id=attention_custom_kernel_id,
+        transformer_block_paths=transformer_block_paths,
+        attention_module_paths=attention_module_paths,
     )
     full_size_check = transformers_full_size_check(
         operation_factory=operation_factory,
@@ -631,6 +702,8 @@ def transformers_runtime_config(
             else dict(numeric_bound_fields),
             "objective": dict(objective_signature),
             "module_call": module_call.signature(),
+            "transformer_block_paths": tuple(transformer_block_paths),
+            "attention_module_paths": tuple(attention_module_paths),
         },
         full_size_check=full_size_check,
     )
@@ -759,7 +832,168 @@ def _standard_candidate(candidate: Candidate) -> Candidate:
         if key not in TRANSFORMERS_RUNTIME_SETTINGS
     }
 
+    if _transformers_adapter_compile_boundary(candidate.settings) is not None:
+        settings = {
+            key: value
+            for key, value in settings.items()
+            if key not in COMPILE_RUNTIME_SETTINGS
+        }
+
     return dataclasses.replace(candidate, settings=settings)
+
+
+def _transformers_forward_patches(
+    model: torch.nn.Module,
+    settings: Mapping[str, Any],
+    *,
+    transformer_block_paths: Sequence[str],
+    attention_module_paths: Sequence[str],
+) -> tuple[_ForwardPatch, ...]:
+    paths = _transformers_compile_paths(
+        settings,
+        transformer_block_paths=transformer_block_paths,
+        attention_module_paths=attention_module_paths,
+    )
+
+    return tuple(_transformers_forward_patch(model, path, settings) for path in paths)
+
+
+def _transformers_compile_paths(
+    settings: Mapping[str, Any],
+    *,
+    transformer_block_paths: Sequence[str],
+    attention_module_paths: Sequence[str],
+) -> tuple[str, ...]:
+    boundary = _transformers_adapter_compile_boundary(settings)
+
+    if boundary is None:
+        return ()
+
+    paths = (
+        transformer_block_paths
+        if boundary == "transformer_block"
+        else attention_module_paths
+    )
+    result = tuple(paths)
+
+    if not result:
+        message = f"compile.boundary={boundary} requires declared module paths"
+        raise MaterializationError(message)
+
+    if not all(isinstance(path, str) and path for path in result):
+        message = f"compile.boundary={boundary} module paths must be non-empty strings"
+        raise MaterializationError(message)
+
+    if len(set(result)) != len(result):
+        message = f"compile.boundary={boundary} module paths must be unique"
+        raise MaterializationError(message)
+
+    _validate_compile_cache_state(settings)
+
+    return result
+
+
+def _transformers_adapter_compile_boundary(settings: Mapping[str, Any]) -> str | None:
+    if settings.get("compile.enabled") != "true":
+        return None
+
+    boundary = settings.get("compile.boundary")
+
+    if boundary in TRANSFORMERS_ADAPTER_COMPILE_BOUNDARIES:
+        return boundary
+
+    return None
+
+
+def _transformers_compile_cache_state(settings: Mapping[str, Any]) -> str | None:
+    if _transformers_adapter_compile_boundary(settings) is None:
+        return None
+
+    value = settings.get("compile.cache_state")
+
+    if value not in {"cold_compile", "warm_cache"}:
+        message = "compile.cache_state must be cold_compile or warm_cache"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _transformers_forward_patch(
+    model: torch.nn.Module,
+    path: str,
+    settings: Mapping[str, Any],
+) -> _ForwardPatch:
+    module = model.get_submodule(path)
+    original_forward = _instance_forward(module)
+    compiled_forward = _compile_transformers_forward(settings, module.forward)
+
+    return _ForwardPatch(
+        module=module,
+        original_forward=original_forward,
+        compiled_forward=compiled_forward,
+    )
+
+
+def _instance_forward(module: torch.nn.Module) -> Callable[..., Any] | None:
+    if "forward" not in module.__dict__:
+        return None
+
+    value = module.__dict__["forward"]
+
+    if not callable(value):
+        message = "module instance forward must be callable"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _compile_transformers_forward(
+    settings: Mapping[str, Any],
+    forward: Callable[..., Any],
+) -> Callable[..., Any]:
+    compiled_autograd = _compile_bool(settings, "compile.compiled_autograd")
+
+    def build_compiled() -> Callable[..., Any]:
+        return torch.compile(
+            forward,
+            backend=_compile_backend(settings),
+            mode=_compile_mode(settings),
+            fullgraph=_compile_bool(settings, "compile.fullgraph"),
+            dynamic=_compile_optional_bool(settings, "compile.dynamic"),
+            options=_compile_options(settings),
+        )
+
+    if compiled_autograd:
+        with _compiled_autograd_patch():
+            compiled = build_compiled()
+    else:
+        compiled = build_compiled()
+
+    def compiled_forward(*args: Any, **kwargs: Any) -> Any:
+        if compiled_autograd:
+            with _compiled_autograd_patch():
+                return compiled(*args, **kwargs)
+
+        return compiled(*args, **kwargs)
+
+    return compiled_forward
+
+
+@contextlib.contextmanager
+def _installed_transformers_forward_patches(
+    patches: tuple[_ForwardPatch, ...],
+) -> Iterator[None]:
+    for patch in patches:
+        patch.module.forward = patch.compiled_forward
+
+    try:
+        yield
+    finally:
+        for patch in reversed(patches):
+            if patch.original_forward is not None:
+                patch.module.forward = patch.original_forward
+            elif "forward" in patch.module.__dict__:
+                del patch.module.forward
 
 
 def transformers_attention_location(
