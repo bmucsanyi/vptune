@@ -612,20 +612,13 @@ def test_sdpa_kernel_values_enter_declared_context(
     assert calls == [((vpat.SDPA_BACKENDS[kernel_name],), False)]
 
 
-def test_flash_sdpa_matches_math_backend_on_cuda() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for Flash SDPA")
-
-    major, _ = torch.cuda.get_device_capability()
-
-    if major < 8:
-        pytest.skip("Flash SDPA requires Ampere or newer CUDA hardware")
-
+def cuda_sdpa_inputs() -> vpat.AttentionInputs:
     torch.manual_seed(0)
     query = torch.randn(2, 4, 128, 64, device="cuda", dtype=torch.float16)
     key = torch.randn(2, 4, 128, 64, device="cuda", dtype=torch.float16)
     value = torch.randn(2, 4, 128, 64, device="cuda", dtype=torch.float16)
-    inputs = vpat.AttentionInputs(
+
+    return vpat.AttentionInputs(
         query=query,
         key=key,
         value=value,
@@ -638,16 +631,51 @@ def test_flash_sdpa_matches_math_backend_on_cuda() -> None:
         inverse_permutation=None,
         query_block_size=None,
     )
-    flash = vpat.run_attention(
-        inputs,
-        attention_settings(
-            "pytorch_sdpa_direct",
-            "flash_attention",
-            (),
-            "full",
-            "dense_padded",
-        ),
+
+
+def is_unavailable_sdpa_backend_error(error: RuntimeError) -> bool:
+    message = str(error).lower()
+
+    return (
+        "no available kernel" in message
+        or "no viable backend" in message
+        or "not available" in message
+        or "not supported" in message
     )
+
+
+@pytest.mark.parametrize(
+    "kernel_name",
+    ["flash_attention", "efficient_attention", "cudnn_attention"],
+)
+def test_cuda_sdpa_backend_matches_math_backend(kernel_name: str) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA SDPA backends")
+
+    major, _ = torch.cuda.get_device_capability()
+
+    if major < 8:
+        pytest.skip("CUDA SDPA backend test requires Ampere or newer CUDA hardware")
+
+    inputs = cuda_sdpa_inputs()
+
+    try:
+        backend_output = vpat.run_attention(
+            inputs,
+            attention_settings(
+                "pytorch_sdpa_direct",
+                kernel_name,
+                (),
+                "full",
+                "dense_padded",
+            ),
+        )
+    except RuntimeError as error:
+        if is_unavailable_sdpa_backend_error(error):
+            pytest.skip(f"{kernel_name} is unavailable for the CUDA SDPA test shape")
+
+        raise
+
     math_output = vpat.run_attention(
         inputs,
         attention_settings(
@@ -660,7 +688,7 @@ def test_flash_sdpa_matches_math_backend_on_cuda() -> None:
     )
 
     torch.testing.assert_close(
-        flash.float(),
+        backend_output.float(),
         math_output.float(),
         atol=3e-2,
         rtol=3e-2,

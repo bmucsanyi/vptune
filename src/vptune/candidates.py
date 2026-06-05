@@ -1274,48 +1274,71 @@ def _gradient_value_reuse_rule_error(
     settings: Mapping[str, Any],
     fixed_fields: Mapping[str, Any],
 ) -> str | None:
-    if settings.get("gradient.value_reuse") != "gradient_and_primal_value":
-        return None
-
-    if settings.get("gradient.path") == "torch_func_grad_and_value":
-        return None
-
-    if fixed_fields.get("gradient.runtime_returns_value_and_grad") is True:
-        return None
-
-    return "gradient_and_primal_value requires a value-and-gradient path"
+    return _path_coupled_rule_error(
+        settings,
+        fixed_fields,
+        setting_key="gradient.value_reuse",
+        required_value="gradient_and_primal_value",
+        path_key="gradient.path",
+        required_path="torch_func_grad_and_value",
+        fixed_field="gradient.runtime_returns_value_and_grad",
+        message="gradient_and_primal_value requires a value-and-gradient path",
+    )
 
 
 def _jvp_linearize_reuse_rule_error(
     settings: Mapping[str, Any],
     fixed_fields: Mapping[str, Any],
 ) -> str | None:
-    if settings.get("jvp.linearize_reuse") != "reuse_at_same_primal":
-        return None
-
-    if settings.get("jvp.path") == "torch_func_linearize":
-        return None
-
-    if fixed_fields.get("jvp.runtime_reuses_linearize_at_same_primal") is True:
-        return None
-
-    return "reuse_at_same_primal requires torch_func_linearize"
+    return _path_coupled_rule_error(
+        settings,
+        fixed_fields,
+        setting_key="jvp.linearize_reuse",
+        required_value="reuse_at_same_primal",
+        path_key="jvp.path",
+        required_path="torch_func_linearize",
+        fixed_field="jvp.runtime_reuses_linearize_at_same_primal",
+        message="reuse_at_same_primal requires torch_func_linearize",
+    )
 
 
 def _vjp_closure_reuse_rule_error(
     settings: Mapping[str, Any],
     fixed_fields: Mapping[str, Any],
 ) -> str | None:
-    if settings.get("vjp.closure_reuse") != "reuse_vjp_closure_at_same_primal":
+    return _path_coupled_rule_error(
+        settings,
+        fixed_fields,
+        setting_key="vjp.closure_reuse",
+        required_value="reuse_vjp_closure_at_same_primal",
+        path_key="vjp.path",
+        required_path="torch_func_vjp",
+        fixed_field="vjp.runtime_reuses_closure_at_same_primal",
+        message="reuse_vjp_closure_at_same_primal requires torch_func_vjp",
+    )
+
+
+def _path_coupled_rule_error(
+    settings: Mapping[str, Any],
+    fixed_fields: Mapping[str, Any],
+    *,
+    setting_key: str,
+    required_value: str,
+    path_key: str,
+    required_path: str,
+    fixed_field: str,
+    message: str,
+) -> str | None:
+    if settings.get(setting_key) != required_value:
         return None
 
-    if settings.get("vjp.path") == "torch_func_vjp":
+    if settings.get(path_key) == required_path:
         return None
 
-    if fixed_fields.get("vjp.runtime_reuses_closure_at_same_primal") is True:
+    if fixed_fields.get(fixed_field) is True:
         return None
 
-    return "reuse_vjp_closure_at_same_primal requires torch_func_vjp"
+    return message
 
 
 def _ggn_vjp_path_rule_error(
@@ -1765,6 +1788,12 @@ ATTENTION_FRONTEND_VALUES = (
     "packed_exact",
     "blockwise_exact",
 )
+BASELINE_ATTENTION_FRONTEND_VALUES = (
+    "transformers_eager",
+    "transformers_sdpa",
+    "pytorch_sdpa_direct",
+    "patched_eager",
+)
 SDPA_KERNEL_VALUES = (
     "math",
     "flash_attention",
@@ -1773,6 +1802,16 @@ SDPA_KERNEL_VALUES = (
     "overrideable",
     "priority_list",
 )
+
+
+def attention_frontend_requires_full_size_agreement(frontend: object) -> bool:
+    """Return whether an attention frontend needs full-size agreement."""
+    if not isinstance(frontend, str):
+        return True
+
+    return frontend not in BASELINE_ATTENTION_FRONTEND_VALUES
+
+
 FORWARD_AD_TRANSFORM_PATHS = ("torch_func_jvp", "jvp_grad")
 TORCH_FUNC_AXIS_FIELDS = tuple(
     field for field in TORCH_FUNC_FIELDS if field not in FORWARD_AD_FIELDS
@@ -3196,6 +3235,12 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("chunk.token_block_size",),
             (),
             admission_rule=_positive_int_axis("chunk.token_block_size"),
+        ),
+        AxisDescriptor(
+            "chunk.sequence_position_block_size",
+            ("chunk.sequence_position_block_size",),
+            (),
+            admission_rule=_positive_int_axis("chunk.sequence_position_block_size"),
         ),
         AxisDescriptor(
             "input.batch_layout",

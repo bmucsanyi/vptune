@@ -519,6 +519,7 @@ class RuntimeConfig:
     signature: Mapping[str, Any]
     autobatch_domains: tuple[AutobatchDomain, ...] = ()
     full_size_check: FullSizeCheck | None = None
+    reference_check_name: str = "tree_close"
 
     def identity(self) -> dict[str, Any]:
         """Return stable runtime identity."""
@@ -537,6 +538,7 @@ class RuntimeConfig:
                 domain.signature() for domain in self.autobatch_domains
             ),
             "full_size_check": full_size_check_identity,
+            "reference_check_name": self.reference_check_name,
         }
 
 

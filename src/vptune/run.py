@@ -187,7 +187,7 @@ def _reference_input(problem: Problem) -> tuple[Batch, TensorTree]:
     family = problem.operator.family
 
     return (
-        problem.data.reference_batch(family, "tree_close"),
+        problem.data.reference_batch(family, problem.runtime.reference_check_name),
         problem.vectors.reference_vectors(family),
     )
 

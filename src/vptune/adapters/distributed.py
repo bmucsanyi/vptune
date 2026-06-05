@@ -2785,6 +2785,7 @@ def distributed_runtime_config(
             "global_parameter_surface": dict(global_parameter_surface),
         },
         full_size_check=full_size_check,
+        reference_check_name="standard_anchor",
     )
 
 

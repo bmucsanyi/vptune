@@ -707,6 +707,62 @@ def gloo_all_gather_worker(
             torch.distributed.destroy_process_group()
 
 
+def nccl_all_gather_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    result_queue: Any,
+) -> None:
+    try:
+        values, total = run_nccl_all_gather(rank, world_size, init_file)
+        result_queue.put((
+            rank,
+            "passed",
+            values,
+            total,
+        ))
+    except (OSError, RuntimeError, ValueError) as error:
+        result_queue.put((rank, "failed", type(error).__name__, str(error)))
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
+def run_nccl_all_gather(
+    rank: int,
+    world_size: int,
+    init_file: str,
+) -> tuple[tuple[float, ...], float]:
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    initialize_process_group(
+        torch.distributed.init_process_group,
+        backend="nccl",
+        init_method=f"file://{init_file}",
+        timeout=datetime.timedelta(seconds=20),
+        world_size=world_size,
+        rank=rank,
+        store=None,
+        pg_options=None,
+        device_id=device,
+    )
+    local = torch.tensor([float(rank + 1)], dtype=torch.float32, device=device)
+    gathered = torch.empty(world_size, dtype=torch.float32, device=device)
+    collective_all_gather_into_tensor(
+        torch.distributed.all_gather_into_tensor,
+        gathered,
+        local,
+        group=None,
+        async_op=False,
+    )
+    torch.cuda.synchronize(device)
+
+    return (
+        tuple(float(value) for value in gathered.cpu().tolist()),
+        float(gathered.sum().cpu().item()),
+    )
+
+
 def test_resolve_process_group_backend_uses_declared_backend() -> None:
     assert (
         resolve_process_group_backend(
@@ -1653,6 +1709,104 @@ def test_gloo_process_group_all_gather_matches_logical_rank_output(
     processes = tuple(
         context.Process(
             target=gloo_all_gather_worker,
+            args=(rank, world_size, init_file, result_queue),
+        )
+        for rank in range(world_size)
+    )
+
+    for process in processes:
+        process.start()
+
+    try:
+        results = [result_queue.get(timeout=30) for _ in range(world_size)]
+    except queue.Empty as error:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+
+        message = "distributed worker did not report"
+        raise AssertionError(message) from error
+    finally:
+        for process in processes:
+            process.join(timeout=30)
+
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert tuple(sorted(results)) == (
+        (0, "passed", (1.0, 2.0), 3.0),
+        (1, "passed", (1.0, 2.0), 3.0),
+    )
+
+
+def test_nccl_process_group_single_rank_all_gather_matches_logical_rank_output(
+    tmp_path: Path,
+) -> None:
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed is unavailable")
+
+    if not torch.distributed.is_nccl_available():
+        pytest.skip("nccl backend is unavailable")
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for NCCL")
+
+    if torch.distributed.is_initialized():
+        pytest.skip("process group already initialized")
+
+    torch.cuda.set_device(0)
+    device = torch.device("cuda", 0)
+    initialize_process_group(
+        torch.distributed.init_process_group,
+        backend="nccl",
+        init_method=f"file://{tmp_path / 'nccl_single_init'}",
+        timeout=datetime.timedelta(seconds=20),
+        world_size=1,
+        rank=0,
+        store=None,
+        pg_options=None,
+        device_id=device,
+    )
+
+    try:
+        local = torch.tensor([1.0], dtype=torch.float32, device=device)
+        gathered = torch.empty(1, dtype=torch.float32, device=device)
+        collective_all_gather_into_tensor(
+            torch.distributed.all_gather_into_tensor,
+            gathered,
+            local,
+            group=None,
+            async_op=False,
+        )
+        torch.cuda.synchronize(device)
+
+        assert tuple(float(value) for value in gathered.cpu().tolist()) == (1.0,)
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
+def test_nccl_process_group_all_gather_matches_logical_rank_output(
+    tmp_path: Path,
+) -> None:
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed is unavailable")
+
+    if not torch.distributed.is_nccl_available():
+        pytest.skip("nccl backend is unavailable")
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required for two-rank NCCL")
+
+    world_size = 2
+    init_file = str(tmp_path / "nccl_init")
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    processes = tuple(
+        context.Process(
+            target=nccl_all_gather_worker,
             args=(rank, world_size, init_file, result_queue),
         )
         for rank in range(world_size)

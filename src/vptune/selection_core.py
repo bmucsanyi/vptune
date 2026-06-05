@@ -2,16 +2,11 @@
 
 from collections.abc import Mapping, Sequence
 
+from vptune.candidates import attention_frontend_requires_full_size_agreement
 from vptune.data import Candidate, FullSizeRecord, Measurement, SelectionPolicy
 from vptune.errors import NoPassedCandidateError
 
 FULL_SIZE_AGREEMENT_KEY = "full_size_agreement_passed"
-BASELINE_ATTENTION_FRONTENDS = {
-    "pytorch_sdpa_direct",
-    "patched_eager",
-    "transformers_eager",
-    "transformers_sdpa",
-}
 COMPILED_SPEED_STATISTIC = "compile_amortized_steady_state_seconds"
 ACCEPTED_STATUS = "passed_current_reference_full_size_agreement_stable_memory"
 
@@ -251,7 +246,9 @@ def _attention_requires_full_size_agreement(
 ) -> bool:
     frontend = settings.get("attention.frontend")
 
-    if frontend is not None and frontend not in BASELINE_ATTENTION_FRONTENDS:
+    if frontend is not None and attention_frontend_requires_full_size_agreement(
+        frontend
+    ):
         return True
 
     if settings.get("attention.partition") in {"packed_tokens", "blockwise_queries"}:

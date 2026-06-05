@@ -4149,6 +4149,7 @@ def test_within_family_selection() -> None:
             "attention.sdpa_priority_list": ("flash_attention", "math"),
         },
         {"attention.frontend": "transformers_flex_attention"},
+        {"attention.frontend": "unknown_eager"},
         {
             "attention.frontend": "packed_exact",
             "attention.partition": "packed_tokens",
@@ -6329,6 +6330,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "batch.hvp_row_batch_size": 2,
             "batch.ggn_batch_size": 3,
             "chunk.token_block_size": 4,
+            "chunk.sequence_position_block_size": 5,
             "chunk.output_cotangent_block_size": 6,
             "chunk.parameter_block_size": 7,
             "chunk.layer_block_size": 8,
@@ -7537,6 +7539,7 @@ def test_tune_uses_explicit_candidates_and_reference_checks(tmp_path: Path) -> N
     ) -> vp.ReferenceResult:
         assert batch["family"] == "family"
         assert batch["source"] == "reference"
+        assert batch["check"] == "tree_close"
         assert isinstance(vector, torch.Tensor)
         assert torch.equal(vector, torch.tensor([1.0]))
 

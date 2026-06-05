@@ -1,6 +1,6 @@
 """Tensor-tree utilities."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, TypeGuard
 
 import torch
@@ -16,7 +16,9 @@ def _is_tree_tuple(tree: TensorTree) -> TypeGuard[tuple[TensorTree, ...]]:
     return isinstance(tree, tuple)
 
 
-def tree_map(fn: Any, tree: TensorTree) -> TensorTree:
+def tree_map(
+    fn: Callable[[torch.Tensor], torch.Tensor], tree: TensorTree
+) -> TensorTree:
     """Apply a function to every tensor leaf.
 
     Returns:
@@ -38,7 +40,11 @@ def tree_map(fn: Any, tree: TensorTree) -> TensorTree:
     raise TypeError(message)
 
 
-def tree_map2(fn: Any, left: TensorTree, right: TensorTree) -> TensorTree:
+def tree_map2(
+    fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    left: TensorTree,
+    right: TensorTree,
+) -> TensorTree:
     """Apply a binary function to matching tensor leaves.
 
     Returns:

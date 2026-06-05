@@ -2701,6 +2701,7 @@ def composition_runtime_config(
         reference_check=reference_check,
         materializer=_standard_materializer(operation_factory),
         axis_registry=axis_registry,
+        reference_check_name="composition_anchor",
         signature={
             "runtime": "composition",
             "operator": operator.signature(),
@@ -4669,6 +4670,7 @@ def standard_runtime_config(
         reference_check=reference_check,
         materializer=materializer,
         axis_registry=axis_registry,
+        reference_check_name="standard_anchor",
         signature={
             "runtime": "standard",
             "operator": operator.signature(),
@@ -12214,21 +12216,17 @@ def _require_gradient_value_reuse_settings(
     path: str,
     settings: Mapping[str, Any],
 ) -> None:
-    if operator.kind != "gradient":
-        return
-
-    reuse = settings.get("gradient.value_reuse")
-
-    if reuse is None or reuse == "gradient_only":
-        return
-
-    if reuse != "gradient_and_primal_value":
-        message = f"gradient.value_reuse is unsupported: {reuse}"
-        raise MaterializationError(message)
-
-    if path != GRADIENT_TORCH_FUNC_VALUE_PATH:
-        message = "gradient_and_primal_value requires torch_func_grad_and_value"
-        raise MaterializationError(message)
+    _require_path_coupled_reuse_setting(
+        operator,
+        path,
+        settings,
+        operator_kind="gradient",
+        setting_key="gradient.value_reuse",
+        default_value="gradient_only",
+        required_value="gradient_and_primal_value",
+        required_path=GRADIENT_TORCH_FUNC_VALUE_PATH,
+        path_message="gradient_and_primal_value requires torch_func_grad_and_value",
+    )
 
 
 def _require_jvp_linearize_reuse_settings(
@@ -12236,21 +12234,17 @@ def _require_jvp_linearize_reuse_settings(
     path: str,
     settings: Mapping[str, Any],
 ) -> None:
-    if operator.kind != "jvp":
-        return
-
-    reuse = settings.get("jvp.linearize_reuse")
-
-    if reuse is None or reuse == "none":
-        return
-
-    if reuse != "reuse_at_same_primal":
-        message = f"jvp.linearize_reuse is unsupported: {reuse}"
-        raise MaterializationError(message)
-
-    if path != JVP_LINEARIZE_PATH:
-        message = "reuse_at_same_primal requires torch_func_linearize"
-        raise MaterializationError(message)
+    _require_path_coupled_reuse_setting(
+        operator,
+        path,
+        settings,
+        operator_kind="jvp",
+        setting_key="jvp.linearize_reuse",
+        default_value="none",
+        required_value="reuse_at_same_primal",
+        required_path=JVP_LINEARIZE_PATH,
+        path_message="reuse_at_same_primal requires torch_func_linearize",
+    )
 
 
 def _require_vjp_closure_reuse_settings(
@@ -12258,21 +12252,45 @@ def _require_vjp_closure_reuse_settings(
     path: str,
     settings: Mapping[str, Any],
 ) -> None:
-    if operator.kind != "vjp":
+    _require_path_coupled_reuse_setting(
+        operator,
+        path,
+        settings,
+        operator_kind="vjp",
+        setting_key="vjp.closure_reuse",
+        default_value="none",
+        required_value="reuse_vjp_closure_at_same_primal",
+        required_path=VJP_PATH,
+        path_message="reuse_vjp_closure_at_same_primal requires torch_func_vjp",
+    )
+
+
+def _require_path_coupled_reuse_setting(
+    operator: OperatorSpec,
+    path: str,
+    settings: Mapping[str, Any],
+    *,
+    operator_kind: str,
+    setting_key: str,
+    default_value: str,
+    required_value: str,
+    required_path: str,
+    path_message: str,
+) -> None:
+    if operator.kind != operator_kind:
         return
 
-    reuse = settings.get("vjp.closure_reuse")
+    value = settings.get(setting_key)
 
-    if reuse is None or reuse == "none":
+    if value is None or value == default_value:
         return
 
-    if reuse != "reuse_vjp_closure_at_same_primal":
-        message = f"vjp.closure_reuse is unsupported: {reuse}"
+    if value != required_value:
+        message = f"{setting_key} is unsupported: {value}"
         raise MaterializationError(message)
 
-    if path != VJP_PATH:
-        message = "reuse_vjp_closure_at_same_primal requires torch_func_vjp"
-        raise MaterializationError(message)
+    if path != required_path:
+        raise MaterializationError(path_message)
 
 
 def _require_metric_runtime_settings(

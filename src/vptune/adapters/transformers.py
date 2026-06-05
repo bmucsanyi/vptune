@@ -687,6 +687,7 @@ def transformers_runtime_config(
         reference_check=reference_check,
         materializer=materializer,
         axis_registry=axis_registry,
+        reference_check_name="standard_anchor",
         signature={
             "runtime": "transformers",
             "operator": operator.signature(),

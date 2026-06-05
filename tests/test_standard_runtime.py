@@ -12264,6 +12264,19 @@ def test_standard_inverse_metric_materializer_preserves_ggn_representation(
 def test_standard_problem_and_plan_handle_common_path(tmp_path: Path) -> None:
     model = OneParameterModule()
     operator = vp.gradient("gradient", "loss", aggregation="sum")
+    observed_reference_checks = []
+
+    def recording_quadratic_scalar(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        if "check" in batch:
+            observed_reference_checks.append(batch["check"])
+
+        return quadratic_scalar(params, buffers, batch, context)
+
     problem = vp.standard_problem(
         model=model,
         parameter_surface=vp.parameter_surface(model),
@@ -12281,7 +12294,7 @@ def test_standard_problem_and_plan_handle_common_path(tmp_path: Path) -> None:
             "directional_rel_diff": 1e-3,
         },
         objective_signature={"loss": "quadratic-v1"},
-        scalar_objectives={"loss": quadratic_scalar},
+        scalar_objectives={"loss": recording_quadratic_scalar},
     )
     plan = vp.tune(
         problem,
@@ -12302,6 +12315,8 @@ def test_standard_problem_and_plan_handle_common_path(tmp_path: Path) -> None:
     )
 
     assert plan.selected_candidate().candidate_id == "autograd"
+    assert observed_reference_checks
+    assert set(observed_reference_checks) == {"standard_anchor"}
     assert loaded.selected_candidate().candidate_id == "autograd"
     assert loaded_from_problem.selected_candidate().candidate_id == "autograd"
     assert vp.materialize(plan) is not None
@@ -12844,6 +12859,140 @@ def test_fisher_style_runtime_rejects_empty_score_blocks(
             },
             vector,
         )()
+
+
+@pytest.mark.parametrize(
+    ("operator", "family", "settings", "batch_key", "extra_batch"),
+    [
+        (
+            score_terms_fisher("fisher", "scores"),
+            "fisher",
+            fisher_settings("materialize_score_gradients"),
+            "score_gradients",
+            {"normalization": 1.0},
+        ),
+        (
+            score_terms_sampled_fisher("sampled", "scores"),
+            "sampled",
+            sampled_fisher_settings("materialize_score_gradients"),
+            "sampled_score_gradients",
+            {"num_examples": 1},
+        ),
+        (
+            vp.empirical_fisher_vp(
+                "empirical",
+                "scores",
+                aggregation="mean_per_example",
+                example_loss_reduction="per_example",
+                denominator="batch_normalization",
+            ),
+            "empirical",
+            empirical_dense_settings(),
+            "per_example_gradients",
+            {"normalization": 1.0},
+        ),
+    ],
+)
+def test_fisher_style_runtime_maps_zero_vector_to_zero(
+    operator: vp.OperatorSpec,
+    family: str,
+    settings: Mapping[str, object],
+    batch_key: str,
+    extra_batch: Mapping[str, object],
+) -> None:
+    params = {"w": torch.tensor([0.3, -0.2], dtype=torch.float64)}
+    vector = {"w": torch.zeros(2, dtype=torch.float64)}
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vp.Candidate(
+            family,
+            "zero-vector",
+            settings,
+            admission_status="passed",
+        ),
+        {
+            batch_key: torch.tensor(
+                [[1.0, 2.0], [3.0, 5.0]],
+                dtype=torch.float64,
+            ),
+            **dict(extra_batch),
+        },
+        vector,
+    )()
+
+    for leaf in tree_leaves(result):
+        torch.testing.assert_close(leaf, torch.zeros_like(leaf))
+
+
+@pytest.mark.parametrize(
+    ("operator", "family", "settings", "batch_key", "extra_batch"),
+    [
+        (
+            score_terms_fisher("fisher", "scores"),
+            "fisher",
+            fisher_settings("blockwise_score_matrix"),
+            "score_gradient_blocks",
+            {"normalization": 1.0},
+        ),
+        (
+            score_terms_sampled_fisher("sampled", "scores"),
+            "sampled",
+            sampled_fisher_settings("blockwise_score_matrix"),
+            "sampled_score_gradient_blocks",
+            {"num_examples": 1},
+        ),
+        (
+            vp.empirical_fisher_vp(
+                "empirical",
+                "scores",
+                aggregation="mean_per_example",
+                example_loss_reduction="per_example",
+                denominator="batch_normalization",
+            ),
+            "empirical",
+            {"empirical_fisher.accumulation": "blockwise_gradient_matrix"},
+            "per_example_gradient_blocks",
+            {"normalization": 1.0},
+        ),
+    ],
+)
+def test_fisher_style_runtime_maps_zero_vector_to_zero_with_blocks(
+    operator: vp.OperatorSpec,
+    family: str,
+    settings: Mapping[str, object],
+    batch_key: str,
+    extra_batch: Mapping[str, object],
+) -> None:
+    params = {"w": torch.tensor([0.3, -0.2], dtype=torch.float64)}
+    vector = {"w": torch.zeros(2, dtype=torch.float64)}
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vp.Candidate(
+            family,
+            "zero-vector-blocks",
+            settings,
+            admission_status="passed",
+        ),
+        {
+            batch_key: (
+                torch.tensor([[1.0], [3.0]], dtype=torch.float64),
+                torch.tensor([[2.0], [5.0]], dtype=torch.float64),
+            ),
+            **dict(extra_batch),
+        },
+        vector,
+    )()
+
+    for leaf in tree_leaves(result):
+        torch.testing.assert_close(leaf, torch.zeros_like(leaf))
 
 
 def test_dense_metric_uses_vector_order_and_fisher_uses_parameter_order() -> None:
@@ -15105,6 +15254,503 @@ def test_standard_runtime_runs_real_torch_compile_fullgraph_whole_operator() -> 
     result = operation()
 
     torch.testing.assert_close(tree_leaves(result)[0], vector["w"])
+
+
+def test_standard_runtime_runs_real_torch_compile_gradient_closure() -> None:
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+    )
+    operation = factory(
+        vp.Candidate(
+            "gradient",
+            "compiled-gradient",
+            {
+                **gradient_settings(),
+                **compile_settings(boundary="gradient_closure"),
+            },
+            admission_status="passed",
+        ),
+        {"scale": 3.0},
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )
+    result = operation()
+
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        torch.tensor([12.0], dtype=torch.float64),
+    )
+
+
+def test_standard_runtime_runs_real_torch_compile_model_forward() -> None:
+    module = StatefulScalarModule()
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=dict(module.named_parameters()),
+        buffers=dict(module.named_buffers()),
+        module=module,
+        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+    )
+    operation = factory(
+        vp.Candidate(
+            "gradient",
+            "compiled-model-forward",
+            {
+                **gradient_settings(),
+                **stateful_module_call_settings(),
+                **compile_settings(boundary="model_forward"),
+            },
+            admission_status="passed",
+        ),
+        {"scale": torch.tensor([4.0], dtype=torch.float64)},
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )
+    result = operation()
+
+    torch.testing.assert_close(
+        tensor_mapping(result)["w"],
+        torch.tensor([4.0], dtype=torch.float64),
+    )
+
+
+def test_standard_runtime_runs_real_torch_compile_loss_closure() -> None:
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+    )
+    operation = factory(
+        vp.Candidate(
+            "gradient",
+            "compiled-loss",
+            {
+                **gradient_settings(),
+                **compile_settings(boundary="loss_closure"),
+            },
+            admission_status="passed",
+        ),
+        {"scale": 3.0},
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )
+    result = operation()
+
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        torch.tensor([12.0], dtype=torch.float64),
+    )
+
+
+@pytest.mark.parametrize(
+    ("operator", "settings", "batch", "vector", "expected"),
+    [
+        (
+            vp.metric(
+                "metric",
+                "dense",
+                aggregation="sum",
+                representation=dense_metric_representation(),
+            ),
+            {
+                **metric_settings(),
+                **compile_settings(boundary="metric_multiply"),
+            },
+            {
+                "metric_matrix": torch.tensor(
+                    [[2.0, 0.5], [0.5, 3.0]],
+                    dtype=torch.float64,
+                )
+            },
+            {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)},
+            torch.tensor([3.0, 6.5], dtype=torch.float64),
+        ),
+        (
+            vp.inverse_metric(
+                "inverse",
+                "dense",
+                aggregation="sum",
+                representation=dense_metric_representation(),
+                damping=0.0,
+            ),
+            {
+                **inverse_metric_settings(),
+                **compile_settings(boundary="inverse_metric_solve"),
+            },
+            {
+                "metric_matrix": torch.tensor(
+                    [[2.0, 0.0], [0.0, 4.0]],
+                    dtype=torch.float64,
+                )
+            },
+            {"w": torch.tensor([6.0, 8.0], dtype=torch.float64)},
+            torch.tensor([3.0, 2.0], dtype=torch.float64),
+        ),
+    ],
+)
+def test_standard_runtime_runs_real_torch_compile_linear_algebra_boundaries(
+    operator: vp.OperatorSpec,
+    settings: Mapping[str, object],
+    batch: vp.Batch,
+    vector: dict[str, torch.Tensor],
+    expected: torch.Tensor,
+) -> None:
+    factory = vpx.standard_operation_factory(
+        operator,
+        params={"w": torch.tensor([1.0, 2.0], dtype=torch.float64)},
+        buffers={},
+    )
+    operation = factory(
+        vp.Candidate(
+            operator.family,
+            "compiled-boundary",
+            settings,
+            admission_status="passed",
+        ),
+        batch,
+        vector,
+    )
+    result = operation()
+
+    torch.testing.assert_close(tree_leaves(result)[0], expected)
+
+
+def test_standard_runtime_runs_real_torch_compile_jvp_closure() -> None:
+    def function(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> vp.TensorTree:
+        assert buffers == {}
+        assert context.family == "jvp"
+
+        return {"w": params["w"] * batch["scale"]}
+
+    factory = vpx.standard_operation_factory(
+        vp.jvp("jvp", "function", aggregation="sum"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        function_objectives={"function": function},
+    )
+    operation = factory(
+        vp.Candidate(
+            "jvp",
+            "compiled-jvp",
+            {
+                **jvp_settings("torch_func_jvp"),
+                **torch_func_settings(requires_forward_ad=True),
+                **compile_settings(boundary="jvp_closure"),
+            },
+            admission_status="passed",
+        ),
+        {"scale": torch.tensor([2.0], dtype=torch.float64)},
+        {"w": torch.tensor([3.0], dtype=torch.float64)},
+    )
+    result = operation()
+
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        torch.tensor([6.0], dtype=torch.float64),
+    )
+
+
+def test_standard_runtime_runs_real_torch_compile_vjp_closure() -> None:
+    def function(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> vp.TensorTree:
+        assert buffers == {}
+        assert context.family == "vjp"
+
+        return {"w": params["w"] * batch["scale"]}
+
+    factory = vpx.standard_operation_factory(
+        vp.vjp("vjp", "function", aggregation="sum"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        function_objectives={"function": function},
+    )
+    operation = factory(
+        vp.Candidate(
+            "vjp",
+            "compiled-vjp",
+            {
+                **vjp_settings(),
+                **torch_func_settings(requires_forward_ad=False),
+                **compile_settings(boundary="vjp_closure"),
+            },
+            admission_status="passed",
+        ),
+        {"scale": torch.tensor([2.0], dtype=torch.float64)},
+        {"w": torch.tensor([3.0], dtype=torch.float64)},
+    )
+    result = operation()
+
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        torch.tensor([6.0], dtype=torch.float64),
+    )
+
+
+def test_standard_runtime_runs_real_torch_compile_hvp_single_vector() -> None:
+    factory = vpx.standard_operation_factory(
+        vp.hvp("hvp", "loss", aggregation="sum"),
+        params={"w": torch.tensor([2.0, -1.0], dtype=torch.float64)},
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+    )
+    operation = factory(
+        vp.Candidate(
+            "hvp",
+            "compiled-hvp",
+            {
+                **hvp_settings("jvp_grad"),
+                **torch_func_settings(requires_forward_ad=True),
+                **compile_settings(boundary="hvp_single_vector"),
+            },
+            admission_status="passed",
+        ),
+        {"scale": 3.0},
+        {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)},
+    )
+    result = operation()
+
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        torch.tensor([6.0, 12.0], dtype=torch.float64),
+    )
+
+
+def test_standard_runtime_runs_real_torch_compile_hvp_batched_vectors() -> None:
+    factory = vpx.standard_operation_factory(
+        vp.hvp("hvp", "loss", aggregation="sum"),
+        params={"w": torch.tensor([2.0, -1.0], dtype=torch.float64)},
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+    )
+    vector = {
+        "w": torch.tensor(
+            [[1.0, 0.0], [0.0, 2.0]],
+            dtype=torch.float64,
+        )
+    }
+    operation = factory(
+        vp.Candidate(
+            "hvp",
+            "compiled-hvp-batched",
+            {
+                **hvp_settings("jvp_grad"),
+                **torch_func_settings(requires_forward_ad=True),
+                "vectorization.mode": "single_loop",
+                "vectorization.in_dims": {"w": 0},
+                **compile_settings(boundary="hvp_batched_vectors"),
+            },
+            admission_status="passed",
+        ),
+        {"scale": 3.0},
+        vector,
+    )
+    result = operation()
+
+    torch.testing.assert_close(tree_leaves(result)[0], vector["w"] * 6.0)
+
+
+def test_standard_runtime_runs_real_torch_compile_ggn_full_product() -> None:
+    factory = vpx.standard_operation_factory(
+        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        function_objectives={"model_output": square_function},
+    )
+    operation = factory(
+        vp.Candidate(
+            "ggn",
+            "compiled-ggn-full",
+            {
+                **ggn_dense_kernel_settings(),
+                **compile_settings(boundary="ggn_full_product"),
+            },
+            admission_status="passed",
+        ),
+        {
+            "scale": 1.0,
+            "loss_hessian": torch.tensor([[5.0]], dtype=torch.float64),
+        },
+        {"w": torch.tensor([3.0], dtype=torch.float64)},
+    )
+    result = operation()
+
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        torch.tensor([240.0], dtype=torch.float64),
+    )
+
+
+def test_standard_runtime_runs_real_torch_compile_ggn_loss_product() -> None:
+    factory = vpx.standard_operation_factory(
+        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        function_objectives={"model_output": square_function},
+    )
+    operation = factory(
+        vp.Candidate(
+            "ggn",
+            "compiled-ggn",
+            {
+                **ggn_dense_kernel_settings(),
+                **compile_settings(boundary="ggn_loss_hessian_product"),
+            },
+            admission_status="passed",
+        ),
+        {
+            "scale": 1.0,
+            "loss_hessian": torch.tensor([[5.0]], dtype=torch.float64),
+        },
+        {"w": torch.tensor([3.0], dtype=torch.float64)},
+    )
+    result = operation()
+
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        torch.tensor([240.0], dtype=torch.float64),
+    )
+
+
+@pytest.mark.parametrize("boundary", ["ggn_jvp", "ggn_vjp"])
+def test_standard_runtime_runs_real_torch_compile_ggn_partial_boundary(
+    boundary: str,
+) -> None:
+    factory = vpx.standard_operation_factory(
+        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        function_objectives={"model_output": square_function},
+    )
+    operation = factory(
+        vp.Candidate(
+            "ggn",
+            f"compiled-{boundary}",
+            {
+                **ggn_dense_kernel_settings(),
+                **compile_settings(boundary=boundary),
+            },
+            admission_status="passed",
+        ),
+        {
+            "scale": 1.0,
+            "loss_hessian": torch.tensor([[5.0]], dtype=torch.float64),
+        },
+        {"w": torch.tensor([3.0], dtype=torch.float64)},
+    )
+    result = operation()
+
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        torch.tensor([240.0], dtype=torch.float64),
+    )
+
+
+@pytest.mark.parametrize(
+    ("operator", "settings", "family", "batch", "expected"),
+    [
+        (
+            score_terms_fisher("fisher", "scores"),
+            {
+                **fisher_settings(
+                    "streaming_dot_accumulate",
+                    score_grad_path="torch_autograd_grad_loop",
+                ),
+                "schedule.per_example": "loop",
+                **compile_settings(boundary="fisher_score_grad"),
+            },
+            "fisher",
+            {
+                "x": torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64),
+                "normalization": 3.0,
+            },
+            torch.tensor([14.0 / 3.0, 28.0 / 3.0], dtype=torch.float64),
+        ),
+        (
+            score_terms_sampled_fisher("sampled", "scores"),
+            {
+                **sampled_fisher_grad_settings("torch_autograd_grad_loop"),
+                "schedule.per_example": "loop",
+                **compile_settings(boundary="sampled_fisher_score_grad"),
+            },
+            "sampled",
+            {
+                "x": torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64),
+                "normalization": 3.0,
+                "num_examples": 3.0,
+            },
+            torch.tensor([7.0 / 3.0, 14.0 / 3.0], dtype=torch.float64),
+        ),
+        (
+            vp.empirical_fisher_vp(
+                "empirical",
+                "scores",
+                aggregation="mean_per_example",
+                example_loss_reduction="per_example",
+                denominator="num_examples",
+            ),
+            {
+                **empirical_grad_settings("torch_autograd_grad_loop"),
+                "schedule.per_example": "loop",
+                **compile_settings(boundary="empirical_fisher_example_grad"),
+            },
+            "empirical",
+            {
+                "x": torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64),
+                "normalization": 3.0,
+                "num_examples": 3.0,
+            },
+            torch.tensor([14.0 / 3.0, 28.0 / 3.0], dtype=torch.float64),
+        ),
+    ],
+)
+def test_standard_runtime_runs_real_torch_compile_score_grad_boundary(
+    operator: vp.OperatorSpec,
+    settings: Mapping[str, object],
+    family: str,
+    batch: vp.Batch,
+    expected: torch.Tensor,
+) -> None:
+    def score_rows(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert context.family == family
+        x = batch["x"].reshape(-1)
+
+        return x * params["w"][0] + 2.0 * x * params["w"][1]
+
+    factory = vpx.standard_operation_factory(
+        operator,
+        params={"w": torch.tensor([1.0, -1.0], dtype=torch.float64)},
+        buffers={},
+        function_objectives={"scores": score_rows},
+    )
+    operation = factory(
+        vp.Candidate(
+            family,
+            "compiled-score",
+            settings,
+            admission_status="passed",
+        ),
+        batch,
+        {"w": torch.tensor([0.5, 0.25], dtype=torch.float64)},
+    )
+    result = operation()
+
+    torch.testing.assert_close(tree_leaves(result)[0], expected)
 
 
 def test_standard_runtime_warms_compile_cache(
@@ -17602,6 +18248,74 @@ def test_composition_compile_whole_operator_uses_torch_compile(
     assert torch.allclose(
         tree_leaves(output)[0],
         torch.tensor([3.0], dtype=torch.float64),
+    )
+
+
+def test_composition_runs_real_torch_compile_whole_composition() -> None:
+    factory = vpx.composition_operation_factory(
+        vp.composition(
+            "compose",
+            "compiled_composition",
+            aggregation="none",
+            children=("multiply", "shift"),
+        ),
+        components={
+            "multiply": multiply_component,
+            "shift": shift_component,
+        },
+    )
+    operation = factory(
+        vp.Candidate(
+            "compose",
+            "compiled",
+            {
+                **composition_settings(execution="compile_whole_composition"),
+                **compile_settings(),
+            },
+            admission_status="passed",
+        ),
+        {"scale": 2.0},
+        {"w": torch.tensor([3.0], dtype=torch.float64)},
+    )
+    output = operation()
+
+    torch.testing.assert_close(
+        tree_leaves(output)[0],
+        torch.tensor([7.0], dtype=torch.float64),
+    )
+
+
+def test_composition_runs_real_torch_compile_child_boundary() -> None:
+    factory = vpx.composition_operation_factory(
+        vp.composition(
+            "compose",
+            "compiled_children",
+            aggregation="none",
+            children=("multiply", "shift"),
+        ),
+        components={
+            "multiply": multiply_component,
+            "shift": shift_component,
+        },
+    )
+    operation = factory(
+        vp.Candidate(
+            "compose",
+            "compiled-children",
+            {
+                **composition_settings(execution="stream_child_outputs"),
+                **compile_settings(boundary="composition_child"),
+            },
+            admission_status="passed",
+        ),
+        {"scale": 2.0},
+        {"w": torch.tensor([3.0], dtype=torch.float64)},
+    )
+    output = operation()
+
+    torch.testing.assert_close(
+        tree_leaves(output)[0],
+        torch.tensor([7.0], dtype=torch.float64),
     )
 
 
