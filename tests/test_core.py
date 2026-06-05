@@ -1354,6 +1354,7 @@ def test_root_api_all_matches_public_surface() -> None:
         "PlanValidationContext",
         "PlanValidator",
         "Problem",
+        "RecordFormatError",
         "ReferenceFailedError",
         "ReferenceResult",
         "ReplayContext",
@@ -1390,6 +1391,7 @@ def test_root_api_all_matches_public_surface() -> None:
         "vjp",
     )
     assert issubclass(vp.MeasurementError, vp.VPTuneError)
+    assert issubclass(vp.RecordFormatError, vp.VPTuneError)
 
 
 def test_standard_front_door_signatures_match_spec() -> None:
@@ -2672,7 +2674,7 @@ def test_write_record_rejects_type_specific_missing_fields(tmp_path: Path) -> No
     missing_status = dict(row)
     missing_status.pop("status")
 
-    with pytest.raises(vp.VPTuneError, match="status"):
+    with pytest.raises(vp.RecordFormatError, match="status"):
         write_record(tmp_path / "missing-status.json", missing_status)
 
     summary = {
@@ -2703,7 +2705,7 @@ def test_write_record_rejects_type_specific_missing_fields(tmp_path: Path) -> No
         "policy": dataclasses.asdict(vp.SelectionPolicy()),
     }
 
-    with pytest.raises(vp.VPTuneError, match="target_identity"):
+    with pytest.raises(vp.RecordFormatError, match="target_identity"):
         write_record(tmp_path / "missing-target.json", summary)
 
 

@@ -20,7 +20,7 @@ from vptune.data import (
     ReplayContext,
     SelectionPolicy,
 )
-from vptune.errors import StaleRecordError, VPTuneError
+from vptune.errors import RecordFormatError, StaleRecordError
 from vptune.identities import (
     canonical_json,
     to_json_value,
@@ -127,12 +127,12 @@ def validate_json_record(record: Mapping[str, Any]) -> None:
 
     Raises:
         StaleRecordError: If schema or package versions changed.
-        VPTuneError: If required fields are missing or record type is invalid.
+        RecordFormatError: If required fields are missing or record type is invalid.
     """
     for field in REQUIRED_COMMON_FIELDS:
         if field not in record:
             message = f"record field is missing: {field}"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
     if record["schema_version"] != SCHEMA_VERSION:
         message = "record schema version changed"
@@ -144,7 +144,7 @@ def validate_json_record(record: Mapping[str, Any]) -> None:
 
     if record["record_type"] not in {"candidate", "reference", "full_size", "summary"}:
         message = f"record type is invalid: {record['record_type']}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     _validate_record_type_fields(record)
 
@@ -162,7 +162,7 @@ def _validate_record_type_fields(record: Mapping[str, Any]) -> None:
     for field in fields:
         if field not in record:
             message = f"{record_type} record field is missing: {field}"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
     if record_type in {"candidate", "reference", "full_size"}:
         _validate_row_input_signature(record)
@@ -182,7 +182,7 @@ def _effective_row_input_signature(record: Mapping[str, Any]) -> Mapping[str, An
 
     if not isinstance(input_signature, Mapping):
         message = "record input_signature must be a mapping"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if (
         record["record_type"] == "reference"
@@ -192,7 +192,7 @@ def _effective_row_input_signature(record: Mapping[str, Any]) -> Mapping[str, An
 
         if not isinstance(nested, Mapping):
             message = "selected-plan validation input signature is missing"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
         return nested
 
@@ -214,12 +214,12 @@ def _validate_tuning_input_signature(signature: Mapping[str, Any]) -> None:
 
         if not family_signatures:
             message = "run input signature has no family signatures"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
         for family_signature in family_signatures:
             if not isinstance(family_signature, Mapping):
                 message = "run family input signature must be a mapping"
-                raise VPTuneError(message)
+                raise RecordFormatError(message)
 
             _validate_problem_input_signature(family_signature)
 
@@ -235,19 +235,19 @@ def _validate_problem_input_signature(signature: Mapping[str, Any]) -> None:
 
     if not isinstance(operator, Mapping):
         message = "input signature operator is missing"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if not isinstance(target, Mapping) or not target:
         message = "input signature target is missing"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if not isinstance(target.get("environment"), Mapping):
         message = "input signature target environment is missing"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if not isinstance(adapter, Mapping):
         message = "input signature adapter identity is missing"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     _validate_adapter_identity(adapter, "input signature adapter")
 
@@ -255,7 +255,7 @@ def _validate_problem_input_signature(signature: Mapping[str, Any]) -> None:
 def _validate_adapter_identity(identity: Mapping[str, Any], label: str) -> None:
     if not identity.get("adapter_id") or not identity.get("adapter_version"):
         message = f"{label} id and version are required"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
 
 def _validate_summary_identity_fields(record: Mapping[str, Any]) -> None:
@@ -264,7 +264,7 @@ def _validate_summary_identity_fields(record: Mapping[str, Any]) -> None:
 
         if not isinstance(nested, Mapping):
             message = "selected-plan validation summary input signature is missing"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
         _validate_tuning_input_signature(nested)
 
@@ -274,11 +274,11 @@ def _validate_summary_identity_fields(record: Mapping[str, Any]) -> None:
 
     if not isinstance(target_identity, Mapping) or not target_identity:
         message = "plan summary target_identity is missing"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if not isinstance(target_identity.get("environment"), Mapping):
         message = "plan summary target environment is missing"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     selected = set(dict(record["selected"]))
     _validate_summary_family_identities(
@@ -300,12 +300,12 @@ def _validate_summary_family_identities(
 ) -> None:
     if not isinstance(identities, Mapping) or set(identities) != selected:
         message = f"plan summary {label} identities are missing"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     for family, identity in identities.items():
         if not isinstance(identity, Mapping) or not identity:
             message = f"plan summary {label} identity is missing: {family}"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
         if label == "adapter":
             _validate_adapter_identity(identity, f"plan summary adapter {family}")
@@ -314,20 +314,20 @@ def _validate_summary_family_identities(
 def _validate_replay_selection_policy(policy: SelectionPolicy) -> None:
     if policy.speed_statistic != "median_elapsed_seconds":
         message = f"unsupported speed statistic: {policy.speed_statistic}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if policy.compiled_speed_statistic != COMPILED_SPEED_STATISTIC:
         message = (
             f"unsupported compiled speed statistic: {policy.compiled_speed_statistic}"
         )
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if policy.distributed_speed_statistic != "global_elapsed_seconds":
         message = (
             "unsupported distributed speed statistic: "
             f"{policy.distributed_speed_statistic}"
         )
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if policy.rank_memory_reduction not in {
         "max_peak_allocated",
@@ -335,27 +335,27 @@ def _validate_replay_selection_policy(policy: SelectionPolicy) -> None:
         "sum_peak_reserved",
     }:
         message = f"unsupported rank memory reduction: {policy.rank_memory_reduction}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if policy.tie_breaker != "min_peak_reserved_mib":
         message = f"unsupported tie breaker: {policy.tie_breaker}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if policy.cohort_speed_statistic != "sum_median_elapsed_seconds":
         message = f"unsupported cohort speed statistic: {policy.cohort_speed_statistic}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if policy.cohort_tie_breaker != "sum_peak_reserved_mib":
         message = f"unsupported cohort tie breaker: {policy.cohort_tie_breaker}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if policy.accepted_status != ACCEPTED_STATUS:
         message = f"unsupported accepted status: {policy.accepted_status}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if policy.compile_call_horizon <= 0:
         message = "compile_call_horizon must be positive"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
 
 def record_current(
@@ -378,7 +378,7 @@ def record_current(
     """Return whether a saved row matches current identity."""
     try:
         validate_json_record(record)
-    except VPTuneError:
+    except (RecordFormatError, StaleRecordError):
         return False
 
     expected = _expected_record_fields(
@@ -573,13 +573,13 @@ def candidate_record_from_json(record: Mapping[str, Any]) -> Candidate:
 
     Raises:
         StaleRecordError: If the saved candidate row differs from its fields.
-        VPTuneError: If the row is not a candidate record.
+        RecordFormatError: If the row is not a candidate record.
     """
     validate_json_record(record)
 
     if record["record_type"] != "candidate":
         message = "candidate replay requires a candidate record"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     candidate = Candidate(
         family=str(record["family"]),
@@ -639,13 +639,13 @@ def check_record_from_json(record: Mapping[str, Any]) -> CheckRecord:
 
     Raises:
         StaleRecordError: If the reference row differs from its fields.
-        VPTuneError: If the row is not a reference record.
+        RecordFormatError: If the row is not a reference record.
     """
     validate_json_record(record)
 
     if record["record_type"] != "reference":
         message = "check replay requires a reference record"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     payload = dict(record)
     payload.pop("record_type")
@@ -794,7 +794,7 @@ def selected_plan_validation_summary_current(
     """Return whether a selected-plan validation summary matches its rows."""
     try:
         validate_json_record(record)
-    except VPTuneError:
+    except (RecordFormatError, StaleRecordError):
         return False
 
     if record.get("record_type") != "summary":
@@ -829,11 +829,11 @@ def _validate_selected_plan_validation_rows(
 
     if tuple(record.family for record in records) != tuple(validation_order):
         message = "plan replay selected-plan validation order differs"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if set(validation_order) != set(plan.selected):
         message = "plan replay selected-plan validation families differ"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     for record in records:
         _validate_selected_plan_validation_row(
@@ -846,7 +846,7 @@ def _validate_selected_plan_validation_rows(
         record.status != "passed" for record in records
     ):
         message = "plan replay selected-plan validation did not pass"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
 
 def _validate_selected_plan_validation_row(
@@ -856,7 +856,7 @@ def _validate_selected_plan_validation_row(
 ) -> None:
     if record.name != "selected_plan_validation":
         message = "plan replay validation row name differs"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if to_json_value(record.input_signature) != to_json_value(expected_input_signature):
         message = "plan replay validation row input signature differs"
@@ -895,7 +895,7 @@ def plan_record_current(record: Mapping[str, Any], plan: Plan) -> bool:
     """Return whether a saved plan matches the current selected plan."""
     try:
         validate_json_record(record)
-    except VPTuneError:
+    except (RecordFormatError, StaleRecordError):
         return False
 
     expected = plan.to_record()
@@ -939,7 +939,7 @@ def _record_by_row_key(records: Sequence[Any], label: str) -> dict[str, Any]:
 
     if len(by_key) != len(records):
         message = f"plan replay has duplicate {label} rows"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     return by_key
 
@@ -952,7 +952,7 @@ def _check_record_by_lookup_key(
 
     if len(by_key) != len(records):
         message = f"plan replay has duplicate {label} rows"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     return by_key
 
@@ -977,13 +977,13 @@ def _records_in_saved_order(
 
         if record is None:
             message = f"plan replay missing {label} row: {value}"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
         ordered.append(record)
 
     if set(records_by_key) != {canonical_json(value) for value in row_keys}:
         message = f"plan replay received extra {label} rows"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     return tuple(ordered)
 
@@ -1001,7 +1001,7 @@ def _check_records_in_saved_order(
 
         if record is None:
             message = f"plan replay missing {label} row: {value}"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
         if to_json_value(record.row_key()) != to_json_value(value):
             message = f"plan replay stale {label} row: {value}"
@@ -1013,7 +1013,7 @@ def _check_records_in_saved_order(
         _check_row_lookup_key(dict(value)) for value in row_keys
     }:
         message = f"plan replay received extra {label} rows"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     return tuple(ordered)
 
@@ -1024,7 +1024,7 @@ def _selection_policy_from_json(record: Mapping[str, Any]) -> SelectionPolicy:
 
     if set(policy) != expected:
         message = "plan replay selection policy fields differ"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     return SelectionPolicy(**policy)
 
@@ -1069,7 +1069,7 @@ def _validation_replay_identity(
 
     if saved_required is not True and saved_required is not False:
         message = "plan validation_required must be a bool"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     return _ValidationReplayIdentity(
         required=saved_required or replay_context.validation_required,
@@ -1135,7 +1135,7 @@ def _validate_reference_linkage(
                 "plan replay accepted full-size row has no matching passed reference: "
                 f"{record.family}/{record.candidate_id}"
             )
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
 
 def _selected_record_keys(
@@ -1150,7 +1150,7 @@ def _selected_record_keys(
 
     if set(selected_record_keys) != set(selected):
         message = "plan replay selected families differ from record families"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     missing_records = tuple(
         family
@@ -1160,7 +1160,7 @@ def _selected_record_keys(
 
     if missing_records:
         message = f"plan replay missing full-size records: {missing_records}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     return selected_record_keys
 
@@ -1175,7 +1175,7 @@ def _validate_materializers(
 
     if missing_materializers:
         message = f"plan replay missing materializers: {missing_materializers}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
 
 def _materializer_identities(
@@ -1220,7 +1220,7 @@ def _validate_replay_context(
 
         if expected_signature is None:
             message = f"plan replay missing family input signature: {row.family}"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
         if canonical_json(
             row.row_key()
@@ -1241,7 +1241,7 @@ def _validate_replay_context(
                 continue
 
             message = f"plan replay missing reference input signature: {row.family}"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
         if not _row_matches_signature(row, expected_signature):
             continue
@@ -1306,7 +1306,7 @@ def _validate_replay_target_identity(
 
     if not record["target_identity"] or not replay_context.target_identity:
         message = "plan replay target identity is missing"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
 
 def _validate_replay_family_identities(
@@ -1331,7 +1331,7 @@ def _validate_replay_family_identities(
         not identity for identity in identities.values()
     ):
         message = f"plan replay {label} identities are missing"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
 
 def _replay_select_family(
@@ -1352,7 +1352,7 @@ def _replay_select_family(
 
     if not accepted:
         message = "plan replay family has no accepted rows"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     autobatch_selected = _replay_autobatch_selected(
         tuple(record for _, record in records),
@@ -1380,7 +1380,7 @@ def _replay_autobatch_selected(
 
     if len(selected) != 1:
         message = "plan replay has multiple Autobatch-selected rows"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     accepted_keys = {canonical_json(record.row_key()) for record in accepted}
 
@@ -1419,11 +1419,11 @@ def _validate_selected_record(
 ) -> None:
     if selected_record.family != family:
         message = f"plan replay selected record family differs: {family}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if selected_record.candidate_id != candidate.candidate_id:
         message = f"plan replay selected record candidate differs: {family}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if selected_record.generator_id != candidate.generator_id:
         message = f"plan replay selected record generator differs: {family}"
@@ -1439,13 +1439,13 @@ def _validate_selected_record(
         or not full_size_agreement_satisfied(selected_record)
     ):
         message = f"plan replay selected record did not pass: {family}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if to_json_value(selected_record.candidate_settings) != to_json_value(
         candidate.settings
     ):
         message = f"plan replay selected record settings differ: {family}"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if to_json_value(selected_record.dependency_identities) != to_json_value(
         candidate.dependency_identities
@@ -1483,7 +1483,7 @@ def _validate_dependency_identities(
 ) -> None:
     if set(dependencies_by_family) != set(selected):
         message = "plan replay dependency families differ"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     for family, candidate in selected.items():
         dependencies = dependencies_by_family[family]
@@ -1499,7 +1499,7 @@ def _validate_dependency_identities(
         for dependency in dependencies:
             if dependency not in selected:
                 message = f"plan replay dependency is missing: {dependency}"
-                raise VPTuneError(message)
+                raise RecordFormatError(message)
 
             expected_identity = _dependency_identity(
                 dependency,
@@ -1562,7 +1562,7 @@ def _candidate_records_by_key(
 
         if key in records:
             message = f"plan replay has duplicate candidate row: {key}"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
         records[key] = (candidate, record)
 
@@ -1596,15 +1596,15 @@ def _validate_candidate_records(
 
     if len(full_size_by_key) != len(full_size_records):
         message = "plan replay has duplicate full-size candidate identities"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if set(by_key) != set(expected_by_key):
         message = "plan replay candidate rows differ from plan summary"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if not set(full_size_by_key) | check_keys <= set(expected_by_key):
         message = "plan replay candidate rows differ from result rows"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     for key, (row_candidate, row) in by_key.items():
         full_size_record = full_size_by_key.get(key)
@@ -1803,7 +1803,7 @@ def _replay_family_order(
 
             if dependencies is None:
                 message = f"plan replay dependency record missing: {family}"
-                raise VPTuneError(message)
+                raise RecordFormatError(message)
 
             if all(dependency in ordered for dependency in dependencies):
                 ordered.append(family)
@@ -1812,7 +1812,7 @@ def _replay_family_order(
 
         if not progressed:
             message = "plan replay dependency graph has a cycle or missing dependency"
-            raise VPTuneError(message)
+            raise RecordFormatError(message)
 
     return tuple(ordered)
 
@@ -2051,17 +2051,17 @@ def _validate_replay_validation_summary(
 ) -> None:
     if validation_records and validation_summary is None:
         message = "plan replay validation records require a validation summary"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if (replay_context.validation_required or plan.validation_required) and (
         validation_summary is None
     ):
         message = "plan replay requires selected-plan validation"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if validation_summary is not None and not validation_records:
         message = "plan replay validation summary requires validation records"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     if validation_summary is None:
         return
@@ -2112,14 +2112,14 @@ def plan_from_json(
 
     Raises:
         StaleRecordError: If the summary does not match the rebuilt plan.
-        VPTuneError: If the record is not a summary or required rows are missing.
+        RecordFormatError: If the record is not a summary or required rows are missing.
     """
     validate_json_record(record)
     _validate_replay_selection_policy(replay_context.selection_policy)
 
     if record["record_type"] != "summary":
         message = "plan replay requires a summary record"
-        raise VPTuneError(message)
+        raise RecordFormatError(message)
 
     selected = _selected_candidates_from_record(record)
     rows = _replay_rows(record, full_size_records, check_records, validation_records)

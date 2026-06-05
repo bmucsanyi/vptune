@@ -13,6 +13,10 @@ class ReferenceFailedError(VPTuneError):
     """Raised when a candidate fails a reference check."""
 
 
+class RecordFormatError(VPTuneError):
+    """Raised when a saved record is malformed."""
+
+
 class NoPassedCandidateError(VPTuneError):
     """Raised when selection has no accepted candidate."""
 
