@@ -14674,6 +14674,40 @@ def test_standard_runtime_runs_real_torch_compile_whole_operator() -> None:
     torch.testing.assert_close(tree_leaves(result)[0], vector["w"])
 
 
+def test_standard_runtime_runs_real_torch_compile_fullgraph_whole_operator() -> None:
+    params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
+    matrix = torch.eye(2, dtype=torch.float64)
+    vector = {"w": torch.tensor([3.0, 4.0], dtype=torch.float64)}
+    factory = vpx.standard_operation_factory(
+        vp.metric(
+            "metric",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    settings = {
+        **metric_settings(),
+        **compile_settings(),
+        "compile.fullgraph": "true",
+    }
+    operation = factory(
+        vp.Candidate(
+            "metric",
+            "compiled-fullgraph",
+            settings,
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        vector,
+    )
+    result = operation()
+
+    torch.testing.assert_close(tree_leaves(result)[0], vector["w"])
+
+
 def test_standard_runtime_warms_compile_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

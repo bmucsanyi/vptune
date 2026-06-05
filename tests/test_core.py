@@ -37,7 +37,7 @@ from vptune.identities import (
     stable_hash,
     to_json_value,
 )
-from vptune.io import read_record, write_record
+from vptune.io import read_record, write_record, write_record_exclusive
 from vptune.measure import (
     CPUMemoryBackend,
     measure_once,
@@ -2625,6 +2625,40 @@ def test_candidate_record_writes_declared_hook_ids(tmp_path: Path) -> None:
     loaded = read_record(path)
 
     assert loaded["candidate_settings"] == candidate.settings
+
+
+def test_write_record_exclusive_preserves_existing_record(tmp_path: Path) -> None:
+    path = tmp_path / "candidate.json"
+    first = vp.Candidate("family", "first", {}, admission_status="passed")
+    second = vp.Candidate("family", "second", {}, admission_status="passed")
+
+    write_record(path, vpx.candidate_record_to_json(first, _input_signature("first")))
+
+    with pytest.raises(FileExistsError):
+        write_record_exclusive(
+            path,
+            vpx.candidate_record_to_json(second, _input_signature("second")),
+        )
+
+    assert read_record(path)["candidate_id"] == "first"
+
+
+def test_write_unique_record_moves_to_numbered_sibling(tmp_path: Path) -> None:
+    path = tmp_path / "candidate.json"
+    first = vp.Candidate("family", "first", {}, admission_status="passed")
+    second = vp.Candidate("family", "second", {}, admission_status="passed")
+
+    run_module._write_unique_record(
+        path,
+        vpx.candidate_record_to_json(first, _input_signature("first")),
+    )
+    run_module._write_unique_record(
+        path,
+        vpx.candidate_record_to_json(second, _input_signature("second")),
+    )
+
+    assert read_record(path)["candidate_id"] == "first"
+    assert read_record(tmp_path / "candidate-000001.json")["candidate_id"] == "second"
 
 
 def test_write_record_rejects_type_specific_missing_fields(tmp_path: Path) -> None:

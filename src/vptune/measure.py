@@ -9,7 +9,7 @@ import torch
 
 from vptune.data import Candidate, FullSizeRecord, Measurement, TimingPolicy
 from vptune.errors import MeasurementError
-from vptune.tensor_tree import TensorTree, tree_detach, tree_signature
+from vptune.tensor_tree import TensorTree, tree_detach, tree_leaves, tree_signature
 
 
 class MemoryBackend(Protocol):
@@ -335,6 +335,7 @@ def run_candidate(
             clock=clock,
             clear_gradients=clear_gradients,
         )
+        _require_finite_output(output)
         selection_metadata = _selection_metadata(
             candidate,
             samples,
@@ -390,6 +391,13 @@ def run_candidate(
         cohort_assignment=dict(candidate.cohort_assignment),
         reference_passed=reference_passed,
     )
+
+
+def _require_finite_output(output: TensorTree) -> None:
+    for tensor in tree_leaves(output):
+        if not torch.isfinite(tensor).all().item():
+            message = "full-size output contains nonfinite values"
+            raise RuntimeError(message)
 
 
 def _selection_metadata(

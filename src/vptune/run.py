@@ -48,7 +48,7 @@ from vptune.errors import (
     ReferenceFailedError,
 )
 from vptune.identities import canonical_json, stable_hash
-from vptune.io import read_record, write_record
+from vptune.io import read_record, write_record, write_record_exclusive
 from vptune.measure import (
     MemoryBackend,
     OperationMeasurementError,
@@ -57,7 +57,7 @@ from vptune.measure import (
     measure_once,
     run_candidate,
 )
-from vptune.runtime import standard_problem
+from vptune.runtime import deferred_runtime_finite_checks, standard_problem
 from vptune.schemas import (
     candidate_from_signature,
     candidate_record_to_json,
@@ -736,7 +736,8 @@ def _measured_operation(
     )
 
     def operation() -> TensorTree:
-        return tuple(candidate_operation() for candidate_operation in operations)
+        with deferred_runtime_finite_checks():
+            return tuple(candidate_operation() for candidate_operation in operations)
 
     return operation
 
@@ -968,17 +969,21 @@ def _write_full_size(run_dir: Path, record: FullSizeRecord) -> None:
 
 
 def _write_unique_record(path: Path, payload: dict[str, Any]) -> None:
-    if not path.exists():
-        write_record(path, payload)
-
+    try:
+        write_record_exclusive(path, payload)
+    except FileExistsError:
+        pass
+    else:
         return
 
     for index in itertools.count(1):
         candidate_path = path.with_name(f"{path.stem}-{index:06d}{path.suffix}")
 
-        if not candidate_path.exists():
-            write_record(candidate_path, payload)
-
+        try:
+            write_record_exclusive(candidate_path, payload)
+        except FileExistsError:
+            pass
+        else:
             return
 
 

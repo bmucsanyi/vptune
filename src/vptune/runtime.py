@@ -1,5 +1,6 @@
 """Runtime builders for package-owned operator anchors."""
 
+import contextlib
 import dataclasses
 import importlib
 import math
@@ -362,6 +363,8 @@ SUPPORTED_STANDARD_SETTINGS = (
     "vectorization.in_dims",
 )
 MATRIX_DIMS = 2
+FINITE_CHECKS_ENABLED = [True]
+BACKEND_SETTINGS_ENABLED = [True]
 STANDARD_ANCHOR_PATHS = {
     "gradient": GRADIENT_PATH,
     "jvp": JVP_PATH,
@@ -1449,9 +1452,9 @@ def _compiled_composition_component(
     def compiled_component(batch: Batch, vector: TensorTree) -> TensorTree:
         if compiled_autograd:
             with _compiled_autograd_patch():
-                return compiled(batch, vector)
+                return _call_with_deferred_finite_checks(compiled, batch, vector)
 
-        return compiled(batch, vector)
+        return _call_with_deferred_finite_checks(compiled, batch, vector)
 
     return compiled_component
 
@@ -2567,10 +2570,84 @@ def _inverse_residual(
     return float((residual / denominator).item())
 
 
+@contextlib.contextmanager
+def deferred_runtime_finite_checks() -> Iterator[None]:
+    """Skip runtime tensor scans inside a timed or compiled callable."""
+    previous = FINITE_CHECKS_ENABLED[0]
+    FINITE_CHECKS_ENABLED[0] = False
+
+    try:
+        yield
+    finally:
+        FINITE_CHECKS_ENABLED[0] = previous
+
+
+def _call_with_deferred_finite_checks(
+    callback: Callable[..., Any],
+    *args: Any,
+) -> Any:
+    with deferred_runtime_finite_checks():
+        return callback(*args)
+
+
+@contextlib.contextmanager
+def _disabled_backend_settings() -> Iterator[None]:
+    previous = BACKEND_SETTINGS_ENABLED[0]
+    BACKEND_SETTINGS_ENABLED[0] = False
+
+    try:
+        yield
+    finally:
+        BACKEND_SETTINGS_ENABLED[0] = previous
+
+
+def _call_compiled_body(callback: Callable[..., Any], *args: Any) -> Any:
+    with deferred_runtime_finite_checks(), _disabled_backend_settings():
+        return callback(*args)
+
+
+def _call_compiled_operation(
+    settings: Mapping[str, Any],
+    callback: Callable[..., Any],
+    *args: Any,
+) -> Any:
+    return _run_with_backend_settings(
+        settings,
+        lambda: _call_compiled_body(callback, *args),
+    )
+
+
 def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
-    if not torch.isfinite(tensor).all().item():
+    if not FINITE_CHECKS_ENABLED[0]:
+        return
+
+    check_tensor = _finite_check_tensor(tensor)
+
+    if not torch.isfinite(check_tensor).all().item():
         message = f"{name} contains nonfinite values"
         raise MaterializationError(message)
+
+
+def _finite_check_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if _is_fp8_tensor(tensor):
+        return tensor.to(torch.float32)
+
+    return tensor
+
+
+def _is_fp8_tensor(tensor: torch.Tensor) -> bool:
+    for dtype_name in (
+        "float8_e4m3fn",
+        "float8_e5m2",
+        "float8_e4m3fnuz",
+        "float8_e5m2fnuz",
+    ):
+        dtype = getattr(torch, dtype_name, None)
+
+        if dtype is not None and tensor.dtype == dtype:
+            return True
+
+    return False
 
 
 def _require_finite_tree(tree: TensorTree, name: str) -> None:
@@ -2817,6 +2894,7 @@ def standard_operation_factory(
         )
         _require_stateful_module_execution(execution)
         execution = _loss_scaled_execution(execution)
+        _require_finite_execution_inputs(execution)
         execution = _prepare_standard_execution(execution)
         execution = _prepare_compile_boundary_execution(execution)
         output_buffer = _standard_output_buffer(execution)
@@ -3308,6 +3386,21 @@ def _tensor_args(value: Any) -> tuple[torch.Tensor, ...]:
     return ()
 
 
+def _require_finite_execution_inputs(execution: StandardExecution) -> None:
+    for name, value in (
+        ("parameters", execution.params),
+        ("buffers", execution.buffers),
+        ("batch", execution.batch),
+        ("vector", execution.vector),
+    ):
+        _require_finite_nested_tensors(value, name)
+
+
+def _require_finite_nested_tensors(value: Any, name: str) -> None:
+    for tensor in _tensor_args(value):
+        _require_finite_tensor(tensor, name)
+
+
 def _has_activation_settings(settings: Mapping[str, Any]) -> bool:
     return any(key.startswith(("activation.", "checkpoint.")) for key in settings)
 
@@ -3421,9 +3514,9 @@ def _compiled_operation(
     def compiled_operation() -> TensorTree:
         if compiled_autograd:
             with _compiled_autograd_patch():
-                return compiled()
+                return _call_compiled_operation(settings, compiled)
 
-        return compiled()
+        return _call_compiled_operation(settings, compiled)
 
     cache_state = settings.get("compile.cache_state")
     _validate_compile_cache_state(settings)
@@ -3467,9 +3560,9 @@ def _compiled_tensor_operation(
     def compiled_operation() -> torch.Tensor:
         if compiled_autograd:
             with _compiled_autograd_patch():
-                return compiled()
+                return _call_with_deferred_finite_checks(compiled)
 
-        return compiled()
+        return _call_with_deferred_finite_checks(compiled)
 
     cache_state = settings.get("compile.cache_state")
     _validate_compile_cache_state(settings)
@@ -3505,9 +3598,9 @@ def _compiled_model_forward(
     def compiled_function(batch: Batch) -> object:
         if compiled_autograd:
             with _compiled_autograd_patch():
-                return compiled(batch)
+                return _call_with_deferred_finite_checks(compiled, batch)
 
-        return compiled(batch)
+        return _call_with_deferred_finite_checks(compiled, batch)
 
     _validate_compile_cache_state(settings)
 
@@ -3540,9 +3633,9 @@ def _compiled_scalar_function(
     def compiled_function(params: ParameterTree) -> torch.Tensor:
         if compiled_autograd:
             with _compiled_autograd_patch():
-                return compiled(params)
+                return _call_with_deferred_finite_checks(compiled, params)
 
-        return compiled(params)
+        return _call_with_deferred_finite_checks(compiled, params)
 
     cache_state = settings.get("compile.cache_state")
     _validate_compile_cache_state(settings)
@@ -3580,9 +3673,13 @@ def _compiled_ggn_loss_product_operation(
     def compiled_operation(output: TensorTree, output_jvp: TensorTree) -> TensorTree:
         if compiled_autograd:
             with _compiled_autograd_patch():
-                return compiled(output, output_jvp)
+                return _call_with_deferred_finite_checks(
+                    compiled,
+                    output,
+                    output_jvp,
+                )
 
-        return compiled(output, output_jvp)
+        return _call_with_deferred_finite_checks(compiled, output, output_jvp)
 
     cache_state = settings.get("compile.cache_state")
     _validate_compile_cache_state(settings)
@@ -3623,9 +3720,9 @@ def _compiled_ggn_vjp_operation(
     def compiled_operation(output_cotangent: TensorTree) -> TensorTree:
         if compiled_autograd:
             with _compiled_autograd_patch():
-                return compiled(output_cotangent)
+                return _call_with_deferred_finite_checks(compiled, output_cotangent)
 
-        return compiled(output_cotangent)
+        return _call_with_deferred_finite_checks(compiled, output_cotangent)
 
     cache_state = settings.get("compile.cache_state")
     _validate_compile_cache_state(settings)
@@ -13752,6 +13849,9 @@ def _run_with_backend_settings(
     settings: Mapping[str, Any],
     callback: Callable[[], Any],
 ) -> Any:
+    if not BACKEND_SETTINGS_ENABLED[0]:
+        return callback()
+
     matmul_precision = _matmul_precision_setting(settings)
     autocast_setting = _autocast_setting(settings)
     allow_bf16_reduction = _bool_string_setting(
