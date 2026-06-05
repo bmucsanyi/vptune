@@ -233,6 +233,10 @@ def _input_signature(problem: Problem, memory_backend: MemoryBackend) -> dict[st
     return signature
 
 
+def _run_input_signature(**fields: Any) -> dict[str, Any]:
+    return dict(fields)
+
+
 def _domain_settings_product(
     domains: tuple[AutobatchDomain, ...],
 ) -> tuple[tuple[tuple[AutobatchDomain, int, Mapping[str, Any]], ...], ...]:
@@ -2759,10 +2763,10 @@ def _tune_cohort_assignment(
     candidate_rows = ()
     full_size_records = ()
     check_records = ()
-    input_signature: dict[str, Any] = {
-        "run_id": run.run_id,
-        "cohort_assignment": assignment.signature(),
-    }
+    input_signature = _run_input_signature(
+        run_id=run.run_id,
+        cohort_assignment=assignment.signature(),
+    )
 
     for family in ordered_families:
         if any(dependency not in selected for dependency in family.dependencies):
@@ -3000,10 +3004,10 @@ def _tune_run_admission(
     memory_backend: MemoryBackend | None,
 ) -> Plan:
     candidate_rows = ()
-    input_signature: dict[str, Any] = {
-        "run_id": run.run_id,
-        "search_strategy": "admission",
-    }
+    input_signature = _run_input_signature(
+        run_id=run.run_id,
+        search_strategy="admission",
+    )
 
     for assignment in cohort_assignments(run.cohort_constraints, index.family_names):
         for family in index.ordered_families:
