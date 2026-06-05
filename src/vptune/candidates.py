@@ -24,55 +24,16 @@ AdmissionRule = Callable[[Candidate], tuple[bool, str | None]]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class AxisTableDescriptor:
-    """One sweep axis entry from the fixed docs."""
-
-    axis_key: str
-    owner_id: str
-    value_domain: tuple[Any, ...]
-    operators: tuple[str, ...]
-    class_c_group: str
-    admission_rule_id: str
-    lowering_rule_id: str
-    optional_settings_keys: tuple[str, ...] = ()
-    class_a: str = ""
-    class_b: str = ""
-    adapter_id: str = ""
-    merge_rules: tuple[str, ...] = ()
-
-    def signature(self) -> dict[str, Any]:
-        """Return stable axis identity.
-
-        Returns:
-            Serializable axis identity.
-        """
-        return {
-            "axis_key": self.axis_key,
-            "owner_id": self.owner_id,
-            "value_domain": self.value_domain,
-            "operators": self.operators,
-            "class_a": self.class_a,
-            "class_b": self.class_b,
-            "class_c_group": self.class_c_group,
-            "merge_rules": self.merge_rules,
-            "optional_settings_keys": self.optional_settings_keys,
-            "admission_rule_id": self.admission_rule_id,
-            "lowering_rule_id": self.lowering_rule_id,
-            "adapter_id": self.adapter_id,
-        }
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
 class AxisTable:
     """Complete sweep axis table."""
 
     package_version: str
     axis_table_version: str
-    axes: tuple[AxisTableDescriptor, ...]
+    axes: tuple["AxisDescriptor", ...]
     class_c_groups: Mapping[str, tuple[str, ...]]
     merge_rules: tuple[str, ...]
 
-    def by_key(self) -> dict[str, AxisTableDescriptor]:
+    def by_key(self) -> dict[str, "AxisDescriptor"]:
         """Return axes keyed by setting key.
 
         Returns:
@@ -80,7 +41,7 @@ class AxisTable:
         """
         return {axis.axis_key: axis for axis in self.axes}
 
-    def optional_owner_by_key(self) -> dict[str, AxisTableDescriptor]:
+    def optional_owner_by_key(self) -> dict[str, "AxisDescriptor"]:
         """Return owner axes keyed by optional setting key.
 
         Returns:
@@ -162,25 +123,6 @@ class AxisTable:
 
 
 AxisManifest = AxisTable
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class AxisTableAdmitter:
-    """Candidate admitter backed by the axis table."""
-
-    axis_table: AxisTable
-    fixed_fields: Mapping[str, Any]
-
-    def admit(self, candidate: Candidate) -> Candidate:
-        """Return candidate with admission status set."""
-        return self.axis_table.admit(candidate, fixed_fields=self.fixed_fields)
-
-    def signature(self) -> dict[str, Any]:
-        """Return stable admission identity."""
-        return {
-            "axis_table": self.axis_table.signature(),
-            "fixed_fields": dict(self.fixed_fields),
-        }
 
 
 ALL_OPERATOR_FAMILIES = (
@@ -468,21 +410,20 @@ def axis_manifest() -> AxisManifest:
 def _axis_table_axis(
     axis_key: str,
     value_domain: tuple[Any, ...],
-) -> AxisTableDescriptor:
+) -> "AxisDescriptor":
     class_c_group = _class_c_group(axis_key)
 
-    return AxisTableDescriptor(
-        axis_key=axis_key,
+    return AxisDescriptor(
+        name=axis_key,
+        settings_keys=(axis_key,),
+        allowed_values=value_domain,
         owner_id=_owner_id(axis_key),
-        value_domain=value_domain,
         operators=_operators_for_axis(axis_key),
         class_a=_class_a(axis_key),
         class_b=_class_b(axis_key),
         class_c_group=class_c_group,
         merge_rules=_axis_merge_rules(axis_key),
         optional_settings_keys=_axis_table_optional_settings(axis_key),
-        admission_rule_id=f"admit.{axis_key}",
-        lowering_rule_id=f"lower.{axis_key}",
         adapter_id=_adapter_id(axis_key),
     )
 
@@ -1011,7 +952,7 @@ def _adapter_id(axis_key: str) -> str:
 
 
 def _axis_table_value_error(
-    axis: AxisTableDescriptor,
+    axis: "AxisDescriptor",
     value: Any,
 ) -> str | None:
     validators = (
@@ -1895,10 +1836,26 @@ class AxisDescriptor:
     settings_keys: tuple[str, ...]
     allowed_values: tuple[Any, ...]
     optional_settings_keys: tuple[str, ...] = ()
+    owner_id: str = "core"
+    operators: tuple[str, ...] = ()
+    class_a: str = ""
+    class_b: str = ""
+    class_c_group: str = ""
+    merge_rules: tuple[str, ...] = ()
     adapter_id: str = "core"
     adapter_version: str = "0.0.1"
     admission_rule: AdmissionRule | None = None
     identity: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+
+    @property
+    def axis_key(self) -> str:
+        """Return the axis key."""
+        return self.name
+
+    @property
+    def value_domain(self) -> tuple[Any, ...]:
+        """Return the allowed value domain."""
+        return self.allowed_values
 
     def admit(self, candidate: Candidate) -> tuple[bool, str | None]:
         """Run the admission rule for a candidate.
@@ -1920,9 +1877,17 @@ class AxisDescriptor:
         """Return stable axis identity."""
         return {
             "name": self.name,
+            "axis_key": self.axis_key,
             "settings_keys": self.settings_keys,
             "optional_settings_keys": self.optional_settings_keys,
             "allowed_values": self.allowed_values,
+            "value_domain": self.value_domain,
+            "owner_id": self.owner_id,
+            "operators": self.operators,
+            "class_a": self.class_a,
+            "class_b": self.class_b,
+            "class_c_group": self.class_c_group,
+            "merge_rules": self.merge_rules,
             "adapter_id": self.adapter_id,
             "adapter_version": self.adapter_version,
             "has_admission_rule": self.admission_rule is not None,

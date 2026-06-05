@@ -1444,8 +1444,6 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "AxisManifest",
         "AxisRegistry",
         "AxisTable",
-        "AxisTableAdmitter",
-        "AxisTableDescriptor",
         "CPUMemoryBackend",
         "CUDAMemoryBackend",
         "CallableMaterializer",
@@ -1842,8 +1840,8 @@ def test_axis_table_matches_spec_feature_space() -> None:
     for axis in by_key.values():
         assert axis.owner_id
         assert axis.value_domain
-        assert axis.admission_rule_id
-        assert axis.lowering_rule_id or axis.adapter_id
+        assert axis.operators
+        assert axis.adapter_id or axis.owner_id
         assert axis.axis_key in axis_table.class_c_groups[axis.class_c_group]
 
     assert by_key["compile.mode"].value_domain == (None, "default", "max-autotune")
