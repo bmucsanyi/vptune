@@ -8,7 +8,6 @@ import torch
 from torch._dynamo import config as torch_dynamo_config
 
 import vptune as vp
-import vptune.checkpoint as checkpoint_module
 import vptune.ext as vpx
 import vptune.runtime as runtime_module
 from vptune.io import read_record
@@ -13204,8 +13203,8 @@ def test_standard_runtime_executes_cpu_saved_tensor_hooks(
     params = {"w": torch.tensor([2.0], dtype=torch.float64, requires_grad=True)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     events = []
-    original_pack = checkpoint_module._cpu_pack_hook
-    original_unpack = checkpoint_module._cpu_unpack_hook
+    original_pack = runtime_module._cpu_pack_hook
+    original_unpack = runtime_module._cpu_unpack_hook
 
     def scalar(
         params: vp.ParameterTree,
@@ -13230,8 +13229,8 @@ def test_standard_runtime_executes_cpu_saved_tensor_hooks(
 
         return original_unpack(packed)
 
-    monkeypatch.setattr(checkpoint_module, "_cpu_pack_hook", recording_pack)
-    monkeypatch.setattr(checkpoint_module, "_cpu_unpack_hook", recording_unpack)
+    monkeypatch.setattr(runtime_module, "_cpu_pack_hook", recording_pack)
+    monkeypatch.setattr(runtime_module, "_cpu_unpack_hook", recording_unpack)
     factory = vpx.standard_operation_factory(
         vp.gradient("gradient", "loss", aggregation="sum"),
         params=params,
