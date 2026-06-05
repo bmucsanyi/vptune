@@ -5226,24 +5226,42 @@ def _run_jvp(execution: StandardExecution) -> TensorTree:
     return _run_jvp_by_path(execution)
 
 
+def _run_by_vectorization_mode(
+    execution: StandardExecution,
+    *,
+    single_vector: Callable[[StandardExecution], TensorTree],
+    single_loop: Callable[[StandardExecution], TensorTree],
+    manual_batch: Callable[[StandardExecution], TensorTree],
+    vmap: Callable[[StandardExecution], TensorTree],
+) -> TensorTree:
+    mode = execution.candidate.settings.get("vectorization.mode")
+
+    if mode == "single_loop":
+        return single_loop(execution)
+
+    if mode == "manual_batch":
+        return manual_batch(execution)
+
+    if mode == "vmap":
+        return vmap(execution)
+
+    return single_vector(execution)
+
+
 def _run_jvp_by_path(execution: StandardExecution) -> TensorTree:
     _require_path(
         execution.operator.kind,
         execution.path,
         (JVP_PATH, JVP_FORWARD_AD_PATH, JVP_LINEARIZE_PATH),
     )
-    mode = execution.candidate.settings.get("vectorization.mode")
 
-    if mode == "single_loop":
-        return _run_jvp_vector_single_loop(execution)
-
-    if mode == "manual_batch":
-        return _run_jvp_vector_manual_batch(execution)
-
-    if mode == "vmap":
-        return _run_jvp_vector_vmap(execution)
-
-    return _run_jvp_single_vector(execution)
+    return _run_by_vectorization_mode(
+        execution,
+        single_vector=_run_jvp_single_vector,
+        single_loop=_run_jvp_vector_single_loop,
+        manual_batch=_run_jvp_vector_manual_batch,
+        vmap=_run_jvp_vector_vmap,
+    )
 
 
 def _run_jvp_single_vector(execution: StandardExecution) -> TensorTree:
@@ -5359,18 +5377,14 @@ def _run_vjp_by_path(execution: StandardExecution) -> TensorTree:
             VJP_BACKWARD_MATERIALIZED_PATH,
         ),
     )
-    mode = execution.candidate.settings.get("vectorization.mode")
 
-    if mode == "single_loop":
-        return _run_vjp_vector_single_loop(execution)
-
-    if mode == "manual_batch":
-        return _run_vjp_vector_manual_batch(execution)
-
-    if mode == "vmap":
-        return _run_vjp_vector_vmap(execution)
-
-    return _run_vjp_single_vector(execution)
+    return _run_by_vectorization_mode(
+        execution,
+        single_vector=_run_vjp_single_vector,
+        single_loop=_run_vjp_vector_single_loop,
+        manual_batch=_run_vjp_vector_manual_batch,
+        vmap=_run_vjp_vector_vmap,
+    )
 
 
 def _run_vjp_single_vector(execution: StandardExecution) -> TensorTree:
@@ -5557,18 +5571,14 @@ def _run_hvp_by_path(execution: StandardExecution) -> TensorTree:
             VHP_PATH,
         ),
     )
-    mode = execution.candidate.settings.get("vectorization.mode")
 
-    if mode == "single_loop":
-        return _run_hvp_vector_single_loop(execution)
-
-    if mode == "manual_batch":
-        return _run_hvp_vector_manual_batch(execution)
-
-    if mode == "vmap":
-        return _run_hvp_vector_vmap(execution)
-
-    return _run_hvp_single_vector(execution)
+    return _run_by_vectorization_mode(
+        execution,
+        single_vector=_run_hvp_single_vector,
+        single_loop=_run_hvp_vector_single_loop,
+        manual_batch=_run_hvp_vector_manual_batch,
+        vmap=_run_hvp_vector_vmap,
+    )
 
 
 def _run_hvp_single_vector(execution: StandardExecution) -> TensorTree:
@@ -6036,18 +6046,14 @@ def _run_ggnvp_by_path(execution: StandardExecution) -> TensorTree:
         ),
     )
     _ggn_loss_geometry(execution.operator)
-    mode = execution.candidate.settings.get("vectorization.mode")
 
-    if mode == "single_loop":
-        return _run_ggnvp_vector_single_loop(execution)
-
-    if mode == "manual_batch":
-        return _run_ggnvp_vector_manual_batch(execution)
-
-    if mode == "vmap":
-        return _run_ggnvp_vector_vmap(execution)
-
-    return _run_ggnvp_single_vector(execution)
+    return _run_by_vectorization_mode(
+        execution,
+        single_vector=_run_ggnvp_single_vector,
+        single_loop=_run_ggnvp_vector_single_loop,
+        manual_batch=_run_ggnvp_vector_manual_batch,
+        vmap=_run_ggnvp_vector_vmap,
+    )
 
 
 def _run_ggnvp_single_vector(execution: StandardExecution) -> TensorTree:
@@ -6966,18 +6972,14 @@ def _run_fisher_vp(execution: StandardExecution) -> TensorTree:
             FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
         ),
     )
-    mode = execution.candidate.settings.get("vectorization.mode")
 
-    if mode == "single_loop":
-        return _run_fisher_vp_vector_single_loop(execution)
-
-    if mode == "manual_batch":
-        return _run_fisher_vp_vector_manual_batch(execution)
-
-    if mode == "vmap":
-        return _run_fisher_vp_vector_vmap(execution)
-
-    return _run_fisher_vp_single_vector(execution)
+    return _run_by_vectorization_mode(
+        execution,
+        single_vector=_run_fisher_vp_single_vector,
+        single_loop=_run_fisher_vp_vector_single_loop,
+        manual_batch=_run_fisher_vp_vector_manual_batch,
+        vmap=_run_fisher_vp_vector_vmap,
+    )
 
 
 def _run_fisher_vp_single_vector(execution: StandardExecution) -> TensorTree:
@@ -7137,18 +7139,14 @@ def _run_sampled_fisher_vp(execution: StandardExecution) -> TensorTree:
             SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
         ),
     )
-    mode = execution.candidate.settings.get("vectorization.mode")
 
-    if mode == "single_loop":
-        return _run_sampled_fisher_vp_vector_single_loop(execution)
-
-    if mode == "manual_batch":
-        return _run_sampled_fisher_vp_vector_manual_batch(execution)
-
-    if mode == "vmap":
-        return _run_sampled_fisher_vp_vector_vmap(execution)
-
-    return _run_sampled_fisher_vp_single_vector(execution)
+    return _run_by_vectorization_mode(
+        execution,
+        single_vector=_run_sampled_fisher_vp_single_vector,
+        single_loop=_run_sampled_fisher_vp_vector_single_loop,
+        manual_batch=_run_sampled_fisher_vp_vector_manual_batch,
+        vmap=_run_sampled_fisher_vp_vector_vmap,
+    )
 
 
 def _run_sampled_fisher_vp_single_vector(execution: StandardExecution) -> TensorTree:
@@ -7319,18 +7317,14 @@ def _run_empirical_fisher_vp(execution: StandardExecution) -> TensorTree:
             EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH,
         ),
     )
-    mode = execution.candidate.settings.get("vectorization.mode")
 
-    if mode == "single_loop":
-        return _run_empirical_fisher_vp_vector_single_loop(execution)
-
-    if mode == "manual_batch":
-        return _run_empirical_fisher_vp_vector_manual_batch(execution)
-
-    if mode == "vmap":
-        return _run_empirical_fisher_vp_vector_vmap(execution)
-
-    return _run_empirical_fisher_vp_single_vector(execution)
+    return _run_by_vectorization_mode(
+        execution,
+        single_vector=_run_empirical_fisher_vp_single_vector,
+        single_loop=_run_empirical_fisher_vp_vector_single_loop,
+        manual_batch=_run_empirical_fisher_vp_vector_manual_batch,
+        vmap=_run_empirical_fisher_vp_vector_vmap,
+    )
 
 
 def _run_empirical_fisher_vp_single_vector(execution: StandardExecution) -> TensorTree:
