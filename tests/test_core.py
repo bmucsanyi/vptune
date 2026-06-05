@@ -3377,8 +3377,18 @@ def test_candidate_rows_reject_missing_runtime_bindings() -> None:
         ),
         vp.Candidate(
             "family",
-            "stateful",
+            "stateful-incomplete",
             {"call.path": "stateful_module"},
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "stateful-unbound",
+            {
+                "call.path": "stateful_module",
+                "call.params": "module_params",
+                "call.buffers": "module_buffers",
+            },
             admission_status="passed",
         ),
     )
@@ -3439,7 +3449,10 @@ def test_candidate_rows_reject_missing_runtime_bindings() -> None:
     assert rows["teacher"].admission_error == (
         "recomputed teacher outputs require a teacher objective"
     )
-    assert rows["stateful"].admission_error == (
+    assert rows["stateful-incomplete"].admission_error == (
+        "call path settings are incomplete: ('call.params', 'call.buffers')"
+    )
+    assert rows["stateful-unbound"].admission_error == (
         "stateful_module requires a ModuleCallSpec binding"
     )
 
@@ -3574,7 +3587,11 @@ def test_candidate_rows_reject_stateful_module_without_module() -> None:
             vp.Candidate(
                 "family",
                 "stateful",
-                {"call.path": "stateful_module"},
+                {
+                    "call.path": "stateful_module",
+                    "call.params": "module_params",
+                    "call.buffers": "module_buffers",
+                },
                 admission_status="passed",
             ),
         ),

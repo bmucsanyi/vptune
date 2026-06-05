@@ -16,6 +16,7 @@ from torch.utils.checkpoint import checkpoint, noop_context_fn
 from vptune.admission import (
     FUNCTIONAL_CALL_FIELDS,
     TORCH_FUNC_FIELDS,
+    admit_call_core_settings,
     admit_checkpoint,
     admit_forward_ad,
     admit_functional_call,
@@ -11167,48 +11168,16 @@ def _require_call_runtime_settings(settings: Mapping[str, Any]) -> None:
 
 
 def _require_call_path_settings(settings: Mapping[str, Any]) -> Any:
-    call_core_keys = ("call.path", "call.params", "call.buffers")
-
-    if any(key in settings for key in call_core_keys):
-        missing = tuple(key for key in call_core_keys if key not in settings)
-
-        if missing:
-            message = f"call path settings are incomplete: {missing}"
-            raise MaterializationError(message)
-
-    path = settings.get("call.path")
-
-    if path not in {None, "functional_call", "stateful_module"}:
-        message = f"call.path is unsupported: {path}"
-        raise MaterializationError(message)
-
-    return path
+    try:
+        return admit_call_core_settings(settings)
+    except AdmissionError as error:
+        raise MaterializationError(str(error)) from error
 
 
 def _require_call_state_settings(
     settings: Mapping[str, Any],
     path: Any,
 ) -> None:
-    params = settings.get("call.params")
-
-    if path == "stateful_module" and params != "module_params":
-        message = "call.path=stateful_module requires call.params=module_params"
-        raise MaterializationError(message)
-
-    if path != "stateful_module" and params not in {None, "explicit_params"}:
-        message = f"call.params is unsupported: {params}"
-        raise MaterializationError(message)
-
-    buffers = settings.get("call.buffers")
-
-    if path == "stateful_module" and buffers != "module_buffers":
-        message = "call.path=stateful_module requires call.buffers=module_buffers"
-        raise MaterializationError(message)
-
-    if path != "stateful_module" and buffers not in {None, "explicit_buffers"}:
-        message = f"call.buffers is unsupported: {buffers}"
-        raise MaterializationError(message)
-
     tied_weights = settings.get("call.tied_weights")
 
     if tied_weights not in {None, "preserve_alias_groups"}:

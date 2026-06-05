@@ -47,6 +47,7 @@ CHECKPOINT_FIELDS = (
     "checkpoint.moves_to_new_device",
     "checkpoint.uses_global_state",
 )
+CALL_CORE_KEYS = ("call.path", "call.params", "call.buffers")
 
 
 def require_fields(settings: Mapping[str, Any], fields: tuple[str, ...]) -> None:
@@ -108,6 +109,51 @@ def admit_functional_call(settings: Mapping[str, Any]) -> None:
     elif mutated_parameter_keys or mutated_buffer_keys:
         message = "mutated keys require mutates_state=True"
         raise AdmissionError(message)
+
+
+def admit_call_core_settings(settings: Mapping[str, Any]) -> str | None:
+    """Validate the core module-call setting triple.
+
+    Returns:
+        Selected call path, or None when no call path is declared.
+
+    Raises:
+        AdmissionError: If the call setting triple is incomplete or inconsistent.
+    """
+    if any(key in settings for key in CALL_CORE_KEYS):
+        missing = tuple(key for key in CALL_CORE_KEYS if key not in settings)
+
+        if missing:
+            message = f"call path settings are incomplete: {missing}"
+            raise AdmissionError(message)
+
+    path = settings.get("call.path")
+
+    if path not in {None, "functional_call", "stateful_module"}:
+        message = f"call.path is unsupported: {path}"
+        raise AdmissionError(message)
+
+    params = settings.get("call.params")
+
+    if path == "stateful_module" and params != "module_params":
+        message = "call.path=stateful_module requires call.params=module_params"
+        raise AdmissionError(message)
+
+    if path != "stateful_module" and params not in {None, "explicit_params"}:
+        message = f"call.params is unsupported: {params}"
+        raise AdmissionError(message)
+
+    buffers = settings.get("call.buffers")
+
+    if path == "stateful_module" and buffers != "module_buffers":
+        message = "call.path=stateful_module requires call.buffers=module_buffers"
+        raise AdmissionError(message)
+
+    if path != "stateful_module" and buffers not in {None, "explicit_buffers"}:
+        message = f"call.buffers is unsupported: {buffers}"
+        raise AdmissionError(message)
+
+    return path
 
 
 def _require_string_tuple(value: Any, label: str) -> None:

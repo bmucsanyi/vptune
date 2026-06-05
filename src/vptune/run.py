@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
+from vptune.admission import admit_call_core_settings
 from vptune.autobatch_bridge import find_autobatch_value
 from vptune.candidates import AxisTable, axis_table, topological_families
 from vptune.cohorts import candidate_matches_assignment, cohort_assignments
@@ -43,6 +44,7 @@ from vptune.data import (
     VectorProvider,
 )
 from vptune.errors import (
+    AdmissionError,
     MaterializationError,
     NoPassedCandidateError,
     ReferenceFailedError,
@@ -467,6 +469,7 @@ def _runtime_binding_admission_error(
         _activation_hook_binding_error(settings, runtime_signature),
         _checkpoint_context_binding_error(settings, runtime_signature),
         _teacher_objective_binding_error(settings, runtime_signature),
+        _call_core_settings_binding_error(settings),
         _module_call_binding_error(settings, runtime_signature),
     ))
 
@@ -672,6 +675,15 @@ def _teacher_objective_binding_error(
         and runtime_signature.get("teacher_objective") is not True
     ):
         return "recomputed teacher outputs require a teacher objective"
+
+    return None
+
+
+def _call_core_settings_binding_error(settings: Mapping[str, Any]) -> str | None:
+    try:
+        admit_call_core_settings(settings)
+    except AdmissionError as error:
+        return str(error)
 
     return None
 
