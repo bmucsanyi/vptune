@@ -6398,13 +6398,6 @@ def _run_ggnvp_vjp_by_path(
             output_cotangent,
         )
 
-    if path == VJP_BACKWARD_MATERIALIZED_PATH:
-        return _backward_materialized_vjp(
-            tensor_function,
-            execution.params,
-            output_cotangent,
-        )
-
     message = f"ggn.vjp_path is unsupported: {path}"
     raise MaterializationError(message)
 
@@ -12058,7 +12051,6 @@ def _require_ggn_vjp_path_settings(
     if value not in {
         "torch_func_vjp",
         "autograd_grad_outputs",
-        "backward_materialized_grad",
     }:
         message = f"ggn.vjp_path is unsupported: {value}"
         raise MaterializationError(message)
