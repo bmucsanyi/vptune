@@ -8951,6 +8951,59 @@ def test_kfac_metric_paths_match_dense_reference() -> None:
         assert reference_result.measurements["psd_violation"] == pytest.approx(0.0)
 
 
+def test_kfac_streaming_metric_uses_streaming_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
+    factors = KFACMetricData.factors()
+    vector = {"w": torch.tensor([[0.25, -0.75], [0.5, 1.25]], dtype=torch.float64)}
+    operator = vp.metric(
+        "metric",
+        "kfac",
+        aggregation="sum",
+        representation=kfac_metric_representation(),
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+
+    def forbidden_kfac_metric_multiply(
+        operator: vp.OperatorSpec,
+        batch: Mapping[str, object],
+        vector_tree: object,
+        settings: Mapping[str, object],
+    ) -> object:
+        assert operator.family == "metric"
+        assert batch
+        assert vector_tree
+        assert settings
+        message = "streaming_multiply called factorized KFAC path"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_kfac_metric_multiply",
+        forbidden_kfac_metric_multiply,
+    )
+    output = factory(
+        vp.Candidate(
+            "metric",
+            "streaming",
+            metric_settings("streaming_multiply"),
+            admission_status="passed",
+        ),
+        {"kfac_factors": factors},
+        vector,
+    )()
+    expected = torch.kron(factors["w_left"], factors["w_right"]) @ vector["w"].reshape(
+        -1
+    )
+
+    torch.testing.assert_close(flatten_tree(output), expected)
+
+
 def test_kfac_inverse_metric_factorized_solve_matches_dense_reference() -> None:
     params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
     factors = KFACMetricData.factors()

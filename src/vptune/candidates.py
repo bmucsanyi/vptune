@@ -34,6 +34,7 @@ class AxisTableDescriptor:
     class_c_group: str
     admission_rule_id: str
     lowering_rule_id: str
+    optional_settings_keys: tuple[str, ...] = ()
     class_a: str = ""
     class_b: str = ""
     adapter_id: str = ""
@@ -54,6 +55,7 @@ class AxisTableDescriptor:
             "class_b": self.class_b,
             "class_c_group": self.class_c_group,
             "merge_rules": self.merge_rules,
+            "optional_settings_keys": self.optional_settings_keys,
             "admission_rule_id": self.admission_rule_id,
             "lowering_rule_id": self.lowering_rule_id,
             "adapter_id": self.adapter_id,
@@ -77,6 +79,20 @@ class AxisTable:
             Mapping from axis key to descriptor.
         """
         return {axis.axis_key: axis for axis in self.axes}
+
+    def optional_owner_by_key(self) -> dict[str, AxisTableDescriptor]:
+        """Return owner axes keyed by optional setting key.
+
+        Returns:
+            Mapping from optional setting key to owning axis descriptor.
+        """
+        owners = {}
+
+        for axis in self.axes:
+            for key in axis.optional_settings_keys:
+                owners[key] = axis
+
+        return owners
 
     def signature(self) -> dict[str, Any]:
         """Return stable axis table identity.
@@ -126,11 +142,15 @@ class AxisTable:
             Failure reason, or None when admitted.
         """
         by_key = self.by_key()
+        optional_owner_by_key = self.optional_owner_by_key()
 
         for key, value in candidate.settings.items():
             axis = by_key.get(key)
 
             if axis is None:
+                if key in optional_owner_by_key:
+                    continue
+
                 return f"candidate setting key has no axis table owner: {key}"
 
             value_error = _axis_table_value_error(axis, value)
@@ -460,10 +480,18 @@ def _axis_table_axis(
         class_b=_class_b(axis_key),
         class_c_group=class_c_group,
         merge_rules=_axis_merge_rules(axis_key),
+        optional_settings_keys=_axis_table_optional_settings(axis_key),
         admission_rule_id=f"admit.{axis_key}",
         lowering_rule_id=f"lower.{axis_key}",
         adapter_id=_adapter_id(axis_key),
     )
+
+
+def _axis_table_optional_settings(axis_key: str) -> tuple[str, ...]:
+    if axis_key == "numeric.loss_scaling":
+        return ("numeric.loss_scale", "numeric.loss_unscale_degree")
+
+    return ()
 
 
 def _axis_table_axis_domains() -> tuple[tuple[str, tuple[Any, ...]], ...]:
@@ -727,8 +755,6 @@ def _axis_table_axis_domains() -> tuple[tuple[str, tuple[Any, ...]], ...]:
         ("numeric.fp16_reduced_precision_reduction", ("false", "true")),
         ("numeric.deterministic_algorithms", ("false", "true")),
         ("numeric.loss_scaling", ("none", "static_scale_with_exact_unscale")),
-        ("numeric.loss_scale", POSITIVE_FLOAT_DOMAIN),
-        ("numeric.loss_unscale_degree", (1, 2)),
         ("compile.enabled", ("false", "true")),
         (
             "compile.boundary",

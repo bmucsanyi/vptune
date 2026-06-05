@@ -9394,6 +9394,14 @@ class StandardMetricOperator:
         batch: Batch,
         vector: TensorTree,
     ) -> TensorTree:
+        if path == METRIC_STREAMING_PATH:
+            return _streaming_metric_multiply(
+                operator,
+                batch,
+                vector,
+                self.candidate.settings,
+            )
+
         kind = _metric_representation_kind(operator)
 
         if kind == "diagonal_tree":
@@ -9413,12 +9421,6 @@ class StandardMetricOperator:
             )
         elif kind == "ggn_derived_factors":
             result = _ggn_metric_multiply(batch, vector, self.candidate.settings)
-        elif path == METRIC_STREAMING_PATH and kind == "block_diagonal":
-            result = _block_diagonal_metric_multiply(
-                batch,
-                vector,
-                self.candidate.settings,
-            )
         else:
             message = f"metric path is not lowered for representation: {path}/{kind}"
             raise MaterializationError(message)
