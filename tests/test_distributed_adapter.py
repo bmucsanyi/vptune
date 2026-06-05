@@ -2,7 +2,7 @@ import dataclasses
 import datetime
 import queue
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import pytest
 import torch
@@ -20,6 +20,7 @@ from vptune import (
     ModuleCallSpec,
     ObjectiveContext,
     ParameterTree,
+    TensorTree,
     gradient,
 )
 from vptune.adapters import distributed as distributed_module
@@ -1478,6 +1479,64 @@ def test_distributed_redistribution_runs_before_output_schedule() -> None:
     assert output.calls[0]["backward_dtype"] is None
 
 
+def test_distributed_redistribution_runs_before_forward_schedule() -> None:
+    events = []
+    bindings = distributed_bindings(events)
+    settings = {
+        **valid_layout_settings(),
+        "dtensor.redistribute_schedule": "before_forward",
+    }
+    plan = distributed_module._distributed_redistribution(settings, bindings)
+    param = RecordingDTensor()
+    params = recording_parameter_tree(param)
+    logits = RecordingDTensor()
+    label = object()
+    batch = {"logits": logits, "labels": label}
+    vector_value = RecordingDTensor()
+    vector = recording_tensor_tree(vector_value)
+
+    redistributed_params = plan.before_forward_params(params)
+    redistributed_batch = plan.before_forward_batch(batch)
+    redistributed_vector = plan.before_forward_vector(vector)
+
+    assert redistributed_params == {"w": param.result}
+    assert redistributed_batch == {
+        "logits": logits.result,
+        "labels": label,
+    }
+    assert redistributed_vector == {"w": vector_value.result}
+    assert param.calls[0]["placements"] == ("shard-0",)
+    assert logits.calls[0]["placements"] == ("replicate",)
+    assert vector_value.calls[0]["placements"] == ("replicate",)
+
+
+@pytest.mark.parametrize(
+    ("schedule", "method_name"),
+    [
+        ("before_backward", "before_backward_vector"),
+        ("between_operator_parts", "between_operator_parts_vector"),
+    ],
+)
+def test_distributed_redistribution_runs_vector_boundary_schedules(
+    schedule: str,
+    method_name: str,
+) -> None:
+    bindings = distributed_bindings([])
+    settings = {
+        **valid_layout_settings(),
+        "dtensor.redistribute_schedule": schedule,
+    }
+    plan = distributed_module._distributed_redistribution(settings, bindings)
+    vector_value = RecordingDTensor()
+    vector = recording_tensor_tree(vector_value)
+    method = getattr(plan, method_name)
+
+    result = method(vector)
+
+    assert result == {"w": vector_value.result}
+    assert vector_value.calls[0]["placements"] == ("replicate",)
+
+
 def test_distributed_redistribution_requires_bindings_for_active_schedule() -> None:
     settings = {
         **valid_layout_settings(),
@@ -1730,7 +1789,10 @@ def test_wait_collective_waits_on_work_handle() -> None:
     assert work.waited is True
 
 
-class RecordingDTensor:
+class RecordingDTensor(torch.Tensor):
+    def __new__(cls) -> Self:
+        return torch.Tensor._make_subclass(cls, torch.zeros(1), False)
+
     def __init__(self) -> None:
         self.calls = []
         self.result = object()
@@ -1764,6 +1826,14 @@ class RecordingWork:
         self.waited = True
 
         return self.result
+
+
+def recording_parameter_tree(tensor: torch.Tensor) -> ParameterTree:
+    return {"w": tensor}
+
+
+def recording_tensor_tree(tensor: torch.Tensor) -> TensorTree:
+    return {"w": tensor}
 
 
 def test_distributed_strategy_axis_validates_modes() -> None:
@@ -2168,6 +2238,26 @@ def test_distributed_strategy_applier_lowers_fsdp2_row_settings() -> None:
     assert fully_shard_call["shard_placement_fn"]
 
 
+def test_distributed_strategy_applier_lowers_cuda_local_rank_binding() -> None:
+    events = []
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    settings = {
+        **valid_fsdp_settings(),
+        **distributed_base_settings(),
+        "distributed.local_rank_binding": "cuda_local_rank",
+    }
+    applier = distributed_strategy_applier(distributed_bindings(events))
+
+    result = applier(model, Candidate("gradient", "fsdp", settings))
+
+    assert isinstance(result, torch.nn.Module)
+    assert {
+        "kind": "device_for_rank",
+        "binding": "cuda_local_rank",
+        "rank": 1,
+    } in events
+
+
 def test_distributed_strategy_applier_lowers_context_parallel_row_settings() -> None:
     events = []
     model = torch.nn.Sequential(torch.nn.Linear(2, 2))
@@ -2209,6 +2299,25 @@ def test_distributed_strategy_applier_lowers_context_parallel_row_settings() -> 
     assert qkv_style[1]["input_layouts"] == "replicate"
     assert qkv_style[1]["output_layouts"] == "replicate"
     assert prepare_style[1]["input_kwarg_layouts"] == {"mask": "replicate"}
+
+
+def test_distributed_strategy_applier_lowers_reduce_scatter_overlap() -> None:
+    events = []
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    settings = {
+        **valid_fsdp_settings(),
+        **distributed_base_settings(),
+        "comm.overlap": "reduce_scatter_overlap",
+    }
+    applier = distributed_strategy_applier(distributed_bindings(events))
+
+    result = applier(model, Candidate("gradient", "fsdp", settings))
+
+    assert isinstance(result, torch.nn.Module)
+    assert {
+        "kind": "communication",
+        "settings": {"comm.overlap": "reduce_scatter_overlap"},
+    } in events
 
 
 def test_distributed_strategy_applier_lowers_sequence_parallel_modules() -> None:

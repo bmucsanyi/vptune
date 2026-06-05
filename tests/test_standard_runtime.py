@@ -14389,8 +14389,14 @@ def test_standard_runtime_rejects_cuda_autocast_without_cuda() -> None:
         )()
 
 
+@pytest.mark.parametrize(
+    ("autocast", "expected_dtype"),
+    [("cuda_fp16", torch.float16), ("cuda_bf16", torch.bfloat16)],
+)
 def test_standard_runtime_enters_cuda_autocast_context(
     monkeypatch: pytest.MonkeyPatch,
+    autocast: str,
+    expected_dtype: torch.dtype,
 ) -> None:
     events = []
 
@@ -14424,7 +14430,7 @@ def test_standard_runtime_enters_cuda_autocast_context(
         vp.Candidate(
             "metric",
             "autocast",
-            {**metric_settings(), "autocast": "cuda_bf16"},
+            {**metric_settings(), "autocast": autocast},
             admission_status="passed",
         ),
         {"metric_matrix": torch.eye(1, dtype=torch.float64)},
@@ -14433,8 +14439,8 @@ def test_standard_runtime_enters_cuda_autocast_context(
 
     assert torch.equal(tree_leaves(result)[0], torch.tensor([2.0], dtype=torch.float64))
     assert events == [
-        ("enter", "cuda", torch.bfloat16),
-        ("exit", "cuda", torch.bfloat16),
+        ("enter", "cuda", expected_dtype),
+        ("exit", "cuda", expected_dtype),
     ]
 
 
