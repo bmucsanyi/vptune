@@ -1858,6 +1858,7 @@ EMPIRICAL_FISHER_VECTOR_ACCUMULATIONS = (
 )
 MATMUL_PRECISION_VALUES = ("highest", "high", "medium")
 SPEC_DTYPE_VALUES = ("fp32", "bf16", "fp16")
+SPEC_STORAGE_COMPUTE_DTYPE_VALUES = (*SPEC_DTYPE_VALUES, "fp8_when_supported")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -2254,6 +2255,21 @@ def _ggn_vjp_path_axis() -> AdmissionRule:
             return _admit_torch_func_path(value, candidate.settings)
 
         return True, None
+
+    return admit
+
+
+def _storage_compute_dtype_axis(key: str) -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings[key]
+
+        if value != "fp8_when_supported":
+            return True, None
+
+        if hasattr(torch, "float8_e4m3fn"):
+            return True, None
+
+        return False, f"{key}=fp8_when_supported requires PyTorch FP8 dtype support"
 
     return admit
 
@@ -2757,12 +2773,14 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
         AxisDescriptor(
             "dtype.parameter_storage",
             ("dtype.parameter_storage",),
-            SPEC_DTYPE_VALUES,
+            SPEC_STORAGE_COMPUTE_DTYPE_VALUES,
+            admission_rule=_storage_compute_dtype_axis("dtype.parameter_storage"),
         ),
         AxisDescriptor(
             "dtype.model_compute",
             ("dtype.model_compute",),
-            SPEC_DTYPE_VALUES,
+            SPEC_STORAGE_COMPUTE_DTYPE_VALUES,
+            admission_rule=_storage_compute_dtype_axis("dtype.model_compute"),
         ),
         AxisDescriptor(
             "dtype.autodiff_compute",

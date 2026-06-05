@@ -13102,6 +13102,109 @@ def test_standard_runtime_executes_autodiff_compute_dtype_axis() -> None:
     }
 
 
+def test_standard_runtime_applies_fp8_storage_before_model_compute() -> None:
+    params = {"w": torch.tensor([1.3], dtype=torch.float32)}
+    buffers = {"b": torch.tensor([0.7], dtype=torch.float32)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float32)}
+    observed = {}
+
+    def scalar(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert context.family == "gradient"
+        observed["param_dtype"] = params["w"].dtype
+        observed["buffer_dtype"] = buffers["b"].dtype
+        observed["batch_dtype"] = batch["scale"].dtype
+        observed["param_value"] = params["w"].detach().clone()
+        observed["buffer_value"] = buffers["b"].detach().clone()
+
+        return (params["w"] + buffers["b"] + batch["scale"]).sum()
+
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers=buffers,
+        scalar_objectives={"loss": scalar},
+    )
+    result = factory(
+        vp.Candidate(
+            "gradient",
+            "fp8-storage",
+            {
+                **gradient_settings(),
+                "dtype.parameter_storage": "fp8_when_supported",
+                "dtype.model_compute": "fp32",
+                "dtype.output": "fp32",
+            },
+            admission_status="passed",
+        ),
+        {"scale": torch.tensor([2.0], dtype=torch.float32)},
+        vector,
+    )()
+    expected_param = (
+        params["w"].to(dtype=runtime_module._fp8_dtype()).to(dtype=torch.float32)
+    )
+    expected_buffer = (
+        buffers["b"].to(dtype=runtime_module._fp8_dtype()).to(dtype=torch.float32)
+    )
+
+    assert observed["param_dtype"] == torch.float32
+    assert observed["buffer_dtype"] == torch.float32
+    assert observed["batch_dtype"] == torch.float32
+    torch.testing.assert_close(observed["param_value"], expected_param)
+    torch.testing.assert_close(observed["buffer_value"], expected_buffer)
+    assert tree_leaves(result)[0].dtype == torch.float32
+
+
+def test_standard_runtime_executes_fp8_model_compute_boundary() -> None:
+    params = {"w": torch.tensor([1.5], dtype=torch.float32)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float32)}
+    observed = {}
+
+    def scalar(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert context.family == "gradient"
+        observed["param_dtype"] = params["w"].dtype
+        observed["batch_dtype"] = batch["scale"].dtype
+
+        return (params["w"].float() * batch["scale"].float()).sum()
+
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        scalar_objectives={"loss": scalar},
+    )
+    result = factory(
+        vp.Candidate(
+            "gradient",
+            "fp8-compute",
+            {
+                **gradient_settings(),
+                "dtype.model_compute": "fp8_when_supported",
+                "dtype.output": "fp32",
+            },
+            admission_status="passed",
+        ),
+        {"scale": torch.tensor([2.0], dtype=torch.float32)},
+        vector,
+    )()
+
+    assert observed == {
+        "param_dtype": runtime_module._fp8_dtype(),
+        "batch_dtype": runtime_module._fp8_dtype(),
+    }
+    assert tree_leaves(result)[0].dtype == torch.float32
+
+
 def test_standard_runtime_executes_split_model_and_autodiff_compute_dtypes() -> None:
     module = DtypeObservingStatefulModule()
     factory = vpx.standard_operation_factory(

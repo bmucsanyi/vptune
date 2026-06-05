@@ -5457,10 +5457,12 @@ def _hvp_scalar_function(
     scalar = _scalar_objective(execution.operator, execution.scalar_objectives)
 
     def scalar_function(active_params: ParameterTree) -> torch.Tensor:
+        settings = execution.candidate.settings
+
         return scalar(
-            active_params,
-            execution.buffers,
-            execution.batch,
+            _model_compute_tree(active_params, settings),
+            _model_compute_tree(execution.buffers, settings),
+            _model_compute_batch(execution.batch, settings),
             execution.context,
         )
 
@@ -10859,12 +10861,26 @@ def _stateful_model_tree(
     values: dict[str, torch.Tensor],
     settings: Mapping[str, Any],
 ) -> dict[str, torch.Tensor]:
+    return _model_compute_tree(values, settings)
+
+
+def _stateful_model_batch(
+    batch: Batch,
+    settings: Mapping[str, Any],
+) -> Batch:
+    return _model_compute_batch(batch, settings)
+
+
+def _model_compute_tree(
+    values: dict[str, torch.Tensor],
+    settings: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
     dtype = _dtype_setting(settings, "dtype.model_compute")
 
     return _runtime_named_tensor_dtype(values, dtype)
 
 
-def _stateful_model_batch(
+def _model_compute_batch(
     batch: Batch,
     settings: Mapping[str, Any],
 ) -> Batch:
@@ -12834,10 +12850,11 @@ def _execution_with_recomputed_teacher_outputs(
 
     fixed_outputs = execution.batch.get("teacher_outputs")
     _require_teacher_output_tree(fixed_outputs)
+    settings = execution.candidate.settings
     recomputed_outputs = execution.teacher_objective(
-        execution.params,
-        execution.buffers,
-        execution.batch,
+        _model_compute_tree(execution.params, settings),
+        _model_compute_tree(execution.buffers, settings),
+        _model_compute_batch(execution.batch, settings),
         execution.context,
     )
     _require_teacher_outputs_match(fixed_outputs, recomputed_outputs)
@@ -13353,11 +13370,6 @@ def _parameter_dtype(settings: Mapping[str, Any]) -> torch.dtype | None:
     if autodiff_dtype is not None:
         return autodiff_dtype
 
-    compute_dtype = _dtype_setting(settings, "dtype.model_compute")
-
-    if compute_dtype is not None:
-        return compute_dtype
-
     return _dtype_setting(settings, "dtype.parameter_storage")
 
 
@@ -13366,11 +13378,6 @@ def _batch_dtype(settings: Mapping[str, Any]) -> torch.dtype | None:
 
     if autodiff_dtype is not None:
         return autodiff_dtype
-
-    compute_dtype = _dtype_setting(settings, "dtype.model_compute")
-
-    if compute_dtype is not None:
-        return compute_dtype
 
     return _dtype_setting(settings, "dtype.intermediate")
 
@@ -13394,7 +13401,18 @@ def _dtype_setting(settings: Mapping[str, Any], key: str) -> torch.dtype | None:
     if dtype_name == "fp32":
         return torch.float32
 
+    if dtype_name == "fp8_when_supported":
+        return _fp8_dtype()
+
     message = f"{key} is unsupported by standard runtime: {dtype_name}"
+    raise MaterializationError(message)
+
+
+def _fp8_dtype() -> torch.dtype:
+    if hasattr(torch, "float8_e4m3fn"):
+        return torch.float8_e4m3fn
+
+    message = "fp8_when_supported requires PyTorch FP8 dtype support"
     raise MaterializationError(message)
 
 
@@ -13871,7 +13889,13 @@ def _call_function_objective(
     batch: Batch | None = None,
 ) -> TensorTree:
     active_batch = execution.batch if batch is None else batch
-    output = function(params, execution.buffers, active_batch, execution.context)
+    settings = execution.candidate.settings
+    output = function(
+        _model_compute_tree(params, settings),
+        _model_compute_tree(execution.buffers, settings),
+        _model_compute_batch(active_batch, settings),
+        execution.context,
+    )
 
     return _checked_function_output(
         execution.candidate.settings,

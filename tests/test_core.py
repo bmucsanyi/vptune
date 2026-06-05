@@ -5719,6 +5719,16 @@ def test_standard_axis_registry_validates_core_axes() -> None:
         {"numeric.bf16_reduced_precision_reduction": True},
     )
     bad_dtype = vp.Candidate("family", "bad-dtype", {"dtype.model_compute": "float64"})
+    fp8_storage = vp.Candidate(
+        "family",
+        "fp8-storage",
+        {"dtype.parameter_storage": "fp8_when_supported"},
+    )
+    fp8_compute = vp.Candidate(
+        "family",
+        "fp8-compute",
+        {"dtype.model_compute": "fp8_when_supported"},
+    )
     bad_path = vp.Candidate(
         "family",
         "bad-path",
@@ -6198,6 +6208,8 @@ def test_standard_axis_registry_validates_core_axes() -> None:
     assert registry.admit(valid_chunk_axes).admission_status == "passed"
     assert registry.admit(invalid_chunk_axis).admission_status == "failed"
     assert registry.axes["dtype.model_compute"].admit(bad_dtype)[0] is False
+    assert registry.admit(fp8_storage).admission_status == "passed"
+    assert registry.admit(fp8_compute).admission_status == "passed"
 
     with pytest.raises(vp.AdmissionError):
         vpx.AxisRegistry().register(vpx.AxisDescriptor("bad", ("x",), ()))
