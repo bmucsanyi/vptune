@@ -171,7 +171,6 @@ class DistributedSequenceParallelBindings:
 
     sequence_parallel: Callable[..., Any]
     sequence_dim: int
-    use_local_output: bool
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -203,6 +202,106 @@ class DistributedStrategyBindings:
     context_parallel: DistributedContextParallelBindings | None
     communication: DistributedCommunicationBindings | None
     hybrid_order: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _DistributedRedistribution:
+    settings: Mapping[str, Any]
+    mesh: Any
+    placements: Mapping[str, Any]
+
+    def before_forward_params(self, params: ParameterTree) -> ParameterTree:
+        if self.settings.get("dtensor.redistribute_schedule") != "before_forward":
+            return params
+
+        return _distributed_tree_map(
+            lambda value: self.redistribute(value, "dtensor.params_placement"),
+            params,
+        )
+
+    def before_forward_batch(self, batch: Batch) -> Batch:
+        if self.settings.get("dtensor.redistribute_schedule") != "before_forward":
+            return batch
+
+        return self._batch_slots(batch, ("logits",))
+
+    def before_forward_vector(self, vector: TensorTree) -> TensorTree:
+        if self.settings.get("dtensor.redistribute_schedule") != "before_forward":
+            return vector
+
+        return _distributed_tree_map(
+            lambda value: self.redistribute(value, "dtensor.vector_placement"),
+            vector,
+        )
+
+    def before_backward_vector(self, vector: TensorTree) -> TensorTree:
+        if self.settings.get("dtensor.redistribute_schedule") != "before_backward":
+            return vector
+
+        return _distributed_tree_map(
+            lambda value: self.redistribute(value, "dtensor.cotangent_placement"),
+            vector,
+        )
+
+    def between_operator_parts_vector(self, vector: TensorTree) -> TensorTree:
+        if (
+            self.settings.get("dtensor.redistribute_schedule")
+            != "between_operator_parts"
+        ):
+            return vector
+
+        return _distributed_tree_map(
+            lambda value: self.redistribute(value, "dtensor.tangent_placement"),
+            vector,
+        )
+
+    def before_output(self, output: TensorTree) -> TensorTree:
+        if self.settings.get("dtensor.redistribute_schedule") != "before_output":
+            return output
+
+        return _distributed_tree_map(
+            lambda value: self.redistribute(value, "dtensor.output_placement"),
+            output,
+        )
+
+    def redistribute(self, value: Any, placement_key: str) -> Any:
+        if placement_key not in self.placements:
+            message = f"dtensor redistribution requires {placement_key}"
+            raise MaterializationError(message)
+
+        if not hasattr(value, "redistribute"):
+            message = f"dtensor redistribution requires a DTensor for {placement_key}"
+            raise MaterializationError(message)
+
+        return redistribute_dtensor(
+            value,
+            device_mesh=self.mesh,
+            placements=(self.placements[placement_key],),
+            async_op=False,
+            forward_dtype=None,
+            backward_dtype=None,
+        )
+
+    def _batch_slots(self, batch: Batch, slots: tuple[str, ...]) -> Batch:
+        result = dict(batch)
+
+        for slot in slots:
+            if slot in result:
+                result[slot] = self.redistribute(
+                    result[slot], "dtensor.logits_placement"
+                )
+
+        return result
+
+
+def _distributed_tree_map(fn: Callable[[Any], Any], value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _distributed_tree_map(fn, child) for key, child in value.items()}
+
+    if isinstance(value, tuple):
+        return tuple(_distributed_tree_map(fn, child) for child in value)
+
+    return fn(value)
 
 
 class _BoundDistributedStrategyApplier:
@@ -999,7 +1098,7 @@ def _apply_declared_sequence_parallel(
     sequence_style = build_sequence_parallel(
         sequence_parallel.sequence_parallel,
         sequence_dim=sequence_parallel.sequence_dim,
-        use_local_output=sequence_parallel.use_local_output,
+        use_local_output=_sequence_parallel_use_local_output(settings),
     )
 
     for module_name in _tuple_of_strings(settings, "sequence_parallel.norm_modules"):
@@ -1012,6 +1111,22 @@ def _apply_declared_sequence_parallel(
         parallelize_plan=plan,
         src_data_rank=tensor_parallel.src_data_rank,
     )
+
+
+def _sequence_parallel_use_local_output(settings: Mapping[str, Any]) -> bool:
+    policy = _required_string_setting(
+        settings,
+        "sequence_parallel.output_placement_policy",
+    )
+
+    if policy == "preserve_sequence_shard":
+        return False
+
+    if policy == "redistribute_to_declared_output":
+        return True
+
+    message = f"unsupported sequence-parallel output policy: {policy}"
+    raise MaterializationError(message)
 
 
 def _apply_declared_context_parallel(
@@ -2383,9 +2498,18 @@ def distributed_operation_factory(
         vector: TensorTree,
     ) -> CandidateOperation:
         distributed_model = resolved_applier(model, candidate)
+        redistribution = _distributed_redistribution(
+            candidate.settings,
+            strategy_bindings,
+        )
+        runtime_params = redistribution.before_forward_params(params)
+        runtime_batch = redistribution.before_forward_batch(batch)
+        runtime_vector = redistribution.before_forward_vector(vector)
+        runtime_vector = redistribution.before_backward_vector(runtime_vector)
+        runtime_vector = redistribution.between_operator_parts_vector(runtime_vector)
         standard_factory = standard_operation_factory(
             operator,
-            params=params,
+            params=runtime_params,
             buffers=buffers,
             parameter_surface=parameter_surface,
             scalar_objectives=scalar_objectives,
@@ -2393,15 +2517,42 @@ def distributed_operation_factory(
             module=distributed_model,
             module_call=module_call,
         )
-        operation = standard_factory(_standard_candidate(candidate), batch, vector)
-
-        return _distributed_loss_parallel(
+        operation = standard_factory(
+            _standard_candidate(candidate),
+            runtime_batch,
+            runtime_vector,
+        )
+        distributed_operation = _distributed_loss_parallel(
             candidate.settings,
             operation,
             resolved_loss_parallel,
         )
 
+        def wrapped() -> TensorTree:
+            return redistribution.before_output(distributed_operation())
+
+        return wrapped
+
     return factory
+
+
+def _distributed_redistribution(
+    settings: Mapping[str, Any],
+    strategy_bindings: DistributedStrategyBindings | None,
+) -> _DistributedRedistribution:
+    schedule = settings.get("dtensor.redistribute_schedule")
+
+    if schedule in {None, "none"}:
+        return _DistributedRedistribution(settings, None, {})
+
+    if strategy_bindings is None:
+        message = "dtensor.redistribute_schedule requires strategy bindings"
+        raise MaterializationError(message)
+
+    mesh = _build_declared_mesh(settings, strategy_bindings.mesh)
+    placements = _build_declared_placements(settings, strategy_bindings.placements)
+
+    return _DistributedRedistribution(settings, mesh, placements)
 
 
 def distributed_reference_check(

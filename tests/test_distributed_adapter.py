@@ -22,6 +22,7 @@ from vptune import (
     ParameterTree,
     gradient,
 )
+from vptune.adapters import distributed as distributed_module
 from vptune.adapters.distributed import (
     DistributedAdmissionPolicy,
     DistributedCommunicationBindings,
@@ -171,6 +172,7 @@ def distributed_policy(
             "allowed_sequence_parallel.norm_modules": (("norm",),),
             "allowed_sequence_parallel.output_placement_policy": (
                 "preserve_sequence_shard",
+                "redistribute_to_declared_output",
             ),
         },
         context_parallel={
@@ -632,7 +634,6 @@ def distributed_sequence_parallel_bindings(
     return DistributedSequenceParallelBindings(
         sequence_parallel=sequence_parallel,
         sequence_dim=1,
-        use_local_output=False,
     )
 
 
@@ -1457,6 +1458,36 @@ def test_redistribute_dtensor_forwards_declared_arguments() -> None:
     ]
 
 
+def test_distributed_redistribution_runs_before_output_schedule() -> None:
+    events = []
+    bindings = distributed_bindings(events)
+    settings = {
+        **valid_layout_settings(),
+        "dtensor.redistribute_schedule": "before_output",
+    }
+    plan = distributed_module._distributed_redistribution(settings, bindings)
+    output = RecordingDTensor()
+
+    result = plan.before_output({"output": output})
+
+    assert result == {"output": output.result}
+    assert len(output.calls) == 1
+    assert output.calls[0]["placements"] == ("replicate",)
+    assert output.calls[0]["async_op"] is False
+    assert output.calls[0]["forward_dtype"] is None
+    assert output.calls[0]["backward_dtype"] is None
+
+
+def test_distributed_redistribution_requires_bindings_for_active_schedule() -> None:
+    settings = {
+        **valid_layout_settings(),
+        "dtensor.redistribute_schedule": "before_output",
+    }
+
+    with pytest.raises(MaterializationError, match="requires strategy bindings"):
+        distributed_module._distributed_redistribution(settings, None)
+
+
 def test_apply_context_parallel_forwards_declared_arguments() -> None:
     calls = []
     mesh = object()
@@ -2198,6 +2229,22 @@ def test_distributed_strategy_applier_lowers_sequence_parallel_modules() -> None
     )
 
     assert "norm" in parallelize_call["parallelize_plan"]
+
+
+def test_distributed_strategy_applier_lowers_sequence_parallel_output_policy() -> None:
+    events = []
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    settings = {
+        **valid_sequence_parallel_settings(),
+        **distributed_single_process_settings(),
+        "sequence_parallel.output_placement_policy": "redistribute_to_declared_output",
+    }
+    applier = distributed_strategy_applier(distributed_bindings(events))
+
+    result = applier(model, Candidate("gradient", "sequence", settings))
+
+    assert result is model
+    assert {"kind": "sequence", "sequence_dim": 1, "use_local_output": True} in events
 
 
 def test_distributed_strategy_applier_rejects_undeclared_tp_layout_key() -> None:
