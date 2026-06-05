@@ -1481,8 +1481,6 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "axis_table",
         "candidate_record_from_json",
         "candidate_record_to_json",
-        "check_patched_attention_output_reference",
-        "check_patched_attention_vjp_reference",
         "check_record_current",
         "check_record_from_json",
         "check_record_to_json",
@@ -2677,6 +2675,15 @@ def test_adapter_namespace_exports_adapter_helpers() -> None:
     assert vpa.apply_fsdp2
     assert vpa.apply_fsdp2_group
     assert vpa.apply_tensor_parallel
+    assert vpa.DistributedCommunicationBindings
+    assert vpa.DistributedContextParallelBindings
+    assert vpa.DistributedFSDPBindings
+    assert vpa.DistributedMeshBindings
+    assert vpa.DistributedPlacementBindings
+    assert vpa.DistributedProcessGroupBindings
+    assert vpa.DistributedSequenceParallelBindings
+    assert vpa.DistributedStrategyBindings
+    assert vpa.DistributedTensorParallelBindings
     assert vpa.build_colwise_parallel
     assert vpa.build_device_mesh
     assert vpa.build_dtensor_placement
@@ -2698,6 +2705,7 @@ def test_adapter_namespace_exports_adapter_helpers() -> None:
     assert vpa.wait_collective
     assert vpa.distributed_axis_manifest
     assert vpa.distributed_strategy_axis
+    assert vpa.distributed_strategy_applier
     assert vpa.RankCompileTiming
     assert vpa.RankStatus
     assert vpa.PilotReadiness
@@ -3226,6 +3234,357 @@ def test_run_candidate_records_compiled_selection_metadata() -> None:
         "compile.compiled_autograd": "false",
         "compile.cuda_graphs": "false",
     }
+
+
+def test_candidate_rows_reject_missing_runtime_bindings() -> None:
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(batch, Mapping)
+
+        return vpx.constant_operation(vector)
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(batch, Mapping)
+        assert vector is not None
+
+        return reference_passed()
+
+    candidates = (
+        vp.Candidate("family", "baseline", {}, admission_status="passed"),
+        vp.Candidate(
+            "family",
+            "fused",
+            {"fusion.loss": "fused_ce"},
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "packed",
+            {"input.batch_layout": "packed_with_inverse_permutation"},
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "lm-head",
+            {"chunk.lm_head_weight_chunk_bytes": 1024},
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "layer-output",
+            {"layout.output": "per_layer_flat"},
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "block-vector",
+            {"layout.vector": "per_block_flat"},
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "layer-chunk",
+            {"chunk.layer_block_size": 2},
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "mmap",
+            {"memory.vector_residency": "mmap_cpu"},
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "intermediate",
+            {"memory.intermediate_residency": "cpu_staged"},
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "manual",
+            {"activation.recompute": "manual_recompute"},
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "teacher",
+            {"teacher_outputs": "recomputed_with_equality_check"},
+            admission_status="passed",
+        ),
+        vp.Candidate(
+            "family",
+            "stateful",
+            {"call.path": "stateful_module"},
+            admission_status="passed",
+        ),
+    )
+    runtime = vpx.RuntimeConfig(
+        candidates,
+        operation_factory,
+        reference_check,
+        materialize_candidate,
+        None,
+        {
+            "runtime": "standard",
+            "fusion_rewriter": False,
+            "batch_layout": False,
+            "lm_head_chunker": False,
+            "mmap_residency": False,
+            "intermediate_residency": False,
+            "manual_recompute": False,
+            "teacher_objective": False,
+            "module": True,
+            "module_call": None,
+            "parameter_surface": {
+                "layer_groups": (),
+                "block_groups": (),
+            },
+        },
+    )
+    rows = {
+        candidate.candidate_id: candidate
+        for candidate in run_module._candidate_rows(runtime)
+    }
+
+    assert rows["baseline"].admission_status == "passed"
+    assert rows["fused"].admission_error == (
+        "fusion.loss requires a registered fused implementation"
+    )
+    assert rows["packed"].admission_error == (
+        "declared input layout requires a batch_layout binding"
+    )
+    assert rows["lm-head"].admission_error == (
+        "chunk.lm_head_weight_chunk_bytes requires an LM-head chunker binding"
+    )
+    assert rows["layer-output"].admission_error == (
+        "layout.output=per_layer_flat requires declared layer_groups"
+    )
+    assert rows["block-vector"].admission_error == (
+        "layout.vector=per_block_flat requires declared block_groups"
+    )
+    assert rows["layer-chunk"].admission_error == (
+        "chunk.layer_block_size requires declared layer_groups"
+    )
+    assert rows["mmap"].admission_error == (
+        "memory.vector_residency=mmap_cpu requires memory-mapped tensor metadata"
+    )
+    assert rows["intermediate"].admission_error == (
+        "memory.intermediate_residency requires named intermediate boundaries"
+    )
+    assert rows["manual"].admission_error == (
+        "manual_recompute requires recompute-region metadata"
+    )
+    assert rows["teacher"].admission_error == (
+        "recomputed teacher outputs require a teacher objective"
+    )
+    assert rows["stateful"].admission_error == (
+        "stateful_module requires a ModuleCallSpec binding"
+    )
+
+    for candidate_id, candidate in rows.items():
+        if candidate_id != "baseline":
+            assert candidate.admission_status == "failed"
+
+
+def test_candidate_rows_admit_declared_parameter_groups() -> None:
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(batch, Mapping)
+
+        return vpx.constant_operation(vector)
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(batch, Mapping)
+        assert vector is not None
+
+        return reference_passed()
+
+    runtime = vpx.RuntimeConfig(
+        (
+            vp.Candidate(
+                "family",
+                "grouped",
+                {
+                    "layout.output": "per_layer_flat",
+                    "layout.vector": "per_block_flat",
+                    "chunk.layer_block_size": 1,
+                },
+                admission_status="passed",
+            ),
+        ),
+        operation_factory,
+        reference_check,
+        materialize_candidate,
+        None,
+        {
+            "runtime": "standard",
+            "parameter_surface": {
+                "layer_groups": (("w",),),
+                "block_groups": (("w",),),
+            },
+        },
+    )
+    rows = tuple(run_module._candidate_rows(runtime))
+
+    assert rows[0].admission_status == "passed"
+
+
+def test_candidate_rows_reject_fusion_without_module() -> None:
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(batch, Mapping)
+
+        return vpx.constant_operation(vector)
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(batch, Mapping)
+        assert vector is not None
+
+        return reference_passed()
+
+    runtime = vpx.RuntimeConfig(
+        (
+            vp.Candidate(
+                "family",
+                "fused",
+                {"fusion.loss": "fused_ce"},
+                admission_status="passed",
+            ),
+        ),
+        operation_factory,
+        reference_check,
+        materialize_candidate,
+        None,
+        {
+            "runtime": "standard",
+            "fusion_rewriter": True,
+            "module": False,
+        },
+    )
+    rows = tuple(run_module._candidate_rows(runtime))
+
+    assert rows[0].admission_status == "failed"
+    assert rows[0].admission_error == "fused rows require a module"
+
+
+def test_candidate_rows_reject_stateful_module_without_module() -> None:
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(batch, Mapping)
+
+        return vpx.constant_operation(vector)
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(batch, Mapping)
+        assert vector is not None
+
+        return reference_passed()
+
+    runtime = vpx.RuntimeConfig(
+        (
+            vp.Candidate(
+                "family",
+                "stateful",
+                {"call.path": "stateful_module"},
+                admission_status="passed",
+            ),
+        ),
+        operation_factory,
+        reference_check,
+        materialize_candidate,
+        None,
+        {
+            "runtime": "standard",
+            "module": False,
+            "module_call": {"positional_batch_keys": ("scale",)},
+        },
+    )
+    rows = tuple(run_module._candidate_rows(runtime))
+
+    assert rows[0].admission_status == "failed"
+    assert rows[0].admission_error == "call.path=stateful_module requires a module"
+
+
+def test_candidate_rows_admit_builtin_intermediate_residency_points() -> None:
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(batch, Mapping)
+
+        return vpx.constant_operation(vector)
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(batch, Mapping)
+        assert vector is not None
+
+        return reference_passed()
+
+    runtime = vpx.RuntimeConfig(
+        (
+            vp.Candidate(
+                "family",
+                "ggn-intermediate",
+                {"memory.intermediate_residency": "cpu_staged"},
+                admission_status="passed",
+            ),
+        ),
+        operation_factory,
+        reference_check,
+        materialize_candidate,
+        None,
+        {
+            "runtime": "standard",
+            "operator": {"kind": "ggnvp"},
+            "intermediate_residency": False,
+        },
+    )
+    rows = tuple(run_module._candidate_rows(runtime))
+
+    assert rows[0].admission_status == "passed"
 
 
 def test_run_candidate_records_full_size_check_metadata() -> None:
@@ -5781,7 +6140,6 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "batch.hvp_row_batch_size": 2,
             "batch.ggn_batch_size": 3,
             "chunk.token_block_size": 4,
-            "chunk.sequence_position_block_size": 5,
             "chunk.output_cotangent_block_size": 6,
             "chunk.parameter_block_size": 7,
             "chunk.layer_block_size": 8,

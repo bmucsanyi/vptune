@@ -3155,12 +3155,6 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             admission_rule=_positive_int_axis("chunk.token_block_size"),
         ),
         AxisDescriptor(
-            "chunk.sequence_position_block_size",
-            ("chunk.sequence_position_block_size",),
-            (),
-            admission_rule=_positive_int_axis("chunk.sequence_position_block_size"),
-        ),
-        AxisDescriptor(
             "input.batch_layout",
             ("input.batch_layout",),
             ("dense_padded", "packed_with_inverse_permutation", "variable_length"),

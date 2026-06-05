@@ -4223,6 +4223,7 @@ def standard_runtime_config(
             "thresholds": dict(thresholds),
             "numeric_bound_fields": bound_fields,
             "objective": dict(objective_signature),
+            "module": module is not None,
             "module_call": None if module_call is None else module_call.signature(),
             "teacher_objective": teacher_objective is not None,
             "batch_layout": batch_layout is not None,
@@ -5013,13 +5014,23 @@ def _run_autograd_vjp(
             execution.vector,
         )
 
-    active_params = _grad_enabled_params(execution.params)
+    return _backward_materialized_vjp(
+        tensor_function,
+        execution.params,
+        execution.vector,
+    )
+
+
+def _backward_materialized_vjp(
+    tensor_function: Callable[[ParameterTree], TensorTree],
+    params: ParameterTree,
+    cotangent: TensorTree,
+) -> TensorTree:
+    active_params = _grad_enabled_params(params)
     output = tensor_function(active_params)
     output_leaves = tree_leaves(output)
     cotangent_leaves = tree_leaves(
-        tree_map2(
-            lambda out, cotangent: cotangent.reshape_as(out), output, execution.vector
-        )
+        tree_map2(lambda out, cotangent: cotangent.reshape_as(out), output, cotangent)
     )
 
     torch.autograd.backward(output_leaves, grad_tensors=cotangent_leaves)
@@ -6382,6 +6393,13 @@ def _run_ggnvp_vjp_by_path(
 
     if path == "autograd_grad_outputs":
         return _autograd_grad_outputs_vjp(
+            tensor_function,
+            execution.params,
+            output_cotangent,
+        )
+
+    if path == VJP_BACKWARD_MATERIALIZED_PATH:
+        return _backward_materialized_vjp(
             tensor_function,
             execution.params,
             output_cotangent,
@@ -12037,7 +12055,11 @@ def _require_ggn_vjp_path_settings(
         message = "ggn.vjp_path is required for JVP-Hessian-VJP rows"
         raise MaterializationError(message)
 
-    if value not in {"torch_func_vjp", "autograd_grad_outputs"}:
+    if value not in {
+        "torch_func_vjp",
+        "autograd_grad_outputs",
+        "backward_materialized_grad",
+    }:
         message = f"ggn.vjp_path is unsupported: {value}"
         raise MaterializationError(message)
 

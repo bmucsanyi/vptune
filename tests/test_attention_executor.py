@@ -130,6 +130,7 @@ def test_core_attention_axis_admits_executable_frontends() -> None:
                 "attention.frontend": "blockwise_exact",
                 "attention.partition": "blockwise_queries",
                 "attention.padding": "dense_padded",
+                "chunk.sequence_position_block_size": 2,
             },
         ),
         vp.Candidate(
@@ -145,6 +146,23 @@ def test_core_attention_axis_admits_executable_frontends() -> None:
 
     for row in rows:
         assert registry.admit(row).admission_status == "passed"
+
+
+def test_core_attention_axis_rejects_invalid_sequence_block_size() -> None:
+    registry = vpx.AxisRegistry()
+    registry.register(vpat.core_attention_axis())
+    row = vp.Candidate(
+        "attention",
+        "bad-block",
+        {
+            "attention.frontend": "blockwise_exact",
+            "attention.partition": "blockwise_queries",
+            "attention.padding": "dense_padded",
+            "chunk.sequence_position_block_size": 0,
+        },
+    )
+
+    assert registry.admit(row).admission_status == "failed"
 
 
 @pytest.mark.parametrize(
@@ -629,6 +647,40 @@ def test_segmented_forward_ad_attention_matches_full_attention_tangent(
         raise AssertionError(message)
 
     monkeypatch.setattr(vpat, "_block_attention", blocked_block_attention)
+
+    with torch.autograd.forward_ad.dual_level():
+        dual_query = torch.autograd.forward_ad.make_dual(inputs.query, tangent)
+        dual_inputs = dataclasses_replace_attention(inputs, query=dual_query)
+        full = vpat.exact_attention(dual_inputs)
+        segmented = vpat.run_attention(dual_inputs, settings)
+        full_primal, full_tangent = torch.autograd.forward_ad.unpack_dual(full)
+        segmented_primal, segmented_tangent = torch.autograd.forward_ad.unpack_dual(
+            segmented
+        )
+
+    torch.testing.assert_close(segmented_primal, full_primal)
+    torch.testing.assert_close(segmented_tangent, full_tangent)
+
+
+def test_segmented_forward_ad_attention_matches_causal_tangent() -> None:
+    inputs = dataclasses_replace_attention(
+        attention_inputs(),
+        query_block_size=2,
+        is_causal=True,
+    )
+    tangent = torch.linspace(
+        0.1,
+        0.4,
+        steps=inputs.query.numel(),
+        dtype=inputs.query.dtype,
+    ).reshape_as(inputs.query)
+    settings = attention_settings(
+        "blockwise_exact",
+        None,
+        (),
+        "segmented_forward_ad",
+        "dense_padded",
+    )
 
     with torch.autograd.forward_ad.dual_level():
         dual_query = torch.autograd.forward_ad.make_dual(inputs.query, tangent)

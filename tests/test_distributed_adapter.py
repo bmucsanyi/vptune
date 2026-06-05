@@ -1,3 +1,4 @@
+import dataclasses
 import datetime
 import queue
 from pathlib import Path
@@ -23,7 +24,16 @@ from vptune import (
 )
 from vptune.adapters.distributed import (
     DistributedAdmissionPolicy,
+    DistributedCommunicationBindings,
+    DistributedContextParallelBindings,
+    DistributedFSDPBindings,
+    DistributedMeshBindings,
+    DistributedPlacementBindings,
+    DistributedProcessGroupBindings,
     DistributedRankReport,
+    DistributedSequenceParallelBindings,
+    DistributedStrategyBindings,
+    DistributedTensorParallelBindings,
     RankCompileTiming,
     RankSelectedSettings,
     RankStatus,
@@ -51,6 +61,7 @@ from vptune.adapters.distributed import (
     distributed_record,
     distributed_reference_check,
     distributed_runtime_config,
+    distributed_strategy_applier,
     distributed_strategy_axis,
     initialize_process_group,
     named_modules_for_distributed_wrap,
@@ -170,8 +181,29 @@ def distributed_policy(
     )
 
 
+def distributed_base_settings() -> dict[str, object]:
+    return {
+        "distributed.launch": "torchrun",
+        "distributed.process_group_backend": "gloo",
+        "distributed.local_rank_binding": "explicit_device_map",
+        "distributed.mesh_shape": (2,),
+        "distributed.mesh_dim_names": ("data",),
+    }
+
+
+def distributed_single_process_settings() -> dict[str, object]:
+    return {
+        "distributed.launch": "single_process",
+        "distributed.process_group_backend": "gloo",
+        "distributed.local_rank_binding": "explicit_device_map",
+        "distributed.mesh_shape": (1,),
+        "distributed.mesh_dim_names": ("data",),
+    }
+
+
 def valid_fsdp_settings() -> dict[str, object]:
     return {
+        **distributed_base_settings(),
         "distributed.strategy": "fsdp2",
         "fsdp.hook_entry_points": ("root.forward",),
         "fsdp.hook_entry_policy": "root-forward",
@@ -196,6 +228,7 @@ def valid_fsdp_settings() -> dict[str, object]:
 
 def valid_layout_settings() -> dict[str, object]:
     return {
+        **distributed_base_settings(),
         "distributed.strategy": "tensor_parallel",
         "dtensor.params_placement": "shard_dim",
         "dtensor.vector_placement": "replicate",
@@ -271,6 +304,351 @@ def distributed_stateful_gradient_settings() -> dict[str, object]:
         "call.grad_mode": "grad_enabled",
         "call.return_type": "raw_tensor_tree",
     }
+
+
+def distributed_bindings(
+    events: list[dict[str, object]],
+) -> DistributedStrategyBindings:
+    return DistributedStrategyBindings(
+        process_group=distributed_process_group_bindings(events),
+        mesh=distributed_mesh_bindings(events),
+        placements=distributed_placement_bindings(events),
+        fsdp=distributed_fsdp_bindings(events),
+        tensor_parallel=distributed_tensor_parallel_bindings(events),
+        sequence_parallel=distributed_sequence_parallel_bindings(events),
+        context_parallel=distributed_context_parallel_bindings(events),
+        communication=DistributedCommunicationBindings(
+            configure=lambda settings: events.append({
+                "kind": "communication",
+                "settings": dict(settings),
+            })
+        ),
+        hybrid_order=("tensor_parallel", "fsdp2"),
+    )
+
+
+def distributed_process_group_bindings(
+    events: list[dict[str, object]],
+) -> DistributedProcessGroupBindings:
+    def device_for_rank(binding: str, rank: int) -> str:
+        events.append({"kind": "device_for_rank", "binding": binding, "rank": rank})
+
+        return f"{binding}:{rank}"
+
+    def init_process_group(
+        *,
+        backend: str,
+        init_method: str | None,
+        timeout: object,
+        world_size: int,
+        rank: int,
+        store: object,
+        pg_options: object,
+        device_id: object,
+    ) -> None:
+        events.append({
+            "kind": "process_group",
+            "backend": backend,
+            "init_method": init_method,
+            "timeout": timeout,
+            "world_size": world_size,
+            "rank": rank,
+            "store": store,
+            "pg_options": pg_options,
+            "device_id": device_id,
+        })
+
+    return DistributedProcessGroupBindings(
+        init_process_group=init_process_group,
+        is_ucc_available=lambda: False,
+        init_method="env://",
+        timeout="timeout",
+        world_size=2,
+        rank=1,
+        store="store",
+        pg_options="pg_options",
+        device_for_rank=device_for_rank,
+    )
+
+
+def distributed_mesh_bindings(
+    events: list[dict[str, object]],
+) -> DistributedMeshBindings:
+    mesh = object()
+
+    def init_device_mesh(
+        device_type: str,
+        mesh_shape: tuple[int, ...],
+        *,
+        mesh_dim_names: tuple[str, ...],
+    ) -> object:
+        events.append({
+            "kind": "mesh",
+            "device_type": device_type,
+            "mesh_shape": mesh_shape,
+            "mesh_dim_names": mesh_dim_names,
+        })
+
+        return mesh
+
+    return DistributedMeshBindings(
+        init_device_mesh=init_device_mesh,
+        device_type="cuda",
+    )
+
+
+def distributed_placement_bindings(
+    events: list[dict[str, object]],
+) -> DistributedPlacementBindings:
+    def replicate() -> str:
+        events.append({"kind": "placement", "placement": "replicate"})
+
+        return "replicate"
+
+    def shard(dim: int) -> str:
+        events.append({"kind": "placement", "placement": "shard", "dim": dim})
+
+        return f"shard-{dim}"
+
+    def partial(reduce_op: str) -> str:
+        events.append({
+            "kind": "placement",
+            "placement": "partial",
+            "reduce_op": reduce_op,
+        })
+
+        return f"partial-{reduce_op}"
+
+    return DistributedPlacementBindings(
+        replicate=replicate,
+        shard=shard,
+        partial=partial,
+        placement_specs={
+            "dtensor.params_placement": {"shard_dim": 0},
+            "dtensor.vector_placement": {},
+            "dtensor.logits_placement": {},
+            "dtensor.tangent_placement": {},
+            "dtensor.cotangent_placement": {},
+            "dtensor.output_placement": {},
+        },
+    )
+
+
+def distributed_fsdp_bindings(
+    events: list[dict[str, object]],
+) -> DistributedFSDPBindings:
+    sharded = torch.nn.Identity()
+
+    def fully_shard(target: object, **kwargs: object) -> torch.nn.Module:
+        events.append({"kind": "fully_shard", "target": target, **kwargs})
+
+        return sharded
+
+    def mixed_precision_policy(**kwargs: object) -> dict[str, object]:
+        events.append({"kind": "mixed_precision", **kwargs})
+
+        return {"mixed_precision": kwargs}
+
+    def offload_policy() -> dict[str, object]:
+        events.append({"kind": "offload", "offload": "none"})
+
+        return {"offload": "none"}
+
+    def cpu_offload_policy(*, pin_memory: bool) -> dict[str, object]:
+        events.append({
+            "kind": "offload",
+            "offload": "cpu",
+            "pin_memory": pin_memory,
+        })
+
+        return {"offload": "cpu", "pin_memory": pin_memory}
+
+    def data_parallel_mesh_dims(
+        *,
+        shard: object,
+        replicate: object,
+    ) -> dict[str, object]:
+        events.append({
+            "kind": "dp_mesh_dims",
+            "shard": shard,
+            "replicate": replicate,
+        })
+
+        return {"shard": shard, "replicate": replicate}
+
+    def shard_placement_fn(param: object) -> str:
+        events.append({"kind": "shard_placement_fn", "param": param})
+
+        return "shard-placement"
+
+    return DistributedFSDPBindings(
+        fully_shard=fully_shard,
+        mixed_precision_policy=mixed_precision_policy,
+        offload_policy=offload_policy,
+        cpu_offload_policy=cpu_offload_policy,
+        data_parallel_mesh_dims=data_parallel_mesh_dims,
+        shard_placement_fns={"declared_fn": shard_placement_fn},
+        ignored_params={},
+        reshard_group_size=3,
+        cpu_offload_pin_memory=True,
+        hsdp_replicate_mesh_dims="replicate",
+    )
+
+
+def distributed_tensor_parallel_bindings(
+    events: list[dict[str, object]],
+) -> DistributedTensorParallelBindings:
+    def parallelize_module(
+        module: torch.nn.Module,
+        device_mesh: object,
+        parallelize_plan: dict[str, object],
+        *,
+        src_data_rank: int,
+    ) -> torch.nn.Module:
+        events.append({
+            "kind": "parallelize_module",
+            "module": module,
+            "device_mesh": device_mesh,
+            "parallelize_plan": dict(parallelize_plan),
+            "src_data_rank": src_data_rank,
+        })
+
+        return module
+
+    def colwise_parallel(**kwargs: object) -> tuple[str, dict[str, object]]:
+        events.append({"kind": "colwise", **kwargs})
+
+        return "colwise", kwargs
+
+    def rowwise_parallel(**kwargs: object) -> tuple[str, dict[str, object]]:
+        events.append({"kind": "rowwise", **kwargs})
+
+        return "rowwise", kwargs
+
+    def sequence_parallel(**kwargs: object) -> tuple[str, dict[str, object]]:
+        events.append({"kind": "sequence", **kwargs})
+
+        return "sequence", kwargs
+
+    def prepare_module_input(**kwargs: object) -> tuple[str, dict[str, object]]:
+        events.append({"kind": "prepare_input", **kwargs})
+
+        return "prepare_input", kwargs
+
+    def prepare_module_output(**kwargs: object) -> tuple[str, dict[str, object]]:
+        events.append({"kind": "prepare_output", **kwargs})
+
+        return "prepare_output", kwargs
+
+    class LossParallel:
+        def __enter__(self) -> None:
+            events.append({"kind": "loss_parallel_enter"})
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            events.append({"kind": "loss_parallel_exit"})
+
+    def loss_parallel() -> LossParallel:
+        return LossParallel()
+
+    return DistributedTensorParallelBindings(
+        parallelize_module=parallelize_module,
+        colwise_parallel=colwise_parallel,
+        rowwise_parallel=rowwise_parallel,
+        prepare_module_input=prepare_module_input,
+        prepare_module_output=prepare_module_output,
+        loss_parallel=loss_parallel,
+        module_paths_by_plan={
+            "linear": {
+                "tp.qkv_projection": "qkv",
+                "tp.output_projection": "out",
+                "tp.mlp_up_gate": "up",
+                "tp.mlp_down": "down",
+                "tp.embedding": "embed",
+                "tp.lm_head": "lm_head",
+            }
+        },
+        style_specs={
+            "tp.qkv_projection": {
+                "input_layouts": "dtensor.vector_placement",
+                "output_layouts": "dtensor.tangent_placement",
+                "use_local_output": False,
+            },
+            "tp.output_projection": {
+                "input_layouts": "dtensor.tangent_placement",
+                "output_layouts": "dtensor.output_placement",
+                "use_local_output": True,
+            },
+            "tp.mlp_up_gate": {
+                "input_layouts": "dtensor.vector_placement",
+                "output_layouts": "dtensor.output_placement",
+                "use_local_output": False,
+            },
+            "tp.mlp_down": {
+                "input_layouts": "dtensor.output_placement",
+                "output_layouts": "dtensor.output_placement",
+                "use_local_output": True,
+            },
+            "tp.embedding": {
+                "input_layouts": "dtensor.vector_placement",
+                "output_layouts": "dtensor.output_placement",
+                "use_local_output": True,
+            },
+            "tp.lm_head": {
+                "input_layouts": "dtensor.output_placement",
+                "output_layouts": "dtensor.logits_placement",
+                "use_local_output": False,
+            },
+        },
+        prepare_input_specs={
+            "declared": {
+                "module_path": "prepare_in",
+                "input_layouts": "dtensor.vector_placement",
+                "desired_input_layouts": "dtensor.tangent_placement",
+                "input_kwarg_layouts": {"mask": "dtensor.logits_placement"},
+                "desired_input_kwarg_layouts": {"mask": "dtensor.cotangent_placement"},
+                "use_local_output": False,
+            }
+        },
+        prepare_output_specs={
+            "declared": {
+                "module_path": "prepare_out",
+                "output_layouts": "dtensor.tangent_placement",
+                "desired_output_layouts": "dtensor.output_placement",
+                "use_local_output": True,
+            }
+        },
+        src_data_rank=0,
+    )
+
+
+def distributed_sequence_parallel_bindings(
+    events: list[dict[str, object]],
+) -> DistributedSequenceParallelBindings:
+    def sequence_parallel(**kwargs: object) -> tuple[str, dict[str, object]]:
+        events.append({"kind": "sequence", **kwargs})
+
+        return "sequence", kwargs
+
+    return DistributedSequenceParallelBindings(
+        sequence_parallel=sequence_parallel,
+        sequence_dim=1,
+        use_local_output=False,
+    )
+
+
+def distributed_context_parallel_bindings(
+    events: list[dict[str, object]],
+) -> DistributedContextParallelBindings:
+    def context_parallel(mesh: object, **kwargs: object) -> object:
+        events.append({"kind": "context_parallel", "mesh": mesh, **kwargs})
+
+        return object()
+
+    return DistributedContextParallelBindings(
+        context_parallel=context_parallel,
+        buffers=(torch.tensor([1.0]), torch.tensor([2.0])),
+        no_restore_buffers=(torch.tensor([2.0]),),
+    )
 
 
 def tensor_dict(tree: object) -> dict[str, torch.Tensor]:
@@ -1089,12 +1467,14 @@ def test_apply_context_parallel_forwards_declared_arguments() -> None:
     def context_parallel(
         mesh: object,
         *,
+        rotate_method: str,
         buffers: tuple[torch.Tensor, ...],
         buffer_seq_dims: tuple[int, ...],
         no_restore_buffers: tuple[torch.Tensor, ...],
     ) -> object:
         calls.append({
             "mesh": mesh,
+            "rotate_method": rotate_method,
             "buffers": buffers,
             "buffer_seq_dims": buffer_seq_dims,
             "no_restore_buffers": no_restore_buffers,
@@ -1105,6 +1485,7 @@ def test_apply_context_parallel_forwards_declared_arguments() -> None:
     applied = apply_context_parallel(
         context_parallel,
         mesh,
+        rotate_method="all_gather",
         buffers=(first, second),
         buffer_seq_dims=(1, 1),
         no_restore_buffers=(second,),
@@ -1114,6 +1495,7 @@ def test_apply_context_parallel_forwards_declared_arguments() -> None:
     assert calls == [
         {
             "mesh": mesh,
+            "rotate_method": "all_gather",
             "buffers": (first, second),
             "buffer_seq_dims": (1, 1),
             "no_restore_buffers": (second,),
@@ -1419,6 +1801,68 @@ def test_fsdp2_admission_requires_hook_entry_and_rejects_bypass() -> None:
     assert admit_distributed_candidate(bypass, policy=policy)[0] is False
 
 
+def test_distributed_admission_accepts_single_gpu_and_hybrid() -> None:
+    policy = distributed_policy()
+    single_gpu = Candidate(
+        "family",
+        "single",
+        {
+            **distributed_single_process_settings(),
+            "distributed.strategy": "single_gpu",
+        },
+    )
+    hybrid = Candidate(
+        "family",
+        "hybrid",
+        {
+            **valid_fsdp_settings(),
+            **valid_layout_settings(),
+            "distributed.strategy": "hybrid",
+        },
+    )
+    hybrid_missing_tensor_plan = Candidate(
+        "family",
+        "hybrid-missing-tp-plan",
+        {
+            **valid_fsdp_settings(),
+            **valid_layout_settings(),
+            "distributed.strategy": "hybrid",
+            "tp.plan": "",
+        },
+    )
+
+    assert admit_distributed_candidate(single_gpu, policy=policy) == (True, None)
+    assert admit_distributed_candidate(hybrid, policy=policy) == (True, None)
+    assert (
+        admit_distributed_candidate(hybrid_missing_tensor_plan, policy=policy)[0]
+        is False
+    )
+
+
+def test_distributed_admission_requires_runtime_identity_fields() -> None:
+    policy = distributed_policy()
+    missing_launch_settings = dict(valid_fsdp_settings())
+    missing_launch_settings.pop("distributed.launch")
+    missing_mesh_name = Candidate(
+        "family",
+        "missing-mesh-name",
+        {
+            **valid_layout_settings(),
+            "distributed.mesh_shape": (2, 1),
+            "distributed.mesh_dim_names": ("data",),
+        },
+    )
+
+    assert (
+        admit_distributed_candidate(
+            Candidate("family", "missing-launch", missing_launch_settings),
+            policy=policy,
+        )[0]
+        is False
+    )
+    assert admit_distributed_candidate(missing_mesh_name, policy=policy)[0] is False
+
+
 def test_fsdp2_admission_requires_policy_axes() -> None:
     policy = distributed_policy()
     valid = Candidate("family", "valid", valid_fsdp_settings())
@@ -1448,6 +1892,37 @@ def test_fsdp2_admission_requires_policy_axes() -> None:
     assert admit_distributed_candidate(hook_policy_mismatch, policy=policy)[0] is False
 
 
+def test_fsdp2_admission_validates_declared_sets_and_communication() -> None:
+    policy = distributed_policy()
+    invalid_ignored_params = Candidate(
+        "family",
+        "bad-ignored-params",
+        {**valid_fsdp_settings(), "fsdp.ignored_params": ("w", 1)},
+    )
+    invalid_dp_dims = Candidate(
+        "family",
+        "bad-dp-dims",
+        {**valid_fsdp_settings(), "fsdp.dp_mesh_dims": ()},
+    )
+    invalid_overlap = Candidate(
+        "family",
+        "bad-overlap",
+        {**valid_fsdp_settings(), "comm.overlap": "async_magic"},
+    )
+    invalid_bucket = Candidate(
+        "family",
+        "bad-bucket",
+        {**valid_fsdp_settings(), "comm.collective_bucket_size": 0},
+    )
+
+    assert (
+        admit_distributed_candidate(invalid_ignored_params, policy=policy)[0] is False
+    )
+    assert admit_distributed_candidate(invalid_dp_dims, policy=policy)[0] is False
+    assert admit_distributed_candidate(invalid_overlap, policy=policy)[0] is False
+    assert admit_distributed_candidate(invalid_bucket, policy=policy)[0] is False
+
+
 def test_dtensor_admission_requires_gradient_placement_policy() -> None:
     policy = distributed_policy()
     valid = Candidate("family", "valid", valid_layout_settings())
@@ -1456,9 +1931,15 @@ def test_dtensor_admission_requires_gradient_placement_policy() -> None:
         "invalid",
         {**valid_layout_settings(), "dtensor.to_local_grad_placement": "drop"},
     )
+    invalid_placement = Candidate(
+        "family",
+        "invalid-placement",
+        {**valid_layout_settings(), "dtensor.params_placement": "scatter"},
+    )
 
     assert admit_distributed_candidate(valid, policy=policy) == (True, None)
     assert admit_distributed_candidate(invalid, policy=policy)[0] is False
+    assert admit_distributed_candidate(invalid_placement, policy=policy)[0] is False
 
 
 def test_dtensor_admission_records_module_class_and_higher_order_diff() -> None:
@@ -1584,6 +2065,207 @@ def test_layout_admission_uses_mode_specific_fields() -> None:
     assert (
         admit_distributed_candidate(context_missing_layout, policy=policy)[0] is False
     )
+
+
+def test_distributed_strategy_applier_lowers_fsdp2_row_settings() -> None:
+    events = []
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+    settings = {
+        **valid_fsdp_settings(),
+        **distributed_base_settings(),
+        "fsdp.hook_entry_points": ("0.forward",),
+        "fsdp.wrap_granularity": "transformer_block",
+        "fsdp.reshard_after_forward": "positive_integer_group_size",
+        "fsdp.shard_placement_fn": "declared_fn",
+        "fsdp.mp_policy.param_dtype": "bf16",
+        "fsdp.mp_policy.reduce_dtype": "fp16",
+        "fsdp.mp_policy.output_dtype": "fp32",
+        "fsdp.mp_policy.cast_forward_inputs": "true",
+        "fsdp.offload_policy": "cpu",
+        "comm.overlap": "both",
+        "comm.prefetch": "forward",
+        "comm.collective_bucket_size": 1024,
+    }
+    applier = distributed_strategy_applier(distributed_bindings(events))
+
+    result = applier(model, Candidate("gradient", "fsdp", settings))
+
+    assert isinstance(result, torch.nn.Module)
+    assert events[0] == {
+        "kind": "device_for_rank",
+        "binding": "explicit_device_map",
+        "rank": 1,
+    }
+    assert events[1]["kind"] == "process_group"
+    assert events[1]["backend"] == "gloo"
+    assert events[1]["device_id"] == "explicit_device_map:1"
+    assert events[2] == {
+        "kind": "mesh",
+        "device_type": "cuda",
+        "mesh_shape": (2,),
+        "mesh_dim_names": ("data",),
+    }
+    assert {
+        "kind": "communication",
+        "settings": {
+            "comm.overlap": "both",
+            "comm.prefetch": "forward",
+            "comm.collective_bucket_size": 1024,
+        },
+    } in events
+    assert {
+        "kind": "mixed_precision",
+        "param_dtype": torch.bfloat16,
+        "reduce_dtype": torch.float16,
+        "output_dtype": torch.float32,
+        "cast_forward_inputs": True,
+    } in events
+    assert {
+        "kind": "offload",
+        "offload": "cpu",
+        "pin_memory": True,
+    } in events
+    assert {
+        "kind": "dp_mesh_dims",
+        "shard": ("data",),
+        "replicate": None,
+    } in events
+    fully_shard_call = next(event for event in events if event["kind"] == "fully_shard")
+
+    assert fully_shard_call["target"] == [model[0]]
+    assert fully_shard_call["reshard_after_forward"] == 3
+    assert fully_shard_call["shard_placement_fn"]
+
+
+def test_distributed_strategy_applier_lowers_context_parallel_row_settings() -> None:
+    events = []
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    settings = {
+        **valid_context_parallel_settings(),
+        **distributed_base_settings(),
+        "comm.overlap": "all_gather_overlap",
+        "comm.prefetch": "both",
+        "comm.collective_bucket_size": 2048,
+    }
+    applier = distributed_strategy_applier(distributed_bindings(events))
+
+    result = applier(model, Candidate("gradient", "context", settings))
+
+    assert result is model
+    assert {"kind": "placement", "placement": "shard", "dim": 0} in events
+    assert {"kind": "placement", "placement": "replicate"} in events
+    context_call = next(
+        event for event in events if event["kind"] == "context_parallel"
+    )
+    parallelize_call = next(
+        event for event in events if event["kind"] == "parallelize_module"
+    )
+
+    assert context_call["rotate_method"] == "all_gather"
+    assert context_call["buffer_seq_dims"] == (1, 1)
+    assert parallelize_call["src_data_rank"] == 0
+    assert set(parallelize_call["parallelize_plan"]) == {
+        "qkv",
+        "out",
+        "up",
+        "down",
+        "prepare_in",
+        "prepare_out",
+    }
+    qkv_style = parallelize_call["parallelize_plan"]["qkv"]
+    prepare_style = parallelize_call["parallelize_plan"]["prepare_in"]
+
+    assert qkv_style[1]["input_layouts"] == "replicate"
+    assert qkv_style[1]["output_layouts"] == "replicate"
+    assert prepare_style[1]["input_kwarg_layouts"] == {"mask": "replicate"}
+
+
+def test_distributed_strategy_applier_lowers_sequence_parallel_modules() -> None:
+    events = []
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    settings = {
+        **valid_sequence_parallel_settings(),
+        **distributed_single_process_settings(),
+    }
+    applier = distributed_strategy_applier(distributed_bindings(events))
+
+    result = applier(model, Candidate("gradient", "sequence", settings))
+
+    assert result is model
+    assert {"kind": "sequence", "sequence_dim": 1, "use_local_output": False} in events
+    parallelize_call = next(
+        event for event in events if event["kind"] == "parallelize_module"
+    )
+
+    assert "norm" in parallelize_call["parallelize_plan"]
+
+
+def test_distributed_strategy_applier_rejects_undeclared_tp_layout_key() -> None:
+    events = []
+    bindings = distributed_bindings(events)
+    tensor_parallel = bindings.tensor_parallel
+    assert tensor_parallel is not None
+    style_specs = dict(tensor_parallel.style_specs)
+    style_specs["tp.qkv_projection"] = {
+        **dict(style_specs["tp.qkv_projection"]),
+        "input_layouts": "dtensor.missing_placement",
+    }
+    applier = distributed_strategy_applier(
+        dataclasses.replace(
+            bindings,
+            tensor_parallel=dataclasses.replace(
+                tensor_parallel,
+                style_specs=style_specs,
+            ),
+        )
+    )
+    settings = {
+        **valid_layout_settings(),
+        **distributed_single_process_settings(),
+    }
+
+    with pytest.raises(MaterializationError, match="undeclared placement"):
+        applier(
+            torch.nn.Sequential(torch.nn.Linear(2, 2)),
+            Candidate("g", "tp", settings),
+        )
+
+
+def test_distributed_operation_factory_wraps_loss_parallel_from_bindings() -> None:
+    events = []
+    model = TinyDistributedScalarModule()
+    factory = distributed_operation_factory(
+        gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=ModuleCallSpec(positional_batch_keys=("scale",)),
+        strategy_bindings=distributed_bindings(events),
+    )
+    settings = {
+        **distributed_stateful_gradient_settings(),
+        **distributed_single_process_settings(),
+        "distributed.strategy": "single_gpu",
+        "tp.loss_parallel": "true",
+    }
+    candidate = Candidate(
+        "gradient",
+        "distributed-loss-parallel",
+        settings,
+        admission_status="passed",
+    )
+    output = factory(
+        candidate,
+        {"scale": torch.tensor([4.0], dtype=torch.float64)},
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )()
+    output_map = tensor_dict(output)
+
+    torch.testing.assert_close(
+        output_map["w"], torch.tensor([4.0], dtype=torch.float64)
+    )
+    assert {"kind": "loss_parallel_enter"} in events
+    assert {"kind": "loss_parallel_exit"} in events
 
 
 def test_reduce_rank_statuses_records_global_failure() -> None:

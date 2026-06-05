@@ -245,6 +245,7 @@ def core_attention_axis(
             "attention.sdpa_priority_list",
             "attention.partition",
             "attention.padding",
+            "chunk.sequence_position_block_size",
         ),
         adapter_id="vptune.core_attention",
         adapter_version="0.0.1",
@@ -637,6 +638,7 @@ def _segmented_forward_ad_attention_block(
             inputs.key.size(-2),
             inputs.query.device,
         ),
+        is_causal=False,
     )
     block_output = exact_attention(block_inputs)
     block_primal, block_tangent = torch.autograd.forward_ad.unpack_dual(block_output)

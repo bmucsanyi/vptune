@@ -1,12 +1,15 @@
+import contextlib
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 import pytest
 import torch
 
 import vptune as vp
 import vptune.adapters as vpa
+import vptune.adapters.transformers as transformers_module
 import vptune.ext as vpx
+import vptune.runtime as runtime_module
 from vptune.data import PACKAGE_VERSION
 from vptune.errors import AdmissionError
 
@@ -85,6 +88,18 @@ class TinyTransformersScalarModule(torch.nn.Module):
 
     def forward(self, scale: torch.Tensor) -> torch.Tensor:
         return (self.w * scale).sum()
+
+
+class ContextCheckingTransformersModule(TinyTransformersScalarModule):
+    def __init__(self, active: list[bool], forward_events: list[bool]) -> None:
+        super().__init__()
+        self.active = active
+        self.forward_events = forward_events
+
+    def forward(self, scale: torch.Tensor) -> torch.Tensor:
+        self.forward_events.append(bool(self.active))
+
+        return super().forward(scale)
 
 
 def fake_attention() -> None:
@@ -225,6 +240,175 @@ def test_transformers_operation_factory_sets_attention_and_runs_module() -> None
     output_map = tensor_dict(output)
     torch.testing.assert_close(
         output_map["w"], torch.tensor([4.0], dtype=torch.float64)
+    )
+
+
+def test_transformers_sdpa_rows_enter_declared_kernel_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = []
+    forward_events = []
+    kernel_calls = []
+    model = ContextCheckingTransformersModule(active, forward_events)
+    settings = {
+        **stateful_transformers_settings(),
+        "attention.frontend": "transformers_sdpa",
+        "attention.sdpa_kernel": "priority_list",
+        "attention.sdpa_priority_list": ("flash_attention", "math"),
+    }
+    candidate = vp.Candidate(
+        "gradient",
+        "transformers-sdpa",
+        settings,
+        admission_status="passed",
+    )
+
+    @contextlib.contextmanager
+    def fake_sdpa_kernel(
+        backends: object,
+        *,
+        set_priority: bool,
+    ) -> Iterator[None]:
+        assert isinstance(backends, list)
+        kernel_calls.append((tuple(backends), set_priority))
+        active.append(True)
+
+        try:
+            yield
+        finally:
+            active.pop()
+
+    def scalar_objective(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert context.family == "gradient"
+
+        return (params["w"] * batch["scale"]).sum()
+
+    monkeypatch.setattr(transformers_module, "sdpa_kernel", fake_sdpa_kernel)
+    factory = vpa.transformers_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+    )
+    check = vpa.transformers_reference_check(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        thresholds={
+            "max_abs_diff": 0.0,
+            "max_rel_diff": 0.0,
+            "directional_abs_diff": 1e-9,
+            "directional_rel_diff": 1e-9,
+        },
+        scalar_objectives={"loss": scalar_objective},
+    )
+    batch = {"scale": torch.tensor([4.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+
+    output = factory(candidate, batch, vector)()
+    reference = check(candidate, batch, vector)
+
+    assert model.attention_values == ["sdpa", "sdpa"]
+    assert all(forward_events)
+    assert len(kernel_calls) == 3
+    assert kernel_calls
+    assert {call[1] for call in kernel_calls} == {True}
+    assert {call[0] for call in kernel_calls} == {
+        (
+            transformers_module.SDPA_KERNEL_BACKENDS["flash_attention"],
+            transformers_module.SDPA_KERNEL_BACKENDS["math"],
+        )
+    }
+    torch.testing.assert_close(
+        tensor_dict(output)["w"],
+        torch.tensor([4.0], dtype=torch.float64),
+    )
+    assert reference.measurements["max_abs_diff"] == pytest.approx(0.0)
+
+
+def test_transformers_sdpa_warm_compile_enters_declared_kernel_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = []
+    forward_events = []
+    kernel_calls = []
+    model = ContextCheckingTransformersModule(active, forward_events)
+    settings = {
+        **stateful_transformers_settings(),
+        "attention.frontend": "transformers_sdpa",
+        "attention.sdpa_kernel": "math",
+        "compile.enabled": "true",
+        "compile.boundary": "whole_operator",
+        "compile.backend": "inductor",
+        "compile.mode": "default",
+        "compile.fullgraph": "false",
+        "compile.dynamic": None,
+        "compile.compiled_autograd": "false",
+        "compile.options.epilogue_fusion": "false",
+        "compile.options.shape_padding": "false",
+        "compile.cuda_graphs": "false",
+        "compile.cache_state": "warm_cache",
+    }
+    candidate = vp.Candidate(
+        "gradient",
+        "transformers-sdpa-warm",
+        settings,
+        admission_status="passed",
+    )
+
+    @contextlib.contextmanager
+    def fake_sdpa_kernel(
+        backend: object,
+        *,
+        set_priority: bool,
+    ) -> Iterator[None]:
+        kernel_calls.append((backend, set_priority))
+        active.append(True)
+
+        try:
+            yield
+        finally:
+            active.pop()
+
+    def fake_compile(
+        operation: Callable[[], vp.TensorTree],
+        **_: object,
+    ) -> Callable[[], vp.TensorTree]:
+        return operation
+
+    monkeypatch.setattr(transformers_module, "sdpa_kernel", fake_sdpa_kernel)
+    monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
+    factory = vpa.transformers_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+    )
+    batch = {"scale": torch.tensor([4.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+    operation = factory(candidate, batch, vector)
+
+    assert forward_events == [True]
+    output = operation()
+
+    assert forward_events == [True, True]
+    assert kernel_calls == [
+        (transformers_module.SDPA_KERNEL_BACKENDS["math"], False),
+        (transformers_module.SDPA_KERNEL_BACKENDS["math"], False),
+    ]
+    torch.testing.assert_close(
+        tensor_dict(output)["w"],
+        torch.tensor([4.0], dtype=torch.float64),
     )
 
 
@@ -676,6 +860,33 @@ def test_transformers_sdpa_axis_admits_priority_list() -> None:
     )
 
     assert axis.admit(candidate) == (True, None)
+
+
+@pytest.mark.parametrize(
+    "settings_override",
+    [
+        {"attention.partition": "full"},
+        {"attention.padding": "dense_padded"},
+        {"chunk.sequence_position_block_size": 2},
+    ],
+)
+def test_transformers_attention_axis_rejects_core_attention_settings(
+    settings_override: dict[str, object],
+) -> None:
+    policy = transformers_policy()
+    axis = vpa.transformers_attention_axis(("transformers_sdpa",), policy=policy)
+    settings = {
+        "attention.frontend": "transformers_sdpa",
+        "attention.sdpa_kernel": "math",
+        "module_mode": "eval",
+        "dropout_p": 0.0,
+        **settings_override,
+    }
+
+    assert axis.admit(vp.Candidate("family", "core-owned", settings)) == (
+        False,
+        f"{next(iter(settings_override))} is owned by the core attention executor",
+    )
 
 
 def test_transformers_sdpa_axis_rejects_unavailable_forced_kernel() -> None:

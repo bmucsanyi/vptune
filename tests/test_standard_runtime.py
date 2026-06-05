@@ -4393,6 +4393,82 @@ def test_ggnvp_autodiff_loss_hvp_uses_output_space_ad(
     torch.testing.assert_close(result_map["w"], expected)
 
 
+def test_ggnvp_backward_materialized_vjp_reads_grad_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params = {"w": torch.tensor([0.5, -0.25], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.5, -2.0], dtype=torch.float64)}
+    loss_hessian = torch.tensor([[2.0, 0.5], [0.5, 4.0]], dtype=torch.float64)
+
+    def blocked_pullback(
+        tensor_function: Callable[[vp.ParameterTree], vp.TensorTree],
+        params: vp.ParameterTree,
+    ) -> Callable[[vp.TensorTree], tuple[vp.TensorTree]]:
+        assert tensor_function
+        assert params
+        message = "backward_materialized_grad used torch.func.vjp"
+        raise AssertionError(message)
+
+    def blocked_autograd_grad_outputs(
+        tensor_function: Callable[[vp.ParameterTree], vp.TensorTree],
+        params: vp.ParameterTree,
+        cotangent: vp.TensorTree,
+    ) -> vp.TensorTree:
+        assert tensor_function
+        assert params
+        assert cotangent
+        message = "backward_materialized_grad used autograd grad_outputs"
+        raise AssertionError(message)
+
+    def function(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert batch["loss_hessian"] is loss_hessian
+        assert context.family == "ggn"
+
+        return torch.stack((
+            params["w"][0] + 2.0 * params["w"][1],
+            3.0 * params["w"][0] - params["w"][1],
+        ))
+
+    monkeypatch.setattr(runtime_module, "_vjp_pullback", blocked_pullback)
+    monkeypatch.setattr(
+        runtime_module,
+        "_autograd_grad_outputs_vjp",
+        blocked_autograd_grad_outputs,
+    )
+    factory = vpx.standard_operation_factory(
+        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        params=params,
+        buffers={},
+        function_objectives={"model_output": function},
+    )
+    result = factory(
+        vp.Candidate(
+            "ggn",
+            "backward-vjp",
+            {
+                **ggn_settings("torch_func_jvp", vjp_path="backward_materialized_grad"),
+                **torch_func_settings(requires_forward_ad=True),
+                "ggn.loss_hessian_path": "autodiff_loss_hvp",
+                "ggn.loss_hessian_kernel": "dense_global",
+            },
+            admission_status="passed",
+        ),
+        {"loss_hessian": loss_hessian},
+        vector,
+    )()
+    jacobian = torch.tensor([[1.0, 2.0], [3.0, -1.0]], dtype=torch.float64)
+    expected = jacobian.T @ (loss_hessian @ (jacobian @ vector["w"]))
+    result_map = tensor_mapping(result)
+
+    torch.testing.assert_close(result_map["w"], expected)
+
+
 def test_ggnvp_executes_intermediate_residency_at_jvp_and_cotangent_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7071,6 +7147,69 @@ def test_standard_runtime_executes_layout_params_and_output_per_layer_flat() -> 
     torch.testing.assert_close(result_map["c"], params["c"])
 
 
+def test_standard_runtime_executes_layout_output_per_layer_flat() -> None:
+    params = {
+        "a": torch.tensor([2.0], dtype=torch.float64),
+        "b": torch.tensor([3.0, 4.0], dtype=torch.float64),
+        "c": torch.tensor([5.0], dtype=torch.float64),
+    }
+    parameter_surface = vp.ParameterSurface(
+        names=("a", "b", "c"),
+        shapes=((1,), (2,), (1,)),
+        trainable=(True, True, True),
+        layer_groups=(("a", "b"), ("c",)),
+    )
+    vector = {
+        "a": torch.tensor([1.0], dtype=torch.float64),
+        "b": torch.tensor([1.0, 1.0], dtype=torch.float64),
+        "c": torch.tensor([1.0], dtype=torch.float64),
+    }
+
+    def storage_id(tensor: torch.Tensor) -> object:
+        return tensor.untyped_storage()._cdata
+
+    def scalar(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert batch == {}
+        assert context.family == "gradient"
+
+        return 0.5 * (
+            params["a"].pow(2).sum()
+            + params["b"].pow(2).sum()
+            + params["c"].pow(2).sum()
+        )
+
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        parameter_surface=parameter_surface,
+        scalar_objectives={"loss": scalar},
+    )
+    result = factory(
+        vp.Candidate(
+            "gradient",
+            "per-layer-output",
+            {**gradient_settings(), "layout.output": "per_layer_flat"},
+            admission_status="passed",
+        ),
+        {},
+        vector,
+    )()
+    result_map = tensor_mapping(result)
+
+    assert storage_id(result_map["a"]) == storage_id(result_map["b"])
+    assert storage_id(result_map["a"]) != storage_id(result_map["c"])
+    torch.testing.assert_close(result_map["a"], params["a"])
+    torch.testing.assert_close(result_map["b"], params["b"])
+    torch.testing.assert_close(result_map["c"], params["c"])
+
+
 def test_standard_runtime_executes_layout_vector_per_layer_flat() -> None:
     params = {
         "a": torch.tensor([0.0], dtype=torch.float64),
@@ -7175,6 +7314,69 @@ def test_standard_runtime_executes_layout_params_and_output_per_block_flat() -> 
                 "layout.params": "per_block_flat",
                 "layout.output": "per_block_flat",
             },
+            admission_status="passed",
+        ),
+        {},
+        vector,
+    )()
+    result_map = tensor_mapping(result)
+
+    assert storage_id(result_map["a"]) != storage_id(result_map["b"])
+    assert storage_id(result_map["b"]) == storage_id(result_map["c"])
+    torch.testing.assert_close(result_map["a"], params["a"])
+    torch.testing.assert_close(result_map["b"], params["b"])
+    torch.testing.assert_close(result_map["c"], params["c"])
+
+
+def test_standard_runtime_executes_layout_output_per_block_flat() -> None:
+    params = {
+        "a": torch.tensor([2.0], dtype=torch.float64),
+        "b": torch.tensor([3.0, 4.0], dtype=torch.float64),
+        "c": torch.tensor([5.0], dtype=torch.float64),
+    }
+    parameter_surface = vp.ParameterSurface(
+        names=("a", "b", "c"),
+        shapes=((1,), (2,), (1,)),
+        trainable=(True, True, True),
+        block_groups=(("a",), ("b", "c")),
+    )
+    vector = {
+        "a": torch.tensor([1.0], dtype=torch.float64),
+        "b": torch.tensor([1.0, 1.0], dtype=torch.float64),
+        "c": torch.tensor([1.0], dtype=torch.float64),
+    }
+
+    def storage_id(tensor: torch.Tensor) -> object:
+        return tensor.untyped_storage()._cdata
+
+    def scalar(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert batch == {}
+        assert context.family == "gradient"
+
+        return 0.5 * (
+            params["a"].pow(2).sum()
+            + params["b"].pow(2).sum()
+            + params["c"].pow(2).sum()
+        )
+
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        parameter_surface=parameter_surface,
+        scalar_objectives={"loss": scalar},
+    )
+    result = factory(
+        vp.Candidate(
+            "gradient",
+            "per-block-output",
+            {**gradient_settings(), "layout.output": "per_block_flat"},
             admission_status="passed",
         ),
         {},
@@ -16506,6 +16708,56 @@ def test_composition_materialize_each_child_uses_child_operations(
     torch.testing.assert_close(
         tree_leaves(result)[0],
         torch.tensor([3.0], dtype=torch.float64),
+    )
+
+
+def test_composition_stream_child_outputs_bypasses_child_operations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def blocked_child_operation(
+        name: str,
+        component: Callable[[vp.Batch, vp.TensorTree], vp.TensorTree],
+        batch: vp.Batch,
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert name
+        assert component
+        assert batch
+        assert vector
+        message = "stream_child_outputs materialized a child operation"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_composition_child_operation",
+        blocked_child_operation,
+    )
+    factory = vpx.composition_operation_factory(
+        vp.composition(
+            "compose",
+            "stream_child",
+            aggregation="none",
+            children=("multiply", "shift"),
+        ),
+        components={
+            "multiply": multiply_component,
+            "shift": shift_component,
+        },
+    )
+    result = factory(
+        vp.Candidate(
+            "compose",
+            "stream-child",
+            composition_settings(execution="stream_child_outputs"),
+            admission_status="passed",
+        ),
+        {"scale": 2.0},
+        {"w": torch.tensor([3.0], dtype=torch.float64)},
+    )()
+
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        torch.tensor([7.0], dtype=torch.float64),
     )
 
 

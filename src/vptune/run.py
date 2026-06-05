@@ -322,6 +322,11 @@ def _candidate_rows(runtime: RuntimeConfig) -> tuple[Candidate, ...]:
     if axis_registry is not None:
         candidates = tuple(axis_registry.admit(candidate) for candidate in candidates)
 
+    candidates = tuple(
+        _admit_runtime_bindings(candidate, runtime.signature)
+        for candidate in candidates
+    )
+
     for candidate in candidates:
         if candidate.admission_status == "pending":
             message = f"candidate admission is pending: {candidate.candidate_id}"
@@ -408,6 +413,233 @@ def _admit_target(candidate: Candidate, target: Target) -> Candidate:
         admission_status="failed",
         admission_error=error,
     )
+
+
+def _admit_runtime_bindings(
+    candidate: Candidate,
+    runtime_signature: Mapping[str, Any],
+) -> Candidate:
+    if candidate.admission_status == "failed":
+        return candidate
+
+    error = _runtime_binding_admission_error(candidate, runtime_signature)
+
+    if error is None:
+        return candidate
+
+    return dataclasses.replace(
+        candidate,
+        admission_status="failed",
+        admission_error=error,
+    )
+
+
+def _runtime_binding_admission_error(
+    candidate: Candidate,
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    if runtime_signature.get("runtime") != "standard":
+        return None
+
+    settings = candidate.settings
+
+    return _first_runtime_binding_error((
+        _fusion_binding_error(settings, runtime_signature),
+        _batch_layout_binding_error(settings, runtime_signature),
+        _parameter_surface_binding_error(settings, runtime_signature),
+        _lm_head_binding_error(settings, runtime_signature),
+        _mmap_binding_error(settings, runtime_signature),
+        _intermediate_residency_binding_error(settings, runtime_signature),
+        _manual_recompute_binding_error(settings, runtime_signature),
+        _teacher_objective_binding_error(settings, runtime_signature),
+        _module_call_binding_error(settings, runtime_signature),
+    ))
+
+
+def _first_runtime_binding_error(errors: tuple[str | None, ...]) -> str | None:
+    for error in errors:
+        if error is not None:
+            return error
+
+    return None
+
+
+def _fusion_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    fused_values = {
+        "fusion.norm": {"fused_rmsnorm", "fused_layernorm"},
+        "fusion.mlp": {"fused_mlp"},
+        "fusion.rope": {"fused_rope"},
+        "fusion.logits": {"fused_logits_projection"},
+        "fusion.loss": {"fused_ce", "fused_kl"},
+    }
+
+    for key, values in fused_values.items():
+        if settings.get(key) not in values:
+            continue
+
+        if runtime_signature.get("fusion_rewriter") is not True:
+            return f"{key} requires a registered fused implementation"
+
+        if runtime_signature.get("module") is not True:
+            return "fused rows require a module"
+
+    return None
+
+
+def _batch_layout_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    uses_batch_layout = (
+        settings.get("input.batch_layout")
+        in {"packed_with_inverse_permutation", "variable_length"}
+        or settings.get("input.length_grouping") == "exact_length_bucket"
+        or settings.get("schedule.per_token") == "packed"
+    )
+
+    if uses_batch_layout and runtime_signature.get("batch_layout") is not True:
+        return "declared input layout requires a batch_layout binding"
+
+    return None
+
+
+def _parameter_surface_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    for key in ("layout.params", "layout.vector", "layout.output"):
+        value = settings.get(key)
+
+        if value == "per_layer_flat" and not _runtime_has_parameter_groups(
+            runtime_signature,
+            "layer_groups",
+        ):
+            return f"{key}=per_layer_flat requires declared layer_groups"
+
+        if value == "per_block_flat" and not _runtime_has_parameter_groups(
+            runtime_signature,
+            "block_groups",
+        ):
+            return f"{key}=per_block_flat requires declared block_groups"
+
+    if "chunk.layer_block_size" not in settings:
+        return None
+
+    if _runtime_has_parameter_groups(runtime_signature, "layer_groups"):
+        return None
+
+    return "chunk.layer_block_size requires declared layer_groups"
+
+
+def _runtime_has_parameter_groups(
+    runtime_signature: Mapping[str, Any],
+    group_field: str,
+) -> bool:
+    surface = runtime_signature.get("parameter_surface")
+
+    if not isinstance(surface, Mapping):
+        return False
+
+    groups = surface.get(group_field)
+
+    if isinstance(groups, tuple):
+        return bool(groups)
+
+    if isinstance(groups, list):
+        return bool(groups)
+
+    return False
+
+
+def _lm_head_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    if (
+        "chunk.lm_head_weight_chunk_bytes" in settings
+        and runtime_signature.get("lm_head_chunker") is not True
+    ):
+        return "chunk.lm_head_weight_chunk_bytes requires an LM-head chunker binding"
+
+    return None
+
+
+def _mmap_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    if runtime_signature.get("mmap_residency") is True:
+        return None
+
+    for key in ("memory.vector_residency", "memory.factor_residency"):
+        if settings.get(key) == "mmap_cpu":
+            return f"{key}=mmap_cpu requires memory-mapped tensor metadata"
+
+    return None
+
+
+def _intermediate_residency_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    if "memory.intermediate_residency" not in settings:
+        return None
+
+    operator = runtime_signature.get("operator")
+    operator_kind = operator.get("kind") if isinstance(operator, Mapping) else None
+
+    if operator_kind in {"composition", "ggnvp"}:
+        return None
+
+    if runtime_signature.get("intermediate_residency") is True:
+        return None
+
+    return "memory.intermediate_residency requires named intermediate boundaries"
+
+
+def _manual_recompute_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    if (
+        settings.get("activation.recompute") == "manual_recompute"
+        and runtime_signature.get("manual_recompute") is not True
+    ):
+        return "manual_recompute requires recompute-region metadata"
+
+    return None
+
+
+def _teacher_objective_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    if (
+        settings.get("teacher_outputs") == "recomputed_with_equality_check"
+        and runtime_signature.get("teacher_objective") is not True
+    ):
+        return "recomputed teacher outputs require a teacher objective"
+
+    return None
+
+
+def _module_call_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    if settings.get("call.path") != "stateful_module":
+        return None
+
+    if runtime_signature.get("module") is not True:
+        return "call.path=stateful_module requires a module"
+
+    if runtime_signature.get("module_call") is None:
+        return "stateful_module requires a ModuleCallSpec binding"
+
+    return None
 
 
 def _single_autobatch_domain(runtime: RuntimeConfig) -> AutobatchDomain | None:

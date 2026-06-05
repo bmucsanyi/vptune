@@ -1,11 +1,13 @@
 """Transformers adapter admission helpers."""
 
+import contextlib
 import dataclasses
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, Protocol
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from vptune.attention import (
     AttentionSemantics,
@@ -82,6 +84,13 @@ SDPA_KERNELS = (
     "priority_list",
 )
 NON_MATH_SDPA_KERNELS = tuple(kernel for kernel in SDPA_KERNELS if kernel != "math")
+SDPA_KERNEL_BACKENDS = {
+    "math": SDPBackend.MATH,
+    "flash_attention": SDPBackend.FLASH_ATTENTION,
+    "efficient_attention": SDPBackend.EFFICIENT_ATTENTION,
+    "cudnn_attention": SDPBackend.CUDNN_ATTENTION,
+    "overrideable": SDPBackend.OVERRIDEABLE,
+}
 FLASH_ATTENTION_DTYPES = ("fp16", "bf16")
 LOAD_TIME_ATTENTION_FRONTENDS = {
     "transformers_eager": "eager",
@@ -348,8 +357,14 @@ def transformers_operation_factory(
             candidate,
             attention_custom_kernel_id=attention_custom_kernel_id,
         )
+        with _transformers_sdpa_kernel_context(candidate.settings):
+            operation = standard_factory(_standard_candidate(candidate), batch, vector)
 
-        return standard_factory(_standard_candidate(candidate), batch, vector)
+        def transformers_operation() -> TensorTree:
+            with _transformers_sdpa_kernel_context(candidate.settings):
+                return operation()
+
+        return transformers_operation
 
     return factory
 
@@ -393,7 +408,8 @@ def transformers_reference_check(
             attention_custom_kernel_id=attention_custom_kernel_id,
         )
 
-        return standard_check(_standard_candidate(candidate), batch, vector)
+        with _transformers_sdpa_kernel_context(candidate.settings):
+            return standard_check(_standard_candidate(candidate), batch, vector)
 
     return check
 
@@ -687,6 +703,55 @@ def _configure_transformers_runtime(
     raise AdmissionError(message)
 
 
+@contextlib.contextmanager
+def _transformers_sdpa_kernel_context(
+    settings: Mapping[str, Any],
+) -> Iterator[None]:
+    if settings.get("attention.frontend") not in SDPA_ATTENTION_FRONTENDS:
+        yield
+
+        return
+
+    kernel = settings.get("attention.sdpa_kernel")
+
+    if kernel == "priority_list":
+        priority_list = _sdpa_priority_list(settings)
+
+        with sdpa_kernel(priority_list, set_priority=True):
+            yield
+
+        return
+
+    backend = _sdpa_backend(kernel)
+
+    with sdpa_kernel(backend, set_priority=False):
+        yield
+
+
+def _sdpa_priority_list(settings: Mapping[str, Any]) -> list[SDPBackend]:
+    priority = settings.get("attention.sdpa_priority_list")
+
+    if not isinstance(priority, Sequence) or isinstance(priority, str) or not priority:
+        message = "attention.sdpa_priority_list must be a non-empty sequence"
+        raise AdmissionError(message)
+
+    return [_sdpa_backend(value) for value in priority]
+
+
+def _sdpa_backend(value: object) -> SDPBackend:
+    if not isinstance(value, str):
+        message = "attention.sdpa_kernel must be a string"
+        raise AdmissionError(message)
+
+    backend = SDPA_KERNEL_BACKENDS.get(value)
+
+    if backend is None:
+        message = f"unsupported SDPA kernel: {value}"
+        raise AdmissionError(message)
+
+    return backend
+
+
 def _standard_candidate(candidate: Candidate) -> Candidate:
     settings = {
         key: value
@@ -927,7 +992,10 @@ def _attention_error(
     policy: TransformersAttentionPolicy,
     attention_frontend: str,
 ) -> str | None:
-    error = _sdpa_kernel_error(candidate.settings, policy, attention_frontend)
+    error = _core_attention_setting_error(candidate.settings)
+
+    if error is None:
+        error = _sdpa_kernel_error(candidate.settings, policy, attention_frontend)
 
     if error is None and attention_frontend in FLASH_ATTENTION_FRONTENDS:
         error = _flash_attention_frontend_error(candidate, policy, attention_frontend)
@@ -952,6 +1020,18 @@ def _attention_error(
         error = _policy_error(policy)
 
     return error
+
+
+def _core_attention_setting_error(settings: Mapping[str, Any]) -> str | None:
+    for key in (
+        "attention.partition",
+        "attention.padding",
+        "chunk.sequence_position_block_size",
+    ):
+        if key in settings:
+            return f"{key} is owned by the core attention executor"
+
+    return None
 
 
 def _flash_attention_frontend_error(
