@@ -2601,6 +2601,7 @@ class StandardExecution:
         None
     )
     compiled_ggn_vjp: Callable[[TensorTree], TensorTree] | None = None
+    prepared_gradient: CandidateOperation | None = None
     linearized_jvp: Callable[[TensorTree], TensorTree] | None = None
     linearized_hvp: Callable[[TensorTree], TensorTree] | None = None
     vjp_closure: Callable[[TensorTree], TensorTree] | None = None
@@ -2753,6 +2754,9 @@ def standard_operation_factory(
 
 
 def _prepare_standard_execution(execution: StandardExecution) -> StandardExecution:
+    if execution.operator.kind == "gradient":
+        return _prepare_gradient_execution(execution)
+
     if execution.operator.kind == "jvp":
         return _prepare_jvp_execution(execution)
 
@@ -2966,6 +2970,22 @@ def _prepare_ggn_vjp_compile_boundary(
     return dataclasses.replace(
         execution,
         compiled_ggn_vjp=compiled_vjp,
+    )
+
+
+def _prepare_gradient_execution(execution: StandardExecution) -> StandardExecution:
+    schedule = execution.candidate.settings.get("gradient.graph_schedule")
+
+    if schedule is None or schedule == "rebuild_per_call":
+        return execution
+
+    if schedule != "build_once":
+        message = f"gradient.graph_schedule is unsupported: {schedule}"
+        raise MaterializationError(message)
+
+    return dataclasses.replace(
+        execution,
+        prepared_gradient=_gradient_operation_by_path(execution),
     )
 
 
@@ -4576,6 +4596,13 @@ def _run_gradient(execution: StandardExecution) -> TensorTree:
 
 
 def _run_gradient_by_path(execution: StandardExecution) -> TensorTree:
+    if execution.prepared_gradient is not None:
+        return execution.prepared_gradient()
+
+    return _gradient_operation_by_path(execution)()
+
+
+def _gradient_operation_by_path(execution: StandardExecution) -> CandidateOperation:
     _require_path(
         execution.operator.kind,
         execution.path,
@@ -4586,26 +4613,42 @@ def _run_gradient_by_path(execution: StandardExecution) -> TensorTree:
             GRADIENT_BACKWARD_MATERIALIZED_PATH,
         ),
     )
-
     scalar_function = _hvp_scalar_function(execution)
 
     if execution.path == GRADIENT_PATH:
-        return gradient_anchor(scalar_function, execution.params)
+
+        def operation() -> TensorTree:
+            return gradient_anchor(scalar_function, execution.params)
+
+        return operation
 
     if execution.path == GRADIENT_TORCH_FUNC_PATH:
-        result = torch.func.grad(scalar_function)(execution.params)
-        _require_finite_tree(result, "gradient result")
+        gradient_function = torch.func.grad(scalar_function)
 
-        return result
+        def operation() -> TensorTree:
+            result = gradient_function(execution.params)
+            _require_finite_tree(result, "gradient result")
+
+            return result
+
+        return operation
 
     if execution.path == GRADIENT_TORCH_FUNC_VALUE_PATH:
-        result, value = torch.func.grad_and_value(scalar_function)(execution.params)
-        _require_finite_tree(result, "gradient result")
-        _require_gradient_value_reuse(execution, value)
+        gradient_function = torch.func.grad_and_value(scalar_function)
 
-        return result
+        def operation() -> TensorTree:
+            result, value = gradient_function(execution.params)
+            _require_finite_tree(result, "gradient result")
+            _require_gradient_value_reuse(execution, value)
 
-    return _run_materialized_gradient(execution)
+            return result
+
+        return operation
+
+    def operation() -> TensorTree:
+        return _run_materialized_gradient(execution)
+
+    return operation
 
 
 def _uses_microbatch_accumulation(execution: StandardExecution) -> bool:
@@ -11357,8 +11400,9 @@ def _require_gradient_graph_schedule_settings(
         message = "gradient.graph_schedule applies only to gradient rows"
         raise MaterializationError(message)
 
-    message = "gradient.graph_schedule requires gradient graph scheduling lowering"
-    raise MaterializationError(message)
+    if graph_schedule not in {"build_once", "rebuild_per_call"}:
+        message = f"gradient.graph_schedule is unsupported: {graph_schedule}"
+        raise MaterializationError(message)
 
 
 def _require_runtime_residency(

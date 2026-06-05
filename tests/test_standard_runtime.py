@@ -8190,25 +8190,96 @@ def test_standard_runtime_rejects_lm_head_chunking_without_binding() -> None:
         )
 
 
-def test_standard_runtime_rejects_gradient_graph_schedule_without_lowering() -> None:
+def test_gradient_graph_schedule_build_once_reuses_prepared_gradient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builds = []
+    original_grad = torch.func.grad
+
+    def recording_grad(function: Any) -> Any:
+        builds.append("grad")
+
+        return original_grad(function)
+
+    monkeypatch.setattr(torch.func, "grad", recording_grad)
     factory = vpx.standard_operation_factory(
         vp.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
+    operation = factory(
+        vp.Candidate(
+            "gradient",
+            "graph-schedule",
+            {
+                "gradient.path": "torch_func_grad",
+                **torch_func_settings(requires_forward_ad=False),
+                "gradient.graph_schedule": "build_once",
+            },
+            admission_status="passed",
+        ),
+        {"scale": torch.tensor(1.0, dtype=torch.float64)},
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )
+    first = operation()
+    second = operation()
 
-    with pytest.raises(vp.MaterializationError, match="graph scheduling lowering"):
-        factory(
-            vp.Candidate(
-                "gradient",
-                "graph-schedule",
-                {**gradient_settings(), "gradient.graph_schedule": "build_once"},
-                admission_status="passed",
-            ),
-            {"scale": torch.tensor(1.0, dtype=torch.float64)},
-            {"w": torch.tensor([1.0], dtype=torch.float64)},
-        )
+    assert builds == ["grad"]
+    torch.testing.assert_close(
+        tree_leaves(first)[0],
+        torch.tensor([4.0], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        tree_leaves(second)[0],
+        torch.tensor([4.0], dtype=torch.float64),
+    )
+
+
+def test_gradient_graph_schedule_rebuild_per_call_rebuilds_gradient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builds = []
+    original_grad = torch.func.grad
+
+    def recording_grad(function: Any) -> Any:
+        builds.append("grad")
+
+        return original_grad(function)
+
+    monkeypatch.setattr(torch.func, "grad", recording_grad)
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+    )
+    operation = factory(
+        vp.Candidate(
+            "gradient",
+            "graph-schedule",
+            {
+                "gradient.path": "torch_func_grad",
+                **torch_func_settings(requires_forward_ad=False),
+                "gradient.graph_schedule": "rebuild_per_call",
+            },
+            admission_status="passed",
+        ),
+        {"scale": torch.tensor(1.0, dtype=torch.float64)},
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )
+    first = operation()
+    second = operation()
+
+    assert builds == ["grad", "grad"]
+    torch.testing.assert_close(
+        tree_leaves(first)[0],
+        torch.tensor([4.0], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        tree_leaves(second)[0],
+        torch.tensor([4.0], dtype=torch.float64),
+    )
 
 
 @pytest.mark.parametrize(
