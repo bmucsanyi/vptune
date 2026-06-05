@@ -7080,6 +7080,104 @@ def test_tune_writes_admission_failure_rows_without_measurement(tmp_path: Path) 
     assert full_size_row["reference_passed"] is False
 
 
+def test_reference_failed_rows_are_rechecked_on_next_tune(tmp_path: Path) -> None:
+    model = torch.nn.Linear(1, 1)
+    candidate = vp.Candidate("family", "row", {}, admission_status="passed")
+    calls = {"reference": 0, "operation": 0}
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert candidate.candidate_id == "row"
+        assert batch["source"] == "reference"
+        assert isinstance(vector, torch.Tensor)
+        calls["reference"] += 1
+
+        if calls["reference"] == 1:
+            message = "reference rejected row"
+            raise vp.ReferenceFailedError(message)
+
+        return reference_passed()
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert candidate.candidate_id == "row"
+        assert batch["source"] == "probe"
+        assert isinstance(vector, torch.Tensor)
+
+        def operation() -> torch.Tensor:
+            calls["operation"] += 1
+
+            return vector
+
+        return operation
+
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=cpu_target(
+            vp.TimingPolicy(
+                short_seconds=0.0,
+                medium_seconds=0.0,
+                long_warmups=0,
+                long_measured_calls=1,
+            )
+        ),
+        runtime=vpx.RuntimeConfig(
+            (candidate,),
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"generator": "reference-rerun"},
+        ),
+    )
+
+    with pytest.raises(vp.NoPassedCandidateError):
+        vp.tune(
+            problem,
+            run_dir=tmp_path,
+            memory_backend=CPUMemoryBackend(),
+            clock=SequenceClock(()),
+        )
+
+    plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0)),
+    )
+    failed_reference = read_record(
+        tmp_path / "references" / "family" / "row" / "tree_close.json"
+    )
+    passed_reference = read_record(
+        tmp_path / "references" / "family" / "row" / "tree_close-000001.json"
+    )
+    failed_full_size = read_record(
+        tmp_path / "full_size" / "family" / "row" / "result.json"
+    )
+    passed_full_size = read_record(
+        tmp_path / "full_size" / "family" / "row" / "result-000001.json"
+    )
+
+    assert calls == {"reference": 2, "operation": 1}
+    assert plan.selected_candidate().candidate_id == "row"
+    assert failed_reference["status"] == "failed"
+    assert failed_reference["error_type"] == "ReferenceFailed"
+    assert passed_reference["status"] == "passed"
+    assert failed_full_size["status"] == "failed"
+    assert failed_full_size["error_type"] == "ReferenceFailed"
+    assert passed_full_size["status"] == "passed"
+
+
 def test_tune_records_reference_runtime_failures() -> None:
     model = torch.nn.Linear(1, 1)
     candidates = (
