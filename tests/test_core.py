@@ -6792,6 +6792,171 @@ def test_tune_fast_strategy_delegates_autobatch_domain_to_autobatch_find(
     assert plan.selected["family"].settings["batch_size"] == 2
 
 
+def test_tune_reuses_current_autobatch_rows_on_next_tune(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = []
+    find_calls = []
+    reference_calls = []
+    model = torch.nn.Linear(1, 1)
+
+    def reference_check(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vp.ReferenceResult:
+        assert candidate.settings["batch_size"] in {1, 2}
+        assert batch["source"] == "reference"
+        assert isinstance(vector, torch.Tensor)
+        reference_calls.append(candidate.candidate_id)
+
+        return reference_passed()
+
+    def operation_factory(
+        candidate: vp.Candidate,
+        batch: Mapping[str, object],
+        vector: vp.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert batch["source"] == "probe"
+        assert isinstance(vector, torch.Tensor)
+
+        def operation() -> torch.Tensor:
+            calls.append(candidate.candidate_id)
+
+            return vector * float(candidate.settings["batch_size"])
+
+        return operation
+
+    def first_find(
+        probe: Callable[[int], None],
+        *,
+        values: Sequence[int],
+        goal: autobatch.Goal,
+        cache_key: Hashable,
+        warmup_steps: int,
+        measure_steps: int,
+        devices: list[int],
+    ) -> int:
+        assert goal == autobatch.Goal.fastest_step()
+        assert isinstance(cache_key, tuple)
+        assert warmup_steps == 0
+        assert measure_steps == 1
+        assert devices == [0]
+        find_calls.append(tuple(values))
+        probe(1)
+        probe(2)
+
+        return 2
+
+    def second_find(
+        probe: Callable[[int], None],
+        *,
+        values: Sequence[int],
+        goal: autobatch.Goal,
+        cache_key: Hashable,
+        warmup_steps: int,
+        measure_steps: int,
+        devices: list[int],
+    ) -> int:
+        assert probe
+        assert values
+        assert goal
+        assert cache_key
+        assert warmup_steps == 0
+        assert measure_steps == 1
+        assert devices == [0]
+        message = "saved autobatch rows should bypass find"
+        raise AssertionError(message)
+
+    target = dataclasses.replace(
+        cpu_target(
+            vp.TimingPolicy(
+                short_seconds=0.0,
+                medium_seconds=0.0,
+                long_warmups=0,
+                long_measured_calls=1,
+            )
+        ),
+        search_policy=vp.SearchPolicy(strategy="fast"),
+    )
+    problem = vp.Problem(
+        model=model,
+        params=vp.parameter_surface(model),
+        data=OneBatchData(),
+        operator=vp.gradient("family", "objective", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=target,
+        runtime=vpx.RuntimeConfig(
+            (
+                vp.Candidate(
+                    "family",
+                    "base",
+                    {},
+                    admission_status="passed",
+                ),
+            ),
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"generator": "autobatch-resume"},
+            (
+                vpx.AutobatchDomain(
+                    axis_name="batch_size",
+                    min_value=1,
+                    max_value=2,
+                    initial_value=1,
+                    growth="linear_step",
+                    values=(1, 2),
+                    settings_by_value={
+                        1: {"batch_size": 1},
+                        2: {"batch_size": 2},
+                    },
+                    value_to_settings_id="tests.batch_size_settings",
+                    admission_identity={"case": "test"},
+                    objective="fastest_passing",
+                    failure_signals=(
+                        "backend_rejection",
+                        "oom",
+                        "reference_failure",
+                        "runtime_failure",
+                    ),
+                    termination="exhausted_declared_values",
+                    warmup_steps=0,
+                    measure_steps=1,
+                    devices=(0,),
+                    cache_key_payload={"case": "autobatch-resume"},
+                ),
+            ),
+        ),
+    )
+
+    monkeypatch.setattr(autobatch_bridge.autobatch, "find", first_find)
+    first_plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 2.0, 2.0, 3.0)),
+    )
+    monkeypatch.setattr(autobatch_bridge.autobatch, "find", second_find)
+    second_plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock(()),
+    )
+
+    assert find_calls == [(1, 2)]
+    assert calls == ["base|batch_size=1", "base|batch_size=2"]
+    assert reference_calls == ["base|batch_size=1", "base|batch_size=2"]
+    assert first_plan.selected["family"].candidate_id == "base|batch_size=2"
+    assert second_plan.selected["family"].candidate_id == "base|batch_size=2"
+    assert not (
+        tmp_path / "full_size" / "family" / "base|batch_size=2" / "result-000001.json"
+    ).exists()
+
+
 def test_autobatch_domain_filters_reference_failures_before_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

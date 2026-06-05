@@ -2648,7 +2648,6 @@ def _probe_problem_with_autobatch(
     backend = _memory_backend(problem.target.devices, memory_backend)
     input_signature = _input_signature(problem, backend)
     run_cache = _run_dir_cache(run_dir)
-    check_records = []
     records = []
     value_to_candidate = {
         value: _candidate_for_domain_value(candidates, domain, value)
@@ -2663,9 +2662,23 @@ def _probe_problem_with_autobatch(
         run_dir,
         run_cache,
     )
-    records.extend(reference_rows.full_size_records)
-    check_records.extend(reference_rows.check_records)
+    cached_probe = _cached_autobatch_probe_result(
+        candidates=candidates,
+        reference_rows=reference_rows,
+        value_to_candidate=value_to_candidate,
+        input_signature=input_signature,
+        materializer=runtime.materializer,
+        runtime_identity=runtime.identity(),
+    )
 
+    if cached_probe is not None:
+        return cached_probe
+
+    records.extend(
+        record
+        for record in reference_rows.full_size_records
+        if not record.reference_passed
+    )
     states = {
         value: _AutobatchProbeState(value_to_candidate[value])
         for value in reference_rows.passed_values
@@ -2724,12 +2737,92 @@ def _probe_problem_with_autobatch(
         candidates=candidates,
         candidate_rows=(*candidates, *reference_rows.candidates),
         full_size_records=tuple(records),
-        check_records=tuple(check_records),
+        check_records=tuple(reference_rows.check_records),
         input_signature=input_signature,
         materializer=runtime.materializer,
         runtime_identity=runtime.identity(),
         autobatch_selected_id=selected_candidate_id,
     )
+
+
+def _cached_autobatch_probe_result(
+    *,
+    candidates: tuple[Candidate, ...],
+    reference_rows: _AutobatchReferenceRows,
+    value_to_candidate: Mapping[int, Candidate],
+    input_signature: dict[str, Any],
+    materializer: Materializer,
+    runtime_identity: Mapping[str, Any],
+) -> _ProbeResult | None:
+    cached_records = _autobatch_cached_records_by_value(
+        reference_rows.full_size_records,
+        value_to_candidate,
+        reference_rows.passed_values,
+        input_signature,
+    )
+    selected_candidate_id = _cached_autobatch_selected_candidate_id(
+        cached_records,
+        reference_rows.passed_values,
+    )
+
+    if selected_candidate_id is None:
+        return None
+
+    return _ProbeResult(
+        candidates=candidates,
+        candidate_rows=(*candidates, *reference_rows.candidates),
+        full_size_records=reference_rows.full_size_records,
+        check_records=tuple(reference_rows.check_records),
+        input_signature=input_signature,
+        materializer=materializer,
+        runtime_identity=runtime_identity,
+        autobatch_selected_id=selected_candidate_id,
+    )
+
+
+def _autobatch_cached_records_by_value(
+    records: tuple[FullSizeRecord, ...],
+    value_to_candidate: Mapping[int, Candidate],
+    passed_values: tuple[int, ...],
+    input_signature: Mapping[str, Any],
+) -> dict[int, FullSizeRecord]:
+    records_by_value = {}
+
+    for value in passed_values:
+        candidate = value_to_candidate[value]
+        matching_records = tuple(
+            record
+            for record in records
+            if record.reference_passed
+            and record_matches_candidate(candidate, record)
+            and canonical_json(record.input_signature)
+            == canonical_json(input_signature)
+        )
+
+        if matching_records:
+            records_by_value[value] = matching_records[-1]
+
+    return records_by_value
+
+
+def _cached_autobatch_selected_candidate_id(
+    records_by_value: Mapping[int, FullSizeRecord],
+    passed_values: tuple[int, ...],
+) -> str | None:
+    if set(records_by_value) != set(passed_values):
+        return None
+
+    selected = tuple(
+        record
+        for record in records_by_value.values()
+        if record.selection_metadata.get("source") == "autobatch"
+        and record.selection_metadata.get("selected") is True
+    )
+
+    if len(selected) != 1:
+        return None
+
+    return selected[0].candidate_id
 
 
 def _autobatch_reference_rows(
@@ -2761,7 +2854,7 @@ def _autobatch_reference_rows(
             input_signature,
             run_dir,
             run_cache,
-            include_full_size=False,
+            include_full_size=True,
         )
         candidates.extend(outcome.candidates)
         check_records.extend(outcome.check_records)
