@@ -847,6 +847,41 @@ def test_tune_balanced_strategy_crosses_retained_group_winners(
     )
     assert plan.selected_candidate().candidate_id == "compiled-cross"
 
+    saved_paths = tuple(
+        sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*.json"))
+    )
+    second_plan = vp.tune(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock(()),
+    )
+
+    assert second_plan.selected_candidate().candidate_id == "compiled-cross"
+    assert tuple(record.candidate_id for record in second_plan.full_size_records) == (
+        "base",
+        "balanced:hvp-fast+dtype",
+        "compiled-cross",
+    )
+    assert tuple(call[1] for call in calls) == (
+        "base",
+        "base",
+        "hvp-slow",
+        "hvp-fast",
+        "hvp-slow",
+        "hvp-fast",
+        "dtype",
+        "dtype",
+        "balanced:hvp-fast+dtype",
+        "balanced:hvp-fast+dtype",
+        "compiled-cross",
+        "compiled-cross",
+    )
+    assert (
+        tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*.json")))
+        == saved_paths
+    )
+
 
 def test_tune_balanced_strategy_halves_group_rows_by_probe_stage(
     tmp_path: Path,

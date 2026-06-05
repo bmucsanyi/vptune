@@ -2069,7 +2069,7 @@ def _probe_balanced_group_rows(
         message = "balanced search requires at least one full-size probe input"
         raise MaterializationError(message)
 
-    active = []
+    contenders = []
     candidate_rows = []
     check_records = []
     records_by_id = {}
@@ -2094,16 +2094,23 @@ def _probe_balanced_group_rows(
 
         if outcome.full_size_record is not None:
             records_by_id[candidate.candidate_id] = outcome.full_size_record
+            contenders.append(candidate)
         elif outcome.passed:
-            active.append(candidate)
+            contenders.append(candidate)
 
-    for probe_input in probe_inputs:
-        if not active:
+    for stage_index, probe_input in enumerate(probe_inputs):
+        if not contenders:
             break
 
         stage_records = []
 
-        for candidate in active:
+        for candidate in contenders:
+            previous = records_by_id.get(candidate.candidate_id)
+
+            if previous is not None and _record_has_probe_stage(previous, stage_index):
+                stage_records.append((candidate, previous))
+                continue
+
             operation = _measured_operation(runtime, candidate, (probe_input,))
             record = run_candidate(
                 candidate,
@@ -2116,7 +2123,7 @@ def _probe_balanced_group_rows(
                 full_size_check=_full_size_check(runtime, candidate, (probe_input,)),
             )
             record = _balanced_accumulated_record(
-                records_by_id.get(candidate.candidate_id),
+                previous,
                 record,
             )
             records_by_id[candidate.candidate_id] = record
@@ -2125,7 +2132,7 @@ def _probe_balanced_group_rows(
             if run_dir is not None:
                 _write_full_size(run_dir, record)
 
-        active = list(
+        contenders = list(
             _balanced_stage_survivors(
                 tuple(stage_records),
                 input_signature=input_signature,
@@ -2134,11 +2141,11 @@ def _probe_balanced_group_rows(
             )
         )
 
-        if len(active) <= retained_top_count:
+        if len(contenders) <= retained_top_count:
             break
 
     retained = _balanced_top_candidates(
-        tuple(active),
+        tuple(contenders),
         records_by_id,
         input_signature=input_signature,
         policy=selection_policy,
@@ -2149,6 +2156,13 @@ def _probe_balanced_group_rows(
         retained=retained,
         candidate_rows=tuple(candidate_rows),
         check_records=tuple(check_records),
+    )
+
+
+def _record_has_probe_stage(record: FullSizeRecord, stage_index: int) -> bool:
+    return (
+        len(record.timing_samples) > stage_index
+        and len(record.memory_samples) > stage_index
     )
 
 
