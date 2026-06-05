@@ -583,7 +583,7 @@ class SelectionPolicy:
     distributed_speed_statistic: str = "global_elapsed_seconds"
     rank_memory_reduction: str = "max_peak_reserved"
     tie_breaker: str = "min_peak_reserved_mib"
-    cohort_speed_statistic: str = "sum_selection_score_seconds"
+    cohort_speed_statistic: str = "sum_median_elapsed_seconds"
     cohort_tie_breaker: str = "sum_peak_reserved_mib"
     accepted_status: str = "passed_current_reference_full_size_agreement_stable_memory"
     compile_call_horizon: int = 1
@@ -667,7 +667,7 @@ class CohortConstraint:
     assignments: tuple[Mapping[str, Any], ...]
     families: tuple[str, ...] = ()
     dependency_inheritance: str = "covered_families"
-    selection_aggregation: str = "sum_selection_score_seconds"
+    selection_aggregation: str = "sum_median_elapsed_seconds"
 
     def __post_init__(self) -> None:
         """Validate supported cohort constraint modes.
@@ -682,7 +682,7 @@ class CohortConstraint:
             )
             raise RuntimeError(message)
 
-        if self.selection_aggregation != "sum_selection_score_seconds":
+        if self.selection_aggregation != "sum_median_elapsed_seconds":
             message = (
                 "unsupported cohort selection aggregation: "
                 f"{self.selection_aggregation}"

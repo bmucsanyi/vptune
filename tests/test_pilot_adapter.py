@@ -1,5 +1,6 @@
 import dataclasses
 from collections.abc import Mapping
+from pathlib import Path
 
 import pytest
 import torch
@@ -7,6 +8,7 @@ import torch
 import vptune as vp
 import vptune.ext as vpx
 from vptune.adapters.pilot import (
+    PilotReadiness,
     acceptance_family_names,
     acceptance_readiness,
     lower,
@@ -291,6 +293,51 @@ def test_pilot_readiness_and_selected_settings() -> None:
 
     with pytest.raises(vp.MaterializationError):
         selected_settings(stale, ("family",))
+
+
+def test_pilot_lowered_run_feeds_downstream_readiness_consumer(
+    tmp_path: Path,
+) -> None:
+    operator = vp.gradient("family", "loss", aggregation="sum")
+
+    def validator(
+        candidate: vp.Candidate,
+        record: vp.FullSizeRecord,
+        context: vp.PlanValidationContext,
+    ) -> vp.ReferenceResult:
+        assert candidate.family == "family"
+        assert record.family == "family"
+        assert context.family == "family"
+
+        return reference_passed()
+
+    tuning = lower(
+        target=cpu_target(),
+        families=(vp.Family("family", operator),),
+        problems=(problem_for("family", operator),),
+        run_id="pilot-e2e",
+        plan_validators={"family": validator},
+        validator_identities={"family": {"validator": "pilot-e2e"}},
+    )
+    plan = vp.tune_run(tuning, run_dir=tmp_path)
+    state = readiness(plan, ("family",))
+    settings = selected_settings(plan, ("family",))
+
+    def downstream_consumer(
+        ready: PilotReadiness,
+        selected: Mapping[str, Mapping[str, object]],
+    ) -> str:
+        if not ready.passed():
+            message = "pilot readiness did not pass"
+            raise vp.MaterializationError(message)
+
+        return str(selected["family"]["candidate_id"])
+
+    assert state.passed()
+    assert settings["family"]["candidate_id"] == "family:row"
+    assert plan.validation_required
+    assert tuple(record.status for record in plan.validation_records) == ("passed",)
+    assert downstream_consumer(state, settings) == "family:row"
 
 
 def test_pilot_readiness_rejects_stale_selected_candidate_metadata() -> None:

@@ -58,7 +58,7 @@ def validate_cohort_constraints(
             message = f"unsupported dependency inheritance: {constraint.name}"
             raise MaterializationError(message)
 
-        if constraint.selection_aggregation != "sum_selection_score_seconds":
+        if constraint.selection_aggregation != "sum_median_elapsed_seconds":
             message = f"unsupported cohort selection aggregation: {constraint.name}"
             raise MaterializationError(message)
 

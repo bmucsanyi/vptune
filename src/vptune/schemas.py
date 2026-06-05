@@ -341,7 +341,7 @@ def _validate_replay_selection_policy(policy: SelectionPolicy) -> None:
         message = f"unsupported tie breaker: {policy.tie_breaker}"
         raise VPTuneError(message)
 
-    if policy.cohort_speed_statistic != "sum_selection_score_seconds":
+    if policy.cohort_speed_statistic != "sum_median_elapsed_seconds":
         message = f"unsupported cohort speed statistic: {policy.cohort_speed_statistic}"
         raise VPTuneError(message)
 

@@ -4019,6 +4019,7 @@ def test_selection_rejects_unsupported_policy_fields() -> None:
         vp.SelectionPolicy(compiled_speed_statistic="steady_elapsed_seconds"),
         vp.SelectionPolicy(distributed_speed_statistic="rank_zero_elapsed_seconds"),
         vp.SelectionPolicy(rank_memory_reduction="rank_zero_peak_reserved"),
+        vp.SelectionPolicy(cohort_speed_statistic="sum_selection_score_seconds"),
         vp.SelectionPolicy(accepted_status="passed_only"),
     )
 
@@ -4039,6 +4040,24 @@ def test_selection_rejects_unsupported_policy_fields() -> None:
                 input_signature={},
                 policy=policy,
             )
+
+
+def test_cohort_constraint_uses_spec_selection_aggregation_token() -> None:
+    constraint = vp.CohortConstraint(
+        name="dtype",
+        settings_keys=("dtype.model_compute",),
+        assignments=({"dtype.model_compute": "fp32"},),
+    )
+
+    assert constraint.selection_aggregation == "sum_median_elapsed_seconds"
+
+    with pytest.raises(RuntimeError):
+        vp.CohortConstraint(
+            name="old-token",
+            settings_keys=("dtype.model_compute",),
+            assignments=({"dtype.model_compute": "fp32"},),
+            selection_aggregation="sum_selection_score_seconds",
+        )
 
 
 def test_selection_rejects_invalid_rows() -> None:
