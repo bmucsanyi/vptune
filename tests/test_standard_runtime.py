@@ -9728,6 +9728,58 @@ def test_inverse_metric_cg_dense_preconditioners_match_reference() -> None:
         assert reference_result.measurements["inverse_residual"] == pytest.approx(0.0)
 
 
+def test_inverse_metric_cg_factor_reuse_does_not_filter_zero_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_count_nonzero(value: torch.Tensor) -> torch.Tensor:
+        _ = value
+        message = "batched CG must keep a fixed RHS shape"
+
+        raise AssertionError(message)
+
+    monkeypatch.setattr(torch, "count_nonzero", forbidden_count_nonzero)
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.eye(2, dtype=torch.float64)
+    vector = {
+        "w": torch.tensor(
+            [[0.0, 0.0], [1.0, 2.0]],
+            dtype=torch.float64,
+        )
+    }
+    operator = vp.inverse_metric(
+        "inverse",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+        damping=0.0,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vp.Candidate(
+            "inverse",
+            "cg-factor-reuse",
+            {
+                **inverse_metric_settings("conjugate_gradient"),
+                "inverse_metric.iteration_budget": 2,
+                "inverse_metric.preconditioner": "none",
+                "inverse_metric.factor_reuse": "reuse_factor_across_rhs",
+                "metric.multiply_path": "dense_matmul",
+                "vectorization.mode": "single_loop",
+                "vectorization.in_dims": {"w": 0},
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        vector,
+    )()
+
+    torch.testing.assert_close(tree_leaves(result)[0], vector["w"])
+
+
 def test_inverse_metric_cg_requires_metric_accumulation_for_non_dense_inner_path() -> (
     None
 ):

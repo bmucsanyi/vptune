@@ -9627,10 +9627,6 @@ def _conjugate_gradient_inverse_metric_multiply(
     _require_metric_accumulation_settings(metric_path, execution.candidate.settings)
     damping = _inverse_metric_damping(execution.operator)
     vector = _flatten_vector(execution.vector)
-
-    if math.isclose(float(vector.norm().item()), 0.0, rel_tol=0.0, abs_tol=0.0):
-        return _tree_zeros_like_runtime(execution.candidate.settings, execution.vector)
-
     solution = torch.zeros_like(vector)
     residual = vector - _metric_apply_flat(
         execution.operator,
@@ -9666,10 +9662,13 @@ def _conjugate_gradient_inverse_metric_multiply(
             metric_path,
             execution.candidate.settings,
         )
-        step = residual_dot / _dot_runtime(
-            execution.candidate.settings,
-            direction,
-            matrix_direction,
+        step = _zero_numerator_divide(
+            residual_dot,
+            _dot_runtime(
+                execution.candidate.settings,
+                direction,
+                matrix_direction,
+            ),
         )
         solution = solution + step * direction
         residual = residual - step * matrix_direction
@@ -9686,12 +9685,30 @@ def _conjugate_gradient_inverse_metric_multiply(
             residual,
             preconditioned,
         )
-        direction = preconditioned + (next_residual_dot / residual_dot) * direction
+        direction = (
+            preconditioned
+            + _zero_numerator_divide(
+                next_residual_dot,
+                residual_dot,
+            )
+            * direction
+        )
         residual_dot = next_residual_dot
 
     _require_finite_tensor(solution, "conjugate gradient result")
 
     return _wrap_flat_vector(execution.vector, solution)
+
+
+def _zero_numerator_divide(
+    numerator: torch.Tensor,
+    denominator: torch.Tensor,
+) -> torch.Tensor:
+    return torch.where(
+        numerator == 0,
+        torch.zeros_like(numerator),
+        numerator / denominator,
+    )
 
 
 def _conjugate_gradient_inverse_metric_multiply_batch(
@@ -9703,15 +9720,9 @@ def _conjugate_gradient_inverse_metric_multiply_batch(
     _require_metric_accumulation_settings(metric_path, execution.candidate.settings)
     damping = _inverse_metric_damping(execution.operator)
     vector_batch = _flat_inverse_metric_vector_batch(execution)
-    active = torch.linalg.vector_norm(vector_batch, dim=1) > 0
-    solution = torch.zeros_like(vector_batch)
-
-    if torch.count_nonzero(active).item() == 0:
-        return _wrap_flat_vector_batch(execution.params, solution)
-
-    solution[active] = _conjugate_gradient_inverse_metric_active_batch(
+    solution = _conjugate_gradient_inverse_metric_batch_solve(
         execution,
-        vector_batch[active],
+        vector_batch,
         budget,
         preconditioner,
         metric_path,
@@ -9722,20 +9733,20 @@ def _conjugate_gradient_inverse_metric_multiply_batch(
     return _wrap_flat_vector_batch(execution.params, solution)
 
 
-def _conjugate_gradient_inverse_metric_active_batch(
+def _conjugate_gradient_inverse_metric_batch_solve(
     execution: StandardExecution,
-    active_vectors: torch.Tensor,
+    vectors: torch.Tensor,
     budget: int,
     preconditioner: str,
     metric_path: str,
     damping: float,
 ) -> torch.Tensor:
-    active_solution = torch.zeros_like(active_vectors)
-    residual = active_vectors - _metric_apply_flat_batch(
+    solution = torch.zeros_like(vectors)
+    residual = vectors - _metric_apply_flat_batch(
         execution.operator,
         execution.batch,
         execution.params,
-        active_solution,
+        solution,
         damping,
         metric_path,
         execution.candidate.settings,
@@ -9765,12 +9776,15 @@ def _conjugate_gradient_inverse_metric_active_batch(
             metric_path,
             execution.candidate.settings,
         )
-        step = residual_dot / _batched_dot_runtime(
-            execution.candidate.settings,
-            direction,
-            matrix_direction,
+        step = _zero_numerator_divide(
+            residual_dot,
+            _batched_dot_runtime(
+                execution.candidate.settings,
+                direction,
+                matrix_direction,
+            ),
         )
-        active_solution = active_solution + step[:, None] * direction
+        solution = solution + step[:, None] * direction
         residual = residual - step[:, None] * matrix_direction
         preconditioned = _apply_inverse_metric_preconditioner_batch(
             execution.operator,
@@ -9785,14 +9799,15 @@ def _conjugate_gradient_inverse_metric_active_batch(
             residual,
             preconditioned,
         )
-        direction = preconditioned + (next_residual_dot / residual_dot)[:, None] * (
-            direction
-        )
+        direction = preconditioned + _zero_numerator_divide(
+            next_residual_dot,
+            residual_dot,
+        )[:, None] * (direction)
         residual_dot = next_residual_dot
 
-    _require_finite_tensor(active_solution, "batched conjugate gradient result")
+    _require_finite_tensor(solution, "batched conjugate gradient result")
 
-    return active_solution
+    return solution
 
 
 def _metric_runtime_path_from_settings(settings: Mapping[str, Any]) -> str:
