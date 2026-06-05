@@ -5431,6 +5431,7 @@ def test_inverse_metric_reference_check_records_inverse_residual() -> None:
             "symmetry_max_abs_diff": 1e-12,
             "psd_violation": 1e-12,
             "inverse_residual": 1e-12,
+            "condition_number_max": 2.0,
         },
     )
     result = check(
@@ -5446,6 +5447,7 @@ def test_inverse_metric_reference_check_records_inverse_residual() -> None:
 
     assert result.measurements["inverse_residual"] == pytest.approx(0.0)
     assert result.measurements["psd_violation"] == pytest.approx(0.0)
+    assert result.measurements["condition_number_max"] == pytest.approx(1.0)
 
 
 def test_inverse_metric_reference_check_uses_declared_damping() -> None:
@@ -5558,6 +5560,7 @@ def test_inverse_metric_dense_direct_solve_paths_match_dense_solve() -> None:
             "symmetry_max_abs_diff": 1e-12,
             "psd_violation": 1e-12,
             "inverse_residual": 1e-12,
+            "condition_number_max": 2.0,
         },
     )
     expected = torch.linalg.solve(matrix, vector["w"])
@@ -5575,6 +5578,45 @@ def test_inverse_metric_dense_direct_solve_paths_match_dense_solve() -> None:
         assert torch.allclose(tree_leaves(output)[0], expected)
         assert reference_result.measurements["max_abs_diff"] == pytest.approx(0.0)
         assert reference_result.measurements["inverse_residual"] == pytest.approx(0.0)
+
+
+def test_inverse_metric_rejects_ill_conditioned_undamped_solve() -> None:
+    params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
+    check = vpx.standard_reference_check(
+        vp.inverse_metric(
+            "inverse",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+            damping=0.0,
+        ),
+        params=params,
+        buffers={},
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "symmetry_max_abs_diff": 1e-12,
+            "psd_violation": 1e-12,
+            "inverse_residual": 1e-12,
+            "condition_number_max": 1e6,
+        },
+    )
+
+    with pytest.raises(vp.ReferenceFailedError, match="condition_number_max"):
+        check(
+            vp.Candidate(
+                "inverse",
+                "ill-conditioned",
+                inverse_metric_settings(),
+                admission_status="passed",
+            ),
+            {
+                "metric_matrix": torch.diag(
+                    torch.tensor([1.0, 1e-8], dtype=torch.float64)
+                )
+            },
+            {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)},
+        )
 
 
 @pytest.mark.parametrize(
@@ -9813,6 +9855,7 @@ def test_inverse_metric_reference_check_rejects_indefinite_metric() -> None:
             "symmetry_max_abs_diff": 1e-12,
             "psd_violation": 1e-12,
             "inverse_residual": 1e-12,
+            "condition_number_max": 10.0,
         },
     )
 

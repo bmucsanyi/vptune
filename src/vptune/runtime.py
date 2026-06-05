@@ -1668,14 +1668,12 @@ def _semantic_measurements(
                 output_tensor,
                 vector_tensor,
             ),
+            "condition_number_max": _matrix_condition_number(inverse_matrix),
         }
         damping = _inverse_metric_damping(operator)
 
         if damping > 0.0:
             measurements["damping_min"] = damping
-            measurements["condition_number_max"] = _matrix_condition_number(
-                inverse_matrix
-            )
 
         return measurements
 
