@@ -2762,6 +2762,7 @@ class StandardExecution:
     compiled_model_forward: Callable[[Batch], object] | None = None
     compiled_scalar_function: Callable[[ParameterTree], torch.Tensor] | None = None
     compiled_score_matrix: Callable[[], torch.Tensor] | None = None
+    compiled_ggn_jvp: Callable[[], tuple[TensorTree, TensorTree]] | None = None
     compiled_ggn_loss_product: Callable[[TensorTree, TensorTree], TensorTree] | None = (
         None
     )
@@ -2991,10 +2992,6 @@ def _prepare_enabled_compile_boundary_execution(
         ("hvp", "hvp_single_vector"): lambda: _run_hvp_single_vector(execution),
         ("hvp", "hvp_batched_vectors"): lambda: _run_hvp_by_path(execution),
         ("ggnvp", "ggn_full_product"): lambda: _run_ggnvp_by_path(execution),
-        ("ggnvp", "ggn_jvp"): lambda: _ggn_output_jvp_by_path(
-            execution,
-            _ggn_tensor_function(execution),
-        ),
         ("metric", "metric_multiply"): lambda: _metric_multiply_by_path(
             execution.operator,
             execution.batch,
@@ -3019,18 +3016,6 @@ def _prepare_enabled_compile_boundary_execution(
             "empirical_fisher_example_grad",
         ): lambda: _empirical_fisher_gradients_by_path(execution),
     }
-    ggn_loss_product_builders = {
-        ("ggnvp", "ggn_loss_hessian_product"): lambda output, output_jvp: (
-            _ggn_loss_hessian_product_by_path(execution, output, output_jvp)
-        ),
-    }
-    ggn_vjp_builders = {
-        ("ggnvp", "ggn_vjp"): lambda output_cotangent: _run_ggnvp_vjp_by_path(
-            execution,
-            _ggn_tensor_function(execution),
-            output_cotangent,
-        ),
-    }
     builder = inner_builders.get((execution.operator.kind, boundary))
 
     if builder is not None:
@@ -3045,24 +3030,59 @@ def _prepare_enabled_compile_boundary_execution(
             score_builder,
         )
 
-    loss_product_builder = ggn_loss_product_builders.get((
-        execution.operator.kind,
+    ggn_execution = _prepare_ggn_compile_boundary_execution(
+        execution,
+        settings,
         boundary,
-    ))
+    )
 
-    if loss_product_builder is not None:
+    if ggn_execution is not None:
+        return ggn_execution
+
+    return execution
+
+
+def _prepare_ggn_compile_boundary_execution(
+    execution: StandardExecution,
+    settings: Mapping[str, Any],
+    boundary: str,
+) -> StandardExecution | None:
+    if execution.operator.kind != "ggnvp":
+        return None
+
+    if boundary == "ggn_loss_hessian_product":
         return _prepare_ggn_loss_product_compile_boundary(
             execution,
             settings,
-            loss_product_builder,
+            lambda output, output_jvp: _ggn_loss_hessian_product_by_path(
+                execution,
+                output,
+                output_jvp,
+            ),
         )
 
-    vjp_builder = ggn_vjp_builders.get((execution.operator.kind, boundary))
+    if boundary == "ggn_jvp":
+        return _prepare_ggn_jvp_compile_boundary(
+            execution,
+            settings,
+            lambda: _ggn_output_and_jvp_by_path(
+                execution,
+                _ggn_tensor_function(execution),
+            ),
+        )
 
-    if vjp_builder is not None:
-        return _prepare_ggn_vjp_compile_boundary(execution, settings, vjp_builder)
+    if boundary == "ggn_vjp":
+        return _prepare_ggn_vjp_compile_boundary(
+            execution,
+            settings,
+            lambda output_cotangent: _run_ggnvp_vjp_by_path(
+                execution,
+                _ggn_tensor_function(execution),
+                output_cotangent,
+            ),
+        )
 
-    return execution
+    return None
 
 
 def _require_compiled_execution(
@@ -3177,6 +3197,20 @@ def _prepare_ggn_loss_product_compile_boundary(
     return dataclasses.replace(
         execution,
         compiled_ggn_loss_product=compiled_loss_product,
+    )
+
+
+def _prepare_ggn_jvp_compile_boundary(
+    execution: StandardExecution,
+    settings: Mapping[str, Any],
+    builder: Callable[[], tuple[TensorTree, TensorTree]],
+) -> StandardExecution:
+    _require_compiled_execution(execution, settings)
+    compiled_ggn_jvp = _compiled_ggn_jvp_operation(settings, builder)
+
+    return dataclasses.replace(
+        execution,
+        compiled_ggn_jvp=compiled_ggn_jvp,
     )
 
 
@@ -3690,6 +3724,44 @@ def _compiled_ggn_loss_product_operation(
             raise MaterializationError(message)
 
         compiled_operation(warm_output, warm_output_jvp)
+
+    return compiled_operation
+
+
+def _compiled_ggn_jvp_operation(
+    settings: Mapping[str, Any],
+    operation: Callable[[], tuple[TensorTree, TensorTree]],
+) -> Callable[[], tuple[TensorTree, TensorTree]]:
+    compiled_autograd = _compile_bool(settings, "compile.compiled_autograd")
+
+    def build_compiled() -> Callable[[], tuple[TensorTree, TensorTree]]:
+        return torch.compile(
+            operation,
+            backend=_compile_backend(settings),
+            mode=_compile_mode(settings),
+            fullgraph=_compile_bool(settings, "compile.fullgraph"),
+            dynamic=_compile_optional_bool(settings, "compile.dynamic"),
+            options=_compile_options(settings),
+        )
+
+    if compiled_autograd:
+        with _compiled_autograd_patch():
+            compiled = build_compiled()
+    else:
+        compiled = build_compiled()
+
+    def compiled_operation() -> tuple[TensorTree, TensorTree]:
+        if compiled_autograd:
+            with _compiled_autograd_patch():
+                return _call_compiled_operation(settings, compiled)
+
+        return _call_compiled_operation(settings, compiled)
+
+    cache_state = settings.get("compile.cache_state")
+    _validate_compile_cache_state(settings)
+
+    if cache_state == "warm_cache":
+        compiled_operation()
 
     return compiled_operation
 
@@ -6156,17 +6228,17 @@ def _run_ggnvp_vector_vmap(execution: StandardExecution) -> TensorTree:
     )
     chunk_size = _vmap_chunk_size(execution.candidate.settings)
     tensor_function = _ggn_tensor_function(execution)
-    output = tensor_function(execution.params)
-    _require_finite_tree(output, "GGN output")
-    _require_ggn_loss_hessian_vector_vmap_inputs(execution, output)
 
     if execution.path == GGN_LINEARIZE_HESSIAN_VJP_PATH:
-        _, jvp_function = torch.func.linearize(tensor_function, execution.params)
+        output, jvp_function = torch.func.linearize(tensor_function, execution.params)
     else:
+        output = tensor_function(execution.params)
 
         def jvp_function(vector: TensorTree) -> TensorTree:
             return jvp_anchor(tensor_function, execution.params, vector)
 
+    _require_finite_tree(output, "GGN output")
+    _require_ggn_loss_hessian_vector_vmap_inputs(execution, output)
     pullback = _vjp_pullback(tensor_function, execution.params)
 
     def ggn_function(vector: TensorTree) -> TensorTree:
@@ -6219,8 +6291,7 @@ def _require_ggn_loss_hessian_vector_vmap_inputs(
 
 def _run_ggnvp_jvp_hessian_vjp(execution: StandardExecution) -> TensorTree:
     tensor_function = _ggn_tensor_function(execution)
-    output = tensor_function(execution.params)
-    output_jvp = _ggn_output_jvp(execution, tensor_function)
+    output, output_jvp = _ggn_output_and_jvp(execution, tensor_function)
     output_jvp = _runtime_intermediate_residency_tree(
         output_jvp,
         execution.candidate.settings,
@@ -6228,7 +6299,7 @@ def _run_ggnvp_jvp_hessian_vjp(execution: StandardExecution) -> TensorTree:
     )
 
     if _ggn_recomputes_jvp(execution.candidate.settings):
-        output_jvp = _ggn_output_jvp(execution, tensor_function)
+        _, output_jvp = _ggn_output_and_jvp(execution, tensor_function)
         output_jvp = _runtime_intermediate_residency_tree(
             output_jvp,
             execution.candidate.settings,
@@ -6281,8 +6352,7 @@ def _ggn_loss_product_warm_inputs(
     execution: StandardExecution,
 ) -> tuple[TensorTree, TensorTree]:
     tensor_function = _ggn_tensor_function(execution)
-    output = tensor_function(execution.params)
-    output_jvp = _ggn_output_jvp_by_path(execution, tensor_function)
+    output, output_jvp = _ggn_output_and_jvp_by_path(execution, tensor_function)
     output_jvp = _runtime_intermediate_residency_tree(
         output_jvp,
         execution.candidate.settings,
@@ -6304,36 +6374,88 @@ def _ggn_vjp_warm_input(execution: StandardExecution) -> TensorTree:
     )
 
 
-def _ggn_output_jvp(
+def _ggn_output_and_jvp(
     execution: StandardExecution,
     tensor_function: Callable[[ParameterTree], TensorTree],
-) -> TensorTree:
+) -> tuple[TensorTree, TensorTree]:
     if (
-        execution.compiled_inner is not None
+        execution.compiled_ggn_jvp is not None
         and execution.candidate.settings.get("compile.boundary") == "ggn_jvp"
     ):
-        return execution.compiled_inner()
+        return execution.compiled_ggn_jvp()
 
-    return _ggn_output_jvp_by_path(execution, tensor_function)
+    return _ggn_output_and_jvp_by_path(execution, tensor_function)
 
 
-def _ggn_output_jvp_by_path(
+def _ggn_output_and_jvp_by_path(
     execution: StandardExecution,
     tensor_function: Callable[[ParameterTree], TensorTree],
-) -> TensorTree:
+) -> tuple[TensorTree, TensorTree]:
     if execution.path == GGN_LINEARIZE_HESSIAN_VJP_PATH:
-        _, jvp_function = torch.func.linearize(tensor_function, execution.params)
+        output, jvp_function = torch.func.linearize(tensor_function, execution.params)
 
-        return jvp_function(execution.vector)
+        return output, jvp_function(execution.vector)
 
     if execution.path == GGN_FORWARD_AD_HESSIAN_VJP_PATH:
-        return forward_ad_jvp_anchor(
+        return _forward_ad_output_and_jvp(
             tensor_function,
             execution.params,
             execution.vector,
         )
 
-    return jvp_anchor(tensor_function, execution.params, execution.vector)
+    jvp_result = torch.func.jvp(
+        tensor_function,
+        (execution.params,),
+        (execution.vector,),
+    )
+
+    return jvp_result[0], jvp_result[1]
+
+
+def _forward_ad_output_and_jvp(
+    function: Callable[[ParameterTree], TensorTree],
+    params: ParameterTree,
+    vector: TensorTree,
+) -> tuple[TensorTree, TensorTree]:
+    vector_params = _parameter_tree_from_tensor_tree(vector, "GGN vector")
+
+    with torch.autograd.forward_ad.dual_level():
+        dual_params = {
+            name: torch.autograd.forward_ad.make_dual(params[name], vector_params[name])
+            for name in params
+        }
+        dual_output = function(dual_params)
+
+        return _split_forward_ad_dual_tree(dual_output)
+
+
+def _split_forward_ad_dual_tree(tree: TensorTree) -> tuple[TensorTree, TensorTree]:
+    if isinstance(tree, torch.Tensor):
+        primal, tangent = torch.autograd.forward_ad.unpack_dual(tree)
+
+        if tangent is None:
+            return primal, torch.zeros_like(primal)
+
+        return primal, tangent
+
+    if isinstance(tree, tuple):
+        pairs = tuple(_split_forward_ad_dual_tree(child) for child in tree)
+
+        return (
+            tuple(pair[0] for pair in pairs),
+            tuple(pair[1] for pair in pairs),
+        )
+
+    if isinstance(tree, dict):
+        pairs = {key: _split_forward_ad_dual_tree(value) for key, value in tree.items()}
+
+        return (
+            {key: pair[0] for key, pair in pairs.items()},
+            {key: pair[1] for key, pair in pairs.items()},
+        )
+
+    message = "forward AD output must be a tensor tree"
+    raise MaterializationError(message)
 
 
 def _ggn_recomputes_jvp(settings: Mapping[str, Any]) -> bool:

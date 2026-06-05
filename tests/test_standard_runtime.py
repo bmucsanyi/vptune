@@ -4330,6 +4330,73 @@ def test_ggnvp_reuse_rows_match_dense_loss_hessian(
     torch.testing.assert_close(result_map["w"], expected)
 
 
+@pytest.mark.parametrize(
+    ("jvp_path", "requires_forward_ad", "expected_calls"),
+    [
+        ("torch_func_jvp", True, 2),
+        ("forward_ad_dual", True, 2),
+        ("torch_func_linearize", False, 3),
+    ],
+)
+def test_ggnvp_reuses_primal_from_jvp(
+    jvp_path: str,
+    requires_forward_ad: bool,
+    expected_calls: int,
+) -> None:
+    params = {"w": torch.tensor([0.5, -0.25], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.5, -2.0], dtype=torch.float64)}
+    loss_hessian = torch.diag(torch.tensor([3.0, 5.0], dtype=torch.float64))
+    calls = []
+
+    def function(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert batch["loss_hessian"] is loss_hessian
+        assert context.family == "ggn"
+        calls.append(None)
+
+        return torch.stack((
+            params["w"][0] ** 2 + params["w"][1],
+            params["w"][0] - params["w"][1] ** 2,
+        ))
+
+    factory = vpx.standard_operation_factory(
+        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        params=params,
+        buffers={},
+        function_objectives={"model_output": function},
+    )
+    settings = {
+        **ggn_settings(jvp_path),
+        **torch_func_settings(requires_forward_ad=requires_forward_ad),
+        "ggn.loss_hessian_path": "autodiff_loss_hvp",
+        "ggn.loss_hessian_kernel": "dense_global",
+    }
+    result = factory(
+        vp.Candidate(
+            "ggn",
+            f"reuse-primal-{jvp_path}",
+            settings,
+            admission_status="passed",
+        ),
+        {"loss_hessian": loss_hessian},
+        vector,
+    )()
+    jacobian = torch.tensor(
+        [[1.0, 1.0], [1.0, 0.5]],
+        dtype=torch.float64,
+    )
+    expected = jacobian.T @ (loss_hessian @ (jacobian @ vector["w"]))
+    result_map = tensor_mapping(result)
+
+    assert len(calls) == expected_calls
+    torch.testing.assert_close(result_map["w"], expected)
+
+
 def test_ggnvp_autodiff_loss_hvp_uses_output_space_ad(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4340,11 +4407,15 @@ def test_ggnvp_autodiff_loss_hvp_uses_output_space_ad(
     original_jvp = runtime_module.torch.func.jvp
 
     def recording_jvp(
-        func: Callable[[torch.Tensor], torch.Tensor],
-        primals: tuple[torch.Tensor],
-        tangents: tuple[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        calls.append((primals[0].shape, tangents[0].shape))
+        func: Callable[..., Any],
+        primals: tuple[Any, ...],
+        tangents: tuple[Any, ...],
+    ) -> tuple[Any, Any]:
+        if isinstance(primals[0], torch.Tensor) and isinstance(
+            tangents[0],
+            torch.Tensor,
+        ):
+            calls.append((primals[0].shape, tangents[0].shape))
 
         result = original_jvp(func, primals, tangents)
 
