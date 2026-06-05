@@ -196,7 +196,10 @@ def uses_reduction_degrading_setting(settings: Mapping[str, Any]) -> bool:
     if settings.get("numeric.fp16_reduced_precision_reduction") == "true":
         return True
 
-    return settings.get("fsdp.mp_policy.reduce_dtype") in {"bf16", "fp16"}
+    return any(
+        key.endswith(".reduce_dtype") and value in {"bf16", "fp16"}
+        for key, value in settings.items()
+    )
 
 
 def finite_value(values: Mapping[str, Any], key: str) -> float:

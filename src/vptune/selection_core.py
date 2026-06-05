@@ -6,33 +6,11 @@ from vptune.data import Candidate, FullSizeRecord, Measurement, SelectionPolicy
 from vptune.errors import NoPassedCandidateError
 
 FULL_SIZE_AGREEMENT_KEY = "full_size_agreement_passed"
-NON_MATH_SDPA_KERNELS = {
-    "flash_attention",
-    "efficient_attention",
-    "cudnn_attention",
-    "overrideable",
-}
-FULL_SIZE_ATTENTION_FRONTENDS = {
-    "transformers_flash_attention_2",
-    "transformers_flash_attention_3",
-    "transformers_flash_attention_4",
-    "transformers_flex_attention",
-    "registered_transformers_attention",
-    "packed_exact",
-    "blockwise_exact",
-    "paged|eager",
-    "paged|sdpa",
-    "paged|flash_attention_2",
-    "paged|flash_attention_3",
-    "paged|flash_attention_4",
-}
-DISTRIBUTED_STRATEGIES = {
-    "fsdp2",
-    "hsdp",
-    "tensor_parallel",
-    "sequence_parallel",
-    "context_parallel",
-    "hybrid",
+BASELINE_ATTENTION_FRONTENDS = {
+    "pytorch_sdpa_direct",
+    "patched_eager",
+    "transformers_eager",
+    "transformers_sdpa",
 }
 COMPILED_SPEED_STATISTIC = "compile_amortized_steady_state_seconds"
 ACCEPTED_STATUS = "passed_current_reference_full_size_agreement_stable_memory"
@@ -273,7 +251,7 @@ def _attention_requires_full_size_agreement(
 ) -> bool:
     frontend = settings.get("attention.frontend")
 
-    if frontend in FULL_SIZE_ATTENTION_FRONTENDS:
+    if frontend is not None and frontend not in BASELINE_ATTENTION_FRONTENDS:
         return True
 
     if settings.get("attention.partition") in {"packed_tokens", "blockwise_queries"}:
@@ -281,7 +259,7 @@ def _attention_requires_full_size_agreement(
 
     kernel = settings.get("attention.sdpa_kernel")
 
-    if kernel in NON_MATH_SDPA_KERNELS:
+    if kernel is not None and kernel not in {"math", "priority_list"}:
         return True
 
     if kernel != "priority_list":
@@ -310,9 +288,9 @@ def _fusion_requires_full_size_agreement(settings: Mapping[str, object]) -> bool
 
 
 def _is_distributed_record(record: FullSizeRecord) -> bool:
-    return (
-        record.candidate_settings.get("distributed.strategy") in DISTRIBUTED_STRATEGIES
-    )
+    strategy = record.candidate_settings.get("distributed.strategy")
+
+    return strategy is not None and strategy != "single_gpu"
 
 
 def _max_peak_allocated_mib(record: FullSizeRecord) -> float:

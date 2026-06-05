@@ -25,6 +25,7 @@ import vptune.run as run_module
 from vptune import autobatch_bridge
 from vptune.checks import (
     numeric_error_bound_measurements,
+    uses_reduction_degrading_setting,
     validate_numeric_error_bound,
     validate_thresholds,
 )
@@ -2884,6 +2885,8 @@ def test_threshold_logic() -> None:
     assert bound_measurements["numeric_error_bound_rel"] == pytest.approx(
         bound_measurements["numeric_error_bound_abs"] / 4.0
     )
+    assert uses_reduction_degrading_setting({"fsdp.mp_policy.reduce_dtype": "bf16"})
+    assert not uses_reduction_degrading_setting({"fsdp.mp_policy.reduce_dtype": "fp32"})
     validate_numeric_error_bound(
         {"max_abs_diff": 0.08, "max_rel_diff": 0.02},
         {"max_abs_diff": 0.1, "max_rel_diff": 0.1},
@@ -4190,6 +4193,57 @@ def test_selection_requires_full_size_agreement(settings: Mapping[str, object]) 
     )
 
     assert selected_with_gate == gated
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"attention.frontend": "pytorch_sdpa_direct"},
+        {"attention.frontend": "patched_eager"},
+        {"attention.frontend": "transformers_eager"},
+        {"attention.frontend": "transformers_sdpa"},
+        {"attention.sdpa_kernel": "math"},
+        {
+            "attention.sdpa_kernel": "priority_list",
+            "attention.sdpa_priority_list": ("math",),
+        },
+        {"distributed.strategy": "single_gpu"},
+    ],
+)
+def test_selection_allows_baseline_rows_without_full_size_agreement(
+    settings: Mapping[str, object],
+) -> None:
+    signature = {"case": "ungated-selection", "settings": dict(settings)}
+    policy = vp.SelectionPolicy()
+    fast = vp.Candidate("family", "fast", settings)
+    slow = vp.Candidate("family", "slow", {})
+
+    selected, _ = select_family(
+        (
+            (
+                fast,
+                _record(
+                    fast,
+                    elapsed=(1.0,),
+                    reserved=(1.0,),
+                    input_signature=signature,
+                ),
+            ),
+            (
+                slow,
+                _record(
+                    slow,
+                    elapsed=(2.0,),
+                    reserved=(1.0,),
+                    input_signature=signature,
+                ),
+            ),
+        ),
+        input_signature=signature,
+        policy=policy,
+    )
+
+    assert selected == fast
 
 
 def test_selection_scores_compiled_rows_by_call_horizon() -> None:
