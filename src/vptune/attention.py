@@ -341,6 +341,7 @@ def attention_reference_check(
     ) -> ReferenceResult:
         del vector
         settings = attention_settings_from_candidate(candidate.settings)
+        _require_deterministic_attention_reference(location, batch, settings)
         candidate_output = execute_attention(location, batch, settings)
         reference_output = _attention_reference_output(location, batch, settings)
         measurements = tree_error_measurements(candidate_output, reference_output)
@@ -353,6 +354,20 @@ def attention_reference_check(
         )
 
     return check
+
+
+def _require_deterministic_attention_reference(
+    location: AttentionLocation,
+    batch: Batch,
+    settings: AttentionSettings,
+) -> None:
+    inputs = _attention_inputs_for_settings(location, batch, settings)
+
+    if math.isclose(inputs.dropout_p, 0.0, rel_tol=0.0, abs_tol=0.0):
+        return
+
+    message = "core attention references require dropout_p=0.0"
+    raise AdmissionError(message)
 
 
 def _attention_reference_output(

@@ -260,6 +260,50 @@ def test_attention_operation_factory_and_reference_check_execute_core_row() -> N
     assert result.measurements["max_abs_diff"] == pytest.approx(0.0)
 
 
+def test_attention_reference_check_rejects_dropout_without_reproducible_policy() -> (
+    None
+):
+    inputs = attention_inputs()
+    batch = {
+        "query": inputs.query,
+        "key": inputs.key,
+        "value": inputs.value,
+    }
+    location = vpat.MappingAttentionLocation(
+        semantics=attention_semantics(),
+        query_key="query",
+        key_key="key",
+        value_key="value",
+        output_key="out",
+        mask_key=None,
+        inverse_permutation_key=None,
+        query_block_size_key=None,
+        dropout_p=0.25,
+        is_causal=False,
+        scale=None,
+        enable_gqa=False,
+    )
+    reference_check = vpat.attention_reference_check(
+        location,
+        thresholds={"max_abs_diff": 1e-6, "max_rel_diff": 1e-6},
+    )
+
+    with pytest.raises(AdmissionError, match=r"dropout_p=0[.]0"):
+        reference_check(
+            vp.Candidate(
+                "attention",
+                "dropout",
+                {
+                    "attention.frontend": "patched_eager",
+                    "attention.partition": "full",
+                    "attention.padding": "dense_padded",
+                },
+            ),
+            batch,
+            {},
+        )
+
+
 def test_attention_operation_uses_candidate_sequence_block_size() -> None:
     inputs = attention_inputs()
     batch = {
