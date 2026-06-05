@@ -4510,6 +4510,62 @@ def test_ggnvp_executes_intermediate_residency_at_jvp_and_cotangent_boundaries(
     torch.testing.assert_close(result_map["w"], expected)
 
 
+def test_ggnvp_executes_intermediate_transform_at_operator_part_boundaries() -> None:
+    params = {"w": torch.tensor([0.5, -0.25], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.5, -2.0], dtype=torch.float64)}
+    loss_hessian = torch.diag(torch.tensor([3.0, 5.0], dtype=torch.float64))
+    calls = []
+
+    def function(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert batch["loss_hessian"] is loss_hessian
+        assert context.family == "ggn"
+
+        return torch.stack((
+            params["w"][0] ** 2 + params["w"][1],
+            params["w"][0] - params["w"][1] ** 2,
+        ))
+
+    def intermediate_transform(tree: vp.TensorTree) -> vp.TensorTree:
+        calls.append(tree_leaves(tree)[0].detach().clone())
+
+        return tree
+
+    factory = vpx.standard_operation_factory(
+        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        params=params,
+        buffers={},
+        function_objectives={"model_output": function},
+        intermediate_transform=intermediate_transform,
+    )
+    result = factory(
+        vp.Candidate(
+            "ggn",
+            "intermediate-transform",
+            ggn_reuse_settings("reuse_jvp", "reuse_output_cotangent"),
+            admission_status="passed",
+        ),
+        {"loss_hessian": loss_hessian},
+        vector,
+    )()
+    jacobian = torch.tensor(
+        [[1.0, 1.0], [1.0, 0.5]],
+        dtype=torch.float64,
+    )
+    expected = jacobian.T @ (loss_hessian @ (jacobian @ vector["w"]))
+    result_map = tensor_mapping(result)
+
+    assert len(calls) == 2
+    torch.testing.assert_close(calls[0], jacobian @ vector["w"])
+    torch.testing.assert_close(calls[1], loss_hessian @ (jacobian @ vector["w"]))
+    torch.testing.assert_close(result_map["w"], expected)
+
+
 def test_ggnvp_chunks_output_cotangent_vjp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

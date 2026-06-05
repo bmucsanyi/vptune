@@ -243,16 +243,16 @@ class _DistributedRedistribution:
             vector,
         )
 
-    def between_operator_parts_vector(self, vector: TensorTree) -> TensorTree:
+    def between_operator_parts(self, tree: TensorTree) -> TensorTree:
         if (
             self.settings.get("dtensor.redistribute_schedule")
             != "between_operator_parts"
         ):
-            return vector
+            return tree
 
         return _distributed_tree_map(
             lambda value: self.redistribute(value, "dtensor.tangent_placement"),
-            vector,
+            tree,
         )
 
     def before_output(self, output: TensorTree) -> TensorTree:
@@ -2506,7 +2506,6 @@ def distributed_operation_factory(
         runtime_batch = redistribution.before_forward_batch(batch)
         runtime_vector = redistribution.before_forward_vector(vector)
         runtime_vector = redistribution.before_backward_vector(runtime_vector)
-        runtime_vector = redistribution.between_operator_parts_vector(runtime_vector)
         standard_factory = standard_operation_factory(
             operator,
             params=runtime_params,
@@ -2516,6 +2515,7 @@ def distributed_operation_factory(
             function_objectives=function_objectives,
             module=distributed_model,
             module_call=module_call,
+            intermediate_transform=redistribution.between_operator_parts,
         )
         operation = standard_factory(
             _standard_candidate(candidate),

@@ -1514,7 +1514,7 @@ def test_distributed_redistribution_runs_before_forward_schedule() -> None:
     ("schedule", "method_name"),
     [
         ("before_backward", "before_backward_vector"),
-        ("between_operator_parts", "between_operator_parts_vector"),
+        ("between_operator_parts", "between_operator_parts"),
     ],
 )
 def test_distributed_redistribution_runs_vector_boundary_schedules(

@@ -531,6 +531,7 @@ ActivationPackHooks = Mapping[str, Callable[[torch.Tensor], Any]]
 ActivationUnpackHooks = Mapping[str, Callable[[Any], torch.Tensor]]
 CheckpointContextFns = Mapping[str, Callable[[], Any]]
 MMapResidency = Callable[[torch.Tensor, str], torch.Tensor]
+IntermediateTransform = Callable[[TensorTree], TensorTree]
 
 
 class _MemoryMappedTensorStore:
@@ -2679,6 +2680,7 @@ class StandardExecution:
         default_factory=dict
     )
     checkpoint_contexts: CheckpointContextFns = dataclasses.field(default_factory=dict)
+    intermediate_transform: IntermediateTransform | None = None
     compiled_inner: CandidateOperation | None = None
     compiled_scalar_function: Callable[[ParameterTree], torch.Tensor] | None = None
     compiled_score_matrix: Callable[[], torch.Tensor] | None = None
@@ -2722,6 +2724,7 @@ def standard_operation_factory(
     activation_pack_hooks: ActivationPackHooks | None = None,
     activation_unpack_hooks: ActivationUnpackHooks | None = None,
     checkpoint_contexts: CheckpointContextFns | None = None,
+    intermediate_transform: IntermediateTransform | None = None,
 ) -> OperationFactory:
     """Return an operation factory for package-owned standard operators."""
     scalar_map = {} if scalar_objectives is None else dict(scalar_objectives)
@@ -2809,6 +2812,7 @@ def standard_operation_factory(
             activation_pack_hooks=pack_hook_map,
             activation_unpack_hooks=unpack_hook_map,
             checkpoint_contexts=checkpoint_context_map,
+            intermediate_transform=intermediate_transform,
         )
         _require_stateful_module_execution(execution)
         execution = _loss_scaled_execution(execution)
@@ -5973,6 +5977,7 @@ def _run_ggnvp_vector_vmap(execution: StandardExecution) -> TensorTree:
         output_jvp = _runtime_intermediate_residency_tree(
             output_jvp,
             execution.candidate.settings,
+            execution.intermediate_transform,
         )
         output_cotangent = _ggn_loss_hessian_product_unchecked(
             execution,
@@ -5982,6 +5987,7 @@ def _run_ggnvp_vector_vmap(execution: StandardExecution) -> TensorTree:
         output_cotangent = _runtime_intermediate_residency_tree(
             output_cotangent,
             execution.candidate.settings,
+            execution.intermediate_transform,
         )
         (result,) = pullback(output_cotangent)
 
@@ -6021,6 +6027,7 @@ def _run_ggnvp_jvp_hessian_vjp(execution: StandardExecution) -> TensorTree:
     output_jvp = _runtime_intermediate_residency_tree(
         output_jvp,
         execution.candidate.settings,
+        execution.intermediate_transform,
     )
 
     if _ggn_recomputes_jvp(execution.candidate.settings):
@@ -6028,6 +6035,7 @@ def _run_ggnvp_jvp_hessian_vjp(execution: StandardExecution) -> TensorTree:
         output_jvp = _runtime_intermediate_residency_tree(
             output_jvp,
             execution.candidate.settings,
+            execution.intermediate_transform,
         )
 
     output_cotangent = _ggn_loss_hessian_product(
@@ -6038,6 +6046,7 @@ def _run_ggnvp_jvp_hessian_vjp(execution: StandardExecution) -> TensorTree:
     output_cotangent = _runtime_intermediate_residency_tree(
         output_cotangent,
         execution.candidate.settings,
+        execution.intermediate_transform,
     )
 
     if _ggn_recomputes_output_cotangent(execution.candidate.settings):
@@ -6049,6 +6058,7 @@ def _run_ggnvp_jvp_hessian_vjp(execution: StandardExecution) -> TensorTree:
         output_cotangent = _runtime_intermediate_residency_tree(
             output_cotangent,
             execution.candidate.settings,
+            execution.intermediate_transform,
         )
 
     _require_finite_tree(output_cotangent, "GGN output cotangent")
@@ -6079,6 +6089,7 @@ def _ggn_loss_product_warm_inputs(
     output_jvp = _runtime_intermediate_residency_tree(
         output_jvp,
         execution.candidate.settings,
+        execution.intermediate_transform,
     )
 
     return output, output_jvp
@@ -6092,6 +6103,7 @@ def _ggn_vjp_warm_input(execution: StandardExecution) -> TensorTree:
     return _runtime_intermediate_residency_tree(
         output_cotangent,
         execution.candidate.settings,
+        execution.intermediate_transform,
     )
 
 
@@ -12213,13 +12225,18 @@ def _runtime_intermediate_tree(
 def _runtime_intermediate_residency_tree(
     tree: TensorTree,
     settings: Mapping[str, Any],
+    intermediate_transform: IntermediateTransform | None = None,
 ) -> TensorTree:
     residency = settings.get("memory.intermediate_residency")
+    result = tree
 
-    if residency is None:
-        return tree
+    if residency is not None:
+        result = _tree_residency(tree, residency, "memory.intermediate_residency")
 
-    return _tree_residency(tree, residency, "memory.intermediate_residency")
+    if intermediate_transform is None:
+        return result
+
+    return intermediate_transform(result)
 
 
 def _runtime_intermediate_tensor(
