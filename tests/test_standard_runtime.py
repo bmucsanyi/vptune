@@ -10659,6 +10659,91 @@ def test_empirical_fisher_vmap_path_rejects_invalid_batch_shape() -> None:
         )()
 
 
+def test_per_example_schedule_rejects_non_batch_data_axis() -> None:
+    params = {"w": torch.tensor([0.4], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.7], dtype=torch.float64)}
+
+    def per_example_losses(
+        params: vp.ParameterTree,
+        buffers: vp.BufferTree,
+        batch: vp.Batch,
+        context: vp.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert params
+        assert buffers == {}
+        assert batch
+        assert context.family == "empirical"
+
+        return torch.tensor([1.0, 2.0], dtype=torch.float64)
+
+    operator = dataclasses.replace(
+        vp.empirical_fisher_vp(
+            "empirical",
+            "losses",
+            aggregation="mean_per_example",
+            example_loss_reduction="per_example",
+            denominator="num_examples",
+        ),
+        data_axis="sequence",
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+        function_objectives={"losses": per_example_losses},
+    )
+
+    with pytest.raises(vp.MaterializationError, match="data_axis=batch"):
+        factory(
+            vp.Candidate(
+                "empirical",
+                "vmap",
+                {
+                    **empirical_grad_settings("vmap_grad"),
+                    **empirical_per_example_vmap_settings(),
+                    **torch_func_settings(requires_forward_ad=False),
+                },
+                admission_status="passed",
+            ),
+            {
+                "x": torch.tensor([1.0, 2.0], dtype=torch.float64),
+                "normalization": 2.0,
+            },
+            vector,
+        )()
+
+
+def test_microbatch_accumulation_rejects_non_batch_data_axis() -> None:
+    params = {"w": torch.tensor([0.4], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.7], dtype=torch.float64)}
+    operator = dataclasses.replace(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        data_axis="sequence",
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+    )
+
+    with pytest.raises(vp.MaterializationError, match="data_axis=batch"):
+        factory(
+            vp.Candidate(
+                "gradient",
+                "microbatch",
+                {
+                    **gradient_settings(),
+                    "schedule.gradient_accumulation": "microbatch_accumulate",
+                    "batch.data_microbatch_size": 1,
+                },
+                admission_status="passed",
+            ),
+            {"scale": torch.tensor([1.0, 2.0], dtype=torch.float64)},
+            vector,
+        )()
+
+
 def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> None:
     params = {"w": torch.tensor([0.3, -0.2], dtype=torch.float64)}
     buffers = {}

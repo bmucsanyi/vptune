@@ -11539,6 +11539,7 @@ def _require_input_schedule_settings(
             message = "vmap_grad rows require schedule.per_example=vmap"
             raise MaterializationError(message)
     else:
+        _require_batch_data_axis(operator, "schedule.per_example")
         _require_per_example_schedule(path, per_example)
 
     _require_per_example_batch_size_settings(path, settings)
@@ -11590,6 +11591,11 @@ def _require_input_schedule_settings(
         )
         raise MaterializationError(message)
 
+    _require_batch_data_axis(
+        operator,
+        "schedule.gradient_accumulation=microbatch_accumulate",
+    )
+
     if (
         settings.get("compile.enabled") == "true"
         and settings.get("compile.boundary") == "loss_closure"
@@ -11598,6 +11604,14 @@ def _require_input_schedule_settings(
         raise MaterializationError(message)
 
     _data_microbatch_size(settings)
+
+
+def _require_batch_data_axis(operator: OperatorSpec, label: str) -> None:
+    if operator.data_axis == "batch":
+        return
+
+    message = f"{label} requires operator data_axis=batch"
+    raise MaterializationError(message)
 
 
 def _data_microbatch_size(settings: Mapping[str, Any]) -> int:
