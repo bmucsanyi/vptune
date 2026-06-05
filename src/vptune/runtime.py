@@ -4012,17 +4012,13 @@ def _compile_backend(settings: Mapping[str, Any]) -> str:
 
 
 def _is_registered_compile_backend(value: str) -> bool:
-    compiler = getattr(torch, "compiler", None)
+    try:
+        backends = torch.compiler.list_backends()
+    except AttributeError as error:
+        message = "torch.compiler.list_backends is required"
+        raise MaterializationError(message) from error
 
-    if compiler is None:
-        return False
-
-    list_backends = getattr(compiler, "list_backends", None)
-
-    if not callable(list_backends):
-        return False
-
-    return value in set(list_backends())
+    return value in set(backends)
 
 
 def _compile_mode(settings: Mapping[str, Any]) -> str | None:

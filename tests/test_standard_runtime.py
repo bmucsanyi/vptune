@@ -845,6 +845,15 @@ def test_compile_backend_accepts_concrete_registered_backend(
     )
 
 
+def test_compile_backend_requires_backend_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(runtime_module.torch.compiler, "list_backends")
+
+    with pytest.raises(vp.MaterializationError, match="list_backends"):
+        runtime_module._compile_backend({"compile.backend": "custom_backend"})
+
+
 @pytest.mark.parametrize(
     ("backend", "message"),
     [
