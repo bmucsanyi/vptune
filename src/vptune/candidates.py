@@ -1079,6 +1079,7 @@ def _axis_table_cross_rule_error(
         _sdpa_rule_error,
         _packing_rule_error,
         _activation_rule_error,
+        _declared_runtime_id_rule_error,
         _compile_rule_error,
         _reduction_bound_rule_error,
         _sampled_fisher_rule_error,
@@ -1161,6 +1162,31 @@ def _activation_rule_error(
         and fixed_fields.get("activation.saved_tensor_hooks_path") is not True
     ):
         return f"{offload} requires an executable saved-tensor-hooks path"
+
+    return None
+
+
+def _declared_runtime_id_rule_error(
+    settings: Mapping[str, Any],
+    fixed_fields: Mapping[str, Any],
+) -> str | None:
+    _ = fixed_fields
+
+    if settings.get("activation.offload") == "custom_saved_tensor_hooks":
+        pack_hook = settings.get("activation.pack_hook")
+        unpack_hook = settings.get("activation.unpack_hook")
+
+        if not isinstance(pack_hook, str) or not pack_hook:
+            return "activation.pack_hook must be a declared hook id"
+
+        if not isinstance(unpack_hook, str) or not unpack_hook:
+            return "activation.unpack_hook must be a declared hook id"
+
+    if settings.get("checkpoint.context_fn") == "declared_context_pair":
+        context_id = settings.get("checkpoint.context_fn_callable")
+
+        if not isinstance(context_id, str) or not context_id:
+            return "checkpoint.context_fn_callable must be a declared context id"
 
     return None
 
@@ -2121,6 +2147,40 @@ def _bool_axis(*keys: str) -> AdmissionRule:
         for key in keys:
             if not isinstance(candidate.settings[key], bool):
                 return False, f"candidate axis must be boolean: {key}"
+
+        return True, None
+
+    return admit
+
+
+def _activation_offload_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        if candidate.settings["activation.offload"] != "custom_saved_tensor_hooks":
+            return True, None
+
+        pack_hook = candidate.settings.get("activation.pack_hook")
+        unpack_hook = candidate.settings.get("activation.unpack_hook")
+
+        if not isinstance(pack_hook, str) or not pack_hook:
+            return False, "activation.pack_hook must be a declared hook id"
+
+        if not isinstance(unpack_hook, str) or not unpack_hook:
+            return False, "activation.unpack_hook must be a declared hook id"
+
+        return True, None
+
+    return admit
+
+
+def _checkpoint_context_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        if candidate.settings["checkpoint.context_fn"] != "declared_context_pair":
+            return True, None
+
+        context_id = candidate.settings.get("checkpoint.context_fn_callable")
+
+        if not isinstance(context_id, str) or not context_id:
+            return False, "checkpoint.context_fn_callable must be a declared context id"
 
         return True, None
 
@@ -3332,6 +3392,7 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("activation.offload",),
             ("none", "saved_tensor_hooks_cpu", "custom_saved_tensor_hooks"),
             optional_settings_keys=("activation.pack_hook", "activation.unpack_hook"),
+            admission_rule=_activation_offload_axis(),
         ),
         AxisDescriptor(
             "checkpoint.use_reentrant",
@@ -3362,6 +3423,7 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("checkpoint.context_fn",),
             ("none", "declared_context_pair"),
             optional_settings_keys=("checkpoint.context_fn_callable",),
+            admission_rule=_checkpoint_context_axis(),
         ),
         AxisDescriptor(
             "numeric.float32_matmul_precision",

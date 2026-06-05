@@ -754,69 +754,6 @@ def test_transformers_model_identity_requires_explicit_fields() -> None:
         )
 
 
-def test_transformers_cache_axis_admission_and_identity() -> None:
-    policy = transformers_policy(use_cache=False)
-    axis = vpa.transformers_cache_axis(policy=policy)
-
-    matching = vp.Candidate("family", "matching", {"use_cache": False})
-    mismatched = vp.Candidate("family", "mismatched", {"use_cache": True})
-    missing = vp.Candidate("family", "missing", {})
-
-    assert axis.admit(matching) == (True, None)
-    assert axis.admit(mismatched)[0] is False
-    assert axis.admit(missing)[0] is False
-    assert vpa.admit_transformers_cache(matching, policy=policy) == (True, None)
-    assert vpa.admit_transformers_cache(mismatched, policy=policy)[0] is False
-
-    signature = axis.signature()
-    assert signature["adapter_id"] == "vptune.transformers"
-    assert signature["adapter_version"] == PACKAGE_VERSION
-    assert signature["settings_keys"] == ("use_cache",)
-    assert signature["identity"]["use_cache"] is False
-
-
-def test_transformers_cache_axis_composes_with_attention_axis() -> None:
-    policy = transformers_policy(use_cache=True)
-    registry = vpx.AxisRegistry()
-    registry.register(
-        vpa.transformers_attention_axis(
-            ("transformers_sdpa",),
-            policy=policy,
-        )
-    )
-    registry.register(vpa.transformers_cache_axis(policy=policy))
-
-    admitted = registry.admit(
-        vp.Candidate(
-            "family",
-            "row",
-            {
-                "attention.frontend": "transformers_sdpa",
-                "attention.sdpa_kernel": "math",
-                "module_mode": "eval",
-                "dropout_p": 0.0,
-                "use_cache": True,
-            },
-        )
-    )
-    rejected = registry.admit(
-        vp.Candidate(
-            "family",
-            "row",
-            {
-                "attention.frontend": "transformers_sdpa",
-                "attention.sdpa_kernel": "math",
-                "module_mode": "eval",
-                "dropout_p": 0.0,
-                "use_cache": False,
-            },
-        )
-    )
-
-    assert admitted.admission_status == "passed"
-    assert rejected.admission_status == "failed"
-
-
 @pytest.mark.parametrize(
     "sdpa_kernel",
     [

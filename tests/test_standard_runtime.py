@@ -6314,33 +6314,50 @@ def test_standard_runtime_executes_metric_factor_residency_axis() -> None:
     )
 
 
-def test_standard_runtime_rejects_memory_mapped_residency_without_metadata() -> None:
+def test_standard_runtime_executes_default_memory_mapped_vector_residency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
+    load_mmap_values = []
+    original_load = torch.load
+
+    def recording_load(
+        f: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
+        load_mmap_values.append(kwargs.get("mmap"))
+
+        return original_load(f, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", recording_load)
     factory = vpx.standard_operation_factory(
         vp.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
+    result = factory(
+        vp.Candidate(
+            "hvp",
+            "vector-mmap",
+            {
+                "hvp.path": "reverse_over_reverse",
+                "memory.vector_residency": "mmap_cpu",
+            },
+            admission_status="passed",
+        ),
+        {"scale": 1.0},
+        vector,
+    )()
+    result_map = tensor_mapping(result)
 
-    with pytest.raises(vp.MaterializationError, match="memory-mapped tensor metadata"):
-        factory(
-            vp.Candidate(
-                "hvp",
-                "vector-mmap",
-                {
-                    "hvp.path": "reverse_over_reverse",
-                    "memory.vector_residency": "mmap_cpu",
-                },
-                admission_status="passed",
-            ),
-            {"scale": 1.0},
-            vector,
-        )
+    assert load_mmap_values == [True]
+    assert torch.equal(result_map["w"], torch.tensor([6.0], dtype=torch.float64))
 
 
-def test_standard_runtime_executes_memory_mapped_vector_residency() -> None:
+def test_standard_runtime_executes_custom_memory_mapped_vector_residency() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     calls = []
@@ -6376,17 +6393,25 @@ def test_standard_runtime_executes_memory_mapped_vector_residency() -> None:
     assert torch.equal(result_map["w"], torch.tensor([6.0], dtype=torch.float64))
 
 
-def test_standard_runtime_executes_memory_mapped_factor_residency() -> None:
+def test_standard_runtime_executes_default_memory_mapped_factor_residency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = LowRankMetricData.factors()
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    calls = []
+    load_mmap_values = []
+    original_load = torch.load
 
-    def mmap_residency(tensor: torch.Tensor, key: str) -> torch.Tensor:
-        calls.append((key, tuple(tensor.shape)))
+    def recording_load(
+        f: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
+        load_mmap_values.append(kwargs.get("mmap"))
 
-        return tensor.detach().clone()
+        return original_load(f, *args, **kwargs)
 
+    monkeypatch.setattr(torch, "load", recording_load)
     operator = vp.metric(
         "metric",
         "low_rank",
@@ -6397,7 +6422,6 @@ def test_standard_runtime_executes_memory_mapped_factor_residency() -> None:
         operator,
         params=params,
         buffers={},
-        mmap_residency=mmap_residency,
     )
     result = factory(
         vp.Candidate(
@@ -6414,10 +6438,7 @@ def test_standard_runtime_executes_memory_mapped_factor_residency() -> None:
     )()
     result_tensor = tree_leaves(result)[0]
 
-    assert calls == [
-        ("memory.factor_residency", (2, 1)),
-        ("memory.factor_residency", (2,)),
-    ]
+    assert load_mmap_values == [True, True]
     assert torch.allclose(
         result_tensor,
         torch.tensor([-0.25, -6.25], dtype=torch.float64),
@@ -6872,7 +6893,22 @@ def test_standard_runtime_rejects_fused_rows_without_registered_implementation(
         )
 
 
-def test_standard_runtime_executes_fused_row_with_registered_rewriter() -> None:
+@pytest.mark.parametrize(
+    ("setting_key", "setting_value"),
+    [
+        ("fusion.norm", "fused_rmsnorm"),
+        ("fusion.norm", "fused_layernorm"),
+        ("fusion.mlp", "fused_mlp"),
+        ("fusion.rope", "fused_rope"),
+        ("fusion.logits", "fused_logits_projection"),
+        ("fusion.loss", "fused_ce"),
+        ("fusion.loss", "fused_kl"),
+    ],
+)
+def test_standard_runtime_executes_fused_row_with_registered_rewriter(
+    setting_key: str,
+    setting_value: str,
+) -> None:
     events = []
 
     class FusibleModule(torch.nn.Module):
@@ -6890,7 +6926,7 @@ def test_standard_runtime_executes_fused_row_with_registered_rewriter() -> None:
         module: torch.nn.Module,
         candidate: vp.Candidate,
     ) -> torch.nn.Module:
-        events.append(candidate.settings["fusion.norm"])
+        events.append(candidate.settings[setting_key])
         assert isinstance(module, FusibleModule)
         fused = FusibleModule()
         fused.fused = True
@@ -6913,7 +6949,7 @@ def test_standard_runtime_executes_fused_row_with_registered_rewriter() -> None:
             {
                 **gradient_settings(),
                 **stateful_module_call_settings(),
-                "fusion.norm": "fused_layernorm",
+                setting_key: setting_value,
             },
             admission_status="passed",
         ),
@@ -6922,7 +6958,7 @@ def test_standard_runtime_executes_fused_row_with_registered_rewriter() -> None:
     )()
     result_map = tensor_mapping(result)
 
-    assert events == ["fused_layernorm", "fused"]
+    assert events == [setting_value, "fused"]
     torch.testing.assert_close(
         result_map["w"], torch.tensor([4.0], dtype=torch.float64)
     )
@@ -13281,7 +13317,15 @@ def test_standard_runtime_uses_checkpoint_operation_for_activation_recompute(
         args: Sequence[object],
         *,
         policy_key: str,
+        activation_pack_hooks: Mapping[str, Callable[[torch.Tensor], object]]
+        | None = None,
+        activation_unpack_hooks: Mapping[str, Callable[[object], torch.Tensor]]
+        | None = None,
+        checkpoint_contexts: Mapping[str, Callable[[], object]] | None = None,
     ) -> vpx.CandidateOperation:
+        assert activation_pack_hooks == {}
+        assert activation_unpack_hooks == {}
+        assert checkpoint_contexts == {}
         calls.append({
             "policy_key": policy_key,
             "recompute": candidate.settings["activation.recompute"],
@@ -13369,7 +13413,15 @@ def test_standard_runtime_executes_selective_checkpoint_with_context_pair(
         args: Sequence[object],
         *,
         policy_key: str,
+        activation_pack_hooks: Mapping[str, Callable[[torch.Tensor], object]]
+        | None = None,
+        activation_unpack_hooks: Mapping[str, Callable[[object], torch.Tensor]]
+        | None = None,
+        checkpoint_contexts: Mapping[str, Callable[[], object]] | None = None,
     ) -> vpx.CandidateOperation:
+        assert activation_pack_hooks == {}
+        assert activation_unpack_hooks == {}
+        assert checkpoint_contexts == {"selective": context_fn}
         calls.append({
             "policy_key": policy_key,
             "recompute": candidate.settings["activation.recompute"],
@@ -13393,6 +13445,7 @@ def test_standard_runtime_executes_selective_checkpoint_with_context_pair(
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
+        checkpoint_contexts={"selective": context_fn},
     )
     result = factory(
         vp.Candidate(
@@ -13403,7 +13456,7 @@ def test_standard_runtime_executes_selective_checkpoint_with_context_pair(
                 **standard_checkpoint_settings(),
                 "activation.recompute": "checkpoint_selective",
                 "checkpoint.context_fn": "declared_context_pair",
-                "checkpoint.context_fn_callable": context_fn,
+                "checkpoint.context_fn_callable": "selective",
             },
             admission_status="passed",
         ),
@@ -13417,19 +13470,22 @@ def test_standard_runtime_executes_selective_checkpoint_with_context_pair(
             "policy_key": "activation.recompute",
             "recompute": "checkpoint_selective",
             "context_fn": "declared_context_pair",
-            "context_callable": context_fn,
+            "context_callable": "selective",
             "arg_count": 2,
         }
     ]
     assert torch.equal(result_map["w"], torch.tensor([4.0], dtype=torch.float64))
 
 
-def test_standard_runtime_rejects_manual_recompute_without_region_metadata() -> None:
+def test_standard_runtime_executes_package_owned_manual_recompute() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     settings = {
         **standard_checkpoint_settings(),
         "activation.recompute": "manual_recompute",
+        "checkpoint.early_stop": "false",
+        "checkpoint.preserve_rng_state": "false",
+        "checkpoint.determinism_check": "none",
     }
     factory = vpx.standard_operation_factory(
         vp.gradient("gradient", "loss", aggregation="sum"),
@@ -13437,21 +13493,22 @@ def test_standard_runtime_rejects_manual_recompute_without_region_metadata() -> 
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
+    result = factory(
+        vp.Candidate(
+            "gradient",
+            "manual-recompute",
+            {**gradient_settings(), **settings},
+            admission_status="passed",
+        ),
+        {"scale": 1.0},
+        vector,
+    )()
+    result_map = tensor_mapping(result)
 
-    with pytest.raises(vp.MaterializationError, match="recompute-region metadata"):
-        factory(
-            vp.Candidate(
-                "gradient",
-                "manual-recompute",
-                {**gradient_settings(), **settings},
-                admission_status="passed",
-            ),
-            {"scale": 1.0},
-            vector,
-        )
+    assert torch.equal(result_map["w"], torch.tensor([4.0], dtype=torch.float64))
 
 
-def test_standard_runtime_executes_manual_recompute_callback() -> None:
+def test_standard_runtime_executes_manual_recompute_callback_override() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     calls = []
@@ -13501,6 +13558,55 @@ def test_standard_runtime_executes_manual_recompute_callback() -> None:
     assert torch.equal(result_map["w"], torch.tensor([4.0], dtype=torch.float64))
 
 
+def test_manual_recompute_executes_custom_saved_tensor_hooks() -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64, requires_grad=True)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+    events = []
+
+    def pack_hook(tensor: torch.Tensor) -> torch.Tensor:
+        events.append("pack")
+
+        return tensor.detach().clone()
+
+    def unpack_hook(tensor: torch.Tensor) -> torch.Tensor:
+        events.append("unpack")
+
+        return tensor
+
+    settings = {
+        **standard_checkpoint_settings(),
+        "activation.recompute": "manual_recompute",
+        "activation.offload": "custom_saved_tensor_hooks",
+        "activation.pack_hook": "recording",
+        "activation.unpack_hook": "recording",
+        "checkpoint.early_stop": "false",
+        "checkpoint.preserve_rng_state": "false",
+        "checkpoint.determinism_check": "none",
+    }
+    factory = vpx.standard_operation_factory(
+        vp.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+        activation_pack_hooks={"recording": pack_hook},
+        activation_unpack_hooks={"recording": unpack_hook},
+    )
+    result = factory(
+        vp.Candidate(
+            "gradient",
+            "manual-offload",
+            {**gradient_settings(), **settings},
+            admission_status="passed",
+        ),
+        {"scale": 1.0},
+        vector,
+    )()
+    result_map = tensor_mapping(result)
+
+    assert events == ["pack", "unpack"]
+    assert torch.equal(result_map["w"], torch.tensor([4.0], dtype=torch.float64))
+
+
 def test_standard_runtime_executes_custom_saved_tensor_hooks() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64, requires_grad=True)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
@@ -13521,6 +13627,8 @@ def test_standard_runtime_executes_custom_saved_tensor_hooks() -> None:
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
+        activation_pack_hooks={"recording": pack_hook},
+        activation_unpack_hooks={"recording": unpack_hook},
     )
     result = factory(
         vp.Candidate(
@@ -13530,8 +13638,8 @@ def test_standard_runtime_executes_custom_saved_tensor_hooks() -> None:
                 **gradient_settings(),
                 "activation.recompute": "none",
                 "activation.offload": "custom_saved_tensor_hooks",
-                "activation.pack_hook": pack_hook,
-                "activation.unpack_hook": unpack_hook,
+                "activation.pack_hook": "recording",
+                "activation.unpack_hook": "recording",
             },
             admission_status="passed",
         ),
@@ -13630,6 +13738,8 @@ def test_reference_check_rejects_custom_saved_tensor_hooks_that_change_values() 
             "directional_rel_diff": 1e-12,
         },
         scalar_objectives={"loss": quadratic_scalar},
+        activation_pack_hooks={"zero": pack_hook},
+        activation_unpack_hooks={"zero": unpack_hook},
     )
 
     with pytest.raises(vp.ReferenceFailedError):
@@ -13641,8 +13751,8 @@ def test_reference_check_rejects_custom_saved_tensor_hooks_that_change_values() 
                     **gradient_settings(),
                     "activation.recompute": "none",
                     "activation.offload": "custom_saved_tensor_hooks",
-                    "activation.pack_hook": pack_hook,
-                    "activation.unpack_hook": unpack_hook,
+                    "activation.pack_hook": "zero",
+                    "activation.unpack_hook": "zero",
                 },
                 admission_status="passed",
             ),
@@ -13671,6 +13781,8 @@ def test_activation_offload_preserves_higher_order_hvp() -> None:
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
+        activation_pack_hooks={"recording": pack_hook},
+        activation_unpack_hooks={"recording": unpack_hook},
     )
     result = factory(
         vp.Candidate(
@@ -13680,8 +13792,8 @@ def test_activation_offload_preserves_higher_order_hvp() -> None:
                 **hvp_settings("reverse_over_reverse"),
                 "activation.recompute": "none",
                 "activation.offload": "custom_saved_tensor_hooks",
-                "activation.pack_hook": pack_hook,
-                "activation.unpack_hook": unpack_hook,
+                "activation.pack_hook": "recording",
+                "activation.unpack_hook": "recording",
             },
             admission_status="passed",
         ),
@@ -13719,6 +13831,8 @@ def test_higher_order_reference_rejects_custom_hooks_that_change_values() -> Non
             "directional_rel_diff": 1e-12,
         },
         scalar_objectives={"loss": quadratic_scalar},
+        activation_pack_hooks={"zero": pack_hook},
+        activation_unpack_hooks={"zero": unpack_hook},
     )
 
     with pytest.raises(vp.ReferenceFailedError):
@@ -13730,8 +13844,8 @@ def test_higher_order_reference_rejects_custom_hooks_that_change_values() -> Non
                     **hvp_settings("reverse_over_reverse"),
                     "activation.recompute": "none",
                     "activation.offload": "custom_saved_tensor_hooks",
-                    "activation.pack_hook": pack_hook,
-                    "activation.unpack_hook": unpack_hook,
+                    "activation.pack_hook": "zero",
+                    "activation.unpack_hook": "zero",
                 },
                 admission_status="passed",
             ),

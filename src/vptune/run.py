@@ -450,7 +450,8 @@ def _runtime_binding_admission_error(
         _lm_head_binding_error(settings, runtime_signature),
         _mmap_binding_error(settings, runtime_signature),
         _intermediate_residency_binding_error(settings, runtime_signature),
-        _manual_recompute_binding_error(settings, runtime_signature),
+        _activation_hook_binding_error(settings, runtime_signature),
+        _checkpoint_context_binding_error(settings, runtime_signature),
         _teacher_objective_binding_error(settings, runtime_signature),
         _module_call_binding_error(settings, runtime_signature),
     ))
@@ -600,15 +601,50 @@ def _intermediate_residency_binding_error(
     return "memory.intermediate_residency requires named intermediate boundaries"
 
 
-def _manual_recompute_binding_error(
+def _activation_hook_binding_error(
     settings: Mapping[str, Any],
     runtime_signature: Mapping[str, Any],
 ) -> str | None:
+    if settings.get("activation.offload") != "custom_saved_tensor_hooks":
+        return None
+
+    pack_hook_id = settings.get("activation.pack_hook")
+    unpack_hook_id = settings.get("activation.unpack_hook")
+
+    if not isinstance(pack_hook_id, str) or not isinstance(unpack_hook_id, str):
+        return "custom_saved_tensor_hooks requires activation pack and unpack hooks"
+
+    pack_hooks = runtime_signature.get("activation_pack_hooks")
+    unpack_hooks = runtime_signature.get("activation_unpack_hooks")
+
+    if not isinstance(pack_hooks, tuple) or pack_hook_id not in pack_hooks:
+        return f"activation pack hook is not registered: {pack_hook_id}"
+
+    if not isinstance(unpack_hooks, tuple) or unpack_hook_id not in unpack_hooks:
+        return f"activation unpack hook is not registered: {unpack_hook_id}"
+
+    return None
+
+
+def _checkpoint_context_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    if settings.get("checkpoint.context_fn") != "declared_context_pair":
+        return None
+
+    context_id = settings.get("checkpoint.context_fn_callable")
+
+    if not isinstance(context_id, str):
+        return "checkpoint.context_fn=declared_context_pair requires context id"
+
+    checkpoint_contexts = runtime_signature.get("checkpoint_contexts")
+
     if (
-        settings.get("activation.recompute") == "manual_recompute"
-        and runtime_signature.get("manual_recompute") is not True
+        not isinstance(checkpoint_contexts, tuple)
+        or context_id not in checkpoint_contexts
     ):
-        return "manual_recompute requires recompute-region metadata"
+        return f"checkpoint context is not registered: {context_id}"
 
     return None
 

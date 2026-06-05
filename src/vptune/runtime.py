@@ -3,8 +3,10 @@
 import dataclasses
 import importlib
 import math
+import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from itertools import starmap
+from pathlib import Path
 from typing import Any, TypeGuard
 
 import torch
@@ -525,6 +527,49 @@ ACTIVE_CHECKPOINT_SETTINGS = (
     "checkpoint_non_reentrant_by_layer",
     "checkpoint_selective",
 )
+ActivationPackHooks = Mapping[str, Callable[[torch.Tensor], Any]]
+ActivationUnpackHooks = Mapping[str, Callable[[Any], torch.Tensor]]
+CheckpointContextFns = Mapping[str, Callable[[], Any]]
+MMapResidency = Callable[[torch.Tensor, str], torch.Tensor]
+
+
+class _MemoryMappedTensorStore:
+    """CPU tensor residency backed by PyTorch memory-mapped loads."""
+
+    def __init__(self) -> None:
+        self._directory = tempfile.TemporaryDirectory(prefix="vptune-mmap-")
+        self._counter = 0
+
+    def materialize(self, tensor: torch.Tensor, key: str) -> torch.Tensor:
+        """Return a CPU tensor loaded through PyTorch mmap.
+
+        Raises:
+            MaterializationError: If the mapped file does not load a tensor.
+        """
+        self._counter += 1
+        path = Path(self._directory.name) / f"{_mmap_file_stem(key)}-{self._counter}.pt"
+        cpu_tensor = tensor.detach().to(device=torch.device("cpu")).contiguous()
+        torch.save(cpu_tensor, path)
+        loaded = torch.load(path, mmap=True, weights_only=True)
+
+        if not isinstance(loaded, torch.Tensor):
+            message = f"{key}=mmap_cpu loaded a non-tensor value"
+            raise MaterializationError(message)
+
+        return loaded
+
+
+def _mmap_file_stem(key: str) -> str:
+    return key.replace(".", "_")
+
+
+def _standard_mmap_residency(mmap_residency: MMapResidency | None) -> MMapResidency:
+    if mmap_residency is not None:
+        return mmap_residency
+
+    store = _MemoryMappedTensorStore()
+
+    return store.materialize
 
 
 def _is_tensor_tree_dict(value: TensorTree) -> TypeGuard[dict[str, TensorTree]]:
@@ -541,6 +586,9 @@ def checkpoint_operation(
     args: Sequence[Any],
     *,
     policy_key: str,
+    activation_pack_hooks: ActivationPackHooks | None = None,
+    activation_unpack_hooks: ActivationUnpackHooks | None = None,
+    checkpoint_contexts: CheckpointContextFns | None = None,
 ) -> CandidateOperation:
     """Return direct or checkpointed execution for an adapter operation.
 
@@ -555,6 +603,8 @@ def checkpoint_operation(
             candidate,
             _direct_operation(function, args),
             offload,
+            activation_pack_hooks,
+            activation_unpack_hooks,
         )
 
     if setting not in ACTIVE_CHECKPOINT_SETTINGS:
@@ -562,7 +612,7 @@ def checkpoint_operation(
         raise AdmissionError(message)
 
     admit_checkpoint(candidate.settings)
-    context_fn = _checkpoint_context_fn(candidate)
+    context_fn = _checkpoint_context_fn(candidate, checkpoint_contexts)
 
     def operation() -> TensorTree:
         return checkpoint(
@@ -578,7 +628,13 @@ def checkpoint_operation(
             early_stop=_checkpoint_bool(candidate, "checkpoint.early_stop"),
         )
 
-    return _with_activation_offload(candidate, operation, offload)
+    return _with_activation_offload(
+        candidate,
+        operation,
+        offload,
+        activation_pack_hooks,
+        activation_unpack_hooks,
+    )
 
 
 def _checkpoint_setting(candidate: Candidate, policy_key: str) -> str:
@@ -609,11 +665,18 @@ def _with_activation_offload(
     candidate: Candidate,
     operation: CandidateOperation,
     offload: str,
+    activation_pack_hooks: ActivationPackHooks | None,
+    activation_unpack_hooks: ActivationUnpackHooks | None,
 ) -> CandidateOperation:
     if offload == "none":
         return operation
 
-    pack_hook, unpack_hook = _saved_tensor_hooks(candidate, offload)
+    pack_hook, unpack_hook = _saved_tensor_hooks(
+        candidate,
+        offload,
+        activation_pack_hooks,
+        activation_unpack_hooks,
+    )
 
     def wrapped() -> TensorTree:
         with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
@@ -635,18 +698,28 @@ def _activation_offload(candidate: Candidate) -> str:
 def _saved_tensor_hooks(
     candidate: Candidate,
     offload: str,
+    activation_pack_hooks: ActivationPackHooks | None,
+    activation_unpack_hooks: ActivationUnpackHooks | None,
 ) -> tuple[Callable[[torch.Tensor], Any], Callable[[Any], torch.Tensor]]:
     if offload == "saved_tensor_hooks_cpu":
         return _cpu_pack_hook, _cpu_unpack_hook
 
-    pack_hook = candidate.settings.get("activation.pack_hook")
-    unpack_hook = candidate.settings.get("activation.unpack_hook")
+    pack_hook_id = candidate.settings.get("activation.pack_hook")
+    unpack_hook_id = candidate.settings.get("activation.unpack_hook")
 
-    if not callable(pack_hook) or not callable(unpack_hook):
+    if not isinstance(pack_hook_id, str) or not isinstance(unpack_hook_id, str):
         message = "custom_saved_tensor_hooks requires activation pack and unpack hooks"
         raise AdmissionError(message)
 
-    return pack_hook, unpack_hook
+    if activation_pack_hooks is None or pack_hook_id not in activation_pack_hooks:
+        message = f"activation pack hook is not registered: {pack_hook_id}"
+        raise AdmissionError(message)
+
+    if activation_unpack_hooks is None or unpack_hook_id not in activation_unpack_hooks:
+        message = f"activation unpack hook is not registered: {unpack_hook_id}"
+        raise AdmissionError(message)
+
+    return activation_pack_hooks[pack_hook_id], activation_unpack_hooks[unpack_hook_id]
 
 
 def _cpu_pack_hook(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.device]:
@@ -659,19 +732,26 @@ def _cpu_unpack_hook(packed: tuple[torch.Tensor, torch.device]) -> torch.Tensor:
     return tensor.to(device)
 
 
-def _checkpoint_context_fn(candidate: Candidate) -> Callable[[], Any]:
+def _checkpoint_context_fn(
+    candidate: Candidate,
+    checkpoint_contexts: CheckpointContextFns | None,
+) -> Callable[[], Any]:
     context_fn = candidate.settings["checkpoint.context_fn"]
 
     if context_fn == "none":
         return noop_context_fn
 
-    callable_context_fn = candidate.settings.get("checkpoint.context_fn_callable")
+    context_id = candidate.settings.get("checkpoint.context_fn_callable")
 
-    if not callable(callable_context_fn):
-        message = "checkpoint.context_fn=declared_context_pair requires callable"
+    if not isinstance(context_id, str):
+        message = "checkpoint.context_fn=declared_context_pair requires context id"
         raise AdmissionError(message)
 
-    return callable_context_fn
+    if checkpoint_contexts is None or context_id not in checkpoint_contexts:
+        message = f"checkpoint context is not registered: {context_id}"
+        raise AdmissionError(message)
+
+    return checkpoint_contexts[context_id]
 
 
 def _checkpoint_bool(candidate: Candidate, key: str) -> bool:
@@ -2594,6 +2674,11 @@ class StandardExecution:
         ]
         | None
     ) = None
+    activation_pack_hooks: ActivationPackHooks = dataclasses.field(default_factory=dict)
+    activation_unpack_hooks: ActivationUnpackHooks = dataclasses.field(
+        default_factory=dict
+    )
+    checkpoint_contexts: CheckpointContextFns = dataclasses.field(default_factory=dict)
     compiled_inner: CandidateOperation | None = None
     compiled_scalar_function: Callable[[ParameterTree], torch.Tensor] | None = None
     compiled_score_matrix: Callable[[], torch.Tensor] | None = None
@@ -2634,10 +2719,21 @@ def standard_operation_factory(
         ]
         | None
     ) = None,
+    activation_pack_hooks: ActivationPackHooks | None = None,
+    activation_unpack_hooks: ActivationUnpackHooks | None = None,
+    checkpoint_contexts: CheckpointContextFns | None = None,
 ) -> OperationFactory:
     """Return an operation factory for package-owned standard operators."""
     scalar_map = {} if scalar_objectives is None else dict(scalar_objectives)
     function_map = {} if function_objectives is None else dict(function_objectives)
+    pack_hook_map = {} if activation_pack_hooks is None else dict(activation_pack_hooks)
+    unpack_hook_map = (
+        {} if activation_unpack_hooks is None else dict(activation_unpack_hooks)
+    )
+    checkpoint_context_map = (
+        {} if checkpoint_contexts is None else dict(checkpoint_contexts)
+    )
+    mmap_residency_callback = _standard_mmap_residency(mmap_residency)
 
     def factory(
         candidate: Candidate,
@@ -2649,12 +2745,14 @@ def standard_operation_factory(
             operator,
             candidate,
             parameter_surface,
-            manual_recompute,
-            mmap_residency,
+            mmap_residency_callback,
             fusion_rewriter,
             batch_layout,
             lm_head_chunker,
             intermediate_residency,
+            pack_hook_map,
+            unpack_hook_map,
+            checkpoint_context_map,
         )
         _require_recomputed_teacher_objective(candidate.settings, teacher_objective)
         runtime_module = _runtime_fusion_module(module, candidate, fusion_rewriter)
@@ -2674,14 +2772,14 @@ def standard_operation_factory(
             move_input_residency=_move_input_residency_outside_measured_call(
                 candidate.settings
             ),
-            mmap_residency=mmap_residency,
+            mmap_residency=mmap_residency_callback,
         )
         runtime_vector = _runtime_vector(
             vector,
             candidate.settings,
             runtime_params,
             parameter_surface,
-            mmap_residency=mmap_residency,
+            mmap_residency=mmap_residency_callback,
         )
         context = ObjectiveContext(
             family=operator.family,
@@ -2706,8 +2804,11 @@ def standard_operation_factory(
             batch_layout=batch_layout,
             lm_head_chunker=lm_head_chunker,
             intermediate_residency=intermediate_residency,
-            mmap_residency=mmap_residency,
+            mmap_residency=mmap_residency_callback,
             manual_recompute=manual_recompute,
+            activation_pack_hooks=pack_hook_map,
+            activation_unpack_hooks=unpack_hook_map,
+            checkpoint_contexts=checkpoint_context_map,
         )
         _require_stateful_module_execution(execution)
         execution = _loss_scaled_execution(execution)
@@ -3068,14 +3169,21 @@ def _activation_operation(
         return operation
 
     if settings.get("activation.recompute") == "manual_recompute":
-        if execution.manual_recompute is None:
-            message = "manual_recompute requires recompute-region metadata"
-            raise MaterializationError(message)
+        recomputed_operation = _manual_recompute_operation(operation)
 
-        return execution.manual_recompute(
+        if execution.manual_recompute is not None:
+            recomputed_operation = execution.manual_recompute(
+                execution.candidate,
+                operation,
+                _activation_tensor_args(execution),
+            )
+
+        return _with_activation_offload(
             execution.candidate,
-            operation,
-            _activation_tensor_args(execution),
+            recomputed_operation,
+            _activation_offload(execution.candidate),
+            execution.activation_pack_hooks,
+            execution.activation_unpack_hooks,
         )
 
     def function(*_: torch.Tensor) -> TensorTree:
@@ -3087,9 +3195,19 @@ def _activation_operation(
             function,
             _activation_tensor_args(execution),
             policy_key="activation.recompute",
+            activation_pack_hooks=execution.activation_pack_hooks,
+            activation_unpack_hooks=execution.activation_unpack_hooks,
+            checkpoint_contexts=execution.checkpoint_contexts,
         )
     except AdmissionError as error:
         raise MaterializationError(str(error)) from error
+
+
+def _manual_recompute_operation(operation: CandidateOperation) -> CandidateOperation:
+    def recomputed_operation() -> TensorTree:
+        return operation()
+
+    return recomputed_operation
 
 
 def _intermediate_residency_operation(
@@ -3739,6 +3857,9 @@ def standard_reference_check(
         ]
         | None
     ) = None,
+    activation_pack_hooks: ActivationPackHooks | None = None,
+    activation_unpack_hooks: ActivationUnpackHooks | None = None,
+    checkpoint_contexts: CheckpointContextFns | None = None,
 ) -> ReferenceCheck:
     """Return a reference check backed by package-owned anchors.
 
@@ -3768,6 +3889,9 @@ def standard_reference_check(
         fusion_rewriter=fusion_rewriter,
         mmap_residency=mmap_residency,
         manual_recompute=manual_recompute,
+        activation_pack_hooks=activation_pack_hooks,
+        activation_unpack_hooks=activation_unpack_hooks,
+        checkpoint_contexts=checkpoint_contexts,
     )
 
     def check(
@@ -4165,9 +4289,13 @@ def standard_runtime_config(
         ]
         | None
     ) = None,
+    activation_pack_hooks: ActivationPackHooks | None = None,
+    activation_unpack_hooks: ActivationUnpackHooks | None = None,
+    checkpoint_contexts: CheckpointContextFns | None = None,
 ) -> RuntimeConfig:
     """Return runtime config for package-owned standard operators."""
     bound_fields = {} if numeric_bound_fields is None else dict(numeric_bound_fields)
+    mmap_residency_callback = _standard_mmap_residency(mmap_residency)
     operation_factory = standard_operation_factory(
         operator,
         params=params,
@@ -4182,8 +4310,11 @@ def standard_runtime_config(
         lm_head_chunker=lm_head_chunker,
         intermediate_residency=intermediate_residency,
         fusion_rewriter=fusion_rewriter,
-        mmap_residency=mmap_residency,
+        mmap_residency=mmap_residency_callback,
         manual_recompute=manual_recompute,
+        activation_pack_hooks=activation_pack_hooks,
+        activation_unpack_hooks=activation_unpack_hooks,
+        checkpoint_contexts=checkpoint_contexts,
     )
     reference_check = standard_reference_check(
         operator,
@@ -4201,10 +4332,17 @@ def standard_runtime_config(
         lm_head_chunker=lm_head_chunker,
         intermediate_residency=intermediate_residency,
         fusion_rewriter=fusion_rewriter,
-        mmap_residency=mmap_residency,
+        mmap_residency=mmap_residency_callback,
         manual_recompute=manual_recompute,
+        activation_pack_hooks=activation_pack_hooks,
+        activation_unpack_hooks=activation_unpack_hooks,
+        checkpoint_contexts=checkpoint_contexts,
     )
-    materializer = _standard_materializer(operation_factory, operator, mmap_residency)
+    materializer = _standard_materializer(
+        operation_factory,
+        operator,
+        mmap_residency_callback,
+    )
 
     return RuntimeConfig(
         candidates=tuple(candidates),
@@ -4230,8 +4368,19 @@ def standard_runtime_config(
             "lm_head_chunker": lm_head_chunker is not None,
             "intermediate_residency": intermediate_residency is not None,
             "fusion_rewriter": fusion_rewriter is not None,
-            "mmap_residency": mmap_residency is not None,
+            "mmap_residency": True,
             "manual_recompute": manual_recompute is not None,
+            "activation_pack_hooks": tuple(
+                sorted(() if activation_pack_hooks is None else activation_pack_hooks)
+            ),
+            "activation_unpack_hooks": tuple(
+                sorted(
+                    () if activation_unpack_hooks is None else activation_unpack_hooks
+                )
+            ),
+            "checkpoint_contexts": tuple(
+                sorted(() if checkpoint_contexts is None else checkpoint_contexts)
+            ),
         },
     )
 
@@ -10036,6 +10185,8 @@ def _standard_materializer(
     operator: OperatorSpec | None = None,
     mmap_residency: Callable[[torch.Tensor, str], torch.Tensor] | None = None,
 ) -> Materializer:
+    mmap_residency_callback = _standard_mmap_residency(mmap_residency)
+
     def callback(candidate: Candidate, record: FullSizeRecord) -> Any:
         if (
             record.family != candidate.family
@@ -10049,7 +10200,7 @@ def _standard_materializer(
                 candidate,
                 record,
                 _metric_representation(operator),
-                mmap_residency=mmap_residency,
+                mmap_residency=mmap_residency_callback,
             )
 
         if operator is not None and operator.kind == "inverse_metric":
@@ -10060,7 +10211,7 @@ def _standard_materializer(
                 default_operation="inverse_multiply",
                 damping=_inverse_metric_damping(operator),
                 inverse_path=_runtime_path(operator, candidate),
-                mmap_residency=mmap_residency,
+                mmap_residency=mmap_residency_callback,
             )
 
         def selected(batch: Batch, vector: TensorTree) -> TensorTree:
@@ -10320,13 +10471,6 @@ def _require_supported_standard_settings(
     operator: OperatorSpec,
     candidate: Candidate,
     parameter_surface: ParameterSurface | None = None,
-    manual_recompute: (
-        Callable[
-            [Candidate, CandidateOperation, tuple[torch.Tensor, ...]],
-            CandidateOperation,
-        ]
-        | None
-    ) = None,
     mmap_residency: Callable[[torch.Tensor, str], torch.Tensor] | None = None,
     fusion_rewriter: (
         Callable[[torch.nn.Module, Candidate], torch.nn.Module] | None
@@ -10336,6 +10480,9 @@ def _require_supported_standard_settings(
     intermediate_residency: (
         Callable[[Candidate, CandidateOperation], CandidateOperation] | None
     ) = None,
+    activation_pack_hooks: ActivationPackHooks | None = None,
+    activation_unpack_hooks: ActivationUnpackHooks | None = None,
+    checkpoint_contexts: CheckpointContextFns | None = None,
 ) -> None:
     unsupported = tuple(
         key for key in candidate.settings if key not in SUPPORTED_STANDARD_SETTINGS
@@ -10377,7 +10524,12 @@ def _require_supported_standard_settings(
     _require_hvp_reuse_settings(operator, path, candidate.settings)
     _require_hvp_row_batch_size_settings(operator, path, candidate.settings)
     _require_vectorization_mode_settings(operator.kind, path, candidate.settings)
-    _require_activation_runtime_settings(candidate.settings, manual_recompute)
+    _require_activation_runtime_settings(
+        candidate.settings,
+        activation_pack_hooks,
+        activation_unpack_hooks,
+        checkpoint_contexts,
+    )
     _require_vectorization_setting_keys(operator.kind, path, candidate.settings)
     _require_transform_admission_settings(operator, path, candidate.settings)
     _require_gradient_value_reuse_settings(operator, path, candidate.settings)
@@ -11525,13 +11677,9 @@ def _has_fused_setting(settings: Mapping[str, Any]) -> bool:
 
 def _require_activation_runtime_settings(
     settings: Mapping[str, Any],
-    manual_recompute: (
-        Callable[
-            [Candidate, CandidateOperation, tuple[torch.Tensor, ...]],
-            CandidateOperation,
-        ]
-        | None
-    ),
+    activation_pack_hooks: ActivationPackHooks | None,
+    activation_unpack_hooks: ActivationUnpackHooks | None,
+    checkpoint_contexts: CheckpointContextFns | None,
 ) -> None:
     if not _has_activation_settings(settings):
         return
@@ -11563,24 +11711,25 @@ def _require_activation_runtime_settings(
 
     if recompute in {"checkpoint_non_reentrant_by_layer", "checkpoint_selective"}:
         _admit_checkpoint_runtime(settings)
+        _require_checkpoint_context_binding(settings, checkpoint_contexts)
+
+        if offload == "custom_saved_tensor_hooks":
+            _require_activation_hook_binding(
+                settings,
+                activation_pack_hooks,
+                activation_unpack_hooks,
+            )
 
         return
 
-    if recompute == "manual_recompute" and manual_recompute is None:
-        message = "manual_recompute requires recompute-region metadata"
-        raise MaterializationError(message)
-
-    _require_disabled_checkpoint_settings(settings)
+    _require_disabled_checkpoint_settings(settings, recompute)
 
     if offload == "custom_saved_tensor_hooks":
-        pack_hook = settings.get("activation.pack_hook")
-        unpack_hook = settings.get("activation.unpack_hook")
-
-        if not callable(pack_hook) or not callable(unpack_hook):
-            message = (
-                "custom_saved_tensor_hooks requires activation pack and unpack hooks"
-            )
-            raise MaterializationError(message)
+        _require_activation_hook_binding(
+            settings,
+            activation_pack_hooks,
+            activation_unpack_hooks,
+        )
 
 
 def _admit_checkpoint_runtime(settings: Mapping[str, Any]) -> None:
@@ -11590,7 +11739,49 @@ def _admit_checkpoint_runtime(settings: Mapping[str, Any]) -> None:
         raise MaterializationError(str(error)) from error
 
 
-def _require_disabled_checkpoint_settings(settings: Mapping[str, Any]) -> None:
+def _require_checkpoint_context_binding(
+    settings: Mapping[str, Any],
+    checkpoint_contexts: CheckpointContextFns | None,
+) -> None:
+    if settings.get("checkpoint.context_fn") != "declared_context_pair":
+        return
+
+    context_id = settings.get("checkpoint.context_fn_callable")
+
+    if not isinstance(context_id, str):
+        message = "checkpoint.context_fn=declared_context_pair requires context id"
+        raise MaterializationError(message)
+
+    if checkpoint_contexts is None or context_id not in checkpoint_contexts:
+        message = f"checkpoint context is not registered: {context_id}"
+        raise MaterializationError(message)
+
+
+def _require_activation_hook_binding(
+    settings: Mapping[str, Any],
+    activation_pack_hooks: ActivationPackHooks | None,
+    activation_unpack_hooks: ActivationUnpackHooks | None,
+) -> None:
+    pack_hook_id = settings.get("activation.pack_hook")
+    unpack_hook_id = settings.get("activation.unpack_hook")
+
+    if not isinstance(pack_hook_id, str) or not isinstance(unpack_hook_id, str):
+        message = "custom_saved_tensor_hooks requires activation pack and unpack hooks"
+        raise MaterializationError(message)
+
+    if activation_pack_hooks is None or pack_hook_id not in activation_pack_hooks:
+        message = f"activation pack hook is not registered: {pack_hook_id}"
+        raise MaterializationError(message)
+
+    if activation_unpack_hooks is None or unpack_hook_id not in activation_unpack_hooks:
+        message = f"activation unpack hook is not registered: {unpack_hook_id}"
+        raise MaterializationError(message)
+
+
+def _require_disabled_checkpoint_settings(
+    settings: Mapping[str, Any],
+    recompute: str,
+) -> None:
     disabled = {
         "checkpoint.use_reentrant": "false",
         "checkpoint.early_stop": "false",
@@ -11603,7 +11794,7 @@ def _require_disabled_checkpoint_settings(settings: Mapping[str, Any]) -> None:
 
     for key, value in disabled.items():
         if key in settings and settings[key] != value:
-            message = f"activation.recompute=none requires {key}={value}"
+            message = f"activation.recompute={recompute} requires {key}={value}"
             raise MaterializationError(message)
 
 
@@ -12781,7 +12972,7 @@ def _runtime_residency_tensor(
     key: str,
     mmap_residency: Callable[[torch.Tensor, str], torch.Tensor] | None,
 ) -> torch.Tensor:
-    if mmap_residency is None:
+    if mmap_residency is None or residency != "mmap_cpu":
         return _residency_tensor(tensor, residency, key)
 
     return _residency_tensor(tensor, residency, key, mmap_residency)

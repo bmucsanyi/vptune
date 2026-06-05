@@ -922,25 +922,6 @@ def transformers_attention_axis(
     )
 
 
-def transformers_cache_axis(
-    *,
-    policy: TransformersAttentionPolicy,
-) -> AxisDescriptor:
-    """Return a cache-flag axis for Transformers models."""
-    return AxisDescriptor(
-        name="transformers_cache",
-        settings_keys=("use_cache",),
-        allowed_values=(True, False),
-        adapter_id="vptune.transformers",
-        adapter_version=PACKAGE_VERSION,
-        admission_rule=lambda candidate: admit_transformers_cache(
-            candidate,
-            policy=policy,
-        ),
-        identity=policy.signature(),
-    )
-
-
 def admit_transformers_attention(
     candidate: Candidate,
     *,
@@ -964,27 +945,6 @@ def admit_transformers_attention(
         return True, None
 
     return False, error
-
-
-def admit_transformers_cache(
-    candidate: Candidate,
-    *,
-    policy: TransformersAttentionPolicy,
-) -> tuple[bool, str | None]:
-    """Return whether a Transformers cache candidate is admitted."""
-    error = _required_bool_setting(candidate.settings, "use_cache")
-
-    if error is not None:
-        return False, error
-
-    use_cache = candidate.settings["use_cache"]
-    if use_cache != policy.use_cache:
-        return (
-            False,
-            f"use_cache={use_cache} differs from policy use_cache={policy.use_cache}",
-        )
-
-    return True, None
 
 
 def _attention_error(

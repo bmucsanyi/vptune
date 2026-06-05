@@ -2606,6 +2606,27 @@ def test_candidate_record_round_trips_migration_source_id() -> None:
     assert replayed.signature() == candidate.signature()
 
 
+def test_candidate_record_writes_declared_hook_ids(tmp_path: Path) -> None:
+    candidate = vp.Candidate(
+        "family",
+        "hooks",
+        {
+            "activation.offload": "custom_saved_tensor_hooks",
+            "activation.pack_hook": "pack",
+            "activation.unpack_hook": "unpack",
+            "checkpoint.context_fn": "declared_context_pair",
+            "checkpoint.context_fn_callable": "default",
+        },
+        admission_status="passed",
+    )
+    path = tmp_path / "candidate.json"
+
+    write_record(path, vpx.candidate_record_to_json(candidate, _input_signature("ids")))
+    loaded = read_record(path)
+
+    assert loaded["candidate_settings"] == candidate.settings
+
+
 def test_write_record_rejects_type_specific_missing_fields(tmp_path: Path) -> None:
     candidate = vp.Candidate(
         "family",
@@ -3380,9 +3401,7 @@ def test_candidate_rows_reject_missing_runtime_bindings() -> None:
     assert rows["intermediate"].admission_error == (
         "memory.intermediate_residency requires named intermediate boundaries"
     )
-    assert rows["manual"].admission_error == (
-        "manual_recompute requires recompute-region metadata"
-    )
+    assert rows["manual"].admission_status == "passed"
     assert rows["teacher"].admission_error == (
         "recomputed teacher outputs require a teacher objective"
     )
@@ -3391,7 +3410,7 @@ def test_candidate_rows_reject_missing_runtime_bindings() -> None:
     )
 
     for candidate_id, candidate in rows.items():
-        if candidate_id != "baseline":
+        if candidate_id not in {"baseline", "manual"}:
             assert candidate.admission_status == "failed"
 
 
@@ -4874,6 +4893,10 @@ def test_checkpoint_operation_can_disable_rng_preservation() -> None:
 def test_checkpoint_operation_uses_declared_context_pair() -> None:
     events = []
     vector = torch.tensor([1.0], requires_grad=True)
+
+    def context_fn() -> tuple[object, object]:
+        return contextlib.nullcontext(), contextlib.nullcontext()
+
     candidate = vp.Candidate(
         "family",
         "row",
@@ -4881,10 +4904,7 @@ def test_checkpoint_operation_uses_declared_context_pair() -> None:
             "activation.recompute": "checkpoint_non_reentrant_by_layer",
             **checkpoint_fields(),
             "checkpoint.context_fn": "declared_context_pair",
-            "checkpoint.context_fn_callable": lambda: (
-                contextlib.nullcontext(),
-                contextlib.nullcontext(),
-            ),
+            "checkpoint.context_fn_callable": "default",
         },
         admission_status="passed",
     )
@@ -4899,6 +4919,7 @@ def test_checkpoint_operation_uses_declared_context_pair() -> None:
         function,
         (vector,),
         policy_key="activation.recompute",
+        checkpoint_contexts={"default": context_fn},
     )()
     assert isinstance(output, torch.Tensor)
     output.backward()
@@ -4909,6 +4930,10 @@ def test_checkpoint_operation_uses_declared_context_pair() -> None:
 def test_checkpoint_operation_executes_selective_checkpoint_context_pair() -> None:
     events = []
     vector = torch.tensor([1.0], requires_grad=True)
+
+    def context_fn() -> tuple[object, object]:
+        return contextlib.nullcontext(), contextlib.nullcontext()
+
     candidate = vp.Candidate(
         "family",
         "row",
@@ -4916,10 +4941,7 @@ def test_checkpoint_operation_executes_selective_checkpoint_context_pair() -> No
             "activation.recompute": "checkpoint_selective",
             **checkpoint_fields(),
             "checkpoint.context_fn": "declared_context_pair",
-            "checkpoint.context_fn_callable": lambda: (
-                contextlib.nullcontext(),
-                contextlib.nullcontext(),
-            ),
+            "checkpoint.context_fn_callable": "default",
         },
         admission_status="passed",
     )
@@ -4934,6 +4956,7 @@ def test_checkpoint_operation_executes_selective_checkpoint_context_pair() -> No
         function,
         (vector,),
         policy_key="activation.recompute",
+        checkpoint_contexts={"default": context_fn},
     )()
     assert isinstance(output, torch.Tensor)
     output.backward()
@@ -4941,7 +4964,7 @@ def test_checkpoint_operation_executes_selective_checkpoint_context_pair() -> No
     assert events == ["called", "called"]
 
 
-def test_checkpoint_operation_rejects_declared_context_without_callable() -> None:
+def test_checkpoint_operation_rejects_declared_context_without_context_id() -> None:
     vector = torch.tensor([1.0], requires_grad=True)
     candidate = vp.Candidate(
         "family",
@@ -4956,7 +4979,7 @@ def test_checkpoint_operation_rejects_declared_context_without_callable() -> Non
     def function(value: torch.Tensor) -> torch.Tensor:
         return value.square()
 
-    with pytest.raises(vp.AdmissionError, match="requires callable"):
+    with pytest.raises(vp.AdmissionError, match="requires context id"):
         vpx.checkpoint_operation(
             candidate,
             function,
@@ -5042,8 +5065,8 @@ def test_checkpoint_operation_runs_custom_saved_tensor_hooks() -> None:
         {
             "activation.recompute": "none",
             "activation.offload": "custom_saved_tensor_hooks",
-            "activation.pack_hook": pack_hook,
-            "activation.unpack_hook": unpack_hook,
+            "activation.pack_hook": "pack",
+            "activation.unpack_hook": "unpack",
         },
         admission_status="passed",
     )
@@ -5056,6 +5079,8 @@ def test_checkpoint_operation_runs_custom_saved_tensor_hooks() -> None:
         function,
         (vector,),
         policy_key="activation.recompute",
+        activation_pack_hooks={"pack": pack_hook},
+        activation_unpack_hooks={"unpack": unpack_hook},
     )()
     assert isinstance(output, torch.Tensor)
     output.backward()
@@ -6106,17 +6131,14 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "memory.output_cotangents": "retain",
             "activation.recompute": "checkpoint_selective",
             "activation.offload": "custom_saved_tensor_hooks",
-            "activation.pack_hook": lambda tensor: tensor,
-            "activation.unpack_hook": lambda tensor: tensor,
+            "activation.pack_hook": "pack",
+            "activation.unpack_hook": "unpack",
             "checkpoint.use_reentrant": "false",
             "checkpoint.early_stop": "true",
             "checkpoint.preserve_rng_state": "false",
             "checkpoint.determinism_check": "default",
             "checkpoint.context_fn": "declared_context_pair",
-            "checkpoint.context_fn_callable": lambda: (
-                contextlib.nullcontext(),
-                contextlib.nullcontext(),
-            ),
+            "checkpoint.context_fn_callable": "default",
             "checkpoint.moves_to_new_device": "false",
             "checkpoint.uses_global_state": "false",
             "metric.block_schedule": "layer_blocks",
@@ -6132,6 +6154,23 @@ def test_standard_axis_registry_validates_core_axes() -> None:
         "family",
         "invalid-package-runtime-axis",
         {"checkpoint.use_reentrant": "true"},
+    )
+    callable_activation_hook_axis = vp.Candidate(
+        "family",
+        "callable-activation-hook-axis",
+        {
+            "activation.offload": "custom_saved_tensor_hooks",
+            "activation.pack_hook": len,
+            "activation.unpack_hook": len,
+        },
+    )
+    callable_checkpoint_context_axis = vp.Candidate(
+        "family",
+        "callable-checkpoint-context-axis",
+        {
+            "checkpoint.context_fn": "declared_context_pair",
+            "checkpoint.context_fn_callable": contextlib.nullcontext,
+        },
     )
     valid_compile_boundary = vp.Candidate(
         "family",
@@ -6203,6 +6242,8 @@ def test_standard_axis_registry_validates_core_axes() -> None:
     assert registry.admit(valid_input_memory_axes).admission_status == "passed"
     assert registry.admit(valid_package_runtime_axes).admission_status == "passed"
     assert registry.admit(invalid_package_runtime_axis).admission_status == "failed"
+    assert registry.admit(callable_activation_hook_axis).admission_status == "failed"
+    assert registry.admit(callable_checkpoint_context_axis).admission_status == "failed"
     assert registry.admit(valid_compile_boundary).admission_status == "passed"
     assert registry.admit(invalid_compile_boundary).admission_status == "failed"
     assert registry.admit(valid_chunk_axes).admission_status == "passed"
