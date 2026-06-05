@@ -12717,6 +12717,135 @@ def test_fisher_style_runtime_rejects_invalid_normalization() -> None:
         )()
 
 
+@pytest.mark.parametrize(
+    ("operator", "family", "settings", "batch_key", "extra_batch"),
+    [
+        (
+            score_terms_fisher("fisher", "scores"),
+            "fisher",
+            fisher_settings("materialize_score_gradients"),
+            "score_gradients",
+            {"normalization": 1.0},
+        ),
+        (
+            score_terms_sampled_fisher("sampled", "scores"),
+            "sampled",
+            sampled_fisher_settings("materialize_score_gradients"),
+            "sampled_score_gradients",
+            {"num_examples": 1},
+        ),
+        (
+            vp.empirical_fisher_vp(
+                "empirical",
+                "scores",
+                aggregation="mean_per_example",
+                example_loss_reduction="per_example",
+                denominator="batch_normalization",
+            ),
+            "empirical",
+            empirical_dense_settings(),
+            "per_example_gradients",
+            {"normalization": 1.0},
+        ),
+    ],
+)
+def test_fisher_style_runtime_rejects_empty_score_surface(
+    operator: vp.OperatorSpec,
+    family: str,
+    settings: Mapping[str, object],
+    batch_key: str,
+    extra_batch: Mapping[str, object],
+) -> None:
+    params = {"w": torch.tensor([0.3, -0.2], dtype=torch.float64)}
+    vector = {"w": torch.tensor([0.4, -0.7], dtype=torch.float64)}
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+
+    with pytest.raises(vp.MaterializationError, match="at least one row"):
+        factory(
+            vp.Candidate(
+                family,
+                "empty-score-surface",
+                settings,
+                admission_status="passed",
+            ),
+            {
+                batch_key: torch.empty((0, 2), dtype=torch.float64),
+                **dict(extra_batch),
+            },
+            vector,
+        )()
+
+
+@pytest.mark.parametrize(
+    ("operator", "family", "settings", "batch_key", "extra_batch"),
+    [
+        (
+            score_terms_fisher("fisher", "scores"),
+            "fisher",
+            fisher_settings("blockwise_score_matrix"),
+            "score_gradient_blocks",
+            {"normalization": 1.0},
+        ),
+        (
+            score_terms_sampled_fisher("sampled", "scores"),
+            "sampled",
+            sampled_fisher_settings("blockwise_score_matrix"),
+            "sampled_score_gradient_blocks",
+            {"num_examples": 1},
+        ),
+        (
+            vp.empirical_fisher_vp(
+                "empirical",
+                "scores",
+                aggregation="mean_per_example",
+                example_loss_reduction="per_example",
+                denominator="batch_normalization",
+            ),
+            "empirical",
+            {"empirical_fisher.accumulation": "blockwise_gradient_matrix"},
+            "per_example_gradient_blocks",
+            {"normalization": 1.0},
+        ),
+    ],
+)
+def test_fisher_style_runtime_rejects_empty_score_blocks(
+    operator: vp.OperatorSpec,
+    family: str,
+    settings: Mapping[str, object],
+    batch_key: str,
+    extra_batch: Mapping[str, object],
+) -> None:
+    params = {"w": torch.tensor([0.3, -0.2], dtype=torch.float64)}
+    vector = {"w": torch.tensor([0.4, -0.7], dtype=torch.float64)}
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+
+    with pytest.raises(vp.MaterializationError, match="at least one row"):
+        factory(
+            vp.Candidate(
+                family,
+                "empty-score-blocks",
+                settings,
+                admission_status="passed",
+            ),
+            {
+                batch_key: (
+                    torch.empty((0, 1), dtype=torch.float64),
+                    torch.empty((0, 1), dtype=torch.float64),
+                ),
+                **dict(extra_batch),
+            },
+            vector,
+        )()
+
+
 def test_dense_metric_uses_vector_order_and_fisher_uses_parameter_order() -> None:
     params = {
         "a": torch.tensor([0.0, 0.0], dtype=torch.float64),

@@ -7575,6 +7575,7 @@ def _score_matrix_product(
     settings: Mapping[str, Any],
     parameter_surface: ParameterSurface | None,
 ) -> torch.Tensor:
+    _require_score_matrix_vector_shape(score_gradients, vector, "score_gradients")
     ranges = _parameter_column_ranges(vector.numel(), settings, parameter_surface)
 
     if ranges is not None:
@@ -7598,7 +7599,7 @@ def _parameter_blocked_score_matrix_product(
     settings: Mapping[str, Any],
     ranges: tuple[tuple[int, int], ...],
 ) -> torch.Tensor:
-    _require_score_matrix_vector_inputs(score_gradients, vector, "score_gradients")
+    _require_score_matrix_vector_shape(score_gradients, vector, "score_gradients")
     score_dot = _parameter_blocked_matrix_vector_product(
         score_gradients,
         vector,
@@ -7790,7 +7791,7 @@ def _parameter_block_ranges(
         yield start, min(start + block_size, width)
 
 
-def _require_score_matrix_vector_inputs(
+def _require_score_matrix_vector_shape(
     score_gradients: torch.Tensor,
     vector: torch.Tensor,
     label: str,
@@ -7803,12 +7804,13 @@ def _require_score_matrix_vector_inputs(
         message = "Fisher vector must flatten to a one-dimensional tensor"
         raise MaterializationError(message)
 
+    if score_gradients.shape[0] == 0:
+        message = f"{label} must have at least one row"
+        raise MaterializationError(message)
+
     if score_gradients.shape[1] != vector.numel():
         message = f"{label} column count must match vector width"
         raise MaterializationError(message)
-
-    _require_finite_tensor(score_gradients, label)
-    _require_finite_tensor(vector, "Fisher vector")
 
 
 def _streaming_score_gradient_product(
@@ -8321,6 +8323,10 @@ def _require_score_matrix_product_inputs(
         message = "vectorized Fisher vectors must flatten to a matrix"
         raise MaterializationError(message)
 
+    if score_gradients.shape[0] == 0:
+        message = f"{label} must have at least one row"
+        raise MaterializationError(message)
+
     if score_gradients.shape[1] != vector_batch.shape[1]:
         message = f"{label} column count must match vector width"
         raise MaterializationError(message)
@@ -8336,6 +8342,10 @@ def _require_blockwise_score_matrix_product_inputs(
 ) -> None:
     if vector_batch.ndim != MATRIX_DIMS:
         message = "vectorized Fisher vectors must flatten to a matrix"
+        raise MaterializationError(message)
+
+    if blocks[0].shape[0] == 0:
+        message = f"{label} blocks must have at least one row"
         raise MaterializationError(message)
 
     width = sum(block.shape[1] for block in blocks)
@@ -14813,6 +14823,10 @@ def _batch_tensor_blocks(batch: Batch, key: str) -> tuple[torch.Tensor, ...]:
 
         if block.ndim != MATRIX_DIMS:
             message = f"batch tensor block must be two-dimensional: {key}"
+            raise MaterializationError(message)
+
+        if block.shape[0] == 0:
+            message = f"batch tensor blocks must have at least one row: {key}"
             raise MaterializationError(message)
 
         _require_finite_tensor(block, key)
