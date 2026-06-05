@@ -53,6 +53,68 @@ class FunctionObjective(Protocol):
         """Return a tensor tree."""
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class ModuleCallSpec:
+    """Explicit module call binding for stateful module rows."""
+
+    positional_batch_keys: tuple[str, ...] = ()
+    keyword_batch_keys: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    output_fields: Mapping[str, tuple[str | int, ...]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        """Validate declared batch and output paths."""
+        _require_string_tuple(self.positional_batch_keys, "positional_batch_keys")
+        _require_string_mapping(self.keyword_batch_keys, "keyword_batch_keys")
+        _require_output_field_paths(self.output_fields)
+
+    def signature(self) -> Mapping[str, Any]:
+        """Return stable module-call identity."""
+        return {
+            "positional_batch_keys": tuple(self.positional_batch_keys),
+            "keyword_batch_keys": dict(sorted(self.keyword_batch_keys.items())),
+            "output_fields": {
+                key: tuple(path) for key, path in sorted(self.output_fields.items())
+            },
+        }
+
+
+def _require_string_tuple(value: Any, label: str) -> None:
+    if isinstance(value, tuple) and all(isinstance(item, str) for item in value):
+        return
+
+    message = f"{label} must be a tuple of strings"
+    raise MaterializationError(message)
+
+
+def _require_string_mapping(value: Any, label: str) -> None:
+    if isinstance(value, Mapping) and all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    ):
+        return
+
+    message = f"{label} must map strings to strings"
+    raise MaterializationError(message)
+
+
+def _require_output_field_paths(
+    value: Mapping[str, tuple[str | int, ...]],
+) -> None:
+    for key, path in value.items():
+        if not isinstance(key, str):
+            message = "output field names must be strings"
+            raise MaterializationError(message)
+
+        if not isinstance(path, tuple) or not path:
+            message = f"output field path must be a nonempty tuple: {key}"
+            raise MaterializationError(message)
+
+        if not all(isinstance(item, (str, int)) for item in path):
+            message = f"output field path items must be strings or integers: {key}"
+            raise MaterializationError(message)
+
+
 class DataProvider(Protocol):
     """Protocol for reference and probe data."""
 
@@ -121,6 +183,7 @@ class FullSizeCheck(Protocol):
         candidate: "Candidate",
         inputs: tuple[tuple[Batch, TensorTree], ...],
         output: TensorTree,
+        samples: tuple["Measurement", ...],
     ) -> Mapping[str, Any]:
         """Return selection metadata for the measured output."""
 
@@ -949,6 +1012,7 @@ class CheckRecord:
             "family": self.family,
             "candidate_id": self.candidate_id,
             "name": self.name,
+            "status": self.status,
             "input_signature": dict(self.input_signature),
             "candidate_settings": dict(self.candidate_settings),
             "thresholds": dict(self.thresholds),
@@ -976,6 +1040,7 @@ class ReferenceResult:
 class ReferenceChildResult:
     """Reference result for a child candidate."""
 
+    name: str
     candidate: Candidate
     input_signature: Mapping[str, Any]
     result: ReferenceResult
@@ -1011,6 +1076,7 @@ class FullSizeRecord:
         return {
             "family": self.family,
             "candidate_id": self.candidate_id,
+            "status": self.status,
             "input_signature": dict(self.input_signature),
             "candidate_settings": dict(self.candidate_settings),
             "dependency_identities": {

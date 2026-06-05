@@ -30,19 +30,6 @@ THRESHOLD_PAIRS = (
     ("multiply_max_abs_diff", "multiply_max_rel_diff"),
     ("inverse_max_abs_diff", "inverse_max_rel_diff"),
 )
-DTYPE_ABS_FLOORS = {
-    "bf16": 0.25 * float(torch.finfo(torch.bfloat16).eps),
-    "fp16": 0.25 * float(torch.finfo(torch.float16).eps),
-}
-DTYPE_FLOOR_FIELDS = ("max_abs_diff", "directional_abs_diff")
-DTYPE_FLOOR_SETTINGS = (
-    "dtype.parameter_storage",
-    "dtype.model_compute",
-    "dtype.autodiff_compute",
-    "dtype.vector",
-    "dtype.intermediate",
-    "dtype.output",
-)
 MIN_THRESHOLD_FIELDS = ("damping_min",)
 NUMERIC_ERROR_BOUND_FIELDS = (
     "k",
@@ -51,34 +38,6 @@ NUMERIC_ERROR_BOUND_FIELDS = (
     "S_row",
     "output_norm_floor",
 )
-
-
-def apply_dtype_floors(
-    thresholds: dict[str, float],
-    settings: Mapping[str, Any],
-) -> None:
-    """Apply dtype absolute-threshold floors in place."""
-    floors = []
-
-    for setting in DTYPE_FLOOR_SETTINGS:
-        dtype_name = settings.get(setting)
-
-        if not isinstance(dtype_name, str):
-            continue
-
-        floor = DTYPE_ABS_FLOORS.get(dtype_name)
-
-        if floor is not None:
-            floors.append(floor)
-
-    if not floors:
-        return
-
-    floor = max(floors)
-
-    for field in DTYPE_FLOOR_FIELDS:
-        if field in thresholds:
-            thresholds[field] = max(thresholds[field], floor)
 
 
 def validate_thresholds(

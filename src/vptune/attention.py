@@ -111,6 +111,7 @@ class AttentionSettings:
     sdpa_priority: tuple[str, ...]
     partition: str
     padding: str
+    query_block_size: int | None
 
     def signature(self) -> dict[str, Any]:
         """Return serializable settings identity."""
@@ -120,6 +121,7 @@ class AttentionSettings:
             "sdpa_priority": self.sdpa_priority,
             "partition": self.partition,
             "padding": self.padding,
+            "query_block_size": self.query_block_size,
         }
 
 
@@ -272,6 +274,10 @@ def attention_settings_from_candidate(settings: Mapping[str, Any]) -> AttentionS
         sdpa_priority=_sdpa_priority_setting(settings),
         partition=_required_string_setting(settings, "attention.partition"),
         padding=_required_string_setting(settings, "attention.padding"),
+        query_block_size=_optional_positive_int_setting(
+            settings,
+            "chunk.sequence_position_block_size",
+        ),
     )
     _validate_attention_settings(attention_settings)
 
@@ -330,7 +336,7 @@ def _attention_reference_output(
     batch: Batch,
     settings: AttentionSettings,
 ) -> TensorTree:
-    inputs = location.inputs(batch)
+    inputs = _attention_inputs_for_settings(location, batch, settings)
     output = exact_attention(inputs)
 
     if settings.partition == "packed_tokens":
@@ -338,7 +344,7 @@ def _attention_reference_output(
             message = "packed attention reference requires inverse token permutation"
             raise AdmissionError(message)
 
-        output = output.index_select(-2, inputs.inverse_permutation)
+        output = _restore_packed_tokens(output, inputs.inverse_permutation)
 
     return location.output(output, batch)
 
@@ -353,7 +359,10 @@ def execute_attention(
     Returns:
         Declared attention output tree.
     """
-    output = run_attention(location.inputs(batch), settings)
+    output = run_attention(
+        _attention_inputs_for_settings(location, batch, settings),
+        settings,
+    )
 
     return location.output(output, batch)
 
@@ -500,13 +509,56 @@ def _packed_exact_attention(
 
     output = exact_attention(inputs)
 
-    return output.index_select(-2, inputs.inverse_permutation)
+    return _restore_packed_tokens(output, inputs.inverse_permutation)
+
+
+def _restore_packed_tokens(
+    output: torch.Tensor,
+    inverse_permutation: torch.Tensor,
+) -> torch.Tensor:
+    if inverse_permutation.ndim != 1:
+        message = "packed inverse permutation must be one-dimensional"
+        raise AdmissionError(message)
+
+    if inverse_permutation.dtype != torch.long:
+        message = "packed inverse permutation must use torch.long indices"
+        raise AdmissionError(message)
+
+    if not torch.is_floating_point(output) and not torch.is_complex(output):
+        message = "packed attention output must be floating point or complex"
+        raise AdmissionError(message)
+
+    packed_length = output.size(-2)
+    logical_length = inverse_permutation.numel()
+    valid = inverse_permutation >= 0
+
+    if torch.any(inverse_permutation < -1).item():
+        message = "packed inverse permutation uses -1 for padded positions"
+        raise AdmissionError(message)
+
+    if torch.any(inverse_permutation[valid] >= packed_length).item():
+        message = "packed inverse permutation index exceeds packed length"
+        raise AdmissionError(message)
+
+    restored = output.new_zeros(*output.shape[:-2], logical_length, output.size(-1))
+
+    if torch.any(valid).item():
+        restored.index_copy_(
+            -2,
+            torch.nonzero(valid, as_tuple=False).reshape(-1),
+            output.index_select(-2, inverse_permutation[valid]),
+        )
+
+    return restored
 
 
 def _blockwise_exact_attention(
     inputs: AttentionInputs,
     settings: AttentionSettings,
 ) -> torch.Tensor:
+    if settings.partition == "segmented_forward_ad":
+        return _segmented_forward_ad_attention(inputs)
+
     if settings.partition != "blockwise_queries":
         message = "blockwise_exact requires attention.partition=blockwise_queries"
         raise AdmissionError(message)
@@ -516,11 +568,97 @@ def _blockwise_exact_attention(
         raise AdmissionError(message)
 
     blocks = []
+    block_size = inputs.query_block_size
     query_length = inputs.query.size(-2)
 
-    for start in range(0, query_length, inputs.query_block_size):
-        stop = min(start + inputs.query_block_size, query_length)
+    for start in range(0, query_length, block_size):
+        stop = min(start + block_size, query_length)
         blocks.append(_block_attention(inputs, start, stop))
+
+    return torch.cat(blocks, dim=-2)
+
+
+def _segmented_forward_ad_attention(inputs: AttentionInputs) -> torch.Tensor:
+    if inputs.query_block_size is None:
+        message = "segmented_forward_ad requires query block size"
+        raise AdmissionError(message)
+
+    block_size = inputs.query_block_size
+    primal_query, query_tangent = torch.autograd.forward_ad.unpack_dual(inputs.query)
+
+    if query_tangent is None:
+        primal_inputs = dataclasses.replace(inputs, query=primal_query)
+
+        return _segmented_forward_ad_primal_attention(primal_inputs)
+
+    primal_blocks = []
+    tangent_blocks = []
+    query_length = primal_query.size(-2)
+
+    for start in range(0, query_length, block_size):
+        stop = min(start + block_size, query_length)
+        block_primal, block_tangent = _segmented_forward_ad_attention_block(
+            inputs,
+            primal_query,
+            query_tangent,
+            start,
+            stop,
+        )
+        primal_blocks.append(block_primal)
+        tangent_blocks.append(block_tangent)
+
+    primal = torch.cat(primal_blocks, dim=-2)
+    tangent = torch.cat(tangent_blocks, dim=-2)
+
+    return torch.autograd.forward_ad.make_dual(primal, tangent)
+
+
+def _segmented_forward_ad_attention_block(
+    inputs: AttentionInputs,
+    primal_query: torch.Tensor,
+    query_tangent: torch.Tensor,
+    start: int,
+    stop: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    query_block = primal_query.narrow(-2, start, stop - start)
+    tangent_block = query_tangent.narrow(-2, start, stop - start)
+    dual_query_block = torch.autograd.forward_ad.make_dual(
+        query_block,
+        tangent_block,
+    )
+    block_inputs = dataclasses.replace(
+        inputs,
+        query=dual_query_block,
+        attn_mask=_block_attention_mask(
+            inputs.attn_mask,
+            inputs.is_causal,
+            start,
+            stop,
+            inputs.key.size(-2),
+            inputs.query.device,
+        ),
+    )
+    block_output = exact_attention(block_inputs)
+    block_primal, block_tangent = torch.autograd.forward_ad.unpack_dual(block_output)
+
+    if block_tangent is None:
+        return block_primal, torch.zeros_like(block_primal)
+
+    return block_primal, block_tangent
+
+
+def _segmented_forward_ad_primal_attention(inputs: AttentionInputs) -> torch.Tensor:
+    if inputs.query_block_size is None:
+        message = "segmented_forward_ad requires query block size"
+        raise AdmissionError(message)
+
+    blocks = []
+    block_size = inputs.query_block_size
+    query_length = inputs.query.size(-2)
+
+    for start in range(0, query_length, block_size):
+        stop = min(start + block_size, query_length)
+        blocks.append(exact_attention(_block_attention_inputs(inputs, start, stop)))
 
     return torch.cat(blocks, dim=-2)
 
@@ -530,6 +668,14 @@ def _block_attention(
     start: int,
     stop: int,
 ) -> torch.Tensor:
+    return exact_attention(_block_attention_inputs(inputs, start, stop))
+
+
+def _block_attention_inputs(
+    inputs: AttentionInputs,
+    start: int,
+    stop: int,
+) -> AttentionInputs:
     query = inputs.query.narrow(-2, start, stop - start)
     mask = _block_attention_mask(
         inputs.attn_mask,
@@ -546,7 +692,7 @@ def _block_attention(
         is_causal=False,
     )
 
-    return exact_attention(block_inputs)
+    return block_inputs
 
 
 def _block_attention_mask(
@@ -812,6 +958,22 @@ def _optional_string_setting(settings: Mapping[str, Any], key: str) -> str | Non
     return value
 
 
+def _optional_positive_int_setting(
+    settings: Mapping[str, Any],
+    key: str,
+) -> int | None:
+    value = settings.get(key)
+
+    if value is None:
+        return None
+
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        message = f"{key} must be a positive integer"
+        raise AdmissionError(message)
+
+    return value
+
+
 def _sdpa_priority_setting(settings: Mapping[str, Any]) -> tuple[str, ...]:
     value = settings.get("attention.sdpa_priority_list")
 
@@ -832,8 +994,11 @@ def _sdpa_priority_setting(settings: Mapping[str, Any]) -> tuple[str, ...]:
 
 
 def _validate_attention_partition_settings(settings: AttentionSettings) -> None:
-    if settings.partition == "segmented_forward_ad":
-        message = "attention.partition=segmented_forward_ad has no core lowering"
+    if settings.query_block_size is not None and settings.partition not in {
+        "blockwise_queries",
+        "segmented_forward_ad",
+    }:
+        message = "chunk.sequence_position_block_size requires query-block partition"
         raise AdmissionError(message)
 
     if settings.frontend in {"pytorch_sdpa_direct", "patched_eager"}:
@@ -847,9 +1012,48 @@ def _validate_attention_partition_settings(settings: AttentionSettings) -> None:
 
         return
 
+    if settings.frontend == "packed_exact":
+        if settings.partition != "packed_tokens":
+            message = "packed_exact requires attention.partition=packed_tokens"
+            raise AdmissionError(message)
+
+        if settings.padding != "unpadded_packed":
+            message = "packed_exact requires attention.padding=unpadded_packed"
+            raise AdmissionError(message)
+
+        return
+
+    if settings.frontend == "blockwise_exact" and settings.partition not in {
+        "blockwise_queries",
+        "segmented_forward_ad",
+    }:
+        message = (
+            "blockwise_exact requires attention.partition=blockwise_queries "
+            "or segmented_forward_ad"
+        )
+        raise AdmissionError(message)
+
     if settings.frontend == "blockwise_exact" and settings.padding != "dense_padded":
         message = "blockwise_exact requires attention.padding=dense_padded"
         raise AdmissionError(message)
+
+
+def _attention_inputs_for_settings(
+    location: AttentionLocation,
+    batch: Mapping[str, Any],
+    settings: AttentionSettings,
+) -> AttentionInputs:
+    inputs = location.inputs(batch)
+    block_size = settings.query_block_size
+
+    if block_size is None:
+        return inputs
+
+    if inputs.query_block_size is not None and inputs.query_block_size != block_size:
+        message = "declared query block sizes differ"
+        raise AdmissionError(message)
+
+    return dataclasses.replace(inputs, query_block_size=block_size)
 
 
 def _validate_attention_inputs(inputs: AttentionInputs) -> None:

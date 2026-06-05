@@ -1,15 +1,29 @@
+import datetime
+import queue
+from pathlib import Path
+from typing import Any
+
 import pytest
 import torch
+import torch.multiprocessing as mp
 
 import vptune.ext as vpx
 from vptune import (
     AdmissionError,
+    Batch,
+    BufferTree,
     Candidate,
+    FullSizeRecord,
     MaterializationError,
     Measurement,
+    ModuleCallSpec,
+    ObjectiveContext,
+    ParameterTree,
+    gradient,
 )
 from vptune.adapters.distributed import (
     DistributedAdmissionPolicy,
+    DistributedRankReport,
     RankCompileTiming,
     RankSelectedSettings,
     RankStatus,
@@ -31,8 +45,12 @@ from vptune.adapters.distributed import (
     collective_all_gather_into_tensor,
     collective_all_to_all_single,
     collective_reduce_scatter_tensor,
+    distributed_axis_manifest,
     distributed_identity,
+    distributed_operation_factory,
     distributed_record,
+    distributed_reference_check,
+    distributed_runtime_config,
     distributed_strategy_axis,
     initialize_process_group,
     named_modules_for_distributed_wrap,
@@ -43,6 +61,49 @@ from vptune.adapters.distributed import (
     run_with_loss_parallel,
     wait_collective,
 )
+
+
+class TinyDistributedScalarModule(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.tensor([2.0], dtype=torch.float64))
+
+    def forward(self, scale: torch.Tensor) -> torch.Tensor:
+        return (self.w * scale).sum()
+
+
+class RecordingStrategyApplier:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(
+        self,
+        module: torch.nn.Module,
+        candidate: Candidate,
+    ) -> torch.nn.Module:
+        self.calls.append(dict(candidate.settings))
+
+        return module
+
+
+class RecordingRankReporter:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(
+        self,
+        candidate: Candidate,
+        samples: tuple[Measurement, ...],
+    ) -> DistributedRankReport:
+        self.calls.append((candidate.candidate_id, samples))
+
+        return DistributedRankReport(
+            rank_statuses=(RankStatus(rank=0, status="passed", device="cpu"),),
+            rank_memory_samples=samples,
+            rank_selected_settings=(
+                RankSelectedSettings(rank=0, settings=dict(candidate.settings)),
+            ),
+        )
 
 
 def distributed_policy(
@@ -195,6 +256,73 @@ def valid_distributed_identity() -> dict[str, object]:
         placements=({"parameter": "weight", "placement": "shard0"},),
         communication={"backend": "nccl"},
     )
+
+
+def distributed_stateful_gradient_settings() -> dict[str, object]:
+    return {
+        **valid_fsdp_settings(),
+        "gradient.path": "torch_autograd_grad",
+        "call.path": "stateful_module",
+        "call.params": "module_params",
+        "call.buffers": "module_buffers",
+        "call.tied_weights": "preserve_alias_groups",
+        "call.parametrizations": "preserve_parametrizations",
+        "call.buffer_mutation": "forbidden",
+        "call.grad_mode": "grad_enabled",
+        "call.return_type": "raw_tensor_tree",
+    }
+
+
+def tensor_dict(tree: object) -> dict[str, torch.Tensor]:
+    assert isinstance(tree, dict)
+    result = {}
+
+    for key, value in tree.items():
+        assert isinstance(key, str)
+        assert isinstance(value, torch.Tensor)
+        result[key] = value
+
+    return result
+
+
+def gloo_all_gather_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    result_queue: Any,
+) -> None:
+    try:
+        initialize_process_group(
+            torch.distributed.init_process_group,
+            backend="gloo",
+            init_method=f"file://{init_file}",
+            timeout=datetime.timedelta(seconds=20),
+            world_size=world_size,
+            rank=rank,
+            store=None,
+            pg_options=None,
+            device_id=None,
+        )
+        local = torch.tensor([float(rank + 1)], dtype=torch.float32)
+        gathered = torch.empty(world_size, dtype=torch.float32)
+        collective_all_gather_into_tensor(
+            torch.distributed.all_gather_into_tensor,
+            gathered,
+            local,
+            group=None,
+            async_op=False,
+        )
+        result_queue.put((
+            rank,
+            "passed",
+            tuple(float(value) for value in gathered.tolist()),
+            float(gathered.sum().item()),
+        ))
+    except (OSError, RuntimeError, ValueError) as error:
+        result_queue.put((rank, "failed", type(error).__name__, str(error)))
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 def test_resolve_process_group_backend_uses_declared_backend() -> None:
@@ -1035,6 +1163,54 @@ def test_collective_all_gather_into_tensor_forwards_declared_arguments() -> None
     ]
 
 
+def test_gloo_process_group_all_gather_matches_logical_rank_output(
+    tmp_path: Path,
+) -> None:
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed is unavailable")
+
+    if not torch.distributed.is_gloo_available():
+        pytest.skip("gloo backend is unavailable")
+
+    world_size = 2
+    init_file = str(tmp_path / "gloo_init")
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    processes = tuple(
+        context.Process(
+            target=gloo_all_gather_worker,
+            args=(rank, world_size, init_file, result_queue),
+        )
+        for rank in range(world_size)
+    )
+
+    for process in processes:
+        process.start()
+
+    try:
+        results = [result_queue.get(timeout=30) for _ in range(world_size)]
+    except queue.Empty as error:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+
+        message = "distributed worker did not report"
+        raise AssertionError(message) from error
+    finally:
+        for process in processes:
+            process.join(timeout=30)
+
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert tuple(sorted(results)) == (
+        (0, "passed", (1.0, 2.0), 3.0),
+        (1, "passed", (1.0, 2.0), 3.0),
+    )
+
+
 def test_collective_reduce_scatter_tensor_forwards_declared_arguments() -> None:
     calls = []
     output = torch.empty(2)
@@ -1198,6 +1374,15 @@ def test_distributed_strategy_axis_records_admission_identity() -> None:
 
     assert first.signature()["identity"]["adapter_id"] == "vptune.distributed"
     assert first.signature()["identity"] != second.signature()["identity"]
+
+
+def test_distributed_axis_manifest_returns_strategy_axis() -> None:
+    policy = distributed_policy()
+    axis = distributed_axis_manifest(("fsdp2", "tensor_parallel"), policy=policy)
+
+    assert axis.name == "distributed.strategy"
+    assert axis.allowed_values == ("fsdp2", "tensor_parallel")
+    assert axis.identity == policy.signature()
 
 
 def test_distributed_strategy_axis_owns_optional_admission_fields() -> None:
@@ -1429,6 +1614,213 @@ def test_distributed_identity_records_mesh_and_communication() -> None:
     assert identity["adapter_id"] == "vptune.distributed"
     assert identity["device_mesh"]["shape"] == (2,)
     assert identity["communication"] == {"backend": "nccl"}
+
+
+def test_distributed_operation_factory_applies_strategy_and_runs_module() -> None:
+    model = TinyDistributedScalarModule()
+    applier = RecordingStrategyApplier()
+    factory = distributed_operation_factory(
+        gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        strategy_applier=applier,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=ModuleCallSpec(positional_batch_keys=("scale",)),
+    )
+    candidate = Candidate(
+        "gradient",
+        "distributed-gradient",
+        distributed_stateful_gradient_settings(),
+        admission_status="passed",
+    )
+    output = factory(
+        candidate,
+        {"scale": torch.tensor([4.0], dtype=torch.float64)},
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )()
+    output_map = tensor_dict(output)
+
+    assert applier.calls == [dict(candidate.settings)]
+    torch.testing.assert_close(
+        output_map["w"], torch.tensor([4.0], dtype=torch.float64)
+    )
+
+
+def test_distributed_operation_factory_delegates_dtensor_layout_to_strategy() -> None:
+    model = TinyDistributedScalarModule()
+    applier = RecordingStrategyApplier()
+    factory = distributed_operation_factory(
+        gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        strategy_applier=applier,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=ModuleCallSpec(positional_batch_keys=("scale",)),
+    )
+    settings = {
+        **valid_layout_settings(),
+        "gradient.path": "torch_autograd_grad",
+        "call.path": "stateful_module",
+        "call.params": "module_params",
+        "call.buffers": "module_buffers",
+        "call.tied_weights": "preserve_alias_groups",
+        "call.parametrizations": "preserve_parametrizations",
+        "call.buffer_mutation": "forbidden",
+        "call.grad_mode": "grad_enabled",
+        "call.return_type": "raw_tensor_tree",
+        "layout.params": "dtensor",
+        "layout.vector": "per_shard",
+        "layout.output": "dtensor",
+    }
+    candidate = Candidate(
+        "gradient",
+        "distributed-dtensor-layout",
+        settings,
+        admission_status="passed",
+    )
+    output = factory(
+        candidate,
+        {"scale": torch.tensor([4.0], dtype=torch.float64)},
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )()
+    output_map = tensor_dict(output)
+
+    assert applier.calls == [settings]
+    torch.testing.assert_close(
+        output_map["w"], torch.tensor([4.0], dtype=torch.float64)
+    )
+
+
+def test_distributed_reference_check_uses_single_device_anchor() -> None:
+    reference_model = TinyDistributedScalarModule()
+
+    def scalar_objective(
+        params: ParameterTree,
+        buffers: BufferTree,
+        batch: Batch,
+        context: ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert context.family == "gradient"
+
+        return (params["w"] * batch["scale"]).sum()
+
+    check = distributed_reference_check(
+        gradient("gradient", "loss", aggregation="sum"),
+        reference_model=reference_model,
+        params=dict(reference_model.named_parameters()),
+        buffers=dict(reference_model.named_buffers()),
+        module_call=ModuleCallSpec(positional_batch_keys=("scale",)),
+        thresholds={
+            "max_abs_diff": 0.0,
+            "max_rel_diff": 0.0,
+            "directional_abs_diff": 1e-9,
+            "directional_rel_diff": 1e-9,
+        },
+        scalar_objectives={"loss": scalar_objective},
+    )
+    result = check(
+        Candidate(
+            "gradient",
+            "distributed-gradient",
+            distributed_stateful_gradient_settings(),
+            admission_status="passed",
+        ),
+        {"scale": torch.tensor([4.0], dtype=torch.float64)},
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )
+
+    assert result.measurements["max_abs_diff"] == pytest.approx(0.0)
+
+
+def test_distributed_runtime_config_records_rank_selection_metadata() -> None:
+    model = TinyDistributedScalarModule()
+    reference_model = TinyDistributedScalarModule()
+    applier = RecordingStrategyApplier()
+    reporter = RecordingRankReporter()
+
+    def scalar_objective(
+        params: ParameterTree,
+        buffers: BufferTree,
+        batch: Batch,
+        context: ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert context.family == "gradient"
+
+        return (params["w"] * batch["scale"]).sum()
+
+    candidate = Candidate(
+        "gradient",
+        "distributed-gradient",
+        distributed_stateful_gradient_settings(),
+        admission_status="passed",
+    )
+    runtime = distributed_runtime_config(
+        gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        reference_model=reference_model,
+        strategy_applier=applier,
+        rank_reporter=reporter,
+        identity=valid_distributed_identity(),
+        expected_rank_count=1,
+        global_parameter_surface={"names": ("w",), "shapes": ((1,),)},
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        candidates=(candidate,),
+        thresholds={
+            "max_abs_diff": 0.0,
+            "max_rel_diff": 0.0,
+            "directional_abs_diff": 1e-9,
+            "directional_rel_diff": 1e-9,
+        },
+        objective_signature={"case": "distributed-runtime"},
+        module_call=ModuleCallSpec(positional_batch_keys=("scale",)),
+        axis_registry=None,
+        scalar_objectives={"loss": scalar_objective},
+    )
+    batch = {"scale": torch.tensor([4.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+    output = runtime.operation_factory(candidate, batch, vector)()
+    samples = (
+        Measurement(
+            elapsed_seconds=2.0,
+            peak_allocated_mib=3.0,
+            peak_reserved_mib=5.0,
+            post_allocated_mib=1.0,
+            post_reserved_mib=2.0,
+            rank=0,
+            device="cpu",
+        ),
+    )
+
+    assert runtime.full_size_check is not None
+    metadata = runtime.full_size_check(
+        candidate,
+        ((batch, vector),),
+        (output,),
+        samples,
+    )
+    record = FullSizeRecord(
+        family="gradient",
+        candidate_id="distributed-gradient",
+        status="passed",
+        input_signature={},
+        candidate_settings=dict(candidate.settings),
+        generator_id=candidate.generator_id,
+        generator_version=candidate.generator_version,
+    )
+    selected = runtime.materializer(candidate, record)
+    selected_map = tensor_dict(selected(batch, vector))
+
+    assert reporter.calls == [("distributed-gradient", samples)]
+    assert metadata["global_elapsed_seconds"] == pytest.approx(2.0)
+    assert metadata["distributed_rank_count"] == 1
+    assert metadata["distributed_status"] == "passed"
+    assert runtime.identity()["full_size_check"] is not None
+    torch.testing.assert_close(
+        selected_map["w"], torch.tensor([4.0], dtype=torch.float64)
+    )
 
 
 def test_distributed_selected_settings_must_match_across_ranks() -> None:

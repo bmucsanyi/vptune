@@ -1,6 +1,7 @@
 import contextlib
 import dataclasses
 import importlib.resources
+import inspect
 import math
 import types
 from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -20,6 +21,7 @@ import vptune as vp
 import vptune.adapters as vpa
 import vptune.ext as vpx
 import vptune.measure as measure_module
+import vptune.run as run_module
 from vptune import autobatch_bridge
 from vptune.checks import (
     numeric_error_bound_measurements,
@@ -585,9 +587,11 @@ def test_tune_fast_strategy_compiles_near_fastest_eager_rows(
             candidate: vp.Candidate,
             inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
             output: vp.TensorTree,
+            samples: tuple[vp.Measurement, ...],
         ) -> Mapping[str, object]:
             assert inputs
             assert output is not None
+            assert samples
 
             if candidate.settings.get("compile.enabled") != "true":
                 return {}
@@ -743,9 +747,11 @@ def test_tune_balanced_strategy_crosses_retained_group_winners(
             candidate: vp.Candidate,
             inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
             output: vp.TensorTree,
+            samples: tuple[vp.Measurement, ...],
         ) -> Mapping[str, object]:
             assert inputs
             assert output is not None
+            assert samples
 
             if candidate.settings.get("compile.enabled") != "true":
                 return {}
@@ -1115,7 +1121,8 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
         "compile.cuda_graphs": "false",
         "compile.cache_state": "warm_cache",
     }
-    candidate = vp.Candidate(
+    base = vp.Candidate("family", "base", {}, admission_status="passed")
+    compiled = vp.Candidate(
         "family",
         "compiled",
         compile_settings,
@@ -1151,10 +1158,16 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
             candidate: vp.Candidate,
             inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
             output: vp.TensorTree,
+            samples: tuple[vp.Measurement, ...],
         ) -> Mapping[str, object]:
-            assert candidate.candidate_id == "compiled"
             assert inputs
             assert output is not None
+            assert samples
+
+            if candidate.candidate_id == "base":
+                return {}
+
+            assert candidate.candidate_id == "compiled"
 
             return {
                 "compile_time_seconds": 6.0,
@@ -1167,7 +1180,7 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
         batch: vp.Batch,
         vector: vp.TensorTree,
     ) -> vpx.CandidateOperation:
-        assert candidate.candidate_id == "compiled"
+        assert candidate.candidate_id in {"base", "compiled"}
         assert batch["source"] == "probe"
         assert isinstance(vector, torch.Tensor)
 
@@ -1178,7 +1191,7 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
         batch: vp.Batch,
         vector: vp.TensorTree,
     ) -> vp.ReferenceResult:
-        assert candidate.candidate_id == "compiled"
+        assert candidate.candidate_id in {"base", "compiled"}
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
 
@@ -1192,7 +1205,7 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
         vectors=OneVectorProvider(),
         target=target,
         runtime=vpx.RuntimeConfig(
-            (candidate,),
+            (base, compiled),
             operation_factory,
             reference_check,
             materialize_candidate,
@@ -1205,8 +1218,22 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
-        clock=SequenceClock((0.0, 1.0, 1.0, 2.0, 2.0, 3.0)),
+        clock=SequenceClock((
+            0.0,
+            10.0,
+            10.0,
+            20.0,
+            20.0,
+            30.0,
+            30.0,
+            31.0,
+            31.0,
+            32.0,
+            32.0,
+            33.0,
+        )),
     )
+    assert plan.selected_candidate().candidate_id == "compiled"
     metadata = plan.records["family"].selection_metadata
     scores = metadata["compile_amortized_seconds_by_horizon"]
     assert isinstance(scores, Mapping)
@@ -1214,7 +1241,10 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
     assert scores["6"] == pytest.approx(4.0)
 
     saved_records, _ = saved_plan_rows(tmp_path, plan)
-    saved_scores = saved_records[0].selection_metadata[
+    saved_compiled = next(
+        record for record in saved_records if record.candidate_id == "compiled"
+    )
+    saved_scores = saved_compiled.selection_metadata[
         "compile_amortized_seconds_by_horizon"
     ]
     assert isinstance(saved_scores, Mapping)
@@ -1314,6 +1344,7 @@ def test_root_api_all_matches_public_surface() -> None:
         "Materializer",
         "Measurement",
         "MeasurementError",
+        "ModuleCallSpec",
         "NoPassedCandidateError",
         "ObjectiveContext",
         "OperatorSpec",
@@ -1361,6 +1392,42 @@ def test_root_api_all_matches_public_surface() -> None:
     assert issubclass(vp.MeasurementError, vp.VPTuneError)
 
 
+def test_standard_front_door_signatures_match_spec() -> None:
+    assert tuple(inspect.signature(vp.autotune).parameters) == (
+        "model",
+        "parameter_surface",
+        "parameter_values",
+        "buffers",
+        "data",
+        "operator",
+        "vectors",
+        "target",
+        "candidates",
+        "thresholds",
+        "objective_signature",
+        "scalar_objectives",
+        "function_objectives",
+        "run_dir",
+        "memory_backend",
+        "clock",
+    )
+    assert tuple(inspect.signature(vp.standard_problem).parameters) == (
+        "model",
+        "parameter_surface",
+        "parameter_values",
+        "buffers",
+        "data",
+        "operator",
+        "vectors",
+        "target",
+        "candidates",
+        "thresholds",
+        "objective_signature",
+        "scalar_objectives",
+        "function_objectives",
+    )
+
+
 def test_extension_api_all_matches_extension_surface() -> None:
     assert tuple(vpx.__all__) == (
         "STANDARD_THRESHOLDS",
@@ -1372,6 +1439,7 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "AutobatchDomain",
         "AutobatchFind",
         "AxisDescriptor",
+        "AxisManifest",
         "AxisRegistry",
         "AxisTable",
         "AxisTableAdmitter",
@@ -1394,6 +1462,7 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "MaterializerCallback",
         "Measurement",
         "MemoryBackend",
+        "ModuleCallSpec",
         "OperationFactory",
         "ReferenceCheck",
         "RuntimeConfig",
@@ -1408,6 +1477,7 @@ def test_extension_api_all_matches_extension_surface() -> None:
         "attention_operation_factory",
         "attention_reference_check",
         "attention_settings_from_candidate",
+        "axis_manifest",
         "axis_table",
         "candidate_record_from_json",
         "candidate_record_to_json",
@@ -1473,6 +1543,8 @@ def test_extension_api_all_matches_extension_surface() -> None:
     )
     assert isinstance(vpx.CPUMemoryBackend(), vpx.CPUMemoryBackend)
     assert vpx.STANDARD_THRESHOLDS["max_abs_diff"] == pytest.approx(1e-4)
+    assert vpx.AxisManifest is vpx.AxisTable
+    assert vpx.axis_manifest().signature() == vpx.axis_table().signature()
 
 
 def test_extension_tensor_and_measurement_helpers() -> None:
@@ -1817,6 +1889,68 @@ def test_axis_table_matches_spec_feature_space() -> None:
         "vptune.adapters.distributed"
     )
     assert axis_table.signature()["axis_table_version"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("settings", "changed_axes", "groups"),
+    [
+        (
+            {"attention.partition": "packed_tokens"},
+            ("attention.partition",),
+            ("attention_dispatch", "input_schedule"),
+        ),
+        (
+            {"compile.boundary": "attention_module"},
+            ("compile.boundary",),
+            ("attention_dispatch", "compile"),
+        ),
+        (
+            {"compile.boundary": "gradient_closure"},
+            ("compile.boundary",),
+            ("ad_lowering", "compile"),
+        ),
+        (
+            {"fusion.mlp": "torch_inductor"},
+            ("fusion.mlp",),
+            ("ad_lowering", "fusion"),
+        ),
+        (
+            {"dtensor.params_placement": ("shard",)},
+            ("dtensor.params_placement",),
+            ("ad_lowering", "distributed_layout"),
+        ),
+        (
+            {"fsdp.mp_policy.reduce_dtype": "bf16"},
+            ("fsdp.mp_policy.reduce_dtype",),
+            ("distributed_layout", "numeric_backend"),
+        ),
+        (
+            {"inverse_metric.solve_path": "factorized_solve"},
+            ("inverse_metric.solve_path",),
+            ("inverse_solve", "metric_storage"),
+        ),
+    ],
+)
+def test_search_grouping_applies_coupled_axis_rules(
+    settings: Mapping[str, object],
+    changed_axes: tuple[str, ...],
+    groups: tuple[str, ...],
+) -> None:
+    candidate = vp.Candidate(
+        "family",
+        "row",
+        settings,
+        changed_axes=changed_axes,
+        admission_status="passed",
+    )
+
+    assert (
+        run_module._candidate_class_c_groups(
+            candidate,
+            vpx.axis_table(),
+        )
+        == groups
+    )
 
 
 def axis_table_candidate(
@@ -2564,10 +2698,13 @@ def test_adapter_namespace_exports_adapter_helpers() -> None:
     assert vpa.resolve_process_group_backend
     assert vpa.run_with_loss_parallel
     assert vpa.wait_collective
+    assert vpa.distributed_axis_manifest
     assert vpa.distributed_strategy_axis
     assert vpa.RankCompileTiming
     assert vpa.RankStatus
     assert vpa.PilotReadiness
+    assert vpa.check_patched_attention_output_reference
+    assert vpa.check_patched_attention_vjp_reference
     assert vpa.load_transformers_model
     assert vpa.register_transformers_attention
     assert vpa.set_transformers_attention_implementation
@@ -2664,7 +2801,7 @@ def test_threshold_logic() -> None:
         {"dtype.model_compute": "fp16"},
     )
 
-    assert thresholds["max_abs_diff"] >= 0.25 * float(torch.finfo(torch.float16).eps)
+    assert thresholds["max_abs_diff"] == pytest.approx(1e-4)
     validate_thresholds({"max_abs_diff": 1e-5, "max_rel_diff": 10.0}, thresholds)
     validate_thresholds({"max_abs_diff": 10.0, "max_rel_diff": 1e-5}, thresholds)
 
@@ -2743,12 +2880,13 @@ def test_threshold_logic() -> None:
             thresholds={"max_abs_diff": 1e-6, "max_rel_diff": 1e-6},
         )
 
-    assert_tree_close(
-        torch.tensor([1.0], dtype=torch.float32),
-        torch.tensor([1.0 + 1e-5], dtype=torch.float32),
-        settings={"dtype.model_compute": "fp16"},
-        thresholds={"max_abs_diff": 0.0, "max_rel_diff": 0.0},
-    )
+    with pytest.raises(ReferenceFailedError):
+        assert_tree_close(
+            torch.tensor([1.0], dtype=torch.float32),
+            torch.tensor([1.0 + 1e-5], dtype=torch.float32),
+            settings={"dtype.model_compute": "fp16"},
+            thresholds={"max_abs_diff": 0.0, "max_rel_diff": 0.0},
+        )
 
 
 def test_gradient_jvp_vjp_hvp_anchors() -> None:
@@ -3105,8 +3243,12 @@ def test_run_candidate_records_full_size_check_metadata() -> None:
     def operation() -> torch.Tensor:
         return torch.tensor([1.0])
 
-    def full_size_check(output: vp.TensorTree) -> Mapping[str, object]:
+    def full_size_check(
+        output: vp.TensorTree,
+        samples: tuple[vp.Measurement, ...],
+    ) -> Mapping[str, object]:
         assert isinstance(output, torch.Tensor)
+        assert len(samples) == 1
         torch.testing.assert_close(output, torch.tensor([1.0]))
 
         return {
@@ -4139,15 +4281,98 @@ def test_record_current_rejects_stale_generator_version() -> None:
     )
 
 
+def test_record_current_rejects_stale_candidate_and_full_size_status() -> None:
+    input_signature = _input_signature("status-current")
+    candidate = vp.Candidate(
+        "family",
+        "row",
+        {"dtype": "fp32"},
+        admission_status="passed",
+    )
+    candidate_row = vpx.candidate_record_to_json(candidate, input_signature)
+
+    assert record_current(
+        candidate_row,
+        record_type="candidate",
+        family=candidate.family,
+        candidate_id=candidate.candidate_id,
+        status="passed",
+        input_signature=input_signature,
+        candidate_settings=candidate.settings,
+        changed_axes=candidate.changed_axes,
+        generator_id=candidate.generator_id,
+        generator_version=candidate.generator_version,
+    )
+    assert not record_current(
+        candidate_row,
+        record_type="candidate",
+        family=candidate.family,
+        candidate_id=candidate.candidate_id,
+        status="failed",
+        input_signature=input_signature,
+        candidate_settings=candidate.settings,
+        changed_axes=candidate.changed_axes,
+        generator_id=candidate.generator_id,
+        generator_version=candidate.generator_version,
+    )
+
+    full_size_row = _record(
+        candidate,
+        elapsed=(1.0,),
+        reserved=(1.0,),
+        input_signature=input_signature,
+    )
+    full_size_json = vpx.full_size_record_to_json(full_size_row)
+
+    assert full_size_row.row_key()["status"] == "passed"
+    assert record_current(
+        full_size_json,
+        record_type="full_size",
+        family=candidate.family,
+        candidate_id=candidate.candidate_id,
+        status="passed",
+        input_signature=input_signature,
+        candidate_settings=candidate.settings,
+        dependency_identities=candidate.dependency_identities,
+        generator_id=candidate.generator_id,
+        generator_version=candidate.generator_version,
+    )
+    assert not record_current(
+        full_size_json,
+        record_type="full_size",
+        family=candidate.family,
+        candidate_id=candidate.candidate_id,
+        status="failed",
+        input_signature=input_signature,
+        candidate_settings=candidate.settings,
+        dependency_identities=candidate.dependency_identities,
+        generator_id=candidate.generator_id,
+        generator_version=candidate.generator_version,
+    )
+
+
 def test_reference_row_key_includes_row_and_check_identity() -> None:
     candidate_a = vp.Candidate("family", "row-a", {"axis": "same"})
     candidate_b = vp.Candidate("family", "row-b", {"axis": "same"})
     first = _check_record(candidate_a, input_signature={})
     second = _check_record(candidate_b, input_signature={})
     third = dataclasses.replace(first, name="second")
+    fourth = dataclasses.replace(first, status="failed")
+    fifth = dataclasses.replace(first, thresholds={"max_abs_diff": 1e-3})
 
     assert first.row_key() != second.row_key()
     assert first.row_key() != third.row_key()
+    assert first.row_key() != fourth.row_key()
+    assert first.row_key() != fifth.row_key()
+
+
+def test_check_record_current_rejects_stale_status_and_thresholds() -> None:
+    record = _check_record(vp.Candidate("family", "row", {}), input_signature={})
+
+    assert not vpx.check_record_current(dataclasses.replace(record, status="failed"))
+    assert not vpx.check_record_current(
+        dataclasses.replace(record, thresholds={"max_abs_diff": 1e-3})
+    )
 
 
 def test_admission_helpers() -> None:
@@ -4975,10 +5200,12 @@ def test_tune_records_runtime_full_size_check_metadata() -> None:
             candidate: vp.Candidate,
             inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
             output: vp.TensorTree,
+            samples: tuple[vp.Measurement, ...],
         ) -> Mapping[str, object]:
             assert candidate.candidate_id == "flash"
             assert len(inputs) == 1
             assert isinstance(output, tuple)
+            assert len(samples) == 1
             self.calls.append(candidate.candidate_id)
 
             return {"full_size_agreement_passed": True}
@@ -6205,7 +6432,7 @@ def test_autobatch_domain_filters_reference_failures_before_probe(
     assert find_values == [(2,)]
     assert probed == [2]
     assert plan.selected["family"].candidate_id == "base|batch_size=2"
-    assert failed["base|batch_size=1"].error_type == "ReferenceFailedError"
+    assert failed["base|batch_size=1"].error_type == "ReferenceFailed"
 
 
 def test_plan_replay_preserves_autobatch_selected_value(
@@ -7715,7 +7942,7 @@ def test_selected_plan_validation_writes_failed_record(tmp_path: Path) -> None:
     summary = read_record(tmp_path / "summaries" / "selected_plan_validation.json")
 
     assert failed["status"] == "failed"
-    assert failed["error_type"] == "ReferenceFailedError"
+    assert failed["error_type"] == "ReferenceFailed"
     assert summary["status"] == "failed"
     failed_record = vpx.check_record_from_json(failed)
 
@@ -7885,6 +8112,7 @@ def test_operator_constructors_declare_kind_and_aggregation() -> None:
         distribution="explicit_score_gradients",
         label_policy="sampled_labels",
         sample_count=8,
+        sample_source="fixed_seed_and_count",
         sampling_bound={"gamma": 0.25},
         score_reduction="none",
         denominator="num_examples",
@@ -7895,6 +8123,7 @@ def test_operator_constructors_declare_kind_and_aggregation() -> None:
         "distribution": "explicit_score_gradients",
         "label_policy": "sampled_labels",
         "sample_count": 8,
+        "sample_source": "fixed_seed_and_count",
         "sampling_bound": {"gamma": 0.25},
         "score_reduction": "none",
         "denominator": "num_examples",
@@ -7908,6 +8137,20 @@ def test_operator_constructors_declare_kind_and_aggregation() -> None:
             distribution="explicit_score_gradients",
             label_policy="sampled_labels",
             sample_count=0,
+            sample_source="fixed_seed_and_count",
+            sampling_bound={"gamma": 0.25},
+            score_reduction="none",
+            denominator="num_examples",
+        )
+    with pytest.raises(vp.MaterializationError, match="sample_source"):
+        vp.sampled_fisher_vp(
+            "metric",
+            "retain",
+            aggregation="mean",
+            distribution="explicit_score_gradients",
+            label_policy="sampled_labels",
+            sample_count=1,
+            sample_source="live_random_samples",
             sampling_bound={"gamma": 0.25},
             score_reduction="none",
             denominator="num_examples",

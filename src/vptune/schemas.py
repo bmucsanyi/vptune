@@ -365,8 +365,10 @@ def record_current(
     family: str,
     candidate_id: str,
     check_name: str = "",
+    status: str | None = None,
     input_signature: Mapping[str, Any],
     candidate_settings: Mapping[str, Any],
+    thresholds: Mapping[str, float] | None = None,
     dependency_identities: Mapping[str, Mapping[str, Any]] | None = None,
     cohort_assignment: Mapping[str, Any] | None = None,
     changed_axes: Sequence[str] = (),
@@ -384,8 +386,10 @@ def record_current(
         family=family,
         candidate_id=candidate_id,
         check_name=check_name,
+        status=status,
         input_signature=input_signature,
         candidate_settings=candidate_settings,
+        thresholds=thresholds,
         dependency_identities=dependency_identities,
         cohort_assignment=cohort_assignment,
         changed_axes=changed_axes,
@@ -402,8 +406,10 @@ def _expected_record_fields(
     family: str,
     candidate_id: str,
     check_name: str,
+    status: str | None,
     input_signature: Mapping[str, Any],
     candidate_settings: Mapping[str, Any],
+    thresholds: Mapping[str, float] | None,
     dependency_identities: Mapping[str, Mapping[str, Any]] | None,
     cohort_assignment: Mapping[str, Any] | None,
     changed_axes: Sequence[str],
@@ -423,10 +429,26 @@ def _expected_record_fields(
     )
 
     if record_type == "reference":
-        return {**expected, "name": check_name}
+        reference_expected = {**expected, "name": check_name}
+
+        if status is not None:
+            reference_expected["status"] = status
+
+        if thresholds is not None:
+            reference_expected["thresholds"] = dict(thresholds)
+
+        return reference_expected
 
     if record_type == "candidate":
-        return {**expected, "changed_axes": tuple(changed_axes)}
+        candidate_expected = {**expected, "changed_axes": tuple(changed_axes)}
+
+        if status is not None:
+            candidate_expected["status"] = status
+
+        return candidate_expected
+
+    if status is not None:
+        return {**expected, "status": status}
 
     return expected
 
@@ -591,6 +613,7 @@ def candidate_record_from_json(record: Mapping[str, Any]) -> Candidate:
         candidate_id=candidate.candidate_id,
         input_signature=record["input_signature"],
         candidate_settings=candidate.settings,
+        status=candidate.admission_status,
         dependency_identities=candidate.dependency_identities,
         cohort_assignment=candidate.cohort_assignment,
         changed_axes=candidate.changed_axes,
@@ -646,8 +669,10 @@ def check_record_current(record: CheckRecord) -> bool:
         family=record.family,
         candidate_id=record.candidate_id,
         check_name=record.name,
+        status=record.status,
         input_signature=record.input_signature,
         candidate_settings=record.candidate_settings,
+        thresholds=record.thresholds,
         dependency_identities=record.dependency_identities,
         cohort_assignment=record.cohort_assignment,
         generator_id=record.generator_id,
@@ -703,6 +728,7 @@ def full_size_record_current(record: FullSizeRecord) -> bool:
         record_type="full_size",
         family=record.family,
         candidate_id=record.candidate_id,
+        status=record.status,
         input_signature=record.input_signature,
         candidate_settings=record.candidate_settings,
         dependency_identities=record.dependency_identities,
@@ -918,6 +944,26 @@ def _record_by_row_key(records: Sequence[Any], label: str) -> dict[str, Any]:
     return by_key
 
 
+def _check_record_by_lookup_key(
+    records: Sequence[CheckRecord],
+    label: str,
+) -> dict[str, CheckRecord]:
+    by_key = {_check_row_lookup_key(record.row_key()): record for record in records}
+
+    if len(by_key) != len(records):
+        message = f"plan replay has duplicate {label} rows"
+        raise VPTuneError(message)
+
+    return by_key
+
+
+def _check_row_lookup_key(row_key: Mapping[str, Any]) -> str:
+    lookup = dict(row_key)
+    lookup.pop("status", None)
+
+    return canonical_json(lookup)
+
+
 def _records_in_saved_order(
     row_keys: Sequence[Any],
     records_by_key: Mapping[str, Any],
@@ -936,6 +982,36 @@ def _records_in_saved_order(
         ordered.append(record)
 
     if set(records_by_key) != {canonical_json(value) for value in row_keys}:
+        message = f"plan replay received extra {label} rows"
+        raise VPTuneError(message)
+
+    return tuple(ordered)
+
+
+def _check_records_in_saved_order(
+    row_keys: Sequence[Any],
+    records_by_key: Mapping[str, CheckRecord],
+    label: str,
+) -> tuple[CheckRecord, ...]:
+    ordered = []
+
+    for value in row_keys:
+        row_key = _check_row_lookup_key(dict(value))
+        record = records_by_key.get(row_key)
+
+        if record is None:
+            message = f"plan replay missing {label} row: {value}"
+            raise VPTuneError(message)
+
+        if to_json_value(record.row_key()) != to_json_value(value):
+            message = f"plan replay stale {label} row: {value}"
+            raise StaleRecordError(message)
+
+        ordered.append(record)
+
+    if set(records_by_key) != {
+        _check_row_lookup_key(dict(value)) for value in row_keys
+    }:
         message = f"plan replay received extra {label} rows"
         raise VPTuneError(message)
 
@@ -1891,13 +1967,13 @@ def _replay_rows(
     validation_records: Sequence[CheckRecord],
 ) -> _ReplayRows:
     full_size_by_key = _record_by_row_key(full_size_records, "full-size")
-    check_by_key = _record_by_row_key(check_records, "reference")
+    check_by_key = _check_record_by_lookup_key(check_records, "reference")
     ordered_full_size = _records_in_saved_order(
         tuple(record["full_size_records"]),
         full_size_by_key,
         "full-size",
     )
-    ordered_checks = _records_in_saved_order(
+    ordered_checks = _check_records_in_saved_order(
         tuple(record["check_records"]),
         check_by_key,
         "reference",
@@ -2138,9 +2214,9 @@ def _plan_validation_records(
     if not row_keys:
         return ()
 
-    return _records_in_saved_order(
+    return _check_records_in_saved_order(
         row_keys,
-        _record_by_row_key(validation_records, "selected-plan validation"),
+        _check_record_by_lookup_key(validation_records, "selected-plan validation"),
         "selected-plan validation",
     )
 
@@ -2149,8 +2225,8 @@ def _summary_validation_records(
     summary: Mapping[str, Any],
     validation_records: Sequence[CheckRecord],
 ) -> tuple[CheckRecord, ...]:
-    return _records_in_saved_order(
+    return _check_records_in_saved_order(
         tuple(summary["records"]),
-        _record_by_row_key(validation_records, "selected-plan validation"),
+        _check_record_by_lookup_key(validation_records, "selected-plan validation"),
         "selected-plan validation",
     )

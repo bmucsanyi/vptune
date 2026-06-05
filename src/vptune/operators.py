@@ -172,6 +172,7 @@ def sampled_fisher_vp(
     distribution: str,
     label_policy: str,
     sample_count: int,
+    sample_source: str,
     sampling_bound: Mapping[str, Any],
     score_reduction: str,
     denominator: str,
@@ -187,10 +188,15 @@ def sampled_fisher_vp(
         message = "sampled Fisher sample_count must be positive"
         raise MaterializationError(message)
 
+    if sample_source not in {"fixed_sample_table", "fixed_seed_and_count"}:
+        message = f"sampled Fisher sample_source is unsupported: {sample_source}"
+        raise MaterializationError(message)
+
     semantics = {
         "distribution": distribution,
         "label_policy": label_policy,
         "sample_count": sample_count,
+        "sample_source": sample_source,
         "sampling_bound": dict(sampling_bound),
         "score_reduction": score_reduction,
         "denominator": denominator,

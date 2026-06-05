@@ -314,7 +314,11 @@ def run_candidate(
     clock: Callable[[], float] = time.perf_counter,
     clear_gradients: Callable[[], None] | None = None,
     reference_passed: bool = True,
-    full_size_check: Callable[[TensorTree], Mapping[str, Any]] | None = None,
+    full_size_check: Callable[
+        [TensorTree, tuple[Measurement, ...]],
+        Mapping[str, Any],
+    ]
+    | None = None,
 ) -> FullSizeRecord:
     """Run and record one full-size candidate.
 
@@ -342,7 +346,7 @@ def run_candidate(
         if full_size_check is not None:
             selection_metadata = {
                 **selection_metadata,
-                **dict(full_size_check(output)),
+                **dict(full_size_check(output, samples)),
             }
     except OperationMeasurementError as error:
         return failed_record(

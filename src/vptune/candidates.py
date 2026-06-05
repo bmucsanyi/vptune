@@ -141,6 +141,9 @@ class AxisTable:
         return _axis_table_cross_rule_error(candidate.settings, fixed_fields)
 
 
+AxisManifest = AxisTable
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class AxisTableAdmitter:
     """Candidate admitter backed by the axis table."""
@@ -431,6 +434,15 @@ def axis_table() -> AxisTable:
         class_c_groups=class_c_groups,
         merge_rules=AXIS_TABLE_MERGE_RULES,
     )
+
+
+def axis_manifest() -> AxisManifest:
+    """Return the complete sweep axis table.
+
+    Returns:
+        Complete axis table for candidate generation and admission.
+    """
+    return axis_table()
 
 
 def _axis_table_axis(

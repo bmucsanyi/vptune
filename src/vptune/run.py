@@ -42,7 +42,11 @@ from vptune.data import (
     TuningRun,
     VectorProvider,
 )
-from vptune.errors import MaterializationError, NoPassedCandidateError
+from vptune.errors import (
+    MaterializationError,
+    NoPassedCandidateError,
+    ReferenceFailedError,
+)
 from vptune.identities import canonical_json, stable_hash
 from vptune.io import read_record, write_record
 from vptune.measure import (
@@ -473,14 +477,17 @@ def _full_size_check(
     runtime: RuntimeConfig,
     candidate: Candidate,
     inputs: tuple[tuple[Batch, TensorTree], ...],
-) -> Callable[[TensorTree], Mapping[str, Any]] | None:
+) -> Callable[[TensorTree, tuple[Measurement, ...]], Mapping[str, Any]] | None:
     full_size_check = runtime.full_size_check
 
     if full_size_check is None:
         return None
 
-    def check(output: TensorTree) -> Mapping[str, Any]:
-        return full_size_check(candidate, inputs, output)
+    def check(
+        output: TensorTree,
+        samples: tuple[Measurement, ...],
+    ) -> Mapping[str, Any]:
+        return full_size_check(candidate, inputs, output, samples)
 
     return check
 
@@ -512,6 +519,7 @@ def _check_records(
     result: ReferenceResult,
 ) -> tuple[CheckRecord, ...]:
     records = []
+    child_descriptors = []
 
     for child in result.child_results:
         child_records = _check_records(
@@ -520,15 +528,17 @@ def _check_records(
             child.result,
         )
         records.extend(child_records)
+        child_descriptors.append({
+            "child_name": child.name,
+            "row": child_records[-1].row_key(),
+        })
 
-    child_rows = tuple(record.row_key() for record in records)
-
-    if child_rows:
+    if child_descriptors:
         result = dataclasses.replace(
             result,
             measurements={
                 **dict(result.measurements),
-                "child_reference_rows": child_rows,
+                "child_reference_rows": tuple(child_descriptors),
             },
             child_results=(),
         )
@@ -840,10 +850,8 @@ def autotune(
     candidates: Mapping[str, Mapping[str, Any]],
     thresholds: Mapping[str, float],
     objective_signature: Mapping[str, Any],
-    numeric_bound_fields: Mapping[str, Any] | None = None,
     scalar_objectives: Mapping[str, ScalarObjective] | None = None,
     function_objectives: Mapping[str, FunctionObjective] | None = None,
-    teacher_objective: FunctionObjective | None = None,
     run_dir: Path | None = None,
     memory_backend: MemoryBackend | None = None,
     clock: Callable[[], float] = time.perf_counter,
@@ -864,11 +872,9 @@ def autotune(
         target=target,
         candidates=candidates,
         thresholds=thresholds,
-        numeric_bound_fields=numeric_bound_fields,
         objective_signature=objective_signature,
         scalar_objectives=scalar_objectives,
         function_objectives=function_objectives,
-        teacher_objective=teacher_objective,
     )
 
     return tune(
@@ -998,7 +1004,63 @@ def _candidate_class_c_groups(
 
         groups.append(axis.class_c_group)
 
+    _add_merged_class_c_groups(groups, candidate.settings)
+
     return tuple(sorted(set(groups)))
+
+
+def _add_merged_class_c_groups(
+    groups: list[str],
+    settings: Mapping[str, Any],
+) -> None:
+    if settings.get("attention.partition") == "packed_tokens":
+        groups.append("input_schedule")
+
+    boundary = settings.get("compile.boundary")
+
+    if boundary == "attention_module":
+        groups.append("attention_dispatch")
+
+    if boundary in {
+        "loss_closure",
+        "gradient_closure",
+        "jvp_closure",
+        "vjp_closure",
+        "hvp_single_vector",
+        "hvp_batched_vectors",
+        "ggn_jvp",
+        "ggn_loss_hessian_product",
+        "ggn_vjp",
+        "ggn_full_product",
+        "fisher_score_grad",
+        "sampled_fisher_score_grad",
+        "empirical_fisher_example_grad",
+        "metric_multiply",
+        "inverse_metric_solve",
+        "composition_child",
+    }:
+        groups.append("ad_lowering")
+
+    if any(
+        key.startswith("fusion.") and value != "model_default"
+        for key, value in settings.items()
+    ):
+        groups.append("ad_lowering")
+
+    if any(key.startswith("dtensor.") for key in settings):
+        groups.append("ad_lowering")
+
+    if settings.get("fsdp.mp_policy.reduce_dtype") not in {None, "fp32"}:
+        groups.append("numeric_backend")
+
+    if settings.get("inverse_metric.solve_path") in {
+        "factorized_solve",
+        "woodbury_low_rank_solve",
+    }:
+        groups.append("metric_storage")
+
+    if settings.get("inverse_metric.preconditioner") not in {None, "none"}:
+        groups.append("metric_storage")
 
 
 def _admission_probe_result(
@@ -1204,6 +1266,7 @@ def _probe_balanced_candidate_rows(
     timing_policy: TimingPolicy,
     selection_policy: SelectionPolicy,
     retained_top_count: int | None,
+    compile_call_horizons: tuple[int, ...],
     memory_backend: MemoryBackend,
     clock: Callable[[], float],
     run_dir: Path | None,
@@ -1223,7 +1286,7 @@ def _probe_balanced_candidate_rows(
         input_signature=input_signature,
         timing_policy=timing_policy,
         selection_policy=selection_policy,
-        compile_call_horizons=(),
+        compile_call_horizons=compile_call_horizons,
         memory_backend=memory_backend,
         clock=clock,
         run_dir=run_dir,
@@ -1321,6 +1384,133 @@ def _probe_balanced_candidate_rows(
             ),
         ),
     )
+
+
+def _probe_thorough_candidate_rows(
+    *,
+    runtime: RuntimeConfig,
+    candidates: tuple[Candidate, ...],
+    reference_batch: Batch,
+    reference_vector: TensorTree,
+    probe_inputs: tuple[tuple[Batch, TensorTree], ...],
+    input_signature: dict[str, Any],
+    timing_policy: TimingPolicy,
+    selection_policy: SelectionPolicy,
+    retained_top_count: int | None,
+    compile_call_horizons: tuple[int, ...],
+    memory_backend: MemoryBackend,
+    clock: Callable[[], float],
+    run_dir: Path | None,
+) -> tuple[tuple[Candidate, ...], _CandidateProbeRows]:
+    balanced_candidates, balanced_rows = _probe_balanced_candidate_rows(
+        runtime=runtime,
+        candidates=candidates,
+        reference_batch=reference_batch,
+        reference_vector=reference_vector,
+        probe_inputs=probe_inputs,
+        input_signature=input_signature,
+        timing_policy=timing_policy,
+        selection_policy=selection_policy,
+        retained_top_count=retained_top_count,
+        compile_call_horizons=compile_call_horizons,
+        memory_backend=memory_backend,
+        clock=clock,
+        run_dir=run_dir,
+    )
+    top_balanced = _near_fastest_candidates(
+        balanced_candidates,
+        balanced_rows.full_size_records,
+        input_signature=input_signature,
+        policy=selection_policy,
+    )
+    expanded_candidates = _thorough_expanded_candidate_rows(
+        candidates,
+        top_balanced,
+        measured_candidates=balanced_candidates,
+    )
+    expanded_rows = _probe_candidate_rows(
+        runtime=runtime,
+        candidates=expanded_candidates,
+        reference_batch=reference_batch,
+        reference_vector=reference_vector,
+        probe_inputs=probe_inputs,
+        input_signature=input_signature,
+        timing_policy=timing_policy,
+        selection_policy=selection_policy,
+        compile_call_horizons=compile_call_horizons,
+        memory_backend=memory_backend,
+        clock=clock,
+        run_dir=run_dir,
+    )
+
+    return (
+        (*balanced_candidates, *expanded_candidates),
+        _CandidateProbeRows(
+            candidate_rows=(
+                *balanced_rows.candidate_rows,
+                *expanded_rows.candidate_rows,
+            ),
+            full_size_records=(
+                *balanced_rows.full_size_records,
+                *expanded_rows.full_size_records,
+            ),
+            check_records=(
+                *balanced_rows.check_records,
+                *expanded_rows.check_records,
+            ),
+        ),
+    )
+
+
+def _thorough_expanded_candidate_rows(
+    candidates: tuple[Candidate, ...],
+    top_candidates: tuple[Candidate, ...],
+    *,
+    measured_candidates: tuple[Candidate, ...],
+) -> tuple[Candidate, ...]:
+    measured_ids = {candidate.candidate_id for candidate in measured_candidates}
+    compile_candidates = _fast_compile_candidate_rows(candidates, top_candidates)
+    group_candidates = _thorough_group_expansion_candidates(candidates, top_candidates)
+    expanded = []
+
+    for candidate in (*compile_candidates, *group_candidates):
+        if candidate.candidate_id in measured_ids:
+            continue
+
+        if candidate in expanded:
+            continue
+
+        expanded.append(candidate)
+
+    return tuple(expanded)
+
+
+def _thorough_group_expansion_candidates(
+    candidates: tuple[Candidate, ...],
+    top_candidates: tuple[Candidate, ...],
+) -> tuple[Candidate, ...]:
+    table = axis_table()
+    top_groups = set()
+
+    for candidate in top_candidates:
+        if candidate.changed_axes:
+            top_groups.update(_candidate_class_c_groups(candidate, table))
+
+    if not top_groups:
+        return ()
+
+    expanded = []
+
+    for candidate in candidates:
+        if candidate.admission_status != "passed" or not candidate.changed_axes:
+            continue
+
+        groups = set(_candidate_class_c_groups(candidate, table))
+
+        if groups & top_groups:
+            expanded.append(candidate)
+
+    return tuple(expanded)
 
 
 def _probe_balanced_group_rows(
@@ -1841,21 +2031,22 @@ def _probe_problem(
             timing_policy=timing_policy,
             selection_policy=problem.target.selection_policy,
             retained_top_count=problem.target.search_policy.retained_top_count,
+            compile_call_horizons=(),
             memory_backend=backend,
             clock=clock,
             run_dir=run_dir,
         )
     elif problem.target.search_policy.strategy == "thorough":
-        measured_candidates = candidates
-        probed = _probe_candidate_rows(
+        measured_candidates, probed = _probe_thorough_candidate_rows(
             runtime=runtime,
-            candidates=measured_candidates,
+            candidates=candidates,
             reference_batch=reference_batch,
             reference_vector=reference_vector,
             probe_inputs=probe_inputs,
             input_signature=input_signature,
             timing_policy=timing_policy,
             selection_policy=problem.target.selection_policy,
+            retained_top_count=problem.target.search_policy.retained_top_count,
             compile_call_horizons=problem.target.search_policy.compile_call_horizons,
             memory_backend=backend,
             clock=clock,
@@ -2082,6 +2273,26 @@ def _reference_outcome(
             reference_batch,
             reference_vector,
         )
+    except ReferenceFailedError as error:
+        return _ReferenceOutcome(
+            candidates=(),
+            check_records=(
+                _failed_check_record(
+                    candidate,
+                    input_signature,
+                    error_type="ReferenceFailed",
+                    error=str(error),
+                ),
+            ),
+            full_size_record=failed_record(
+                candidate,
+                input_signature,
+                error_type="ReferenceFailed",
+                error=str(error),
+                reference_passed=False,
+            ),
+            passed=False,
+        )
     except RuntimeError as error:
         return _ReferenceOutcome(
             candidates=(),
@@ -2158,7 +2369,7 @@ def _probe_autobatch_value(
         if check is not None:
             state.selection_metadata = {
                 **dict(state.selection_metadata),
-                **dict(check(output)),
+                **dict(check(output, tuple(state.samples))),
             }
     except RuntimeError as error:
         state.error_type = type(error).__name__
@@ -2944,6 +3155,7 @@ def validate_plan(
 
     Raises:
         MaterializationError: If validators differ from selected families.
+        ReferenceFailedError: If a selected family validator fails reference validation.
         RuntimeError: If a selected family validator fails validation.
     """
     selected_families = set(plan.selected)
@@ -2999,6 +3211,24 @@ def validate_plan(
 
         try:
             result = validators[family](candidate, selected_record, context)
+        except ReferenceFailedError as error:
+            record = _failed_validation_record(
+                candidate,
+                input_signature,
+                error_type="ReferenceFailed",
+                error=str(error),
+            )
+            records.append(record)
+
+            if run_dir is not None:
+                _write_validation(run_dir, record)
+                _write_validation_summary(
+                    run_dir,
+                    plan,
+                    tuple(records),
+                )
+
+            raise
         except RuntimeError as error:
             record = _failed_validation_record(
                 candidate,

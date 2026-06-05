@@ -62,6 +62,7 @@ def attention_settings(
     sdpa_priority: tuple[str, ...],
     partition: str,
     padding: str,
+    query_block_size: int | None = None,
 ) -> vpat.AttentionSettings:
     return vpat.AttentionSettings(
         frontend=frontend,
@@ -69,6 +70,7 @@ def attention_settings(
         sdpa_priority=sdpa_priority,
         partition=partition,
         padding=padding,
+        query_block_size=query_block_size,
     )
 
 
@@ -130,6 +132,15 @@ def test_core_attention_axis_admits_executable_frontends() -> None:
                 "attention.padding": "dense_padded",
             },
         ),
+        vp.Candidate(
+            "attention",
+            "segmented-forward-ad",
+            {
+                "attention.frontend": "blockwise_exact",
+                "attention.partition": "segmented_forward_ad",
+                "attention.padding": "dense_padded",
+            },
+        ),
     )
 
     for row in rows:
@@ -183,7 +194,19 @@ def test_attention_settings_from_candidate_records_priority_order() -> None:
         "sdpa_priority": ("flash_attention", "math"),
         "partition": "full",
         "padding": "dense_padded",
+        "query_block_size": None,
     }
+
+
+def test_attention_settings_from_candidate_records_sequence_block_size() -> None:
+    settings = vpat.attention_settings_from_candidate({
+        "attention.frontend": "blockwise_exact",
+        "attention.partition": "blockwise_queries",
+        "attention.padding": "dense_padded",
+        "chunk.sequence_position_block_size": 2,
+    })
+
+    assert settings.signature()["query_block_size"] == 2
 
 
 def test_attention_operation_factory_and_reference_check_execute_core_row() -> None:
@@ -216,6 +239,68 @@ def test_attention_operation_factory_and_reference_check_execute_core_row() -> N
     torch.testing.assert_close(attention_output_tensor(output), expected)
     assert result.name == "core_attention_reference"
     assert result.measurements["max_abs_diff"] == pytest.approx(0.0)
+
+
+def test_attention_operation_uses_candidate_sequence_block_size() -> None:
+    inputs = attention_inputs()
+    batch = {
+        "query": inputs.query,
+        "key": inputs.key,
+        "value": inputs.value,
+    }
+    candidate = vp.Candidate(
+        "attention",
+        "blockwise",
+        {
+            "attention.frontend": "blockwise_exact",
+            "attention.partition": "blockwise_queries",
+            "attention.padding": "dense_padded",
+            "chunk.sequence_position_block_size": 2,
+        },
+    )
+    location = vpat.MappingAttentionLocation(
+        semantics=attention_semantics(),
+        query_key="query",
+        key_key="key",
+        value_key="value",
+        output_key="out",
+        mask_key=None,
+        inverse_permutation_key=None,
+        query_block_size_key=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
+        enable_gqa=False,
+    )
+    factory = vpat.attention_operation_factory(location)
+    output = factory(candidate, batch, {})()
+    expected = vpat.exact_attention(inputs)
+
+    torch.testing.assert_close(attention_output_tensor(output), expected)
+
+
+def test_attention_rejects_conflicting_query_block_sizes() -> None:
+    inputs = attention_inputs()
+    batch = {
+        "query": inputs.query,
+        "key": inputs.key,
+        "value": inputs.value,
+        "query_block_size": 3,
+    }
+    candidate = vp.Candidate(
+        "attention",
+        "blockwise",
+        {
+            "attention.frontend": "blockwise_exact",
+            "attention.partition": "blockwise_queries",
+            "attention.padding": "dense_padded",
+            "chunk.sequence_position_block_size": 2,
+        },
+    )
+    factory = vpat.attention_operation_factory(attention_location())
+
+    with pytest.raises(vp.AdmissionError, match="query block sizes differ"):
+        factory(candidate, batch, {})()
 
 
 def test_pytorch_sdpa_direct_matches_exact_attention() -> None:
@@ -347,6 +432,61 @@ def test_sdpa_kernel_values_enter_declared_context(
     assert calls == [((vpat.SDPA_BACKENDS[kernel_name],), False)]
 
 
+def test_flash_sdpa_matches_math_backend_on_cuda() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for Flash SDPA")
+
+    major, _ = torch.cuda.get_device_capability()
+
+    if major < 8:
+        pytest.skip("Flash SDPA requires Ampere or newer CUDA hardware")
+
+    torch.manual_seed(0)
+    query = torch.randn(2, 4, 128, 64, device="cuda", dtype=torch.float16)
+    key = torch.randn(2, 4, 128, 64, device="cuda", dtype=torch.float16)
+    value = torch.randn(2, 4, 128, 64, device="cuda", dtype=torch.float16)
+    inputs = vpat.AttentionInputs(
+        query=query,
+        key=key,
+        value=value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
+        score_softcap=None,
+        enable_gqa=False,
+        inverse_permutation=None,
+        query_block_size=None,
+    )
+    flash = vpat.run_attention(
+        inputs,
+        attention_settings(
+            "pytorch_sdpa_direct",
+            "flash_attention",
+            (),
+            "full",
+            "dense_padded",
+        ),
+    )
+    math_output = vpat.run_attention(
+        inputs,
+        attention_settings(
+            "pytorch_sdpa_direct",
+            "math",
+            (),
+            "full",
+            "dense_padded",
+        ),
+    )
+
+    torch.testing.assert_close(
+        flash.float(),
+        math_output.float(),
+        atol=3e-2,
+        rtol=3e-2,
+    )
+
+
 def test_mapping_attention_location_executes_non_transformers_attention() -> None:
     inputs = attention_inputs()
     location = vpat.MappingAttentionLocation(
@@ -407,6 +547,41 @@ def test_packed_exact_attention_restores_token_order() -> None:
     torch.testing.assert_close(output, vpat.exact_attention(inputs))
 
 
+def test_packed_exact_attention_restores_padded_positions() -> None:
+    inputs = attention_inputs()
+    packed_indices = torch.tensor([2, 0, 3])
+    inverse_permutation = torch.tensor([1, -1, 0, 2, -1])
+    packed_inputs = dataclasses_replace_attention(
+        inputs,
+        query=inputs.query.index_select(-2, packed_indices),
+        key=inputs.key.index_select(-2, packed_indices),
+        value=inputs.value.index_select(-2, packed_indices),
+        inverse_permutation=inverse_permutation,
+    )
+    settings = attention_settings(
+        "packed_exact",
+        None,
+        (),
+        "packed_tokens",
+        "unpadded_packed",
+    )
+    packed_output = vpat.exact_attention(packed_inputs)
+    expected = packed_output.new_zeros(
+        *packed_output.shape[:-2],
+        5,
+        packed_output.size(-1),
+    )
+    expected.index_copy_(
+        -2,
+        torch.tensor([0, 2, 3]),
+        packed_output.index_select(-2, torch.tensor([1, 0, 2])),
+    )
+
+    output = vpat.run_attention(packed_inputs, settings)
+
+    torch.testing.assert_close(output, expected)
+
+
 def test_blockwise_exact_attention_matches_full_attention() -> None:
     inputs = dataclasses_replace_attention(attention_inputs(), query_block_size=2)
     causal_inputs = dataclasses_replace_attention(inputs, is_causal=True)
@@ -423,6 +598,50 @@ def test_blockwise_exact_attention_matches_full_attention() -> None:
 
     torch.testing.assert_close(output, vpat.exact_attention(inputs))
     torch.testing.assert_close(causal_output, vpat.exact_attention(causal_inputs))
+
+
+def test_segmented_forward_ad_attention_matches_full_attention_tangent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = dataclasses_replace_attention(attention_inputs(), query_block_size=2)
+    tangent = torch.linspace(
+        0.1,
+        0.4,
+        steps=inputs.query.numel(),
+        dtype=inputs.query.dtype,
+    ).reshape_as(inputs.query)
+    settings = attention_settings(
+        "blockwise_exact",
+        None,
+        (),
+        "segmented_forward_ad",
+        "dense_padded",
+    )
+
+    def blocked_block_attention(
+        inputs: vpat.AttentionInputs,
+        start: int,
+        stop: int,
+    ) -> torch.Tensor:
+        assert inputs
+        assert stop >= start
+        message = "segmented_forward_ad used blockwise query helper"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(vpat, "_block_attention", blocked_block_attention)
+
+    with torch.autograd.forward_ad.dual_level():
+        dual_query = torch.autograd.forward_ad.make_dual(inputs.query, tangent)
+        dual_inputs = dataclasses_replace_attention(inputs, query=dual_query)
+        full = vpat.exact_attention(dual_inputs)
+        segmented = vpat.run_attention(dual_inputs, settings)
+        full_primal, full_tangent = torch.autograd.forward_ad.unpack_dual(full)
+        segmented_primal, segmented_tangent = torch.autograd.forward_ad.unpack_dual(
+            segmented
+        )
+
+    torch.testing.assert_close(segmented_primal, full_primal)
+    torch.testing.assert_close(segmented_tangent, full_tangent)
 
 
 def test_exact_attention_applies_score_softcap() -> None:
@@ -547,14 +766,14 @@ def test_attention_executor_rejects_invalid_rows() -> None:
             ),
         )
 
-    with pytest.raises(AdmissionError, match="segmented_forward_ad"):
+    with pytest.raises(AdmissionError, match="blockwise_exact requires"):
         vpat.run_attention(
-            inputs,
+            dataclasses_replace_attention(inputs, query_block_size=2),
             attention_settings(
                 "blockwise_exact",
                 None,
                 (),
-                "segmented_forward_ad",
+                "full",
                 "dense_padded",
             ),
         )

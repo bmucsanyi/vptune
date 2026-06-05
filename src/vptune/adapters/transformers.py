@@ -7,11 +7,45 @@ from typing import Any, Protocol
 
 import torch
 
-from vptune.attention import AttentionSemantics, MappingAttentionLocation
+from vptune.attention import (
+    AttentionSemantics,
+    MappingAttentionLocation,
+)
+from vptune.attention import (
+    check_patched_attention_output_reference as _check_patched_attention_output,
+)
+from vptune.attention import (
+    check_patched_attention_vjp_reference as _check_patched_attention_vjp,
+)
 from vptune.candidates import AxisDescriptor
-from vptune.data import PACKAGE_VERSION, Candidate
-from vptune.errors import AdmissionError
+from vptune.checks import tree_error_measurements, validate_thresholds
+from vptune.data import (
+    PACKAGE_VERSION,
+    Batch,
+    BufferTree,
+    CallableMaterializer,
+    Candidate,
+    CandidateAdmitter,
+    CandidateOperation,
+    FullSizeCheck,
+    FullSizeRecord,
+    FunctionObjective,
+    Measurement,
+    ModuleCallSpec,
+    OperationFactory,
+    OperatorSpec,
+    ParameterSurface,
+    ParameterTree,
+    ReferenceCheck,
+    ReferenceResult,
+    RuntimeConfig,
+    ScalarObjective,
+    TensorTree,
+)
+from vptune.errors import AdmissionError, MaterializationError
 from vptune.identities import module_identity
+from vptune.runtime import standard_operation_factory, standard_reference_check
+from vptune.tensor_tree import tree_signature
 
 EAGER_ATTENTION_FRONTENDS = (
     "transformers_eager",
@@ -62,6 +96,21 @@ LOAD_TIME_ATTENTION_FRONTENDS = {
     "paged|flash_attention_3": "paged|flash_attention_3",
     "paged|flash_attention_4": "paged|flash_attention_4",
 }
+TRANSFORMERS_RUNTIME_SETTINGS = (
+    "attention.frontend",
+    "attention.sdpa_kernel",
+    "attention.sdpa_priority_list",
+    "attention.custom_kernel_id",
+    "attention.mask_formatter_id",
+    "use_cache",
+    "output_attentions",
+    "module_mode",
+    "dropout_p",
+    "enable_gqa",
+    "query_heads",
+    "key_heads",
+    "value_heads",
+)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -158,7 +207,7 @@ def load_transformers_model(
     revision: str,
     torch_dtype: torch.dtype,
     attention_frontend: str,
-    attention_custom_kernel_id: str | None = None,
+    attention_custom_kernel_id: str | None,
     use_cache: bool,
 ) -> torch.nn.Module:
     """Load a Transformers model with explicit execution settings.
@@ -172,7 +221,7 @@ def load_transformers_model(
         torch_dtype=torch_dtype,
         attn_implementation=transformers_attn_implementation(
             attention_frontend,
-            attention_custom_kernel_id=attention_custom_kernel_id,
+            attention_custom_kernel_id,
         ),
         use_cache=use_cache,
     )
@@ -180,8 +229,7 @@ def load_transformers_model(
 
 def transformers_attn_implementation(
     attention_frontend: str,
-    *,
-    attention_custom_kernel_id: str | None = None,
+    attention_custom_kernel_id: str | None,
 ) -> str:
     """Return the Transformers loader value for an attention frontend.
 
@@ -215,7 +263,7 @@ def set_transformers_attention_implementation(
     model: TransformersAttentionConfigurable,
     *,
     attention_frontend: str,
-    attention_custom_kernel_id: str | None = None,
+    attention_custom_kernel_id: str | None,
 ) -> str:
     """Set the active Transformers attention implementation.
 
@@ -224,7 +272,7 @@ def set_transformers_attention_implementation(
     """
     attn_implementation = transformers_attn_implementation(
         attention_frontend,
-        attention_custom_kernel_id=attention_custom_kernel_id,
+        attention_custom_kernel_id,
     )
     model.set_attn_implementation(attn_implementation)
 
@@ -264,6 +312,389 @@ def register_transformers_attention(
         "attention_custom_kernel_id": attention_custom_kernel_id,
         "mask_formatter_id": mask_formatter_id,
     }
+
+
+def transformers_operation_factory(
+    operator: OperatorSpec,
+    *,
+    model: Any,
+    params: ParameterTree,
+    buffers: BufferTree,
+    module_call: ModuleCallSpec,
+    parameter_surface: ParameterSurface | None = None,
+    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
+    function_objectives: Mapping[str, FunctionObjective] | None = None,
+    attention_custom_kernel_id: str | None = None,
+) -> OperationFactory:
+    """Return a Transformers-backed standard operation factory."""
+    standard_factory = standard_operation_factory(
+        operator,
+        params=params,
+        buffers=buffers,
+        parameter_surface=parameter_surface,
+        scalar_objectives=scalar_objectives,
+        function_objectives=function_objectives,
+        module=model,
+        module_call=module_call,
+    )
+
+    def factory(
+        candidate: Candidate,
+        batch: Batch,
+        vector: TensorTree,
+    ) -> CandidateOperation:
+        _configure_transformers_runtime(
+            model,
+            candidate,
+            attention_custom_kernel_id=attention_custom_kernel_id,
+        )
+
+        return standard_factory(_standard_candidate(candidate), batch, vector)
+
+    return factory
+
+
+def transformers_reference_check(
+    operator: OperatorSpec,
+    *,
+    model: Any,
+    params: ParameterTree,
+    buffers: BufferTree,
+    module_call: ModuleCallSpec,
+    thresholds: Mapping[str, float],
+    parameter_surface: ParameterSurface | None = None,
+    numeric_bound_fields: Mapping[str, Any] | None = None,
+    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
+    function_objectives: Mapping[str, FunctionObjective] | None = None,
+    attention_custom_kernel_id: str | None = None,
+) -> ReferenceCheck:
+    """Return a Transformers-backed standard reference check."""
+    standard_check = standard_reference_check(
+        operator,
+        params=params,
+        buffers=buffers,
+        thresholds=thresholds,
+        parameter_surface=parameter_surface,
+        numeric_bound_fields=numeric_bound_fields,
+        scalar_objectives=scalar_objectives,
+        function_objectives=function_objectives,
+        module=model,
+        module_call=module_call,
+    )
+
+    def check(
+        candidate: Candidate,
+        batch: Batch,
+        vector: TensorTree,
+    ) -> ReferenceResult:
+        _configure_transformers_runtime(
+            model,
+            candidate,
+            attention_custom_kernel_id=attention_custom_kernel_id,
+        )
+
+        return standard_check(_standard_candidate(candidate), batch, vector)
+
+    return check
+
+
+def check_patched_attention_output_reference(
+    reference: Callable[..., TensorTree],
+    patched: Callable[..., TensorTree],
+    args: Sequence[Any],
+    *,
+    thresholds: Mapping[str, float],
+) -> ReferenceResult:
+    """Return adapter reference result for patched attention output.
+
+    Returns:
+        Reference result with output error measurements.
+    """
+    measurements = _check_patched_attention_output(
+        reference,
+        patched,
+        args,
+        thresholds=thresholds,
+    )
+
+    return ReferenceResult(
+        "patched_attention_output",
+        dict(thresholds),
+        measurements,
+    )
+
+
+def check_patched_attention_vjp_reference(
+    reference: Callable[..., torch.Tensor],
+    patched: Callable[..., torch.Tensor],
+    args: Sequence[Any],
+    cotangent: torch.Tensor,
+    differentiable_arg_indices: Sequence[int],
+    *,
+    thresholds: Mapping[str, float],
+) -> ReferenceResult:
+    """Return adapter reference result for patched attention VJP.
+
+    Returns:
+        Reference result with VJP error measurements.
+    """
+    measurements = _check_patched_attention_vjp(
+        reference,
+        patched,
+        args,
+        cotangent,
+        differentiable_arg_indices,
+        thresholds=thresholds,
+    )
+
+    return ReferenceResult(
+        "patched_attention_vjp",
+        dict(thresholds),
+        measurements,
+    )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TransformersFullSizeCheck:
+    """Full-size check for Transformers-backed rows."""
+
+    operation_factory: OperationFactory
+    reference_check: ReferenceCheck
+    thresholds: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        """Validate output comparison thresholds.
+
+        Raises:
+            MaterializationError: If required thresholds are missing.
+        """
+        for key in ("max_abs_diff", "max_rel_diff"):
+            if key not in self.thresholds:
+                message = f"Transformers full-size check requires threshold: {key}"
+                raise MaterializationError(message)
+
+    def identity(self) -> Mapping[str, Any]:
+        """Return stable full-size check identity."""
+        return {
+            "full_size_check": "vptune.transformers.full_size",
+            "thresholds": {
+                "max_abs_diff": self.thresholds["max_abs_diff"],
+                "max_rel_diff": self.thresholds["max_rel_diff"],
+            },
+        }
+
+    def __call__(
+        self,
+        candidate: Candidate,
+        inputs: tuple[tuple[Batch, TensorTree], ...],
+        output: TensorTree,
+        samples: tuple[Measurement, ...],
+    ) -> Mapping[str, Any]:
+        """Validate measured full-size outputs against rerun and reference checks.
+
+        Returns:
+            Selection metadata for the checked row.
+        """
+        del samples
+
+        outputs = _full_size_output_tuple(output, len(inputs))
+        max_abs = 0.0
+        max_rel = 0.0
+
+        for (batch, vector), observed in zip(inputs, outputs, strict=True):
+            rerun = self.operation_factory(candidate, batch, vector)()
+            measurements = tree_error_measurements(observed, rerun)
+            validate_thresholds(measurements, self._output_thresholds())
+            self.reference_check(candidate, batch, vector)
+            max_abs = max(max_abs, float(measurements["max_abs_diff"]))
+            max_rel = max(max_rel, float(measurements["max_rel_diff"]))
+
+        return {
+            "transformers_full_size_max_abs_diff": max_abs,
+            "transformers_full_size_max_rel_diff": max_rel,
+            "transformers_full_size_checked_inputs": len(inputs),
+        }
+
+    def _output_thresholds(self) -> dict[str, float]:
+        return {
+            "max_abs_diff": self.thresholds["max_abs_diff"],
+            "max_rel_diff": self.thresholds["max_rel_diff"],
+        }
+
+
+def transformers_full_size_check(
+    *,
+    operation_factory: OperationFactory,
+    reference_check: ReferenceCheck,
+    thresholds: Mapping[str, float],
+) -> FullSizeCheck:
+    """Return a Transformers full-size checker."""
+    return TransformersFullSizeCheck(
+        operation_factory=operation_factory,
+        reference_check=reference_check,
+        thresholds=dict(thresholds),
+    )
+
+
+def transformers_runtime_config(
+    operator: OperatorSpec,
+    *,
+    model: Any,
+    params: ParameterTree,
+    buffers: BufferTree,
+    candidates: Sequence[Candidate],
+    thresholds: Mapping[str, float],
+    objective_signature: Mapping[str, Any],
+    module_call: ModuleCallSpec,
+    axis_registry: CandidateAdmitter | None,
+    parameter_surface: ParameterSurface | None = None,
+    numeric_bound_fields: Mapping[str, Any] | None = None,
+    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
+    function_objectives: Mapping[str, FunctionObjective] | None = None,
+    attention_custom_kernel_id: str | None = None,
+) -> RuntimeConfig:
+    """Return a runtime config for Transformers-backed standard operators."""
+    operation_factory = transformers_operation_factory(
+        operator,
+        model=model,
+        params=params,
+        buffers=buffers,
+        module_call=module_call,
+        parameter_surface=parameter_surface,
+        scalar_objectives=scalar_objectives,
+        function_objectives=function_objectives,
+        attention_custom_kernel_id=attention_custom_kernel_id,
+    )
+    reference_check = transformers_reference_check(
+        operator,
+        model=model,
+        params=params,
+        buffers=buffers,
+        module_call=module_call,
+        thresholds=thresholds,
+        parameter_surface=parameter_surface,
+        numeric_bound_fields=numeric_bound_fields,
+        scalar_objectives=scalar_objectives,
+        function_objectives=function_objectives,
+        attention_custom_kernel_id=attention_custom_kernel_id,
+    )
+    full_size_check = transformers_full_size_check(
+        operation_factory=operation_factory,
+        reference_check=reference_check,
+        thresholds=thresholds,
+    )
+    materializer = CallableMaterializer(
+        "vptune.transformers_runtime",
+        PACKAGE_VERSION,
+        {"operation_factory": "transformers_operation_factory"},
+        lambda candidate, record: _materialize_transformers_selected(
+            operation_factory,
+            candidate,
+            record,
+        ),
+    )
+
+    return RuntimeConfig(
+        candidates=tuple(candidates),
+        operation_factory=operation_factory,
+        reference_check=reference_check,
+        materializer=materializer,
+        axis_registry=axis_registry,
+        signature={
+            "runtime": "transformers",
+            "operator": operator.signature(),
+            "model": module_identity(model),
+            "params": tree_signature(params),
+            "buffers": tree_signature(buffers),
+            "parameter_surface": (
+                None if parameter_surface is None else parameter_surface.signature()
+            ),
+            "thresholds": dict(thresholds),
+            "numeric_bound_fields": {}
+            if numeric_bound_fields is None
+            else dict(numeric_bound_fields),
+            "objective": dict(objective_signature),
+            "module_call": module_call.signature(),
+        },
+        full_size_check=full_size_check,
+    )
+
+
+def _materialize_transformers_selected(
+    operation_factory: OperationFactory,
+    candidate: Candidate,
+    record: FullSizeRecord,
+) -> Any:
+    if (
+        record.family != candidate.family
+        or record.candidate_id != candidate.candidate_id
+    ):
+        message = "selected record does not match selected Transformers candidate"
+        raise MaterializationError(message)
+
+    def selected(batch: Batch, vector: TensorTree) -> TensorTree:
+        return operation_factory(candidate, batch, vector)()
+
+    return selected
+
+
+def _full_size_output_tuple(
+    output: TensorTree,
+    expected_count: int,
+) -> tuple[Any, ...]:
+    if not isinstance(output, tuple):
+        message = "Transformers full-size output must be a tuple"
+        raise MaterializationError(message)
+
+    if len(output) != expected_count:
+        message = "Transformers full-size output count differs from inputs"
+        raise MaterializationError(message)
+
+    return tuple(output)
+
+
+def _configure_transformers_runtime(
+    model: Any,
+    candidate: Candidate,
+    *,
+    attention_custom_kernel_id: str | None,
+) -> None:
+    attention_frontend = candidate.settings.get("attention.frontend")
+
+    if isinstance(attention_frontend, str):
+        set_transformers_attention_implementation(
+            model,
+            attention_frontend=attention_frontend,
+            attention_custom_kernel_id=attention_custom_kernel_id,
+        )
+
+    module_mode = candidate.settings.get("module_mode")
+
+    if module_mode is None:
+        return
+
+    if module_mode == "eval":
+        model.eval()
+
+        return
+
+    if module_mode == "train":
+        model.train()
+
+        return
+
+    message = f"module_mode is unsupported: {module_mode}"
+    raise AdmissionError(message)
+
+
+def _standard_candidate(candidate: Candidate) -> Candidate:
+    settings = {
+        key: value
+        for key, value in candidate.settings.items()
+        if key not in TRANSFORMERS_RUNTIME_SETTINGS
+    }
+
+    return dataclasses.replace(candidate, settings=settings)
 
 
 def transformers_attention_location(

@@ -2,14 +2,38 @@
 
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
 from vptune.candidates import AxisDescriptor
-from vptune.data import PACKAGE_VERSION, Candidate, Measurement
+from vptune.checks import tree_error_measurements, validate_thresholds
+from vptune.data import (
+    PACKAGE_VERSION,
+    Batch,
+    BufferTree,
+    CallableMaterializer,
+    Candidate,
+    CandidateAdmitter,
+    CandidateOperation,
+    FullSizeCheck,
+    FullSizeRecord,
+    FunctionObjective,
+    Measurement,
+    ModuleCallSpec,
+    OperationFactory,
+    OperatorSpec,
+    ParameterSurface,
+    ParameterTree,
+    ReferenceCheck,
+    ReferenceResult,
+    RuntimeConfig,
+    ScalarObjective,
+)
 from vptune.errors import AdmissionError, MaterializationError
-from vptune.identities import to_json_value
+from vptune.identities import module_identity, to_json_value
+from vptune.runtime import standard_operation_factory, standard_reference_check
+from vptune.tensor_tree import TensorTree, tree_signature
 
 DISTRIBUTED_STRATEGIES = (
     "single_gpu",
@@ -33,6 +57,38 @@ DTENSOR_PLACEMENT_KEYS = (
     "dtensor.cotangent_placement",
     "dtensor.output_placement",
 )
+DISTRIBUTED_RUNTIME_SETTING_PREFIXES = (
+    "distributed.",
+    "dtensor.",
+    "fsdp.",
+    "tp.",
+    "sequence_parallel.",
+    "context_parallel.",
+    "comm.",
+)
+DISTRIBUTED_LAYOUT_VALUES = ("per_shard", "dtensor")
+
+
+class DistributedStrategyApplier(Protocol):
+    """Apply one distributed strategy row to a module."""
+
+    def __call__(
+        self,
+        module: torch.nn.Module,
+        candidate: Candidate,
+    ) -> torch.nn.Module:
+        """Return the rank-local module used by the measured operation."""
+
+
+class DistributedRankReporter(Protocol):
+    """Report rank-local status, memory, settings, and compile timing."""
+
+    def __call__(
+        self,
+        candidate: Candidate,
+        samples: tuple[Measurement, ...],
+    ) -> "DistributedRankReport":
+        """Return rank reports for the measured candidate."""
 
 
 def build_device_mesh(
@@ -590,6 +646,16 @@ class RankCompileTiming:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class DistributedRankReport:
+    """Rank reports collected after a measured distributed row."""
+
+    rank_statuses: tuple[RankStatus, ...]
+    rank_memory_samples: tuple[Measurement, ...]
+    rank_selected_settings: tuple[RankSelectedSettings, ...]
+    rank_compile_timings: tuple[RankCompileTiming, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class DistributedAdmissionPolicy:
     """Admission identity for distributed candidates."""
 
@@ -711,6 +777,15 @@ def distributed_strategy_axis(
         ),
         identity=policy.signature(),
     )
+
+
+def distributed_axis_manifest(
+    strategies: Sequence[str],
+    *,
+    policy: DistributedAdmissionPolicy,
+) -> AxisDescriptor:
+    """Return the distributed adapter axis descriptor."""
+    return distributed_strategy_axis(strategies, policy=policy)
 
 
 def admit_distributed_candidate(
@@ -1130,6 +1205,339 @@ def distributed_record(
             timing.to_record() for timing in rank_compile_timings
         ),
     }
+
+
+def distributed_operation_factory(
+    operator: OperatorSpec,
+    *,
+    model: torch.nn.Module,
+    strategy_applier: DistributedStrategyApplier,
+    params: ParameterTree,
+    buffers: BufferTree,
+    module_call: ModuleCallSpec,
+    parameter_surface: ParameterSurface | None = None,
+    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
+    function_objectives: Mapping[str, FunctionObjective] | None = None,
+) -> OperationFactory:
+    """Return a distributed standard-operation factory."""
+
+    def factory(
+        candidate: Candidate,
+        batch: Batch,
+        vector: TensorTree,
+    ) -> CandidateOperation:
+        distributed_model = strategy_applier(model, candidate)
+        standard_factory = standard_operation_factory(
+            operator,
+            params=params,
+            buffers=buffers,
+            parameter_surface=parameter_surface,
+            scalar_objectives=scalar_objectives,
+            function_objectives=function_objectives,
+            module=distributed_model,
+            module_call=module_call,
+        )
+
+        return standard_factory(_standard_candidate(candidate), batch, vector)
+
+    return factory
+
+
+def distributed_reference_check(
+    operator: OperatorSpec,
+    *,
+    reference_model: torch.nn.Module,
+    params: ParameterTree,
+    buffers: BufferTree,
+    module_call: ModuleCallSpec,
+    thresholds: Mapping[str, float],
+    parameter_surface: ParameterSurface | None = None,
+    numeric_bound_fields: Mapping[str, Any] | None = None,
+    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
+    function_objectives: Mapping[str, FunctionObjective] | None = None,
+) -> ReferenceCheck:
+    """Return a single-device reference check for distributed rows."""
+    standard_check = standard_reference_check(
+        operator,
+        params=params,
+        buffers=buffers,
+        thresholds=thresholds,
+        parameter_surface=parameter_surface,
+        numeric_bound_fields=numeric_bound_fields,
+        scalar_objectives=scalar_objectives,
+        function_objectives=function_objectives,
+        module=reference_model,
+        module_call=module_call,
+    )
+
+    def check(
+        candidate: Candidate,
+        batch: Batch,
+        vector: TensorTree,
+    ) -> ReferenceResult:
+        return standard_check(_standard_candidate(candidate), batch, vector)
+
+    return check
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DistributedFullSizeCheck:
+    """Full-size check and rank reduction for distributed rows."""
+
+    operation_factory: OperationFactory
+    reference_check: ReferenceCheck
+    thresholds: Mapping[str, float]
+    identity_payload: Mapping[str, Any]
+    expected_rank_count: int
+    global_parameter_surface: Mapping[str, Any]
+    rank_reporter: DistributedRankReporter
+
+    def __post_init__(self) -> None:
+        """Validate output comparison thresholds.
+
+        Raises:
+            MaterializationError: If a required threshold is missing.
+        """
+        for key in ("max_abs_diff", "max_rel_diff"):
+            if key not in self.thresholds:
+                message = f"distributed full-size check requires threshold: {key}"
+                raise MaterializationError(message)
+
+    def identity(self) -> Mapping[str, Any]:
+        """Return stable full-size check identity."""
+        return {
+            "full_size_check": "vptune.distributed.full_size",
+            "identity": dict(self.identity_payload),
+            "expected_rank_count": self.expected_rank_count,
+            "global_parameter_surface": dict(self.global_parameter_surface),
+            "thresholds": {
+                "max_abs_diff": self.thresholds["max_abs_diff"],
+                "max_rel_diff": self.thresholds["max_rel_diff"],
+            },
+        }
+
+    def __call__(
+        self,
+        candidate: Candidate,
+        inputs: tuple[tuple[Batch, TensorTree], ...],
+        output: TensorTree,
+        samples: tuple[Measurement, ...],
+    ) -> Mapping[str, Any]:
+        """Return distributed selection metadata for the measured row."""
+        outputs = _full_size_output_tuple(output, len(inputs))
+        max_abs = 0.0
+        max_rel = 0.0
+
+        for (batch, vector), observed in zip(inputs, outputs, strict=True):
+            rerun = self.operation_factory(candidate, batch, vector)()
+            measurements = tree_error_measurements(observed, rerun)
+            validate_thresholds(measurements, self._output_thresholds())
+            self.reference_check(candidate, batch, vector)
+            max_abs = max(max_abs, float(measurements["max_abs_diff"]))
+            max_rel = max(max_rel, float(measurements["max_rel_diff"]))
+
+        report = self.rank_reporter(candidate, samples)
+        record = distributed_record(
+            identity=self.identity_payload,
+            expected_rank_count=self.expected_rank_count,
+            rank_statuses=report.rank_statuses,
+            rank_memory_samples=report.rank_memory_samples,
+            rank_selected_settings=report.rank_selected_settings,
+            global_parameter_surface=self.global_parameter_surface,
+            rank_compile_timings=report.rank_compile_timings,
+        )
+
+        return {
+            **dict(record["selection_metadata"]),
+            "distributed_status": record["status"],
+            "distributed_rank_count": record["rank_count"],
+            "distributed_failed_ranks": record["failed_ranks"],
+            "distributed_full_size_max_abs_diff": max_abs,
+            "distributed_full_size_max_rel_diff": max_rel,
+        }
+
+    def _output_thresholds(self) -> dict[str, float]:
+        return {
+            "max_abs_diff": self.thresholds["max_abs_diff"],
+            "max_rel_diff": self.thresholds["max_rel_diff"],
+        }
+
+
+def distributed_full_size_check(
+    *,
+    operation_factory: OperationFactory,
+    reference_check: ReferenceCheck,
+    thresholds: Mapping[str, float],
+    identity: Mapping[str, Any],
+    expected_rank_count: int,
+    global_parameter_surface: Mapping[str, Any],
+    rank_reporter: DistributedRankReporter,
+) -> FullSizeCheck:
+    """Return a distributed full-size checker."""
+    return DistributedFullSizeCheck(
+        operation_factory=operation_factory,
+        reference_check=reference_check,
+        thresholds=dict(thresholds),
+        identity_payload=dict(identity),
+        expected_rank_count=expected_rank_count,
+        global_parameter_surface=dict(global_parameter_surface),
+        rank_reporter=rank_reporter,
+    )
+
+
+def distributed_runtime_config(
+    operator: OperatorSpec,
+    *,
+    model: torch.nn.Module,
+    reference_model: torch.nn.Module,
+    strategy_applier: DistributedStrategyApplier,
+    rank_reporter: DistributedRankReporter,
+    identity: Mapping[str, Any],
+    expected_rank_count: int,
+    global_parameter_surface: Mapping[str, Any],
+    params: ParameterTree,
+    buffers: BufferTree,
+    candidates: Sequence[Candidate],
+    thresholds: Mapping[str, float],
+    objective_signature: Mapping[str, Any],
+    module_call: ModuleCallSpec,
+    axis_registry: CandidateAdmitter | None,
+    parameter_surface: ParameterSurface | None = None,
+    numeric_bound_fields: Mapping[str, Any] | None = None,
+    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
+    function_objectives: Mapping[str, FunctionObjective] | None = None,
+) -> RuntimeConfig:
+    """Return a distributed runtime config for standard operators."""
+    operation_factory = distributed_operation_factory(
+        operator,
+        model=model,
+        strategy_applier=strategy_applier,
+        params=params,
+        buffers=buffers,
+        module_call=module_call,
+        parameter_surface=parameter_surface,
+        scalar_objectives=scalar_objectives,
+        function_objectives=function_objectives,
+    )
+    reference_check = distributed_reference_check(
+        operator,
+        reference_model=reference_model,
+        params=params,
+        buffers=buffers,
+        module_call=module_call,
+        thresholds=thresholds,
+        parameter_surface=parameter_surface,
+        numeric_bound_fields=numeric_bound_fields,
+        scalar_objectives=scalar_objectives,
+        function_objectives=function_objectives,
+    )
+    full_size_check = distributed_full_size_check(
+        operation_factory=operation_factory,
+        reference_check=reference_check,
+        thresholds=thresholds,
+        identity=identity,
+        expected_rank_count=expected_rank_count,
+        global_parameter_surface=global_parameter_surface,
+        rank_reporter=rank_reporter,
+    )
+    materializer = distributed_materializer(operation_factory)
+
+    return RuntimeConfig(
+        candidates=tuple(candidates),
+        operation_factory=operation_factory,
+        reference_check=reference_check,
+        materializer=materializer,
+        axis_registry=axis_registry,
+        signature={
+            "runtime": "distributed",
+            "operator": operator.signature(),
+            "model": module_identity(model),
+            "reference_model": module_identity(reference_model),
+            "params": tree_signature(params),
+            "buffers": tree_signature(buffers),
+            "parameter_surface": (
+                None if parameter_surface is None else parameter_surface.signature()
+            ),
+            "thresholds": dict(thresholds),
+            "numeric_bound_fields": {}
+            if numeric_bound_fields is None
+            else dict(numeric_bound_fields),
+            "objective": dict(objective_signature),
+            "module_call": module_call.signature(),
+            "distributed": dict(identity),
+            "expected_rank_count": expected_rank_count,
+            "global_parameter_surface": dict(global_parameter_surface),
+        },
+        full_size_check=full_size_check,
+    )
+
+
+def distributed_materializer(
+    operation_factory: OperationFactory,
+) -> CallableMaterializer:
+    """Return a materializer for selected distributed rows."""
+    return CallableMaterializer(
+        "vptune.distributed_runtime",
+        PACKAGE_VERSION,
+        {"operation_factory": "distributed_operation_factory"},
+        lambda candidate, record: _materialize_distributed_selected(
+            operation_factory,
+            candidate,
+            record,
+        ),
+    )
+
+
+def _materialize_distributed_selected(
+    operation_factory: OperationFactory,
+    candidate: Candidate,
+    record: FullSizeRecord,
+) -> Any:
+    if (
+        record.family != candidate.family
+        or record.candidate_id != candidate.candidate_id
+    ):
+        message = "selected record does not match selected distributed candidate"
+        raise MaterializationError(message)
+
+    def selected(batch: Batch, vector: TensorTree) -> TensorTree:
+        return operation_factory(candidate, batch, vector)()
+
+    return selected
+
+
+def _full_size_output_tuple(
+    output: TensorTree,
+    expected_count: int,
+) -> tuple[Any, ...]:
+    if not isinstance(output, tuple):
+        message = "distributed full-size output must be a tuple"
+        raise MaterializationError(message)
+
+    if len(output) != expected_count:
+        message = "distributed full-size output count differs from inputs"
+        raise MaterializationError(message)
+
+    return tuple(output)
+
+
+def _standard_candidate(candidate: Candidate) -> Candidate:
+    settings = {
+        key: value
+        for key, value in candidate.settings.items()
+        if not _is_distributed_runtime_setting(key, value)
+    }
+
+    return dataclasses.replace(candidate, settings=settings)
+
+
+def _is_distributed_runtime_setting(key: str, value: Any) -> bool:
+    if any(key.startswith(prefix) for prefix in DISTRIBUTED_RUNTIME_SETTING_PREFIXES):
+        return True
+
+    return key in {"layout.params", "layout.vector", "layout.output"} and (
+        value in DISTRIBUTED_LAYOUT_VALUES
+    )
 
 
 def _distributed_selection_metadata(
