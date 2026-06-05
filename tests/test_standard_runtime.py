@@ -2420,6 +2420,51 @@ def test_fisher_family_single_loop_vectorization_runs_batched_vectors(
     torch.testing.assert_close(tree_leaves(result)[0], vector["w"])
 
 
+def test_parameter_order_vector_is_prepared_before_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    original = runtime_module._build_parameter_order_vector
+
+    def counted_build(execution: runtime_module.StandardExecution) -> torch.Tensor:
+        calls.append(execution.candidate.candidate_id)
+
+        return original(execution)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_build_parameter_order_vector",
+        counted_build,
+    )
+    operator = score_terms_fisher_sum("fisher", "scores")
+    factory = vpx.standard_operation_factory(
+        operator,
+        params={"w": torch.zeros(2, dtype=torch.float64)},
+        buffers={},
+    )
+    operation = factory(
+        vp.Candidate(
+            operator.family,
+            "cached-vector",
+            fisher_settings("materialize_score_gradients"),
+            admission_status="passed",
+        ),
+        {"score_gradients": torch.eye(2, dtype=torch.float64)},
+        {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)},
+    )
+
+    assert calls == ["cached-vector"]
+
+    first = operation()
+    second = operation()
+
+    expected = torch.tensor([1.0, 2.0], dtype=torch.float64)
+
+    torch.testing.assert_close(tree_leaves(first)[0], expected)
+    torch.testing.assert_close(tree_leaves(second)[0], expected)
+    assert calls == ["cached-vector"]
+
+
 @pytest.mark.parametrize(
     ("operator", "settings", "batch"),
     [

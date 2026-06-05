@@ -2756,6 +2756,8 @@ class StandardExecution:
     )
     checkpoint_contexts: CheckpointContextFns = dataclasses.field(default_factory=dict)
     intermediate_transform: IntermediateTransform | None = None
+    flat_parameter_vector: torch.Tensor | None = None
+    flat_parameter_vector_batch: torch.Tensor | None = None
     compiled_inner: CandidateOperation | None = None
     compiled_model_forward: Callable[[Batch], object] | None = None
     compiled_scalar_function: Callable[[ParameterTree], torch.Tensor] | None = None
@@ -2769,6 +2771,31 @@ class StandardExecution:
     linearized_jvp: Callable[[TensorTree], TensorTree] | None = None
     linearized_hvp: Callable[[TensorTree], TensorTree] | None = None
     vjp_closure: Callable[[TensorTree], TensorTree] | None = None
+
+
+PARAMETER_VECTOR_CACHE_OPERATOR_KINDS = (
+    "hvp",
+    "ggnvp",
+    "fisher_vp",
+    "sampled_fisher_vp",
+    "empirical_fisher_vp",
+    "metric",
+    "inverse_metric",
+)
+
+
+def _execution_with_vector(
+    execution: StandardExecution,
+    vector: TensorTree,
+    **changes: Any,
+) -> StandardExecution:
+    return dataclasses.replace(
+        execution,
+        vector=vector,
+        flat_parameter_vector=None,
+        flat_parameter_vector_batch=None,
+        **changes,
+    )
 
 
 def standard_operation_factory(
@@ -2895,6 +2922,7 @@ def standard_operation_factory(
         execution = _loss_scaled_execution(execution)
         _require_finite_execution_inputs(execution)
         execution = _prepare_standard_execution(execution)
+        execution = _prepare_flat_vector_execution(execution)
         execution = _prepare_compile_boundary_execution(execution)
         output_buffer = _standard_output_buffer(execution)
 
@@ -2962,6 +2990,29 @@ def _prepare_compile_boundary_execution(
         return execution
 
     return _prepare_enabled_compile_boundary_execution(execution, settings, boundary)
+
+
+def _prepare_flat_vector_execution(
+    execution: StandardExecution,
+) -> StandardExecution:
+    if execution.operator.kind not in PARAMETER_VECTOR_CACHE_OPERATOR_KINDS:
+        return execution
+
+    mode = execution.candidate.settings.get("vectorization.mode")
+
+    if mode == "vmap":
+        return dataclasses.replace(
+            execution,
+            flat_parameter_vector_batch=_build_flat_vector_batch(execution),
+        )
+
+    if mode in {"single_loop", "manual_batch"}:
+        return execution
+
+    return dataclasses.replace(
+        execution,
+        flat_parameter_vector=_build_parameter_order_vector(execution),
+    )
 
 
 def _prepare_enabled_compile_boundary_execution(
@@ -5225,7 +5276,7 @@ def _run_jvp_vector_single_loop(execution: StandardExecution) -> TensorTree:
 
     for index in range(vector_count):
         vector = _vector_tree_select(execution.vector, vector_in_dims, index)
-        result = _run_jvp_single_vector(dataclasses.replace(execution, vector=vector))
+        result = _run_jvp_single_vector(_execution_with_vector(execution, vector))
         results.append(result)
 
     return _stack_tensor_trees(tuple(results), 0)
@@ -5349,7 +5400,7 @@ def _run_vjp_vector_single_loop(execution: StandardExecution) -> TensorTree:
 
     for index in range(vector_count):
         vector = _vector_tree_select(execution.vector, vector_in_dims, index)
-        result = _run_vjp_single_vector(dataclasses.replace(execution, vector=vector))
+        result = _run_vjp_single_vector(_execution_with_vector(execution, vector))
         results.append(result)
 
     return _stack_tensor_trees(tuple(results), 0)
@@ -5639,7 +5690,7 @@ def _run_hvp_vector_single_loop(execution: StandardExecution) -> TensorTree:
 
     for index in range(vector_count):
         vector = _vector_tree_select(execution.vector, vector_in_dims, index)
-        result = _run_hvp_single_vector(dataclasses.replace(execution, vector=vector))
+        result = _run_hvp_single_vector(_execution_with_vector(execution, vector))
         results.append(result)
 
     return _stack_tensor_trees(tuple(results), 0)
@@ -5664,7 +5715,7 @@ def _run_vector_manual_batches(
     for start in range(0, vector_count, batch_size):
         stop = min(start + batch_size, vector_count)
         vector = _vector_tree_slice(execution.vector, vector_in_dims, start, stop)
-        result = runner(dataclasses.replace(execution, vector=vector))
+        result = runner(_execution_with_vector(execution, vector))
         results.append(result)
 
     return _cat_tensor_trees(tuple(results), 0)
@@ -5683,7 +5734,7 @@ def _run_vector_single_loop(
 
     for index in range(vector_count):
         vector = _vector_tree_select(execution.vector, vector_in_dims, index)
-        result = runner(dataclasses.replace(execution, vector=vector))
+        result = runner(_execution_with_vector(execution, vector))
         results.append(result)
 
     return _stack_tensor_trees(tuple(results), 0)
@@ -6009,8 +6060,7 @@ def _run_ggnvp_single_vector(execution: StandardExecution) -> TensorTree:
     function = _function_objective(execution.operator, execution.function_objectives)
     parameter_items = tuple(execution.params.items())
     parameter_leaves = tuple(tensor for _, tensor in parameter_items)
-    vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
-    vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
+    vector_tensor = _parameter_order_vector(execution)
 
     def tensor_function(*active_leaves: torch.Tensor) -> torch.Tensor:
         active_params = {
@@ -6190,7 +6240,7 @@ def _run_ggnvp_vector_single_loop(execution: StandardExecution) -> TensorTree:
     for index in range(vector_count):
         vector = _vector_tree_select(execution.vector, vector_in_dims, index)
         result = _run_ggnvp_single_vector(
-            dataclasses.replace(
+            _execution_with_vector(
                 execution,
                 vector=vector,
                 compiled_inner=None,
@@ -6960,8 +7010,7 @@ def _run_fisher_vp_single_vector(execution: StandardExecution) -> TensorTree:
     score_gradients = _batch_tensor(execution.batch, "score_gradients")
 
     score_gradients = _loss_scaled_score_matrix(execution, score_gradients)
-    vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
-    vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
+    vector_tensor = _parameter_order_vector(execution)
     _require_finite_tensor(score_gradients, "score_gradients")
     _require_finite_tensor(vector_tensor, "Fisher vector")
     result = _score_matrix_product(
@@ -7134,8 +7183,7 @@ def _run_sampled_fisher_vp_single_vector(execution: StandardExecution) -> Tensor
         execution,
         sampled_score_gradients,
     )
-    vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
-    vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
+    vector_tensor = _parameter_order_vector(execution)
     _require_finite_tensor(sampled_score_gradients, "sampled_score_gradients")
     _require_finite_tensor(vector_tensor, "sampled Fisher vector")
     result = _score_matrix_product(
@@ -7319,8 +7367,7 @@ def _run_empirical_fisher_vp_single_vector(execution: StandardExecution) -> Tens
     per_example_gradients = _batch_tensor(execution.batch, "per_example_gradients")
 
     per_example_gradients = _loss_scaled_score_matrix(execution, per_example_gradients)
-    vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
-    vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
+    vector_tensor = _parameter_order_vector(execution)
     _require_finite_tensor(per_example_gradients, "per_example_gradients")
     _require_finite_tensor(vector_tensor, "empirical Fisher vector")
     result = _score_matrix_product(
@@ -7465,8 +7512,7 @@ def _run_blockwise_score_matrix_product(
         execution,
         _batch_tensor_blocks(execution.batch, batch_key),
     )
-    vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
-    vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
+    vector_tensor = _parameter_order_vector(execution)
     result = _blockwise_score_matrix_product(
         blocks,
         vector_tensor,
@@ -8133,6 +8179,13 @@ def _flat_gradient_row(gradients: Sequence[torch.Tensor]) -> torch.Tensor:
 
 
 def _parameter_order_vector(execution: StandardExecution) -> torch.Tensor:
+    if execution.flat_parameter_vector is not None:
+        return execution.flat_parameter_vector
+
+    return _build_parameter_order_vector(execution)
+
+
+def _build_parameter_order_vector(execution: StandardExecution) -> torch.Tensor:
     vector_leaves = _matching_vector_leaves(execution.params, execution.vector)
     vector_tensor = torch.cat(tuple(leaf.reshape(-1) for leaf in vector_leaves))
     _require_finite_tensor(vector_tensor, "streaming Fisher vector")
@@ -8245,6 +8298,13 @@ def _blockwise_score_matrix_product_unchecked(
 
 
 def _flat_vector_batch(execution: StandardExecution) -> torch.Tensor:
+    if execution.flat_parameter_vector_batch is not None:
+        return execution.flat_parameter_vector_batch
+
+    return _build_flat_vector_batch(execution)
+
+
+def _build_flat_vector_batch(execution: StandardExecution) -> torch.Tensor:
     vector_in_dims = _vector_tree_in_dims(
         execution.vector,
         execution.candidate.settings,
