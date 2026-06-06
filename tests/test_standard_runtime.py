@@ -2195,7 +2195,7 @@ def test_ggn_single_loop_vectorization_runs_batched_vectors() -> None:
         )
     }
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": square_tensor_function},
@@ -2241,7 +2241,7 @@ def test_ggn_vmap_vectorization_runs_batched_vectors(
 
     monkeypatch.setattr(runtime_module, "_torch_func_vmap", recording_vmap)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": square_tensor_function},
@@ -2305,7 +2305,7 @@ def test_ggn_manual_batch_vectorization_runs_declared_chunks(
         recording_single_loop,
     )
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": square_tensor_function},
@@ -2335,7 +2335,7 @@ def test_ggn_manual_batch_vectorization_runs_declared_chunks(
 
 def test_ggn_vectorization_rejects_inner_compile_boundary() -> None:
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_tensor_function},
@@ -2586,7 +2586,7 @@ def test_ggn_vjp_path_autograd_grad_outputs_matches_torch_func_vjp() -> None:
         return torch.stack((params["w"][0].pow(2), 3.0 * params["w"][0]))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": function},
@@ -2635,7 +2635,7 @@ def test_ggn_vjp_path_autograd_grad_outputs_matches_torch_func_vjp() -> None:
 
 def test_ggn_vjp_path_is_required_for_jvp_hessian_vjp_rows() -> None:
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
@@ -4036,7 +4036,7 @@ def test_standard_operation_factory_rejects_missing_declared_batch_input() -> No
         return params["w"]
 
     ggn_factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4074,7 +4074,7 @@ def test_dense_standard_paths_reject_nonfinite_inputs() -> None:
         return params["w"]
 
     ggn_factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4168,7 +4168,7 @@ def test_ggnvp_closed_form_ce_kl_kernels_match_dense_loss_hessian(
         return params["logits"]
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4238,7 +4238,7 @@ def test_ggnvp_closed_form_ce_kl_token_blocks_match_dense_loss_hessian(
         "chunk.token_block_size": 2,
     }
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4297,7 +4297,7 @@ def test_ggnvp_closed_form_ce_kl_reference_matches_dense_anchor(
         return params["logits"]
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -4359,7 +4359,7 @@ def test_ggnvp_reuse_rows_match_dense_loss_hessian(
         ))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4419,7 +4419,7 @@ def test_ggnvp_reuses_primal_from_jvp(
         ))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4492,7 +4492,7 @@ def test_ggnvp_autodiff_loss_hvp_uses_output_space_ad(
 
     monkeypatch.setattr(runtime_module.torch.func, "jvp", recording_jvp)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4539,7 +4539,7 @@ def test_ggnvp_rejects_backward_materialized_vjp_path() -> None:
         ))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4600,7 +4600,7 @@ def test_ggnvp_executes_intermediate_residency_at_jvp_and_cotangent_boundaries(
 
     monkeypatch.setattr(runtime_module, "_residency_tensor", recording_residency)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4662,7 +4662,7 @@ def test_ggnvp_executes_intermediate_transform_at_operator_part_boundaries() -> 
         return tree
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4733,7 +4733,7 @@ def test_ggnvp_chunks_output_cotangent_vjp(
 
     monkeypatch.setattr(runtime_module, "_run_ggnvp_vjp_by_path", recording_vjp)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4808,7 +4808,7 @@ def test_dense_ggnvp_executes_declared_row_batches(
         runtime_module, "_dense_jacobian_row_block", recording_row_block
     )
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4873,7 +4873,7 @@ def test_dense_ggnvp_rejects_reuse_settings(settings: dict[str, object]) -> None
         return params["w"]
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -6873,7 +6873,7 @@ def test_ggn_memory_recompute_uses_jvp_and_cotangent_recompute_settings() -> Non
         ))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -9989,7 +9989,7 @@ def test_ggnvp_reference_check_rejects_nonsymmetric_loss_hessian() -> None:
         return torch.stack((params["w"][0], 2.0 * params["w"][0]))
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -10036,7 +10036,7 @@ def test_ggnvp_reference_check_rejects_indefinite_loss_hessian() -> None:
         return torch.stack((params["w"][0], 2.0 * params["w"][0]))
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -10070,7 +10070,7 @@ def test_ggnvp_reference_check_rejects_indefinite_loss_hessian() -> None:
         )
 
 
-def test_ggnvp_linear_map_loss_geometry_skips_metric_checks() -> None:
+def test_ggnvp_rejects_non_psd_loss_metric_semantics() -> None:
     params = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def function(
@@ -10085,40 +10085,37 @@ def test_ggnvp_linear_map_loss_geometry_skips_metric_checks() -> None:
 
         return torch.stack((params["w"][0], 2.0 * params["w"][0]))
 
-    check = vpx.standard_reference_check(
+    operator = dataclasses.replace(
         vp.ggnvp(
             "ggn",
             "model_output",
             aggregation="sum",
-            loss_geometry="linear_map",
         ),
+        semantics={"loss_geometry": "linear_map"},
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
         params=params,
         buffers={},
-        thresholds={
-            "max_abs_diff": 1e-12,
-            "max_rel_diff": 1e-12,
-        },
         function_objectives={"model_output": function},
     )
-    result = check(
-        vp.Candidate(
-            "ggn",
-            "row",
-            ggn_dense_kernel_settings(),
-            admission_status="passed",
-        ),
-        {
-            "loss_hessian": torch.tensor(
-                [[1.0, 2.0], [0.0, 1.0]],
-                dtype=torch.float64,
-            )
-        },
-        {"w": torch.tensor([1.0], dtype=torch.float64)},
-    )
 
-    assert "symmetry_max_abs_diff" not in result.measurements
-    assert "psd_violation" not in result.measurements
-    assert "inner_abs_diff" not in result.measurements
+    with pytest.raises(vp.MaterializationError, match="PSD output-space loss metric"):
+        factory(
+            vp.Candidate(
+                "ggn",
+                "row",
+                ggn_dense_kernel_settings(),
+                admission_status="passed",
+            ),
+            {
+                "loss_hessian": torch.tensor(
+                    [[1.0, 2.0], [0.0, 1.0]],
+                    dtype=torch.float64,
+                )
+            },
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+        )()
 
 
 def test_ggnvp_reference_check_uses_jvp_hessian_vjp_anchor() -> None:
@@ -10139,7 +10136,7 @@ def test_ggnvp_reference_check_uses_jvp_hessian_vjp_anchor() -> None:
         return multiplier * torch.stack((params["w"][0], 3.0 * params["w"][0]))
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -10191,7 +10188,7 @@ def test_ggnvp_reference_check_cross_checks_jvp_path_with_dense_anchor() -> None
         return multiplier * torch.stack((params["w"][0], 3.0 * params["w"][0]))
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -10241,7 +10238,7 @@ def test_ggnvp_reference_check_records_dense_anchor_errors() -> None:
         return torch.stack((params["w"][0], 3.0 * params["w"][0]))
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -10880,7 +10877,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         ))
 
     ggn_factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers=buffers,
         function_objectives={"model_output": function},
@@ -11212,7 +11209,7 @@ def test_parameter_block_size_chunks_dense_ggn_transpose_product(
 
     monkeypatch.setattr(runtime_module, "_matmul_runtime", recording_matmul)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -11302,7 +11299,7 @@ def test_layer_block_size_chunks_dense_ggn_transpose_product(
 
     monkeypatch.setattr(runtime_module, "_matmul_runtime", recording_matmul)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         parameter_surface=parameter_surface,
@@ -13484,7 +13481,7 @@ def test_dense_ggnvp_supports_parameter_tree_order() -> None:
         ))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -15561,7 +15558,7 @@ def test_standard_runtime_runs_real_torch_compile_hvp_batched_vectors() -> None:
 
 def test_standard_runtime_runs_real_torch_compile_ggn_full_product() -> None:
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
@@ -15592,7 +15589,7 @@ def test_standard_runtime_runs_real_torch_compile_ggn_full_product() -> None:
 
 def test_standard_runtime_runs_real_torch_compile_ggn_loss_product() -> None:
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
@@ -15626,7 +15623,7 @@ def test_standard_runtime_runs_real_torch_compile_ggn_partial_boundary(
     boundary: str,
 ) -> None:
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
@@ -16624,7 +16621,7 @@ def test_standard_runtime_compiles_ggn_full_product_boundary_only(
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
@@ -16732,7 +16729,7 @@ def test_standard_runtime_compiles_ggn_jvp_boundary_only(
     monkeypatch.setattr(runtime_module, "_run_ggnvp_vjp", recording_vjp)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
@@ -16831,7 +16828,7 @@ def test_standard_runtime_compiles_ggn_loss_product_boundary_only(
     monkeypatch.setattr(runtime_module, "_run_ggnvp_vjp", recording_vjp)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
@@ -16907,7 +16904,7 @@ def test_standard_runtime_warms_ggn_loss_product_compile_boundary(
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
@@ -17011,7 +17008,7 @@ def test_standard_runtime_compiles_ggn_vjp_boundary_only(
     )
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum", loss_geometry="psd_metric"),
+        vp.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},

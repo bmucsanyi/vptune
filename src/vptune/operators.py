@@ -7,7 +7,6 @@ from vptune.data import OperatorSpec
 from vptune.errors import MaterializationError
 
 AGGREGATIONS = ("sum", "mean", "mean_per_example", "none")
-GGN_LOSS_GEOMETRIES = ("psd_metric", "linear_map")
 FISHER_DISTRIBUTIONS = ("explicit_score_gradients",)
 FISHER_LABEL_POLICIES = ("explicit_scores",)
 SAMPLED_FISHER_LABEL_POLICIES = ("sampled_labels",)
@@ -109,32 +108,22 @@ def ggnvp(
     objective_id: str,
     *,
     aggregation: str,
-    loss_geometry: str,
     randomness: Mapping[str, Any] | None = None,
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
     """Return a GGNVP operator spec."""
     _require_value(aggregation, AGGREGATIONS, "aggregation")
-    _require_value(loss_geometry, GGN_LOSS_GEOMETRIES, "loss_geometry")
-
-    if loss_geometry == "psd_metric":
-        batch_inputs = {
-            "reference": ("loss_hessian", "symmetry_vector"),
-            "operation": ("loss_hessian",),
-        }
-    else:
-        batch_inputs = {
-            "reference": ("loss_hessian",),
-            "operation": ("loss_hessian",),
-        }
 
     return OperatorSpec(
         family,
         "ggnvp",
         objective_id,
         aggregation=aggregation,
-        semantics={"loss_geometry": loss_geometry},
-        batch_inputs=batch_inputs,
+        semantics={"loss_geometry": "psd_metric"},
+        batch_inputs={
+            "reference": ("loss_hessian", "symmetry_vector"),
+            "operation": ("loss_hessian",),
+        },
         randomness={} if randomness is None else dict(randomness),
         thresholds={} if thresholds is None else dict(thresholds),
     )

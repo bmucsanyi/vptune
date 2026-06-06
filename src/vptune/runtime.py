@@ -1638,9 +1638,7 @@ def _semantic_measurements(
     output: TensorTree,
 ) -> dict[str, float]:
     if operator.kind == "ggnvp":
-        if _ggn_loss_geometry(operator) != "psd_metric":
-            return {}
-
+        _require_ggn_psd_metric(operator)
         loss_hessian = _batch_tensor(batch, "loss_hessian")
 
         return {
@@ -1857,9 +1855,10 @@ def _ggn_inner_product_measurements(
     candidate_factory: OperationFactory,
     parameter_surface: ParameterSurface | None,
 ) -> dict[str, float]:
-    if operator.kind != "ggnvp" or _ggn_loss_geometry(operator) != "psd_metric":
+    if operator.kind != "ggnvp":
         return {}
 
+    _require_ggn_psd_metric(operator)
     symmetry_vector = _batch_tree(batch, "symmetry_vector")
     anchor_symmetry = candidate_factory(
         anchor_candidate,
@@ -6047,7 +6046,7 @@ def _run_ggnvp_by_path(execution: StandardExecution) -> TensorTree:
             GGN_LINEARIZE_HESSIAN_VJP_PATH,
         ),
     )
-    _ggn_loss_geometry(execution.operator)
+    _require_ggn_psd_metric(execution.operator)
 
     return _run_by_vectorization_mode(
         execution,
@@ -15172,14 +15171,14 @@ def _require_explicit_score_fisher_semantics(operator: OperatorSpec) -> None:
     )
 
 
-def _ggn_loss_geometry(operator: OperatorSpec) -> str:
+def _require_ggn_psd_metric(operator: OperatorSpec) -> None:
     value = _operator_semantic(operator, "loss_geometry")
 
-    if value not in {"psd_metric", "linear_map"}:
-        message = f"GGNVP loss_geometry is unsupported: {value}"
-        raise MaterializationError(message)
+    if value == "psd_metric":
+        return
 
-    return value
+    message = "GGNVP requires a PSD output-space loss metric"
+    raise MaterializationError(message)
 
 
 def _operator_semantic(operator: OperatorSpec, key: str) -> str:

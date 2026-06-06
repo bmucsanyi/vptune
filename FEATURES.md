@@ -21,11 +21,14 @@ sweep axes:
 - RNG semantics
 - scalar loss for gradient and HVP
 - function output surface for JVP and VJP
-- loss and output surface for GGNVP
+- loss and output-space Hessian for GGNVP
 - score or log-prob definition for FisherVP
 - per-example loss definition for empirical FisherVP
 - metric definition and damping
 - target devices and process count
+
+The typed `loss`, `output`, `likelihood`, and `metric` objects carry these fixed
+fields and validate their closed-set choices at construction.
 
 Rows may change representations of fixed fields only when the row computes the
 same operator and passes package-owned reference checks. Sequence packing,
@@ -37,10 +40,20 @@ memory-stability checks are acceptance rules. They are not speed knobs.
 
 ## Axis Ownership
 
-Every setting key has exactly one owner. Duplicate owners are invalid.
+Every setting key has exactly one owner, with one exception: `attention.frontend` is a
+single key whose values split between the core attention executor (`pytorch_sdpa_direct`,
+`patched_eager`, `packed_exact`, `blockwise_exact`) and the Transformers adapter (the
+`transformers_*`, `paged|*`, and `registered_transformers_attention` values), so for it
+the one-owner rule is read per value and the `AxisDescriptor` carries a per-value owner.
+Duplicate owners on any other key are invalid.
 
 - Operator-owned axes define the mathematical lowering for one operator family.
 - Shared axes define implementation choices used by many operators.
+- Adapter-owned axes are registered and lowered by an adapter. The model-library
+  attention frontends (`transformers_*`, `paged|*`, `registered_transformers_attention`)
+  and the whole distributed family (`distributed.*`, `dtensor.*`, `fsdp.*`, `tp.*`,
+  `sequence_parallel.*`, `context_parallel.*`, `comm.*`) are adapter-owned; the core
+  runtime does not lower them.
 - Applicability lists say which operators may use a shared axis.
 - A candidate row contains one flat setting map, but each key is validated by one
   owner.
@@ -60,8 +73,13 @@ The package sweep space covers:
 - FisherVP
 - sampled FisherVP
 - empirical FisherVP
+- per-example gradient
 - metric multiply
+- metric inner product
+- metric square-root multiply
 - inverse metric multiply
+- inverse metric inner product
+- inverse metric square-root multiply
 - composition of selected operators
 
 ## Operator-Owned Axes
@@ -203,11 +221,13 @@ Mandatory checks:
 
 ### GGNVP
 
-For model output $z(\theta)$, declared loss $\ell(z)$, Jacobian $J$, and vector
-$v$, compute $Gv = J^\top H_\ell Jv$.
+For model output $z(\theta)$, a typed loss $\ell(z)$, Jacobian $J$, and vector $v$,
+compute $Gv = J^\top H_\ell Jv$.
 
-The loss and output surface define the operator. Cross entropy, KL, retain KL,
-token masking, and reductions are fixed problem fields.
+The typed loss and the output surface define the operator. Generalized Gauss-Newton is
+defined for a loss convex in the output, so the output-space loss Hessian $H_\ell$ is
+PSD and $G$ is PSD. Cross entropy, KL, retain KL, token masking, and reductions are
+carried by the typed loss object as fixed problem fields.
 
 Owned axes:
 
@@ -241,7 +261,7 @@ Mandatory checks:
 
 - dense tiny $J^\top H_\ell Jv$
 - JVP/VJP dot identity
-- PSD check when $H_\ell$ is declared PSD
+- symmetry and PSD checks on the output-space loss Hessian $H_\ell$; a non-PSD $H_\ell$ fails admission
 - segmentation invariance for output chunking
 - attention-backend equality on small inputs for attention rows
 - full-size agreement for non-math or shape-dependent attention, compile, fusion, or
@@ -363,13 +383,75 @@ Mandatory checks:
 - full-size agreement for non-math or shape-dependent attention, compile, fusion, or
   sharded-reduction rows
 
+### Per-Example Gradient
+
+For per-example loss, compute the stacked gradients $g_i=\nabla_\theta\ell_i(\theta)$. The
+output is a parameter tree with a leading axis of size $n$, the batch example count; it is
+not reduced.
+
+Owned axes:
+
+- `per_example_gradient.grad_path`: `torch_autograd_grad_loop`, `torch_func_grad`, `vmap_grad`, `backward_materialized_grad`
+- `per_example_gradient.accumulation`: `stacked_leading_axis`, `blockwise_stacked`
+
+Shared axes that apply: vectorization (the per-example axis), model call, batching and
+chunking, memory schedule, dtype and numeric backend, torch compile, parameter and
+vector layout, distributed execution.
+
+Mandatory checks:
+
+- per-example gradients by for-loop reference
+- agreement that the outer-product reduction equals empirical FisherVP
+- full-size agreement for non-math or shape-dependent attention, compile, fusion, or
+  sharded-reduction rows
+
+### Metric Square-Root Multiply
+
+For a metric $M$, apply a factor $Lv$ and its adjoint $L^\top v$, with $LL^\top=M$ for the
+square root and $LL^\top=(M+\lambda I)^{-1}$ for the inverse square root. The
+inverse-square-root operator applies $Lv$ for the damped-inverse factor, not $L^{-1}v$. The
+factor is a covariance factor for posterior sampling, not the symmetric square root unless
+an eigenbasis path is selected; the adjoint $L^\top v$ is the application the metric inner
+product's `sqrt_apply_reduce` path consumes.
+
+Owned axes:
+
+- `sqrt_metric.factor_path`: `closed_form_factor_square_root`, `cholesky_factor`, `eigenbasis_factor`, `matrix_free_lanczos`
+- `sqrt_metric.lanczos_iterations`: a finite positive integer domain (matrix-free path only)
+
+Representation compatibility:
+
+- `closed_form_factor_square_root` requires diagonal, KFAC, EKFAC, low-rank, or GGN-derived factors. It forms the forward factor directly ($A^{1/2}\otimes G^{1/2}$ for KFAC, the rooted corrected eigenvalues for EKFAC, $[U, D^{1/2}]$ for low-rank, $J^\top H_\ell^{1/2}$ for GGN-derived, the pointwise root for diagonal). For the damped inverse it serves diagonal, EKFAC (the corrected eigenvalues raised by `eigenvalue_floor`), KFAC under `kfac_pi` damping (whose factored shift keeps the Kronecker form $(A+\cdot)^{-1/2}\otimes(G+\cdot)^{-1/2}$), and low-rank and GGN-derived through the Woodbury capacitance.
+- `cholesky_factor` requires a positive-definite dense or block-diagonal metric, and supplies the forward factor and a Cholesky of the dense damped inverse.
+- `eigenbasis_factor` requires a symmetric dense, KFAC, or EKFAC metric. It is the path for the damped inverse square root over a KFAC metric with scalar or per-group damping, where the joint Kronecker spectrum is shifted by $\lambda$ before the inverse root and the un-shifted factor $A^{1/2}\otimes G^{1/2}$ cannot absorb the shift.
+- `matrix_free_lanczos` requires a matrix-free metric and is the only path for it
+
+Every KFAC and EKFAC metric is admitted for the forward and the damped inverse square root; the
+rules above route each (metric kind, damping) pair to the factor path that produces the correct
+factor, and the $LL^\top$ reference check rejects any other.
+
+Shared axes that apply: batching and chunking, memory schedule, dtype and numeric
+backend, torch compile, parameter and vector layout, distributed execution.
+
+Mandatory checks:
+
+- dense tiny factor check: $L L^\top$ matches $M$ or $(M+\lambda I)^{-1}$ on a reference
+- a covariance check that $L z$ has the declared covariance on repeated draws for the
+  matrix-free Lanczos path
+
 ### Metric Multiply
 
 A metric operator is declared by its mathematical representation. Dense, KFAC,
-diagonal, block diagonal, low rank, and GGN-derived metrics are different metric
-specs unless the spec declares equivalence. The representation supplies the
-required fields: dense matrix, diagonal tree, metric blocks, KFAC factors,
-low-rank factors, or GGN-derived factors.
+EKFAC, diagonal, block diagonal, low rank, GGN-derived, and matrix-free metrics are
+different metric specs unless the spec declares equivalence. The representation
+supplies the required fields: dense matrix, diagonal tree, metric blocks, KFAC
+factors, EKFAC Kronecker eigenbases with corrected eigenvalues, low-rank factors,
+GGN-derived factors, or, for a matrix-free metric, the forward action of an admitted
+PSD operator or composition (a GGN or Fisher). A matrix-free metric whose operator is
+data-dependent takes the batch alongside the vector; the factored representations are
+data-independent. The square-root and inverse-square-root multiplies apply a Cholesky
+or eigenbasis factor for the factored kinds and a Lanczos approximation of $f(M)v$ for
+the matrix-free kind.
 
 Owned axes for a fixed metric spec:
 
@@ -380,9 +462,10 @@ Owned axes for a fixed metric spec:
 Representation compatibility:
 
 - `dense_matmul` requires dense matrix representation
-- `factorized_multiply` requires diagonal, KFAC, low-rank, or GGN-derived factors
+- `factorized_multiply` requires diagonal, KFAC, EKFAC, low-rank, or GGN-derived factors; EKFAC multiplies in the Kronecker eigenbasis
 - `blockwise_multiply` requires block-diagonal blocks
-- `streaming_multiply` requires diagonal, block-diagonal, KFAC, low-rank, or GGN-derived representation fields
+- `streaming_multiply` requires diagonal, block-diagonal, KFAC, EKFAC, low-rank, or GGN-derived representation fields
+- a matrix-free metric multiplies through its declared forward operator and uses none of `metric.multiply_path`, `metric.block_schedule`, or `metric.accumulation`
 - `metric.block_schedule` requires block-diagonal blocks or KFAC factors
 - `metric.accumulation` applies only to non-dense metric multiply paths
 
@@ -405,37 +488,40 @@ Mandatory checks:
   GGN-derived assembles $M=J^\top H J$
 - symmetry check when the metric is declared symmetric
 - PSD check when the metric is declared PSD
+- a matrix-free metric is checked through its operator's own anchors for the forward multiply and through the inverse residual for the solve, not through dense reconstruction
 
 ### Inverse Metric Multiply
 
-For a declared metric $M$, compute $M^{-1}v$ or the declared damped inverse.
-Damping and the accepted residual define the inverse metric spec.
+For a declared or matrix-free metric $M$, compute $M^{-1}v$ or the declared damped
+inverse. Damping and the accepted residual define the inverse metric spec.
 
 Owned axes:
 
 - `inverse_metric.solve_path`: `dense_solve`, `cholesky_solve`, `eigh_solve`, `svd_solve`, `conjugate_gradient`, `factorized_solve`, `blockwise_solve`, `woodbury_low_rank_solve`
-- `inverse_metric.preconditioner`: `none`, `diagonal`, `block_diagonal`, `factorized_metric`
+- `inverse_metric.preconditioner`: `none`, `diagonal`, `block_diagonal`, `factorized_metric`, `matrix_free`
 - `inverse_metric.iteration_budget`: declared positive integer set
 - `inverse_metric.factor_reuse`: `refactor_each_rhs`, `reuse_factor_across_rhs`
 - `inverse_metric.block_schedule`: `layer_blocks`, `module_blocks`, `custom_blocks`
+- `inverse_metric.multi_rhs`: `single_column`, `block`
 
 `inverse_metric.iteration_budget` is an implementation cap. A row with too low a
-cap fails the fixed inverse residual acceptance check. Residual tolerance is not
-a sweep axis.
+cap fails the fixed inverse residual acceptance check. Residual tolerance is the
+operator's declared `tol`, a fixed acceptance field, not a sweep axis.
 `inverse_metric.iteration_budget` applies only to iterative solve rows.
 
 Representation compatibility:
 
 - `dense_solve`, `cholesky_solve`, `eigh_solve`, and `svd_solve` require dense matrix representation
-- `cholesky_solve` requires a PSD metric
-- `eigh_solve` requires a symmetric metric
-- `conjugate_gradient` requires an admitted metric multiply path for the same representation
-- `factorized_solve` requires diagonal, KFAC, low-rank, or GGN-derived factors
+- `cholesky_solve`, `eigh_solve`, and `svd_solve` over a PSD-declared metric require a positive-definite operator (damping greater than zero); a PSD-but-singular GGN or Fisher with `damping=0` is rejected, because a zero eigenvalue or singular value makes the inverse undefined. `eigh_solve` additionally requires a symmetric metric
+- `conjugate_gradient` requires an admitted metric multiply path for the same representation and a positive-definite metric, so a PSD-but-singular metric needs damping greater than zero; it is the only solve path for a matrix-free metric, inverting its forward operator iteratively
+- `factorized_solve` requires diagonal, KFAC, EKFAC, low-rank, or GGN-derived factors; EKFAC inverts in the Kronecker eigenbasis by dividing the corrected eigenvalues
 - `blockwise_solve` requires block-diagonal blocks
 - `woodbury_low_rank_solve` requires low-rank factors
 - `inverse_metric.preconditioner=block_diagonal` requires block-diagonal blocks or KFAC factors
-- `inverse_metric.preconditioner=factorized_metric` requires diagonal, KFAC, low-rank, or GGN-derived factors
+- `inverse_metric.preconditioner=factorized_metric` requires diagonal, KFAC, EKFAC, low-rank, or GGN-derived factors
+- `inverse_metric.preconditioner=matrix_free` wraps an admitted PSD operator, a tuned inverse-metric or factored-metric product named as the preconditioner
 - `inverse_metric.block_schedule` requires block-diagonal blocks or KFAC factors
+- `inverse_metric.multi_rhs=block` applies the solve to a stacked right-hand side, enabling block conjugate gradient and block Lanczos; `metric_vp` and `inverse_metric_vp` join the vectorization applicability for stacked vectors
 - `dtype.metric_factor` and `memory.factor_residency` are declared only by rows whose metric or inverse path uses declared or computed factors
 
 Shared axes that apply:
@@ -453,15 +539,99 @@ Mandatory checks:
 - inverse residual against the declared operator: $\|(M+\lambda I)x-v\| / \|v\|$ for damped inverse rows and $\|Mx-v\| / \|v\|$ for undamped inverse rows
 - symmetry check when applicable
 
+### Metric Inner Product
+
+For a declared or matrix-free metric $M$ and two stacked vectors $U,V$ each $n\times k$, compute the $k\times k$ Gram $U^\top M V$. The $k=1$ case is the scalar $u^\top M v$. A generalized eigensolver reads the diagonal $v^\top M v$ as the squared $M$-norm for $M$-orthonormalization, and the operator's `as_norm` declaration requires an exactly nonnegative diagonal and pins the reduction path accordingly.
+
+Owned axes:
+
+- `metric_inner.reduction_path`: `multiply_then_reduce`, `factored_gram`, `sqrt_apply_reduce`
+- `metric_inner.multi_rhs`: `single_column`, `block`
+
+`multiply_then_reduce` applies the metric multiply to $V$ and forms $U^\top(MV)$; `factored_gram` forms the Gram from the metric factors in a Kronecker-aware order without materializing $MV$; `sqrt_apply_reduce` applies the square-root factor adjoint $L^\top$ (with $LL^\top=M$) to $U$ and $V$ and forms $(L^\top U)^\top(L^\top V)$, whose diagonal is $\|L^\top v\|^2\ge 0$ by construction. `as_norm=True` admits only `sqrt_apply_reduce`, because the tuner sweeps generic probes that never reach the near-null-space vectors where the other paths round to a negative diagonal.
+
+Representation compatibility:
+
+- `multiply_then_reduce` requires an admitted `metric.multiply_path` for the same representation
+- `factored_gram` requires diagonal, KFAC, EKFAC, low-rank, or GGN-derived factors
+- `sqrt_apply_reduce` requires an admitted `sqrt_metric.factor_path` for the metric and composes with it; a matrix-free metric uses the matrix-free Lanczos square root, whose Gram diagonal stays nonnegative under approximation
+- `metric_inner.multi_rhs=block` batches the $k$ columns into one fused reduction and joins `metric_inner_vp` to the vectorization applicability
+
+Shared axes that apply:
+
+- batching, chunking, and input representation
+- memory schedule
+- dtype and numeric backend
+- torch compile
+- parameter and vector layout
+- distributed execution
+
+Mandatory checks:
+
+- dense tiny Gram against the reconstructed dense $M$: $U^\top M V$
+- diagonal nonnegativity on the same-vector probe entries when `as_norm` is declared; the off-diagonal entries compare against the dense reference only
+- symmetry of the Gram when $U=V$
+
+### Inverse Metric Inner Product
+
+For a declared or matrix-free metric $M$, two stacked vectors $U,V$ each $n\times k$, and the declared damping, compute the $k\times k$ Gram $U^\top (M+\lambda I)^{-1} V$. A generalized eigensolver reads the diagonal $r^\top (M+\lambda I)^{-1} r$ as the squared $R^{-1}$-norm of its residual, and the `as_norm` declaration requires an exactly nonnegative diagonal and pins the reduction path accordingly.
+
+Owned axes:
+
+- `inverse_metric_inner.reduction_path`: `solve_then_reduce`, `factored_gram`, `sqrt_apply_reduce`
+- `inverse_metric_inner.multi_rhs`: `single_column`, `block`
+
+`solve_then_reduce` solves $(M+\lambda I)X=V$ and forms $U^\top X$; `factored_gram` forms the Gram from the inverse factors, EKFAC through the corrected eigenvalues in the Kronecker eigenbasis; `sqrt_apply_reduce` applies the inverse-square-root factor adjoint $L^\top$ (with $LL^\top=(M+\lambda I)^{-1}$) to $U$ and $V$ and forms $(L^\top U)^\top(L^\top V)$, a forward factor application and not a solve, whose diagonal is $\|L^\top r\|^2\ge 0$. `as_norm=True` admits only `sqrt_apply_reduce`. The inverse inner product carries the operator's declared damping and residual tolerance `tol`.
+
+Representation compatibility:
+
+- `solve_then_reduce` requires an admitted `inverse_metric.solve_path` for the same representation and the same positive-damping requirement on a PSD-but-singular metric
+- `factored_gram` requires diagonal, KFAC, EKFAC, low-rank, or GGN-derived factors
+- `sqrt_apply_reduce` requires an admitted `sqrt_metric.factor_path`; a matrix-free metric uses the matrix-free Lanczos inverse square root, whose Gram diagonal stays nonnegative under approximation
+- `inverse_metric_inner.multi_rhs=block` batches the $k$ columns and joins `inverse_metric_inner_vp` to the vectorization applicability
+
+Shared axes that apply:
+
+- batching, chunking, and input representation
+- memory schedule
+- dtype and numeric backend
+- torch compile
+- parameter and vector layout
+- distributed execution
+
+Mandatory checks:
+
+- dense tiny Gram against the reconstructed damped inverse: $U^\top (M+\lambda I)^{-1} V$
+- diagonal nonnegativity on the same-vector probe entries when `as_norm` is declared
+- inverse residual on each solved column for `solve_then_reduce`
+- positive damping over a PSD-but-singular metric
+
 ### Composition
 
-For declared child operators $A_1,\ldots,A_k$, compute the declared composition.
-The mathematical order is fixed by the operator spec.
+For child operators arranged by an operator expression, compute the declared
+composition. The expression has two node types and two leaves: `compose` gives the
+sequential application $e_1(e_2(\cdots e_k(v)))$, `linear_combination` gives the
+weighted sum $\sum_i c_i e_i(v)$, the `scaled_identity` leaf gives $c v$, and the
+`source` leaf seeds $v$ from a batch-to-vector child. `compose` and `linear_combination`
+close the linear operator algebra under composition, addition, and scalar
+multiplication; `scaled_identity` supplies the identity, and `source` seeds the vector so a
+source-bearing expression is vector-valued, a generator of $v$ rather than an operator on it.
+Preconditioning is a `compose`, damping and averaging are a `linear_combination`, the
+natural-gradient step is a `compose` over a `source`, and fused composites are the
+`fuse_adjacent_children` lowering of a `compose` node. A `source` may appear only as the
+innermost argument of a `compose` or a term of a `linear_combination`; an expression with
+a source is vector-valued. Inversion is the inverse-metric operator's responsibility: a
+PSD matrix-free composite, a GGN or Fisher, is inverted by wrapping it as a matrix-free
+metric and solving with conjugate gradient, which requires the PSD operator.
 
-The operator spec contains the ordered child-family list. That list is the single
-source for the composition family's dependencies. Composition requires a
-multi-family run because child families must be present in the same run-level
-dependency graph.
+The child-name leaves of the expression are the single source for the composition
+family's dependencies. Composition requires a multi-family run because child
+families must be present in the same run-level dependency graph.
+
+A `compose` node lowers through the `sequential_composition` runtime path; a
+`linear_combination` node lowers through the `linear_combination` runtime path,
+applying its terms to the same input vector and reducing them with the declared
+coefficients. `composition.execution` arranges a `compose` node's children.
 
 Owned axes:
 
@@ -489,9 +659,13 @@ Mandatory checks:
 ### Vectorization
 
 Applies to JVP, VJP, HVP, GGNVP, FisherVP, sampled FisherVP, empirical
-FisherVP, and any composition child that accepts multiple vectors or cotangents.
-This axis owns the vector, tangent, or cotangent dimension only. It does not own
-data-example batching, per-example gradient batching, token packing, or
+FisherVP, metric multiply, inverse metric multiply, the metric inner products, the
+square-root multiplies, and any composition child that accepts multiple vectors or
+cotangents. For metric multiply, inverse metric multiply, and the metric inner products it
+carries the stacked right-hand side that `inverse_metric.multi_rhs=block`,
+`metric_inner.multi_rhs=block`, and `inverse_metric_inner.multi_rhs=block` consume. This
+axis owns the vector, tangent, or cotangent dimension only. It does not
+own data-example batching, per-example gradient batching, token packing, or
 microbatching.
 
 - `vectorization.mode`: `single_loop`, `manual_batch`, `vmap`
@@ -553,7 +727,8 @@ Core attention execution owns `pytorch_sdpa_direct`, `patched_eager`,
 `packed_exact`, `blockwise_exact`, `attention.sdpa_kernel`,
 `attention.partition`, and `attention.padding`. A model adapter supplies an
 attention-location descriptor. The Transformers adapter owns
-`transformers_*`, `paged|*`, and `registered_transformers_attention` frontends.
+`transformers_*`, `paged|*`, and `registered_transformers_attention` frontends and
+enters them into the search space through `space.with_attention(...)`.
 
 `attention.sdpa_kernel` applies only when the executable calls PyTorch SDPA.
 Auto selection is represented by `priority_list` with the exact backend order
@@ -732,7 +907,7 @@ first-class sweep axis, and rows must name the callable boundary that is
 compiled.
 
 - `compile.enabled`: `false`, `true`
-- `compile.boundary`: `model_forward`, `transformer_block`, `attention_module`, `loss_closure`, `gradient_closure`, `jvp_closure`, `vjp_closure`, `hvp_single_vector`, `hvp_batched_vectors`, `ggn_jvp`, `ggn_loss_hessian_product`, `ggn_vjp`, `ggn_full_product`, `fisher_score_grad`, `sampled_fisher_score_grad`, `empirical_fisher_example_grad`, `metric_multiply`, `inverse_metric_solve`, `composition_child`, `whole_operator`
+- `compile.boundary`: `model_forward`, `transformer_block`, `attention_module`, `loss_closure`, `gradient_closure`, `jvp_closure`, `vjp_closure`, `hvp_single_vector`, `hvp_batched_vectors`, `ggn_jvp`, `ggn_loss_hessian_product`, `ggn_vjp`, `ggn_full_product`, `fisher_score_grad`, `sampled_fisher_score_grad`, `empirical_fisher_example_grad`, `metric_multiply`, `metric_inner_reduce`, `metric_sqrt_multiply`, `inverse_metric_solve`, `inverse_metric_inner_reduce`, `per_example_gradient`, `bound_operator_vector_step`, `composition_child`, `whole_operator`
 - `compile.backend`: `inductor`, or a registered backend returned by `torch.compiler.list_backends()` that does not own CUDA graph capture
 - `compile.mode`: `None`, `default`, `max-autotune`
 - `compile.fullgraph`: `false`, `true`
@@ -805,7 +980,10 @@ placement setting.
 ### Distributed Execution
 
 Applies to rows that run under a declared process group and measure all ranks.
-DTensor placement and distributed output placement are owned here.
+DTensor placement and distributed output placement are owned here. The whole
+distributed family is owned by the distributed adapter (`vptune.adapters.distributed`)
+and enters the search space through `space.with_distributed(...)`; the core runtime
+does not lower it.
 
 - `distributed.launch`: `single_process`, `torchrun`
 - `distributed.process_group_backend`: `nccl`, `gloo`, `ucc_when_available`
@@ -925,8 +1103,8 @@ attention frontend, compile state, and distributed strategy.
 Class C primary groups form a partition:
 
 - `ad_lowering`: `gradient.*`, `jvp.*`, `vjp.*`, `hvp.*`, `ggn.*`,
-  `fisher.*`, `sampled_fisher.*`, `empirical_fisher.*`, `composition.*`,
-  `vectorization.*`, and `call.*`
+  `fisher.*`, `sampled_fisher.*`, `empirical_fisher.*`, `per_example_gradient.*`,
+  `composition.*`, `vectorization.*`, and `call.*`
 - `attention_dispatch`: `attention.frontend`, `attention.sdpa_kernel`,
   `attention.custom_kernel_id`, `attention.mask_formatter_id`,
   `attention.partition`, and `attention.padding`
@@ -940,8 +1118,9 @@ Class C primary groups form a partition:
   `tp.*`, `sequence_parallel.*`, `context_parallel.*`, and `comm.*`
 - `compile`: `compile.*` and `memory.output_buffers`
 - `fusion`: `fusion.*`
-- `metric_storage`: `metric.*` and `memory.factor_residency`
-- `inverse_solve`: `inverse_metric.*`
+- `metric_storage`: `metric.*`, `metric_inner.*`, `sqrt_metric.*`, and
+  `memory.factor_residency`
+- `inverse_solve`: `inverse_metric.*` and `inverse_metric_inner.*`
 
 Class C merge rules:
 
@@ -959,6 +1138,9 @@ Class C merge rules:
   `distributed_layout` with `numeric_backend`.
 - If an inverse row uses a factorized metric or factorized preconditioner,
   merge `inverse_solve` with `metric_storage`.
+- If an `inverse_metric_inner` row uses `factored_gram` or `sqrt_apply_reduce`,
+  merge `inverse_solve` with `metric_storage`, since the reduction reads the same
+  factors.
 
 Class C groups after merge must be searched jointly or with a staged method that
 keeps top rows from each group before crossing groups.

@@ -8,10 +8,10 @@
 
 `vptune` owns:
 
-- Operator families: gradient, JVP, VJP, HVP, GGNVP, FisherVP, sampled FisherVP, empirical FisherVP, metrics, inverse metrics, and compositions.
+- Operator families: gradient, JVP, VJP, HVP, GGNVP, FisherVP, sampled FisherVP, empirical FisherVP, per-example gradient, metrics, metric inner products, metric square roots, inverse metrics, inverse metric inner products, inverse metric square roots, and compositions.
 - Package-owned anchors for standard operator families.
 - Candidate generation, candidate validation, candidate dependency ordering, and candidate admission checks.
-- Execution strategies: forward-over-reverse, reverse-over-reverse, reverse-over-forward, `vmap` batched transforms, row loops, microbatching, recomputation, checkpointing, model dtype, compute dtype, attention implementation, tensor layout, and sharding.
+- Execution strategies: forward-over-reverse, reverse-over-reverse, reverse-over-forward, `vmap` batched transforms, row loops, microbatching, recomputation, checkpointing, model dtype, compute dtype, the model-agnostic attention executor, and tensor layout. The model-library attention frontends and sharding are adapter-owned.
 - Measurement: elapsed time, peak allocated memory, peak reserved memory, post-call allocated memory, post-call reserved memory, OOM status, runtime failure status, and repeated-call memory behavior.
 - Selection: fastest stable row, then lower peak reserved memory among near-fastest rows.
 - Saved records: inputs, candidates, checks, measurements, selected settings, and selected-plan validation results. Replay uses direct field equality only.
@@ -118,88 +118,132 @@ Core package:
 
 Adapter modules:
 
-- `vptune.adapters.transformers`: Hugging Face model loading, attention implementation settings, tied-weight handling, cache flags, tokenizer-aware batching, and model-specific attention variants.
-- `vptune.adapters.distributed`: DTensor, FSDP2, tensor parallel, rank-local memory, global status, and selected settings agreement.
+- `vptune.adapters.transformers`: Hugging Face model loading, the attention frontends and the `attention_space(...)` they register, tied-weight handling, cache flags, tokenizer-aware batching, and model-specific attention variants.
+- `vptune.adapters.distributed`: the `target(...)`/`space(...)` builders for DTensor, FSDP2, tensor parallel, sequence and context parallel, rank-local memory, global status, and selected settings agreement.
 - `vptune.adapters.pilot`: pilot lowering, readiness, selected settings conversion, and adapter-owned validation.
 
-`import vptune as vp` exports the main tuning API: operator declarations, problem and run objects, plans, policies, objective/data/vector protocols, validation protocols, and package errors. Adapter and runtime authors import lower-level tools from `vptune.ext`. Adapter helpers are imported from `vptune.adapters` or the specific adapter module.
+`import vptune as vp` exports the user-facing surface: the model builders `torch_model`, `parameters`, and `module_call`; the typed math objects `output`, `loss.*`, `likelihood.*`, `metric.*`, `samples.*`, and `damping.*`; the operator constructors, the returned `Operator`, and the composition combinators `compose`, `linear_combination`, `scaled_identity`, and `source`; the `space`, `search`, `cuda`, `cohort.*`, and `CohortConstraint` builders; `tune`; the lower-layer `problem`, `autotune`, `Plan`, `TuningRun`, `tune_run`, and replay functions; and the package errors. `Candidate`, `RuntimeConfig`, the axis table and manifest, operation factories, reference checks, package-owned anchors, memory backends, Autobatch domains, and the schema and replay helpers live in `vptune.ext`; a normal caller never touches them. Adapter helpers are imported from `vptune.adapters` or the specific adapter module.
+
+Non-goals. The package tunes matrix-free matvecs and the factor, inverse, square-root, and inner-product products built from them; it does not own the algorithms that orchestrate them. The boundary is the tuning surface: a product is in scope when it has an implementation choice beyond the matvec it sits on (the inverse solve path, the square-root factor path, the inner-product reduction path and its block batching), and out of scope when it is loop orchestration with no such choice. Out of scope: eigensolvers and Krylov drivers (Lanczos, LOBPCG, CG loops) that sequence the tuned products; indefinite-Hessian inversion (CG requires a PD operator and the package ships no MINRES or SYMMLQ, so the indefinite object stays `hvp`); non-PyTorch backends; and any sampling scheme without a fixed-seed or fixed-table identity. The $R$-norm and $R^{-1}$-norm Gram matrices a generalized eigensolver consumes are tuned products, `metric_inner_vp` and `inverse_metric_inner_vp`; the eigensolver loop that calls them is the caller's.
 
 The live package spec is `SPEC.md`. The live package scratchpad is `SCRATCHPAD.md`.
 
 ## Public API
 
-Single-family standard PyTorch tuning:
+The public surface declares mathematical objects. A caller declares a model, what to differentiate, the vectors and data, a search space, and a target. The operator is the front-door object: it is callable on a default implementation immediately, and tuning returns a faster callable that carries its selection record. `Candidate`, `RuntimeConfig`, the axis table, anchors, and schema helpers live in `vptune.ext`; a normal caller never writes a candidate row.
+
+### Model
 
 ```python
 import vptune as vp
 
-operator = vp.hvp("loss_hvp", "training_loss", aggregation="sum")
-plan = vp.autotune(
-    model=model,
-    parameter_surface=vp.parameter_surface(model, include=include_rule),
-    parameter_values=dict(model.named_parameters(remove_duplicate=False)),
-    buffers=dict(model.named_buffers()),
-    data=data,
-    operator=operator,
-    vectors=vectors,
-    target=vp.Target(
-        devices=("cuda:0",),
-        accelerator="cuda",
-        allowed_dtypes=("bfloat16", "float32"),
-        allowed_attention_frontends=("transformers_sdpa", "transformers_eager"),
-        allowed_sdpa_kernels=("math", "flash_attention"),
-        allowed_sharding_modes=("single_device",),
-        timing_policy=timing_policy,
-        selection_policy=selection_policy,
-        determinism_policy=determinism_policy,
-        environment_capture=environment_capture,
-    ),
-    candidates={
-        "reverse-over-reverse-small": {"operator_path": "reverse_over_reverse"},
-        "vhp-large": {"operator_path": "vhp"},
-    },
-    thresholds={"max_abs_diff": 1e-4, "max_rel_diff": 1e-3},
-    objective_signature={"training_loss": "loss-v1"},
-    scalar_objectives={"training_loss": training_loss},
-    run_dir=run_dir,
+model = vp.torch_model(
+    module,
+    parameters=vp.parameters(module, include=include_rule, buffers="include", tied="preserve"),
+    call=vp.module_call(args=("input_ids",), kwargs={"attention_mask": "attention_mask"}, output="logits"),
 )
-
-selected = plan.materialize()
 ```
 
-`vp.standard_problem(...)` builds the same standard `Problem` without running it. `vp.tune(problem)` remains the lower-level entry point. `vp.load_tuned_plan(run_dir, problem)` replays a saved single-family problem run without requiring caller-built replay identity. `vp.load_tuned_run(run_dir, tuning)` does the same for a saved multi-family `TuningRun`. Composition specs require `TuningRun` because their child families must be present in the same run-level dependency graph; `vp.autotune(...)` and `vp.standard_problem(...)` reject composition specs. Custom operators and adapters can provide `vptune.ext.RuntimeConfig` directly with an operation factory, reference check, materializer, axis registry, and runtime identity.
+`vp.parameters(...)` is the typed parameter surface: active set, trainable flags, tied-weight and buffer policy, and the canonical flatten order. `vp.module_call(...)` is the batch-to-`forward` binding. Together with the module they carry everything the front door previously asked for through `parameter_surface`, `parameter_values`, `buffers`, and objective wiring.
 
-Multi-family tuning:
+### Typed inputs that carry the math
+
+A typed object carries the mathematical content each operator needs and validates its closed-set fields at construction:
+
+- `vp.output(field)` is the vector output function $z(\theta)$ that JVP and VJP differentiate; `field` names a key in the model-call output, for example `vp.output("logits")`. The `output=` field on a loss or likelihood names the same model-output key that object reads.
+- `vp.loss.*` is a scalar loss that also exposes its output-space Hessian $H_\ell$. `vp.loss.softmax_cross_entropy(output="logits", labels="labels", mask=None, reduction="token_mean", denominator="num_tokens")` has the per-token block $\operatorname{diag}(p_t)-p_t p_t^\top$, and the operator-level $H_\ell$ is the masked, normalized sum $\frac{1}{N}\sum_{m_t=1}(\operatorname{diag}(p_t)-p_t p_t^\top)$ with $N=\sum_t m_t$ and a zero block at masked positions. `vp.loss.kl(...)` and `vp.loss.mse(...)` follow. `vp.loss.from_scalar(fn, output=..., version=...)` takes $H_\ell$ from autodiff, PSD-checked at the probe. `vp.loss.declared_psd(output=..., factors=...)` is PSD by construction; `vp.loss.declared_psd_matrix_free(output=..., matvec=..., version=...)` is PSD-checked by a Lanczos eigenvalue estimate with a residual bound, admitted only when $\theta_1-\|r_1\|\ge-\tau$ for the smallest Ritz value $\theta_1$ and its residual norm $\|r_1\|$, or refused. `reduction` is `sum`, `mean`, `token_mean`, or a named adapter reduction; `denominator` aligns with the likelihood denominator so CE-GGN and exact Fisher coincide.
+- `vp.likelihood.*` is the predictive distribution defining the score $s_\theta=\nabla_\theta\log p_\theta(y\mid x)$: `vp.likelihood.categorical(output="logits", labels="labels", sample_space="terms", denominator="num_tokens", label_policy="explicit")` and `vp.likelihood.gaussian(output=..., target=..., noise=..., sample_space=..., denominator=...)`. The label policy, sample space, score reduction, and denominator that were string arguments are validated closed-set fields here.
+- `vp.metric.*` is a typed metric: `vp.metric.dense(matrix=...)`, `vp.metric.diagonal(diag=...)`, `vp.metric.block_diagonal(blocks=...)`, `vp.metric.kfac(factors=..., dampings=None)`, `vp.metric.ekfac(eigvecs_a=..., eigvecs_g=..., corrected_eigenvalues=...)`, `vp.metric.low_rank(factor=..., diagonal=...)`, `vp.metric.ggn_derived(factors=...)`, and `vp.metric.matrix_free(operator=...)` where `operator` is a sibling product, an `Operator` carrying a `name`. The metric records the product name so dependency and cohort machinery reach it, and an anonymous operator is rejected; its operator must be an admitted PSD curvature (a GGN or Fisher), inverted through conjugate gradient with positive damping. It replaces the opaque `representation: Mapping[str, Any]`.
+- `vp.samples.*` declares a sampled-Fisher sample source: `vp.samples.fixed_seed(seed, count)` or `vp.samples.table(table=..., identity=...)`.
+- `vp.damping.*` is the typed damping for `inverse_metric_vp`, `inverse_metric_inner_vp`, and `inverse_sqrt_metric_vp`: `vp.damping.scalar(lam)`, `vp.damping.per_group(values)` keyed by parameter-surface block, `vp.damping.kfac_pi(lam, policy="trace_norm" | "equal")` for the Martens-Grosse factor split, and `vp.damping.eigenvalue_floor(lam)` for EKFAC. `kfac_pi` requires a `vp.metric.kfac` metric (it needs the separate $A$ and $G$ factor norms, which EKFAC discards); `eigenvalue_floor` requires `vp.metric.ekfac` and adds $\lambda$ to the corrected eigenvalues; admission rejects the other pairings.
+
+### The operator is the object
+
+```python
+ggn = vp.ggnvp(model, vp.loss.softmax_cross_entropy(output="logits", labels="labels", mask="attention_mask"))
+y = ggn(batch, vector)             # callable now on a default reference implementation
+
+ggn = ggn.tune(                    # returns a new tuned operator carrying its record
+    data=probe_batches, vectors=probe_vectors,
+    target=vp.cuda(0, "h100"),
+    space=vp.space.standard(...).with_attention(...),
+    search=vp.search.balanced(retain=4),
+    run_dir=run_dir,
+)
+y = ggn(batch, vector)             # fastest stable implementation
+ggn.plan                           # selection, measurements, replay record
+ggn = vp.ggnvp(model, loss).load(run_dir)   # replay a saved tuning without re-searching
+```
+
+The call signature matches the operator. `gradient` takes a batch. `jvp`, `vjp`, `hvp`, `ggnvp`, and the three Fishers take a batch and a vector. `metric_vp` and `inverse_metric_vp` over a declared, factored metric take only a vector, because that metric is data-independent; over a `vp.metric.matrix_free(...)` metric wrapping a data-dependent operator they take a batch and a vector. `tune` returns a new operator and does not mutate in place; every default it applied is recorded in `ggn.plan`.
+
+### Data and vectors
+
+`data` is an iterable of representative batches, or a mapping by product name when products consume different data; `vectors` is an iterable for a single product or a mapping by product name for several products. A composition with per-child data (influence functions with a test and a train batch, forget and retain losses on disjoint subsets, function-space Laplace with distinct evaluation batches) routes a named data stream to each child by the child's product name. The tuner forms probe `(batch, vector)` pairs and derives a tiny reference pair for correctness checks. The overrides are `reference=vp.case(batch=..., vector=...)` for the correctness input and `probes=[(batch, vector), ...]` for exact control. This replaces the `DataProvider`/`VectorProvider` providers zipped by position. A data-independent operator such as `metric_vp` over a factored metric takes vectors with no batch. `cohort_constraints` pins sweep axes that several products must agree on; the pilot pins `layout.vector`, `layout.flatten_order`, and `dtype.vector` across its $H$, $R$, and $R^{-1}$ products so a generalized eigensolver can feed one vector to all three.
+
+### Search space, target, and search
+
+```python
+space = vp.space.standard(
+    autodiff=vp.AD(paths=("torch_func_jvp", "forward_ad_dual")),
+    vectorization=vp.Vectorization(modes=("single_loop", "vmap", "manual_batch")),
+    precision=vp.Precision(model=("fp32", "bf16"), accumulation=("fp32", "bf16")),
+    compile=vp.Compile(enabled=(False, True), boundaries=("ggn_full_product",)),
+    layout=vp.Layout(params=("flat_contiguous",), vector=("flat_contiguous",)),
+    memory=vp.Memory(vector_residency=("gpu",), recompute=("none",)),
+)
+space = space.with_attention(vp.adapters.transformers.attention_space(frontends=("sdpa", "flash_attention_2")))
+space = space.with_distributed(vp.adapters.distributed.space(strategy=("fsdp2",)))
+
+target = vp.cuda(
+    device=0, accelerator="h100",
+    timing=vp.TimingPolicy(), selection=vp.SelectionPolicy(),
+    determinism=vp.DeterminismPolicy(), environment=vp.EnvironmentPolicy(),
+)
+search = vp.search.balanced(retain=4, compile_horizons=(1, 10, 100))   # .fast/.thorough/.smoke/.admission/.exhaustive
+```
+
+`vp.space.standard(...)` declares only the axes the core runtime lowers. Attention frontends and distributed strategies are adapter-owned and enter the search space through `space.with_attention(...)` and `space.with_distributed(...)`. `vp.cuda(...)` is the hardware target with its timing, selection, determinism, and environment-capture policies. `vp.search.balanced(...)` and its `.fast`, `.thorough`, `.smoke`, `.admission`, and `.exhaustive` siblings select the search strategy.
+
+### Multiple products
+
+Several products tuned in one run (cohorts, compositions) use `vp.tune`, which returns tuned callables by name:
+
+```python
+run = vp.tune(
+    products=[curvature, preconditioner, preconditioned_hvp],   # composition children are sibling products
+    model=model, data=probe_batches,
+    vectors={"curvature": [...], "preconditioner": [...], "preconditioned_hvp": [...]},
+    target=vp.cuda(0, "h100"),
+    search=vp.search.balanced(retain=4, compile_horizons=(1, 10, 100)),
+    space=space, run_dir=run_dir,
+)
+precond = run["preconditioned_hvp"]         # tuned callable
+```
+
+### The lower layer
+
+`operator.tune(...)` and `vp.tune(...)` build a `Problem` (single product) or a `TuningRun` (several products) and run the search under it. Advanced callers reach that layer directly: `vp.problem(product, ...)` builds a single-product `Problem`, `vp.autotune(problem, run_dir=...)` runs the search and returns a `Plan`, and `plan.materialize(name)` returns the selected callable. A `composition` is an `Operator`, but its children are sibling products in a run-level dependency graph, so a composition is tuned only through `vp.tune(...)` or a `TuningRun`; `operator.tune(...)` on a composition, and `vp.problem`/`vp.autotune` on a composition spec, are rejected. Custom operators and adapters can provide `vptune.ext.RuntimeConfig` directly with an operation factory, reference check, materializer, axis registry, and runtime identity.
+
+`vp.tune(products=...)` returns a `Run`, a mapping from product name to tuned `Operator`; it builds and runs a `TuningRun` internally and exposes the `Run` view. The `TuningRun` plus `tune_run` path below is the lower layer a caller reaches directly only to supply adapter-lowered `problems`, `validators`, and `validator_identities`:
 
 ```python
 import vptune as vp
+
+loss = vp.loss.softmax_cross_entropy(output="logits", labels="labels")
+curvature = vp.hvp(model, loss, name="curvature")
+preconditioner = vp.inverse_metric_vp(model, vp.metric.kfac(factors=kfac), damping=vp.damping.scalar(1e-2), name="preconditioner")
+preconditioned_hvp = vp.composition(
+    model,
+    children=("preconditioner", "curvature"),
+    combine=vp.compose("preconditioner", "curvature"),
+    name="preconditioned_hvp",
+)
 
 tuning = vp.TuningRun(
     target=target,
-    families=(
-        vp.Family(
-            "loss_gradient",
-            vp.gradient("loss_gradient", "training_loss", aggregation="sum"),
-        ),
-        vp.Family(
-            "metric",
-            vp.ggnvp(
-                "metric",
-                "training_loss",
-                aggregation="mean_per_example",
-                loss_geometry="psd_metric",
-            ),
-        ),
-        vp.Family(
-            "preconditioned_hvp",
-            vp.composition(
-                "preconditioned_hvp",
-                "metric_inverse_after_hvp",
-                aggregation="sum",
-                children=("loss_gradient", "metric"),
-            ),
-        ),
-    ),
+    products=(curvature, preconditioner, preconditioned_hvp),
+    cohort_constraints=(vp.cohort.layout_coherence(("layout.vector", "layout.flatten_order", "dtype.vector")),),
     problems=adapter.lower(tuning_inputs),
     validators=adapter.validators(tuning_inputs),
     validator_identities=adapter.validator_identities(tuning_inputs),
@@ -209,51 +253,103 @@ tuning = vp.TuningRun(
 plan = vp.tune_run(tuning, run_dir=run_dir)
 ```
 
-When `TuningRun.validators` is non-empty, `TuningRun.validator_identities` must cover the same families with non-empty identities. `tune_run` rejects validator key mismatches before search, writes the selected plan with `validation_required=True`, runs selected-plan validation in `Plan.validation_order`, writes validation records and `summaries/selected_plan_validation.json`, and raises if any selected family fails validation.
+When `TuningRun.validators` is non-empty, `TuningRun.validator_identities` must cover the same products with non-empty identities. `tune_run` rejects validator key mismatches before search, writes the selected plan with `validation_required=True`, runs selected-plan validation in `Plan.validation_order`, writes validation records and `summaries/selected_plan_validation.json`, and raises if any selected product fails validation.
 
-Every public object must be typed and serializable. Every replay-relevant identity must be saved as explicit fields, and a selected run can be reproduced from saved records without re-running search.
+Replay has a front door and a lower layer, and each entry point reads one kind of saved run. `vp.<op>(model, spec).load(run_dir)` replays a saved single-product tuning into a callable; it is the only door for a run produced by `operator.tune(...)`. `vp.load_tuned_plan(run_dir, problem)` replays a saved single-product run produced by `vp.problem`/`vp.autotune`, and `vp.load_tuned_run(run_dir, tuning)` replays a saved `TuningRun` produced by `vp.tune`/`tune_run`, both without a caller-built replay identity. `vp.load_plan(run_dir, replay_context, materializers)` is the manual door for callers that supply their own replay context. The package reads the saved run kind and raises when an entry point is handed a run it does not cover; the kinds do not overlap.
+
+Every public object is typed and serializable. Every replay-relevant identity is saved as explicit fields, and a selected run can be reproduced from saved records without re-running search.
 
 Concrete public signatures:
 
 ```python
-def autotune(
+def torch_model(
+    module: torch.nn.Module,
     *,
-    model: torch.nn.Module,
-    parameter_surface: ParameterSurface,
-    parameter_values: ParameterTree,
-    buffers: BufferTree,
-    data: DataProvider,
-    operator: OperatorSpec,
-    vectors: VectorProvider,
+    parameters: ParameterSurface,
+    call: ModuleCallSpec,
+) -> Model: ...
+
+def parameters(
+    module: torch.nn.Module,
+    *,
+    include: Callable[[str, torch.nn.Parameter], bool] | None = None,
+    buffers: str = "include",
+    tied: str = "preserve",
+) -> ParameterSurface: ...
+
+def module_call(
+    *,
+    args: Sequence[str],
+    kwargs: Mapping[str, str],
+    output: str,
+) -> ModuleCallSpec: ...
+```
+
+Every operator constructor returns an `Operator`. The operator binds its model, is callable on a default implementation, and tunes into a faster callable that carries its `Plan`:
+
+```python
+class Operator(Protocol):
+    plan: Plan | None
+    call_inputs: tuple[str, ...]   # ("batch",) | ("batch", "vector") | ("vector",) | ("left", "right") | ("batch", "left", "right")
+
+    # gradient(batch); jvp/vjp/hvp/ggnvp/fisher*(batch, vector);
+    # metric_vp/inverse_metric_vp(vector) for a factored metric, (batch, vector) for matrix_free
+    # metric_inner_vp/inverse_metric_inner_vp(left, right) for a factored metric, (batch, left, right) for matrix_free
+    def __call__(self, *call_inputs: Any) -> Any: ...
+
+    # fix the batch for repeated calls (a Krylov solver wants op(vector)); the result has call_inputs ("vector",)
+    def bind(self, *, batch: Batch) -> Operator: ...
+
+    def tune(
+        self,
+        *,
+        data: Iterable[Batch] | None = None,
+        vectors: Iterable[TensorTree] | None = None,
+        target: Target,
+        space: SearchSpace,
+        search: SearchStrategy,
+        run_dir: Path | None = None,
+        reference: Case | None = None,
+        probes: Sequence[tuple[Batch, TensorTree]] | None = None,
+        memory_backend: vptune.ext.MemoryBackend | None = None,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> Operator: ...
+
+    def load(
+        self,
+        run_dir: Path,
+        *,
+        memory_backend: vptune.ext.MemoryBackend | None = None,
+    ) -> Operator: ...
+```
+
+```python
+def tune(
+    *,
+    products: Sequence[Operator],
+    model: Model,
+    data: Iterable[Batch] | Mapping[str, Iterable[Batch]],
+    vectors: Mapping[str, Iterable[TensorTree]],
     target: Target,
-    candidates: Mapping[str, Mapping[str, Any]],
-    thresholds: Mapping[str, float],
-    objective_signature: Mapping[str, Any],
-    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
-    function_objectives: Mapping[str, FunctionObjective] | None = None,
+    space: SearchSpace,
+    search: SearchStrategy,
+    cohort_constraints: Sequence[CohortConstraint] = (),
     run_dir: Path | None = None,
     memory_backend: vptune.ext.MemoryBackend | None = None,
     clock: Callable[[], float] = time.perf_counter,
-) -> Plan: ...
+) -> Run: ...
 
-def standard_problem(
+def problem(
+    product: Operator,
     *,
-    model: torch.nn.Module,
-    parameter_surface: ParameterSurface,
-    parameter_values: ParameterTree,
-    buffers: BufferTree,
-    data: DataProvider,
-    operator: OperatorSpec,
-    vectors: VectorProvider,
+    data: Iterable[Batch],
+    vectors: Iterable[TensorTree],
     target: Target,
-    candidates: Mapping[str, Mapping[str, Any]],
-    thresholds: Mapping[str, float],
-    objective_signature: Mapping[str, Any],
-    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
-    function_objectives: Mapping[str, FunctionObjective] | None = None,
+    space: SearchSpace,
+    search: SearchStrategy,
 ) -> Problem: ...
 
-def tune(
+def autotune(
     problem: Problem,
     *,
     run_dir: Path | None = None,
@@ -269,7 +365,7 @@ def tune_run(
     clock: Callable[[], float] = time.perf_counter,
 ) -> Plan: ...
 
-def materialize(plan: Plan, *, family: str | None = None) -> Any: ...
+def materialize(plan: Plan, *, name: str | None = None) -> Any: ...
 
 def load_tuned_plan(
     run_dir: Path,
@@ -298,94 +394,119 @@ def validate_plan(
     *,
     run_dir: Path | None = None,
 ) -> tuple[CheckRecord, ...]: ...
-
-def parameter_surface(
-    model: torch.nn.Module,
-    *,
-    include: Callable[[str, torch.nn.Parameter], bool] | None = None,
-    buffers: str = "include",
-    tied_weights: str = "preserve",
-) -> ParameterSurface: ...
 ```
 
 Operator constructor signatures:
 
+Every operator except `composition` follows one shape, `(model, spec, name=None, **op_specific)`, and returns an `Operator`. The spec is the typed object that carries the math: a `Loss` for `gradient`, `hvp`, `ggnvp`, `empirical_fisher_vp`, and `per_example_gradient`; an `Output` for `jvp` and `vjp`; a `Likelihood` for `fisher_vp` and `sampled_fisher_vp`; a `Metric` for `metric_vp`, `metric_inner_vp`, `inverse_metric_vp`, `inverse_metric_inner_vp`, `sqrt_metric_vp`, and `inverse_sqrt_metric_vp`. `composition` is the explicit exception: it carries no single spec but a `children` list and a `combine` expression. `name` is optional for a single product and required when several products tune together. Each operator declares its `call_inputs`, the ordered call arguments, one of `("batch",)`, `("batch", "vector")`, `("vector",)`, `("left", "right")`, or `("batch", "left", "right")`, so the call arity is inspectable and not a hidden mode.
+
 ```python
-def gradient(family: str, objective_id: str, *, aggregation: str) -> OperatorSpec: ...
-def jvp(family: str, objective_id: str, *, aggregation: str) -> OperatorSpec: ...
-def vjp(family: str, objective_id: str, *, aggregation: str) -> OperatorSpec: ...
-def hvp(family: str, objective_id: str, *, aggregation: str) -> OperatorSpec: ...
-
-def ggnvp(
-    family: str,
-    objective_id: str,
-    *,
-    aggregation: str,
-    loss_geometry: str,
-) -> OperatorSpec: ...
-
-def fisher_vp(
-    family: str,
-    objective_id: str,
-    *,
-    aggregation: str,
-    distribution: str,
-    label_policy: str,
-    sample_space: str,
-    score_reduction: str,
-    denominator: str,
-) -> OperatorSpec: ...
+def gradient(model: Model, loss: Loss, name: str | None = None) -> Operator: ...
+def jvp(model: Model, output: Output, name: str | None = None) -> Operator: ...
+def vjp(model: Model, output: Output, name: str | None = None) -> Operator: ...
+def hvp(model: Model, loss: Loss, name: str | None = None) -> Operator: ...
+def ggnvp(model: Model, loss: Loss, name: str | None = None) -> Operator: ...
+def fisher_vp(model: Model, likelihood: Likelihood, name: str | None = None) -> Operator: ...
 
 def sampled_fisher_vp(
-    family: str,
-    objective_id: str,
+    model: Model,
+    likelihood: Likelihood,
+    name: str | None = None,
     *,
-    aggregation: str,
-    distribution: str,
-    label_policy: str,
-    sample_count: int,
-    sample_source: str,
-    sampling_bound: Mapping[str, Any],
-    score_reduction: str,
-    denominator: str,
-) -> OperatorSpec: ...
+    samples: SampleSource,
+) -> Operator: ...
 
-def empirical_fisher_vp(
-    family: str,
-    objective_id: str,
-    *,
-    aggregation: str,
-    example_loss_reduction: str,
-    denominator: str,
-) -> OperatorSpec: ...
+def empirical_fisher_vp(model: Model, loss: Loss, name: str | None = None) -> Operator: ...
 
-def metric(
-    family: str,
-    objective_id: str,
-    *,
-    aggregation: str,
-    representation: Mapping[str, Any],
-) -> OperatorSpec: ...
+def per_example_gradient(model: Model, loss: Loss, name: str | None = None) -> Operator: ...
 
-def inverse_metric(
-    family: str,
-    objective_id: str,
+def metric_vp(model: Model, metric: Metric, name: str | None = None) -> Operator: ...
+
+def metric_inner_vp(
+    model: Model,
+    metric: Metric,
+    name: str | None = None,
     *,
-    aggregation: str,
-    representation: Mapping[str, Any],
-    damping: float,
-) -> OperatorSpec: ...
+    as_norm: bool = False,
+) -> Operator: ...
+
+def sqrt_metric_vp(model: Model, metric: Metric, name: str | None = None) -> Operator: ...
+
+def inverse_metric_vp(
+    model: Model,
+    metric: Metric,
+    name: str | None = None,
+    *,
+    damping: Damping,
+    tol: float | None = None,
+) -> Operator: ...
+
+def inverse_metric_inner_vp(
+    model: Model,
+    metric: Metric,
+    name: str | None = None,
+    *,
+    damping: Damping,
+    as_norm: bool = False,
+    tol: float | None = None,
+) -> Operator: ...
+
+def inverse_sqrt_metric_vp(
+    model: Model,
+    metric: Metric,
+    name: str | None = None,
+    *,
+    damping: Damping,
+    tol: float | None = None,
+) -> Operator: ...
 
 def composition(
-    family: str,
-    objective_id: str,
+    model: Model,
+    name: str | None = None,
     *,
-    aggregation: str,
     children: Sequence[str],
-) -> OperatorSpec: ...
+    combine: Combine,
+) -> Operator: ...
 ```
 
-Required callable protocols:
+`ggnvp` takes a loss (or `vp.loss.declared_psd(...)`) and enforces PSD on the output-space Hessian $H_\ell$: a non-PSD $H_\ell$ fails admission with "GGN requires a PSD output-space metric." There is no `loss_geometry` and no `linear_map`. Exact categorical Fisher is `vp.ggnvp(model, vp.loss.softmax_cross_entropy(...))`, the same object by the math; `fisher_vp` stays a distinct family for the score-gradient outer-product construction. The five string knobs of the old Fisher constructors (`distribution`, `label_policy`, `sample_space`, `score_reduction`, `denominator`) are validated fields of the `Likelihood`. The opaque `representation` mapping of the old metric constructors is the typed `Metric`. Every closed-set field of these objects is validated at construction and raises on a typo.
+
+`combine` is an operator expression over the named children. `vp.compose(e_1, ..., e_k)` is sequential application $e_1(e_2(\cdots e_k(v)))$, `vp.linear_combination((c_1, e_1), ..., (c_m, e_m))` is the weighted sum $\sum_i c_i e_i(v)$, `vp.scaled_identity(c)` is the leaf $c v$, and `vp.source(child)` is a leaf that seeds $v$ from a batch-to-vector child. `vp.compose` and `vp.linear_combination` close the linear operator algebra under composition, addition, and scalar multiplication; `vp.scaled_identity(c)` supplies the operator $cI$, making the algebra unital. `vp.source(child)` is a depth-0 leaf that seeds $v$ from a batch-to-vector child, so a source-bearing expression is vector-valued, a generator of $v$ rather than an operator on an external $v$. Preconditioning $M^{-1}H$ is `vp.compose("inverse_metric", "hvp")`, damping $H+\lambda I$ is `vp.linear_combination((1.0, "hvp"), (lam, vp.scaled_identity(1.0)))`, averaging is a `vp.linear_combination` over the terms, and the natural-gradient step $F^{-1}\nabla f$ is `vp.compose("inverse_fisher", vp.source("loss_gradient"))`. The child-name string leaves of the expression are the declared `children` and are the composition's dependencies; `vp.scaled_identity` is not a child; admission rejects an expression whose child-name string leaves are not exactly `children`. `vp.compose` requires each node's output space to match the next node's input space, and `vp.linear_combination` requires its terms to share input and output space.
+
+The expression type is `Combine`:
+
+```python
+Leaf = str | ScaledIdentity | Source        # a child-name string, vp.scaled_identity(c), or vp.source(child)
+Combine = Compose | LinearCombination | Leaf
+
+def compose(*terms: Combine) -> Compose: ...                         # e_1(e_2(... e_k(v)))
+def linear_combination(*weighted: tuple[float, Combine]) -> LinearCombination: ...   # sum_i c_i e_i(v)
+def scaled_identity(c: float) -> ScaledIdentity: ...                 # c v
+def source(child: str) -> Source: ...                               # seeds v from a batch-to-vector child
+```
+
+`vp.source(child)` seeds the threaded vector and so may appear only as the innermost argument of a `vp.compose` or as a term of a `vp.linear_combination`; admission rejects a source in any other position, where a later node would be applied to it as a function (`vp.compose(vp.source("g"), "hvp")` is rejected). An expression that contains a source is vector-valued and the composition is called as `composition(batch)`; a source-free expression is an operator called as `composition(batch, vector)`. Inversion stays with `inverse_metric_vp`, which solves $M^{-1}v$. A `vp.metric.matrix_free` metric is a PSD curvature, a GGN or Fisher, and a PSD curvature is generically singular, so `conjugate_gradient` requires the shifted operator $M+\lambda I$ with $\lambda>0$ to be positive-definite: $(G+\lambda I)^{-1}v$ is `inverse_metric_vp(vp.metric.matrix_free(operator=ggn), damping=lam)` with `lam > 0`. Admission rejects `damping=0` on a `conjugate_gradient`, `cholesky_solve`, `eigh_solve`, or `svd_solve` row over a PSD-but-not-PD metric, since a zero eigenvalue makes the inverse undefined.
+
+A `Case` pairs one batch with one vector. It is the reference and probe input the tuner forms from the `data` and `vectors` iterables, and the type `vp.case(batch=..., vector=...)` builds for the `reference=` and `probes=` overrides. A `Run`, returned by `vp.tune(products=...)`, maps each product name to its tuned `Operator`:
+
+```python
+def case(*, batch: Batch | None = None, vector: TensorTree | None = None) -> Case: ...
+
+class Case(Protocol):
+    batch: Batch | None
+    vector: TensorTree | None
+
+class Run(Protocol):
+    plan: Plan
+    def __getitem__(self, name: str) -> Operator: ...
+    def __iter__(self) -> Iterator[str]: ...
+    def __contains__(self, name: str) -> bool: ...
+    def __len__(self) -> int: ...
+```
+
+The annotation types in these signatures are the typed objects the `vp.*` constructors produce, each validating its closed-set fields at construction: `Model` (`vp.torch_model`), `ParameterSurface` (`vp.parameters`), `ModuleCallSpec` (`vp.module_call`), `Output` (`vp.output`), `Loss` (`vp.loss.*`), `Likelihood` (`vp.likelihood.*`), `Metric` (`vp.metric.*`), `SampleSource` (`vp.samples.*`), `Damping` (`vp.damping.*`), `Target` (`vp.cuda`), `SearchSpace` (`vp.space.*`), `SearchStrategy` (`vp.search.*`), `Operator` (the operator constructors), and `Combine` with its node types `Compose`, `LinearCombination`, `ScaledIdentity`, and `Source` (`vp.compose`, `vp.linear_combination`, `vp.scaled_identity`, `vp.source`). Each is opaque to the caller; its fields are listed where the constructor is described.
+
+The typed front-door objects build on lower-layer callable protocols that live in `vptune.ext`. `vp.loss.from_scalar(fn, ...)` wraps a `ScalarObjective`; `vp.output(...)` and the likelihood internals wrap a `FunctionObjective`. A normal caller uses the typed objects, not these protocols:
 
 ```python
 class ScalarObjective(Protocol):
@@ -405,16 +526,6 @@ class FunctionObjective(Protocol):
         batch: Batch,
         context: ObjectiveContext,
     ) -> TensorTree: ...
-
-class DataProvider(Protocol):
-    def signature(self) -> Mapping[str, Any]: ...
-    def reference_batch(self, family: str, check_name: str) -> Batch: ...
-    def probe_batches(self, family: str) -> Sequence[Batch]: ...
-
-class VectorProvider(Protocol):
-    def signature(self) -> Mapping[str, Any]: ...
-    def reference_vectors(self, family: str) -> TensorTree: ...
-    def probe_vectors(self, family: str) -> Sequence[TensorTree]: ...
 
 class Materializer(Protocol):
     def identity(self) -> Mapping[str, Any]: ...
@@ -439,15 +550,17 @@ Extension API:
 ```python
 import vptune.ext as vpx
 
+candidate = vpx.Candidate(...)
 runtime = vpx.standard_runtime_config(...)
 operation_factory = vpx.standard_operation_factory(...)
 reference_check = vpx.standard_reference_check(...)
+manifest = vpx.axis_manifest()
 record = vpx.plan_to_json(plan)
 plan = vpx.plan_from_json(...)
 current = vpx.plan_record_current(record, plan)
 ```
 
-`vptune.ext` also exports package-owned anchors, candidate-axis builders, memory backends, checkpoint execution, Autobatch integration helpers, schema helpers, and standard runtime implementation types. These names are part of the adapter-author API, not the root `vptune` namespace.
+`vptune.ext` owns `Candidate`, `RuntimeConfig`, `OperatorSpec`, `Family`, the axis table and manifest, the package-owned anchors, candidate-axis builders, memory backends, checkpoint execution, Autobatch integration helpers, schema helpers, and standard runtime implementation types. These names are the adapter-author and custom-runtime API, not the root `vptune` namespace.
 
 Mutation rules:
 
@@ -473,27 +586,49 @@ Error types:
 - Device list.
 - Accelerator type.
 - Allowed dtypes.
-- Allowed attention frontends.
-- Allowed SDPA kernels.
-- Allowed sharding modes.
+- Allowed core attention frontends and SDPA kernels.
 - Timing policy.
 - Selection policy.
 - Determinism policy.
 - Environment capture policy.
 
+`vp.cuda(...)` constructs the core target. Adapter attention frontends and sharding allowances are carried by the adapter spaces composed into the search space, not by the core target.
+
 `Problem` fields:
 
 - Model.
 - Parameter surface.
-- Data provider.
+- Data iterable.
 - Operator spec.
-- Vector provider.
+- Vector iterable.
 - Target.
+- Search space.
+- Search strategy.
 - Runtime config.
 - Anchor policy.
 - Replay policy.
 
-`RuntimeConfig` fields:
+A single-product `Problem` carries no cohort constraints; cohort coherence is a run-level
+relationship and lives on the `TuningRun`.
+
+`TuningRun` fields:
+
+- Products. The operators tuned together; composition children are sibling products.
+- Target.
+- Search space.
+- Search strategy.
+- Cohort constraints. The `CohortConstraint`s the products must jointly satisfy.
+- Data and vector iterables by product name.
+- Problems, validators, and validator identities when an adapter lowers them.
+- Run id.
+
+`vp.cohort.layout_coherence(settings_keys)` builds a `CohortConstraint` whose
+`settings_keys` are the listed axes and whose allowed assignments are the common values
+those axes take across the search space; it pins, for example, `layout.vector`,
+`layout.flatten_order`, and `dtype.vector` so the pilot's $H$, $R$, and $R^{-1}$ products
+share one vector representation.
+
+`RuntimeConfig` is a `vptune.ext` type. Its fields:
 
 - Candidate rows.
 - Operation factory.
@@ -514,7 +649,7 @@ Error types:
 - Full-size probe inputs.
 - Materialization rule.
 
-`Candidate` fields:
+`Candidate` is a `vptune.ext` type. Its fields:
 
 - Family.
 - Row id.
@@ -662,46 +797,62 @@ Required replay fields:
 
 - Model fields: class name, package version, config fields, parameter name list, parameter shape list, buffer name list, buffer shape list, tied-weight groups, active parametrizations, train/eval mode, device placement, dtype policy, source revision, parameter value version, buffer value version, and adapter id.
 - Parameter surface fields: included parameter names, flattened order, shape list, trainable flags, tied-weight treatment, buffer policy, parametrization policy, parameter value version, and buffer value version.
-- Objective fields: qualified callable name, user-supplied id, reduction rule, data aggregation rule, RNG policy, module mode, and gradient target.
+- Loss, output, and likelihood fields: the typed object kind, the validated closed-set fields (reduction, denominator, sample space, label policy), the qualified callable name and the caller-declared value version when a custom `from_scalar`, `declared_psd_matrix_free`, or `output` callable is wrapped, RNG policy, module mode, and gradient target. Editing a wrapped callable without bumping its value version is a caller error that reuses stale numeric checks.
 - Data fields: dataset name or user id, data value version, revision, selected row ids or slice fields, and batch collation policy.
 - Vector fields: vector source id, vector value version, shape tree, dtype tree, norm summary, seed when generated, and storage id when loaded from tensors.
-- Metric representation fields: representation kind, metric value version, declared factor names, factor order, factor shape tree, block order, damping, denominator, and normalization fields.
+- Metric fields: metric kind, metric value version, declared factor names, factor order, factor shape tree, block order, denominator, and normalization fields; for a `matrix_free` metric, the wrapped operator's product name and its selected-plan identity stand in for the factor fields.
+- Composition expression fields: the tree shape of the `Combine` expression, every `linear_combination` coefficient, every `scaled_identity` constant, every child-name leaf, every `source` child, and the `call_inputs` the expression implies.
+- Damping fields: the damping kind (scalar, per-group, KFAC-pi) and its values.
+- Solver-tolerance fields: the residual tolerance `tol` on the iterative inverse and inverse-inner rows, setting the iterative stopping criterion and the accepted residual.
+- Sample source fields: the sample source kind (fixed_seed, table), the seed when fixed_seed, the sample count, the table identity when table, and the sampling-bound formula id when exact-Fisher comparison is enabled.
+- Bound-operator fields: whether the operator is batch-bound (`is_bound`), and the bound batch signature (shape tree, dtype tree, value version). A bound operator compiles the `bound_operator_vector_step` boundary and scores its call horizon over the fixed-batch inner loop; `bind` on a data-independent operator is rejected.
+- Inner-product fields: the norm declaration `as_norm` for `metric_inner_vp` and `inverse_metric_inner_vp`.
 - Target fields: declared devices, per-device hardware signatures, GPU model, device capability, driver version when CUDA reports it, CUDA or ROCm runtime version, PyTorch version, `torch.__config__` summary, allocator config, deterministic flags, TF32 flags, cuDNN flags, BF16 reduced-reduction flags, matmul precision, MPS availability, and relevant environment variables. `vptune.ext.environment_signature()` captures the runtime fields, and `Target.signature()` binds both the declared target devices and their device signatures. The selected memory backend fields are part of the per-problem input signature because callers may supply the backend at tune time.
 - Adapter fields: adapter package version, adapter registry id, model-specific admission rules, and candidate-generator version.
 
 Every saved row is current only when its saved replay fields match the current run by direct field equality: family, row id, check name for reference rows, input signature, settings, thresholds, dependency fields, cohort assignment fields, changed axes for candidate rows, generator fields, axis descriptor fields, admission fields, migration source id, and selected dependency fields.
 
-Value-version fields are caller-declared drift signals. The package compares those fields directly and does not inspect tensor content during replay. Callers must change parameter, buffer, data, vector, or metric-representation value-version fields when value changes should invalidate saved numeric checks or selected rows.
+Value-version fields are caller-declared drift signals. The package compares those fields directly and does not inspect tensor content during replay. Callers must change parameter, buffer, data, vector, metric, wrapped-callable (`from_scalar`, `declared_psd_matrix_free`, `output`), or sample-source value-version fields when value changes should invalidate saved numeric checks or selected rows.
 
 When runtime fields declare `adapter_id` and `adapter_version`, the enclosing `Problem.adapter_identity` must declare the same values. Mismatched adapter fields fail before search.
 
 ## Operator Semantics
 
-`vp.gradient(family, objective_id, aggregation=...)` declares $\nabla_\theta f(\theta)$ for the declared parameter surface.
+`vp.gradient(model, loss)` declares $\nabla_\theta f(\theta)$ for the model's parameter surface, called as `gradient(batch)`. The loss carries $f$.
 
-`vp.jvp(family, objective_id, aggregation=...)` declares $J_f(\theta)v$.
+`vp.jvp(model, output)` declares $J_f(\theta)v$, called as `jvp(batch, vector)`. The output carries the vector function $z(\theta)$.
 
-`vp.vjp(family, objective_id, aggregation=...)` declares $J_f(\theta)^\top u$.
+`vp.vjp(model, output)` declares $J_f(\theta)^\top u$, called as `vjp(batch, cotangent)`.
 
-`vp.hvp(family, objective_id, aggregation=...)` declares $\nabla_\theta^2 f(\theta)v$.
+`vp.hvp(model, loss)` declares $\nabla_\theta^2 f(\theta)v$, called as `hvp(batch, vector)`. The Hessian is indefinite; among the parameter-space curvature operators (`hvp`, `ggnvp`, the Fishers, `metric_vp`), `hvp` is the only one that may be indefinite, and `jvp`/`vjp` map between distinct tangent and cotangent spaces where the term does not apply.
 
-`vp.ggnvp(family, objective_id, aggregation=..., loss_geometry=...)` declares $J^\top H_\ell Jv$ for output Jacobian $J$ and loss Hessian $H_\ell$. `loss_geometry="psd_metric"` requires symmetry, PSD, and dot-product checks on the output-space loss Hessian. `loss_geometry="linear_map"` checks candidate agreement against anchors without metric-only checks.
+`vp.ggnvp(model, loss)` declares $J^\top H_\ell Jv$ for output Jacobian $J=\partial z/\partial\theta$ and output-space loss Hessian $H_\ell=\partial^2\ell/\partial z^2$, called as `ggnvp(batch, vector)`. Generalized Gauss-Newton is defined for a loss convex in the output, so $H_\ell\succeq 0$ and $G\succeq 0$, and PSD is intrinsic to the object. The loss carries $H_\ell$, and `ggnvp` enforces symmetry, PSD, and the dot-product identity on it in two stages: a closed-form loss with known PSD status (`softmax_cross_entropy`, `kl`, `mse`) is decided at admission; `vp.loss.from_scalar` passes admission and its $H_\ell$ is checked by the symmetry and PSD reference checks at the probe, which certify point PSD only, so the caller owns output convexity off the probe. `vp.loss.declared_psd(factors=...)` is PSD by construction; `vp.loss.declared_psd_matrix_free(matvec=...)` is checked by a Lanczos eigenvalue estimate with a declared iteration count and a residual bound, admitted only when $\theta_1-\|r_1\|\ge-\tau$ for the smallest Ritz value $\theta_1$ and its residual norm $\|r_1\|$ (the smallest Ritz value alone is an upper bound on $\lambda_{\min}$, so the residual correction is required), or refused at admission.
 
-`vp.fisher_vp(family, objective_id, aggregation=..., distribution=..., label_policy=..., sample_space=..., score_reduction=..., denominator=...)` declares $Fv = \mathbb{E}[s_\theta s_\theta^\top v]$, where $s_\theta=\nabla_\theta \log p_\theta(y|x)$ is the declared score. FisherVP rows compute exact score-gradient outer products over the declared score source. Exact categorical NLL Fisher is represented by GGNVP with the CE/KL loss Hessian.
+`vp.fisher_vp(model, likelihood)` declares $Fv = \mathbb{E}[s_\theta s_\theta^\top v]$, where $s_\theta=\nabla_\theta \log p_\theta(y|x)$ is the score the likelihood defines, called as `fisher_vp(batch, vector)`. FisherVP rows compute exact score-gradient outer products over the declared score source. Exact categorical NLL Fisher is represented by GGNVP with the CE or KL loss Hessian; the two are the same object when the loss `reduction` and the likelihood `denominator` apply the same per-token (or per-example) normalization over the same mask, which the typed objects make explicit.
 
-`vp.sampled_fisher_vp(family, objective_id, aggregation=..., distribution=..., label_policy=..., sample_count=..., sample_source=..., sampling_bound=..., score_reduction=..., denominator=...)` declares $\hat F_S v = \frac{1}{nS}\sum_{i,s} g_{is}(g_{is}^\top v)$ for a fixed sample table or fixed seed and sample count $S$. It is a separate operator family from exact FisherVP. `sampling_bound` declares the exact-Fisher comparison formula used when a row enables exact-Fisher comparison.
+`vp.sampled_fisher_vp(model, likelihood, samples=...)` declares $\hat F_S v = \frac{1}{nS}\sum_{i,s} g_{is}(g_{is}^\top v)$ for the sample source the `samples` argument declares, called as `sampled_fisher_vp(batch, vector)`. It is a separate operator family from exact FisherVP. The sample source carries the fixed sample table or the fixed seed and sample count $S$, and the exact-Fisher comparison formula used when a row enables exact-Fisher comparison. That formula is a declared known bound id (a matrix-Bernstein or Hutchinson relative-variance bound as a function of $S$ and the score moments) that the package interprets; a free-form bound is refused at admission.
 
-`vp.empirical_fisher_vp(family, objective_id, aggregation=..., example_loss_reduction=..., denominator=...)` declares $\frac{1}{n}\sum_i g_i(g_i^\top v)$ for per-example gradients $g_i = \nabla_\theta \ell_i(\theta)$. The operator spec records the within-example loss reduction and denominator. The standard anchor computes those gradients from the declared loss and data axis. A supplied `per_example_gradients` matrix is a dense candidate input, not the semantic anchor.
+`vp.empirical_fisher_vp(model, loss)` declares $\frac{1}{n}\sum_i g_i(g_i^\top v)$ for per-example gradients $g_i = \nabla_\theta \ell_i(\theta)$, called as `empirical_fisher_vp(batch, vector)`. The loss carries the within-example loss reduction and denominator. The standard anchor computes those gradients from the declared loss and data axis. A supplied `per_example_gradients` matrix is a dense candidate input, not the semantic anchor.
 
-`Metric` returns multiply, inverse multiply, inner product, and factor records when the metric spec declares factors. `representation` declares one of: dense matrix, diagonal tree, block-diagonal blocks, KFAC factors, low-rank factors, or GGN-derived factors. The representation fields are fixed problem fields, not sweep axes.
+`vp.metric_vp(model, metric)` declares $Mv$. The operator declares its `call_inputs`: a declared, factored metric is data-independent and is called as `metric_vp(vector)`; a `vp.metric.matrix_free(...)` metric whose forward operator is data-dependent is called as `metric_vp(batch, vector)`. The arity is the operator's declared `call_inputs`, inspectable on the operator, not a hidden mode. The metric object returns multiply, inverse multiply, inner product, and factor records when it declares factors. It is one of dense matrix, diagonal tree, block-diagonal blocks, KFAC factors, eigenvalue-corrected KFAC (EKFAC) factors, low-rank factors, GGN-derived factors, or a matrix-free PSD forward operator. The metric fields are fixed problem fields, not sweep axes.
 
-`vp.composition(family, objective_id, aggregation=..., children=...)` declares an ordered composition of selected operator implementations. `children` is the ordered child-family list and is the single source for the composition family's dependencies. The built-in composition runtime path is `sequential_composition`; it applies named components in declared order to the current vector.
+`vp.metric_inner_vp(model, metric, as_norm=...)` declares the Gram $U^\top M V$ for stacked vectors $U,V$ each $n\times k$; the $k=1$ case is the scalar $u^\top M v$. Its `call_inputs` follow the metric like `metric_vp`: `metric_inner_vp(left, right)` for a declared, factored metric and `metric_inner_vp(batch, left, right)` for a `matrix_free` metric. The reduction path is a sweep axis: `multiply_then_reduce` applies $MV$ and forms $U^\top(MV)$, `factored_gram` forms the $k\times k$ Gram directly from the metric factors in a Kronecker-aware order, and `sqrt_apply_reduce` applies the square-root factor adjoint $L^\top$ (the factor `sqrt_metric_vp` builds, $LL^\top=M$) to $U$ and $V$ and forms $(L^\top U)^\top(L^\top V)$, so the diagonal is $\lVert L^\top v\rVert^2\ge 0$ by construction. A generalized eigensolver reads that diagonal as the squared $M$-norm for $M$-orthonormalization, and `as_norm=True` declares that use: it admits only `sqrt_apply_reduce`, the one path whose diagonal is exactly nonnegative for every input, including the near-null-space vectors a probe sweep never reaches. `as_norm` is a fixed problem field, not a sweep axis.
+
+`vp.inverse_metric_vp(model, metric, damping=..., tol=...)` declares $(M+\lambda I)^{-1}v$ for the declared damping. Its `call_inputs` follow the metric the same way `metric_vp` does. A `vp.metric.matrix_free` metric is a PSD curvature inverted only through the iterative solve paths; a PSD curvature is generically singular, so `conjugate_gradient` requires $\lambda>0$, and $(G+\lambda I)^{-1}$ on a matrix-free GGN or Fisher is `inverse_metric_vp(vp.metric.matrix_free(operator=ggn), damping=lam)` with `lam > 0`. `damping` is a typed `Damping` (scalar, per-group, or KFAC-pi factor split), and an iterative row carries a residual tolerance `tol` that sets both the CG stopping criterion and the accepted inverse residual.
+
+`vp.inverse_metric_inner_vp(model, metric, damping=..., as_norm=..., tol=...)` declares the Gram $U^\top(M+\lambda I)^{-1}V$ for the declared damping, with $U,V$ each $n\times k$. Its `call_inputs` follow the metric like `inverse_metric_vp`. The reduction path is a sweep axis: `solve_then_reduce` solves $(M+\lambda I)X=V$ and forms $U^\top X$, `factored_gram` forms the Gram from the inverse factors (EKFAC through the corrected eigenvalues in the Kronecker eigenbasis), and `sqrt_apply_reduce` applies the inverse-square-root factor adjoint $L^\top$ (the factor `inverse_sqrt_metric_vp` builds, $LL^\top=(M+\lambda I)^{-1}$) to $U$ and $V$ and forms $(L^\top U)^\top(L^\top V)$. That last path is a forward factor application and not a solve, so the diagonal is $\lVert L^\top r\rVert^2\ge 0$ even under the matrix-free Lanczos square root, whose value stays nonnegative regardless of approximation quality. A generalized eigensolver reads that diagonal as the squared $R^{-1}$-norm of its residual, and `as_norm=True` admits only `sqrt_apply_reduce`. The positive-damping requirement on a PSD-but-singular metric is the same as `inverse_metric_vp`, and the operator carries the residual tolerance `tol`.
+
+`vp.sqrt_metric_vp(model, metric)` and `vp.inverse_sqrt_metric_vp(model, metric, damping=..., tol=...)` apply a factor $Lv$ and its adjoint $L^\top v$, with $LL^\top=M$ for the square root and $LL^\top=(M+\lambda I)^{-1}$ for the inverse square root; the inverse-square-root operator applies $Lv$ for the damped-inverse factor, not $L^{-1}v$. The $Lv$ application is what a weight-space posterior sample $\theta=\mu+L z$ with $z\sim\mathcal{N}(0,I)$ needs, and the adjoint $L^\top v$ is what the metric inner product's `sqrt_apply_reduce` path uses for the $M$-norm and $R^{-1}$-norm; the result is a valid covariance factor, not the symmetric square root unless an eigenbasis path is selected. The forward factor per metric kind, with $LL^\top=M$: diagonal uses the pointwise square root; KFAC and EKFAC use the closed-form factor square root in the Kronecker eigenbasis; low-rank $M=UU^\top+D$ uses $L=[U, D^{1/2}]$; GGN-derived $M=J^\top H_\ell J$ uses $L=J^\top H_\ell^{1/2}$; dense and block use a Cholesky factor; a matrix-free metric uses a Lanczos approximation of $f(M)v$ with $f(t)=t^{1/2}$. The damped inverse factor, with $LL^\top=(M+\lambda I)^{-1}$, is direct for the kinds whose damped inverse stays elementwise or in a known eigenbasis: diagonal inverts $d+\lambda$, KFAC and EKFAC inverse-square-root the Kronecker spectrum shifted by the declared damping (the eigenbasis for KFAC scalar or per-group damping, the factored shift for `kfac_pi`, the corrected-eigenvalue floor for EKFAC), and dense and block take a Cholesky of the dense damped inverse. Low-rank and GGN-derived build the inverse factor through the Woodbury capacitance matrix, and a matrix-free metric uses a Lanczos approximation with $f(t)=(t+\lambda)^{-1/2}$.
+
+`vp.per_example_gradient(model, loss)` declares the stacked per-example gradients $\{g_i\}_i$ with $g_i=\nabla_\theta\ell_i(\theta)$, called as `per_example_gradient(batch)`. Its output is a fixed problem field: a parameter tree whose every leaf gains a leading axis of size $n$, the batch's example count taken from the declared data axis, so a consumer can bind to the shape. It is the object influence functions and per-group unlearning consume directly, with the per-example gradient paths `torch_autograd_grad_loop`, `torch_func_grad`, `vmap_grad`, and `backward_materialized_grad`; empirical Fisher is `per_example_gradient` followed by an outer-product reduction.
+
+`vp.composition(model, children=..., combine=...)` declares a composition of selected operator implementations. `children` is the child-product list and is the single source for the composition's dependencies; `combine` is the operator expression that arranges them. The built-in composition runtime paths are `sequential_composition`, which applies a `vp.compose` node's components in declared order to the current vector, and `linear_combination`, which applies a `vp.linear_combination` node's terms to the same vector and reduces them with the declared coefficients.
 
 Every operator spec declares:
 
 - Parameter surface.
 - Data axis.
-- Aggregation rule.
+- Aggregation rule, carried by the typed object (the loss reduction, the likelihood denominator and sample space, or the sample source), not a separate operator argument.
 - Output shape.
 - Dtype policy.
 - Required batch inputs by phase: `reference` and `operation`.
@@ -714,16 +865,15 @@ All built-in operators obey these rules:
 - Operation and reference entry points validate declared batch inputs before objective execution.
 - `vp.hvp(...)` declares `symmetry_vector` for reference checks.
 - `vp.vjp(...)` declares `tangent_vector` for reference checks.
-- `vp.ggnvp(..., loss_geometry="psd_metric")` declares `loss_hessian` for operation and `loss_hessian`, `symmetry_vector` for reference checks.
-- `vp.ggnvp(..., loss_geometry="linear_map")` declares `loss_hessian` for operation and reference checks.
-- `vp.metric(...)` and `vp.inverse_metric(...)` declare the representation fields needed by the selected metric representation.
+- `vp.ggnvp(...)` declares `symmetry_vector` for the dot-product reference check. The output-space Hessian $H_\ell$ is produced by the typed loss, not a caller-supplied batch input; the PSD and symmetry reference checks run on it.
+- `vp.metric_vp(...)` and `vp.inverse_metric_vp(...)` declare the fields needed by the selected metric.
 - Fisher, sampled Fisher, and empirical Fisher dense candidate paths add dense matrix inputs to the declared base inputs: `score_gradients` for `dense_score_outer`, `sampled_score_gradients` for sampled Fisher dense rows, `per_example_gradients` for `dense_empirical_fisher`, and denominator inputs such as `normalization` or `num_examples` when their declared denominator needs a batch field.
-- Metric representations add their declared inputs: `metric_matrix` for dense, `metric_diagonal` for diagonal, `metric_blocks` for block diagonal, `kfac_factors` for KFAC, `low_rank_factors` for low rank, and `ggn_factors` for GGN-derived factors.
+- Metric representations add their declared inputs: `metric_matrix` for dense, `metric_diagonal` for diagonal, `metric_blocks` for block diagonal, `kfac_factors` for KFAC, `ekfac_eigvecs_a`/`ekfac_eigvecs_g`/`ekfac_corrected_eigenvalues` for EKFAC, `low_rank_factors` for low rank, and `ggn_factors` for GGN-derived factors. A matrix-free metric adds the wrapped product's name instead of factors.
 - Flattening order is the declared parameter-surface order. The order is stored in the parameter surface identity and compared directly during replay.
 - Dense GGNVP, metric, inverse metric, FisherVP, sampled FisherVP, and empirical FisherVP flatten full vector trees for matrix multiplication and reconstruct the original tree shape on return.
 - Tree outputs preserve key order. Vectorized outputs declare whether vectors are stacked on a leading axis or returned as a sequence.
-- Loss reductions are explicit: `sum`, `mean_per_example`, `none`, or a named adapter reduction.
-- Data aggregation is explicit: full batch, segmented sum, segmented mean, per-example sum, exact score expectation, or fixed-sample average.
+- The math aggregation is carried by the typed object: the loss `reduction` (`sum`, `mean`, `token_mean`, or a named adapter reduction) for loss-based operators, the likelihood denominator and sample space for exact Fisher, and the sample source for sampled Fisher. There is no separate `aggregation` argument, for the same reason there is no `loss_geometry`: a string that changes the math belongs on a typed object.
+- Segmented sum, segmented mean, and microbatch accumulation are execution rows (`batch.data_microbatch_size`, `schedule.gradient_accumulation`) that preserve the declared aggregation, not semantic choices. Per-example structure is intrinsic to `empirical_fisher_vp`, not a reduction of `gradient`.
 - `None` gradients are represented as zero tensors with matching parameter shape only when the parameter is declared active and mathematically disconnected.
 - A parameter excluded from the parameter surface never appears in a returned vector tree.
 - Buffers are part of the functional input unless the parameter surface declares them fixed.
@@ -754,7 +904,7 @@ VJP anchors:
 
 - `torch.func.vjp` for pure functions.
 - `torch.autograd.grad` with explicit `grad_outputs` on eager functions.
-- Dot-product identity check: $\langle Jv,u\rangle = \langle v,J^\top u\rangle$. The tangent vector for this check is an explicit reference-batch field.
+- Dot-product identity check: $\langle Jv,u\rangle = \langle v,J^\top u\rangle$. The tangent vector for this check is an explicit reference-batch field. The reference tangent and cotangent must satisfy $\|v\| \ge \tau$ and $\|u\| \ge \tau$ for a fixed positive $\tau$; admission rejects a zero or near-zero probe, which passes the identity vacuously.
 
 HVP anchors:
 
@@ -762,7 +912,7 @@ HVP anchors:
 - `torch.autograd.functional.hvp` for small scalar references.
 - `torch.autograd.functional.vhp` for small scalar references when symmetry and smoothness checks pass.
 - `torch.func.jvp(torch.func.grad(f))` for pure functions with forward AD coverage.
-- Symmetry check: $\langle x,Hy\rangle = \langle y,Hx\rangle$.
+- Symmetry check: $\langle x,Hy\rangle = \langle y,Hx\rangle$. The reference vectors $x$ and $y$ must satisfy $\|x\| \ge \tau$ and $\|y\| \ge \tau$ for a fixed positive $\tau$; admission rejects zero or near-zero probes, which pass the identity vacuously.
 - Finite-difference gradient-direction check.
 - Segmentation invariance check.
 
@@ -770,10 +920,10 @@ GGNVP anchors:
 
 - Explicit JVP through model outputs, exact loss-Hessian product in output space, and VJP back to parameters.
 - Dense output-Jacobian construction on small references.
-- Dot-product identity check when `loss_geometry="psd_metric"`.
+- Dot-product identity check on the output-space loss Hessian.
 - Loss-Hessian shape check against flattened model output.
 - Finite-value check for the output metric and candidate product.
-- Symmetry and PSD checks when the loss geometry declares a metric.
+- Symmetry and PSD checks on the output-space loss Hessian.
 - Cross-check between dense-Jacobian product and JVP-Hessian-VJP product.
 
 FisherVP anchors:
@@ -797,15 +947,35 @@ EmpiricalFisherVP anchors:
 - Dense empirical Fisher matrix on tiny models.
 - Precomputed `per_example_gradients` matrices are admitted as dense candidate inputs with their own identity and normalization fields.
 
+PerExampleGradient anchors:
+
+- Per-example gradients by for-loop from the declared per-example loss, stacked on a leading axis.
+- Per-example gradients by `vmap(grad)` where function purity permits it.
+- Agreement that the outer-product reduction of the stacked gradients equals the empirical FisherVP anchor.
+
+MetricSquareRoot anchors:
+
+- Dense factor check on small references: the applied factor satisfies $LL^\top=M$ for the square root and $LL^\top=(M+\lambda I)^{-1}$ for the inverse square root.
+- Eigenbasis cross-check for KFAC and EKFAC; Cholesky cross-check for dense and block metrics.
+- Repeated-draw covariance check for the matrix-free Lanczos path.
+
 Metric anchors:
 
 - Dense matrix multiply, solve, and inner product on small block references.
-- Dense references are reconstructed from the declared representation before the check: dense matrix uses $M$ directly; diagonal tree assembles $\operatorname{diag}(d)$ in parameter order; block-diagonal blocks assemble $M=\operatorname{blockdiag}(M_1,\ldots,M_b)$ in declared block order; KFAC assembles each block as $A_b \otimes G_b$; low-rank assembles $M=UU^\top + D$; GGN-derived assembles $M=J^\top H J$.
+- Dense references are reconstructed from the declared representation before the check: dense matrix uses $M$ directly; diagonal tree assembles $\operatorname{diag}(d)$ in parameter order; block-diagonal blocks assemble $M=\operatorname{blockdiag}(M_1,\ldots,M_b)$ in declared block order; KFAC assembles each block as $A_b \otimes G_b$; EKFAC assembles each block as $(U_{a,b}\otimes U_{g,b})\operatorname{diag}(s_b)(U_{a,b}\otimes U_{g,b})^\top$ from the eigenbases and corrected eigenvalues; low-rank assembles $M=UU^\top + D$; GGN-derived assembles $M=J^\top H J$.
 - Metric multiply, inner product, and inverse references use the reconstructed dense $M$ plus the declared damping when present.
 - Inverse residual check: $\|(M+\lambda I)x-v\|/\|v\|$ for damped inverse rows and $\|Mx-v\|/\|v\|$ for undamped inverse rows.
 - Symmetry check.
 - PSD check by eigenvalue floor for dense references.
+- A matrix-free metric is checked through its operator's own anchors for the forward multiply and through the inverse residual for the conjugate-gradient solve, not through dense reconstruction.
 - Positive damping and conditioning checks for inverse rows when the candidate declares a damped metric.
+
+Metric inner-product anchors:
+
+- Gram against the reconstructed dense reference: $U^\top M V$ for the forward inner product and $U^\top(M+\lambda I)^{-1}V$ for the inverse inner product, over small block references.
+- Diagonal nonnegativity on the same-vector entries ($U=V$) for an `as_norm` row; the off-diagonal entries compare against the dense reference only, since a general bilinear entry has no sign to check.
+- For `sqrt_apply_reduce`, agreement that the Gram equals $(L^\top U)^\top(L^\top V)$ formed from the square-root anchor's factor.
+- Inverse residual on each solved column for an `inverse_metric_inner_vp` `solve_then_reduce` row, and the same positive-damping requirement on a PSD-but-singular metric.
 
 Low-precision candidate rows compare against anchors run without candidate dtype downcasting. Rows that degrade reduction precision must also pass the derived numeric error bound from `FEATURES.md`.
 
@@ -822,7 +992,7 @@ Composite anchors:
 
 ## Candidate Axes
 
-`vptune` provides a feature manifest, exposed as `vptune.ext.axis_manifest()`, that implements every axis key in `FEATURES.md`. Axis registration is admission; execution belongs to the runtime that owns the candidate.
+`vptune` provides a feature manifest, exposed as `vptune.ext.axis_manifest()`. The manifest is the union of the core registry and the adapter registrations, so it contains every axis key in `FEATURES.md` with exactly one owner each. The core registry owns only the axes the core runtime lowers. The adapter attention frontends (`transformers_*`, `paged|*`, `registered_transformers_attention`) and the whole distributed family (`distributed.*`, `dtensor.*`, `fsdp.*`, `tp.*`, `sequence_parallel.*`, `context_parallel.*`, `comm.*`) are owned by the Transformers and distributed adapter registries and composed into the search space through `space.with_attention(...)` and `space.with_distributed(...)`. Axis registration is admission; execution belongs to the runtime that owns the candidate.
 
 Every axis descriptor uses the `AxisDescriptor` fields from the core data model. There is one descriptor shape in the package.
 
@@ -847,7 +1017,7 @@ Every integer-valued axis must be finite before candidate generation. It has eit
 
 The package-owned standard runtime executes these settings:
 
-- operator paths for gradient, JVP, VJP, HVP, GGNVP, FisherVP, sampled FisherVP, empirical FisherVP, metric multiply, inverse metric multiply, and composition
+- operator paths for gradient, JVP, VJP, HVP, GGNVP, FisherVP, sampled FisherVP, empirical FisherVP, per-example gradient, metric multiply, metric inner product, metric square-root multiply, inverse metric multiply, inverse metric inner product, inverse metric square-root multiply, and composition
 - dtype fields, autocast fields, matmul precision fields, and reduced-precision-reduction fields
 - vectorization fields for vector, tangent, and cotangent batching
 - `vmap_chunk_size` for vmap-owned paths
@@ -881,6 +1051,8 @@ Candidate grid generation is registry-aware. For a multi-key axis, each grid val
 
 ### Axis Manifest Contents
 
+The enumeration below is the full manifest, the union of the core registry and the adapter registrations. The adapter attention frontends (`transformers_*`, `paged|*`, `registered_transformers_attention`) and the distributed family (`distributed.*`, `dtensor.*`, `fsdp.*`, `tp.*`, `sequence_parallel.*`, `context_parallel.*`, `comm.*`) are owned by the Transformers and distributed adapter registries; the core registry owns the rest, including the core attention executor's `attention.sdpa_kernel`, `attention.partition`, `attention.padding`, and the four model-agnostic `attention.frontend` values (`pytorch_sdpa_direct`, `patched_eager`, `packed_exact`, `blockwise_exact`).
+
 The package manifest must include these operator-owned axes:
 
 - `gradient.path`: `torch_autograd_grad`, `torch_func_grad`, `torch_func_grad_and_value`, `backward_materialized_grad`.
@@ -912,11 +1084,20 @@ The package manifest must include these operator-owned axes:
 - `metric.multiply_path`: `dense_matmul`, `factorized_multiply`, `blockwise_multiply`, `streaming_multiply`.
 - `metric.block_schedule`: `layer_blocks`, `module_blocks`, `custom_blocks`.
 - `metric.accumulation`: `streaming`, `materialized_blocks`.
+- `metric_inner.reduction_path`: `multiply_then_reduce`, `factored_gram`, `sqrt_apply_reduce`.
+- `metric_inner.multi_rhs`: `single_column`, `block`.
 - `inverse_metric.solve_path`: `dense_solve`, `cholesky_solve`, `eigh_solve`, `svd_solve`, `conjugate_gradient`, `factorized_solve`, `blockwise_solve`, `woodbury_low_rank_solve`.
-- `inverse_metric.preconditioner`: `none`, `diagonal`, `block_diagonal`, `factorized_metric`.
+- `inverse_metric.preconditioner`: `none`, `diagonal`, `block_diagonal`, `factorized_metric`, `matrix_free`.
 - `inverse_metric.iteration_budget`: a finite positive integer domain.
 - `inverse_metric.factor_reuse`: `refactor_each_rhs`, `reuse_factor_across_rhs`.
 - `inverse_metric.block_schedule`: `layer_blocks`, `module_blocks`, `custom_blocks`.
+- `inverse_metric.multi_rhs`: `single_column`, `block`.
+- `inverse_metric_inner.reduction_path`: `solve_then_reduce`, `factored_gram`, `sqrt_apply_reduce`.
+- `inverse_metric_inner.multi_rhs`: `single_column`, `block`.
+- `sqrt_metric.factor_path`: `closed_form_factor_square_root`, `cholesky_factor`, `eigenbasis_factor`, `matrix_free_lanczos`.
+- `sqrt_metric.lanczos_iterations`: a finite positive integer domain.
+- `per_example_gradient.grad_path`: `torch_autograd_grad_loop`, `torch_func_grad`, `vmap_grad`, `backward_materialized_grad`.
+- `per_example_gradient.accumulation`: `stacked_leading_axis`, `blockwise_stacked`.
 - `composition.execution`: `materialize_each_child`, `stream_child_outputs`, `fuse_adjacent_children`, `compile_whole_composition`.
 - `composition.child_evaluation`: `selected_child_rows`, `inline_child_lowering`.
 - `composition.validation`: `validate_each_child`, `validate_composed_output`.
@@ -991,7 +1172,7 @@ The package manifest must include these shared axes:
 - `numeric.deterministic_algorithms`: `false`, `true`.
 - `numeric.loss_scaling`: `none`, `static_scale_with_exact_unscale`.
 - `compile.enabled`: `false`, `true`.
-- `compile.boundary`: `model_forward`, `transformer_block`, `attention_module`, `loss_closure`, `gradient_closure`, `jvp_closure`, `vjp_closure`, `hvp_single_vector`, `hvp_batched_vectors`, `ggn_jvp`, `ggn_loss_hessian_product`, `ggn_vjp`, `ggn_full_product`, `fisher_score_grad`, `sampled_fisher_score_grad`, `empirical_fisher_example_grad`, `metric_multiply`, `inverse_metric_solve`, `composition_child`, `whole_operator`.
+- `compile.boundary`: `model_forward`, `transformer_block`, `attention_module`, `loss_closure`, `gradient_closure`, `jvp_closure`, `vjp_closure`, `hvp_single_vector`, `hvp_batched_vectors`, `ggn_jvp`, `ggn_loss_hessian_product`, `ggn_vjp`, `ggn_full_product`, `fisher_score_grad`, `sampled_fisher_score_grad`, `empirical_fisher_example_grad`, `metric_multiply`, `metric_inner_reduce`, `metric_sqrt_multiply`, `inverse_metric_solve`, `inverse_metric_inner_reduce`, `per_example_gradient`, `bound_operator_vector_step`, `composition_child`, `whole_operator`.
 - `compile.backend`: `inductor` or a registered backend returned by the PyTorch compiler backend list that does not own CUDA graph capture.
 - `compile.mode`: `None`, `default`, `max-autotune`.
 - `compile.fullgraph`: `false`, `true`.
@@ -1078,11 +1259,12 @@ These manifest rules reject contradictory rows:
 - `gradient.value_reuse=gradient_and_primal_value` requires `gradient.path=torch_func_grad_and_value` or a runtime path that explicitly returns both the primal value and gradient.
 - `inverse_metric.iteration_budget` applies only to iterative solve rows.
 - `attention.partition=segmented_forward_ad` requires a forward-AD operator path.
-- Metric and inverse-metric rows require representation-compatible paths. `metric.multiply_path=dense_matmul` requires a dense matrix. `metric.multiply_path=factorized_multiply` requires diagonal, KFAC, low-rank, or GGN-derived factors. `metric.multiply_path=blockwise_multiply` requires block-diagonal blocks. `metric.multiply_path=streaming_multiply` requires diagonal, block-diagonal, KFAC, low-rank, or GGN-derived representation fields.
+- Metric and inverse-metric rows require representation-compatible paths. `metric.multiply_path=dense_matmul` requires a dense matrix. `metric.multiply_path=factorized_multiply` requires diagonal, KFAC, EKFAC, low-rank, or GGN-derived factors. `metric.multiply_path=blockwise_multiply` requires block-diagonal blocks. `metric.multiply_path=streaming_multiply` requires diagonal, block-diagonal, KFAC, EKFAC, low-rank, or GGN-derived representation fields. A matrix-free metric multiplies through its declared forward operator and uses no `metric.*` path.
 - `metric.block_schedule` requires block-diagonal blocks or KFAC factors. `metric.accumulation` applies only to non-dense metric multiply paths.
-- Direct inverse solve paths `dense_solve`, `cholesky_solve`, `eigh_solve`, and `svd_solve` require a dense matrix; `cholesky_solve` additionally requires a PSD metric, and `eigh_solve` additionally requires a symmetric metric. `conjugate_gradient` requires an admitted metric multiply path for the same representation. `factorized_solve` requires diagonal, KFAC, low-rank, or GGN-derived factors. `blockwise_solve` requires block-diagonal blocks. `woodbury_low_rank_solve` requires low-rank factors.
-- `inverse_metric.preconditioner=block_diagonal` requires block-diagonal blocks or KFAC factors. `inverse_metric.preconditioner=factorized_metric` requires diagonal, KFAC, low-rank, or GGN-derived factors. `inverse_metric.block_schedule` requires block-diagonal blocks or KFAC factors.
+- Direct inverse solve paths `dense_solve`, `cholesky_solve`, `eigh_solve`, and `svd_solve` require a dense matrix; `cholesky_solve`, `eigh_solve`, and `svd_solve` over a PSD-declared metric additionally require positive damping (the shifted operator must be PD), and `eigh_solve` additionally requires a symmetric metric. `conjugate_gradient` requires an admitted metric multiply path for the same representation and a positive-definite operator (positive damping over a PSD-singular metric), and is the only solve path admitted for a matrix-free metric, inverting its forward operator iteratively. `factorized_solve` requires diagonal, KFAC, EKFAC, low-rank, or GGN-derived factors; EKFAC inverts in the Kronecker eigenbasis by dividing the corrected eigenvalues. `blockwise_solve` requires block-diagonal blocks. `woodbury_low_rank_solve` requires low-rank factors.
+- `inverse_metric.preconditioner=block_diagonal` requires block-diagonal blocks or KFAC factors. `inverse_metric.preconditioner=factorized_metric` requires diagonal, KFAC, EKFAC, low-rank, or GGN-derived factors. `inverse_metric.preconditioner=matrix_free` names a sibling product whose operator is an admitted PSD curvature, and the named product must have selected rows before this row's reference check. `inverse_metric.block_schedule` requires block-diagonal blocks or KFAC factors. `inverse_metric.multi_rhs=block` applies the solve to a stacked right-hand side, and joins `metric_vp`/`inverse_metric_vp` to the vectorization applicability.
 - `dtype.metric_factor` and `memory.factor_residency` are declared only by rows whose metric or inverse path uses declared or computed factors.
+- Inner-product rows reuse the metric's representation compatibility. `metric_inner.reduction_path=multiply_then_reduce` requires an admitted `metric.multiply_path`; `inverse_metric_inner.reduction_path=solve_then_reduce` requires an admitted `inverse_metric.solve_path` and the same positive-damping requirement on a PSD-but-singular metric. `factored_gram` requires diagonal, KFAC, EKFAC, low-rank, or GGN-derived factors; EKFAC forms the Gram in the Kronecker eigenbasis through the corrected eigenvalues. `sqrt_apply_reduce` requires an admitted `sqrt_metric.factor_path` for the metric and composes with it. An `as_norm` row admits only `sqrt_apply_reduce`. `metric_inner.multi_rhs=block` and `inverse_metric_inner.multi_rhs=block` batch the $k$ columns into one fused reduction and join `metric_inner_vp`/`inverse_metric_inner_vp` to the vectorization applicability.
 - Candidate generators do not emit representation-incompatible metric or inverse-metric rows; hand-supplied incompatible rows fail admission before reference checks.
 
 ## Execution Lowering
@@ -1214,6 +1396,11 @@ Metric and inverse metric:
 - `inverse_metric.solve_path=woodbury_low_rank_solve` applies the Woodbury identity using the declared low-rank factors and diagonal base.
 - `inverse_metric.preconditioner` supplies the declared preconditioner to iterative solves.
 - `inverse_metric.factor_reuse=reuse_factor_across_rhs` reuses declared or computed factors across right-hand sides with identical metric representation fields.
+- `inverse_metric.preconditioner=matrix_free` applies the named sibling product as the preconditioner inside the iterative solve.
+- `inverse_metric.multi_rhs=block` runs the block solve (block conjugate gradient or block Lanczos) over a stacked right-hand side; `single_column` runs one column at a time.
+- `sqrt_metric.factor_path` lowers to the closed-form factor square root, a Cholesky factor, an eigenbasis factor, or a matrix-free Lanczos polynomial of $f(M)v$ capped by `sqrt_metric.lanczos_iterations`, with $f(t)=t^{1/2}$ for the forward factor; the inverse-square-root operator applies the inverse factor for the closed-form kinds and a Lanczos polynomial of $(t+\lambda)^{-1/2}$ for the matrix-free kind.
+- `per_example_gradient.grad_path` lowers like the empirical-Fisher gradient paths but writes the stacked per-example gradients to a leading axis instead of reducing them; `per_example_gradient.accumulation` selects a single stacked tensor or blockwise-stacked output.
+- `metric_inner.reduction_path` lowers to a metric multiply followed by $U^\top(MV)$, a Kronecker-aware factor reduction into the $k\times k$ Gram, or the square-root factor adjoint applied to both blocks followed by $(L^\top U)^\top(L^\top V)$; `inverse_metric_inner.reduction_path` lowers the same three shapes over the inverse solve and the inverse-square-root factor. `metric_inner.multi_rhs=block` and `inverse_metric_inner.multi_rhs=block` run the reduction over the stacked block; `single_column` runs one column at a time.
 - Damped inverse rows check $\|(M+\lambda I)x-v\|/\|v\|$.
 - `inverse_metric.iteration_budget` caps iterative solves only; direct solve rows reject it.
 
@@ -1421,7 +1608,7 @@ Class B keys are swept only after the row fixes operator path, attention fronten
 
 Class C primary groups form a partition:
 
-- `ad_lowering`: `gradient.*`, `jvp.*`, `vjp.*`, `hvp.*`, `ggn.*`, `fisher.*`, `sampled_fisher.*`, `empirical_fisher.*`, `composition.*`, `vectorization.*`, and `call.*`.
+- `ad_lowering`: `gradient.*`, `jvp.*`, `vjp.*`, `hvp.*`, `ggn.*`, `fisher.*`, `sampled_fisher.*`, `empirical_fisher.*`, `per_example_gradient.*`, `composition.*`, `vectorization.*`, and `call.*`.
 - `attention_dispatch`: `attention.frontend`, `attention.sdpa_kernel`, `attention.custom_kernel_id`, `attention.mask_formatter_id`, `attention.partition`, and `attention.padding`.
 - `input_schedule`: `batch.*`, `chunk.*`, `schedule.*`, `input.*`, and `teacher_outputs`.
 - `activation_memory`: `checkpoint.*`, `activation.*`, `memory.primal_outputs`, `memory.jvp_outputs`, `memory.output_cotangents`, `memory.vector_residency`, and `memory.intermediate_residency`.
@@ -1429,8 +1616,8 @@ Class C primary groups form a partition:
 - `distributed_layout`: `layout.*`, `dtensor.*`, `distributed.*`, `fsdp.*`, `tp.*`, `sequence_parallel.*`, `context_parallel.*`, and `comm.*`.
 - `compile`: `compile.*` and `memory.output_buffers`.
 - `fusion`: `fusion.*`.
-- `metric_storage`: `metric.*` and `memory.factor_residency`.
-- `inverse_solve`: `inverse_metric.*`.
+- `metric_storage`: `metric.*`, `metric_inner.*`, `sqrt_metric.*`, and `memory.factor_residency`.
+- `inverse_solve`: `inverse_metric.*` and `inverse_metric_inner.*`.
 
 Class C merge rules:
 
@@ -1441,6 +1628,7 @@ Class C merge rules:
 - DTensor placement for params, vectors, logits, tangents, cotangents, or outputs merges `distributed_layout` with `ad_lowering`.
 - `fsdp.mp_policy.reduce_dtype=bf16` or `fsdp.mp_policy.reduce_dtype=fp16` merges `distributed_layout` with `numeric_backend`.
 - A factorized metric or factorized preconditioner in an inverse row merges `inverse_solve` with `metric_storage`.
+- An `inverse_metric_inner.reduction_path` of `factored_gram` or `sqrt_apply_reduce` merges `inverse_solve` with `metric_storage`, since the reduction reads the same factors.
 
 After merging, the search strategy must search each merged group jointly or use a staged method that carries top rows forward before crossing groups.
 
@@ -1485,8 +1673,10 @@ Every probe row records:
 Current-record validation:
 
 - Reference rows are current only when record type, status, input signature, candidate settings, thresholds, family, row id, check name, dependency identities, cohort assignment identity, package version, and schema version match the current run by direct field equality.
-- Candidate rows are current only when record type, status, input signature, settings, changed axes, family, row id, generator id, generator version, admission status, admission error, migration source id, dependency identity records, selected dependency identities, cohort assignment identity, package version, and schema version match the current run by direct field equality.
-- Full-size rows are current only when record type, status, input signature, settings, family, row id, dependency identities, selected dependency identities, cohort assignment identity, generator identity, package version, and schema version match the current run by direct field equality.
+- Candidate rows are current only when record type, status, input signature, settings, changed axes, family, row id, generator id, generator version, admission status, admission error, migration source id, dependency identity records, selected dependency identities, cohort assignment identity, operator spec identity, package version, and schema version match the current run by direct field equality.
+- The operator spec identity bucket holds the typed-object fields that are fixed problem fields rather than sweep axes: the loss/output/likelihood closed-set fields and wrapped-callable value versions, the metric kind and value version (and the wrapped product name for a `matrix_free` metric), the sample-source seed, count, and table identity, the damping kind and values, the solver residual tolerance `tol`, and the inner-product norm declaration `as_norm`. A different `from_scalar` value version, sample seed, damping value, `tol`, or `as_norm` setting is a different row.
+- Composition rows additionally compare the composition expression fields by direct field equality: the `Combine` tree shape, every coefficient and constant, every child-name and `source` leaf, and the implied `call_inputs`. A different `linear_combination` coefficient is a different row.
+- Full-size rows are current only when record type, status, input signature, settings, family, row id, dependency identities, selected dependency identities, cohort assignment identity, operator spec identity, generator identity, package version, and schema version match the current run by direct field equality.
 - A failed row with `ReferenceFailed` or `NoPassedCandidate` is non-terminal. It must be rechecked when reference state or dependency selection changes.
 - Runtime failures and OOM failures are terminal for that row and input signature. If the operation enters the timed region, the failed row keeps elapsed and memory samples from that call.
 - Selected-plan validation summaries are current only when the saved plan fields, validation order, validation row descriptors, validation row statuses, and summary fields match the current run and loaded validation rows by direct field equality.
@@ -1949,6 +2139,7 @@ Reference checks receive explicit numeric thresholds from the operator spec, run
 - `psd_violation`: `1e-12`.
 - `directional_abs_diff`: `1e-3`.
 - `directional_rel_diff`: `1e-2`.
+- `min_probe_norm`: `1e-3`. The dot-product and symmetry reference probes must have norm at least this value, so a zero probe cannot pass an identity vacuously.
 
 Paired absolute and relative thresholds pass when either the absolute or relative scale is within tolerance. Unpaired thresholds pass directly.
 
@@ -1965,8 +2156,9 @@ Operator-specific threshold policies:
 
 - Gradient, JVP, VJP, and HVP declare denominators for directional checks.
 - HVP declares the symmetry vector used for $\langle x,Hy\rangle = \langle y,Hx\rangle$ checks.
-- GGNVP declares whether the output-space loss Hessian is a PSD metric. Metric rows require `symmetry_max_abs_diff`, `psd_violation`, and `inner_abs_diff`.
+- GGNVP requires `symmetry_max_abs_diff`, `psd_violation`, and `inner_abs_diff` on the output-space loss Hessian, which is always a PSD metric.
 - Inverse metric rows require `inverse_residual`, `symmetry_max_abs_diff`, and `psd_violation`; damped inverse rows also declare `damping_min` and `condition_number_max` thresholds.
+- Metric inner-product rows require `inner_abs_diff` against the dense Gram reference; an `as_norm` row additionally requires the same-vector diagonal nonnegativity check (`psd_violation` on the diagonal entries), and an inverse-metric-inner `solve_then_reduce` row additionally requires the per-column `inverse_residual` and, when damped, `damping_min` and `condition_number_max`.
 - FisherVP declares score policy and normalization denominator.
 - Sampled FisherVP declares sample source, sample count, sample identity, normalization denominator, and sampling-bound formula when exact-Fisher comparison is enabled.
 - Empirical FisherVP declares per-example loss reduction and normalization denominator.
@@ -2020,14 +2212,15 @@ Package tests:
 - Axis manifest rejects contradictory rows for packing, checkpoint and activation recompute, activation offload, compile aliases, SDPA kernels, DTensor placements, sampled Fisher, and exact categorical Fisher.
 - Axis manifest rejects `compile.options.*=true` with `compile.mode` other than `None`, rejects `compile.mode=None` when all compile options are disabled, and uses `numeric.float32_matmul_precision` as the only CUDA matmul TF32 sweep key.
 - Axis manifest rejects metric and inverse-metric rows whose path, block schedule, preconditioner, factor dtype, or factor residency is incompatible with the declared metric representation.
-- Single-family `vp.autotune(...)` and `vp.standard_problem(...)` reject composition specs because composition children require sibling families in a `TuningRun`.
+- `vp.problem(...)` and `vp.autotune(...)` reject composition specs because composition children require sibling products in a `TuningRun`.
+- Operator constructors validate the closed-set fields of the typed `Loss`, `Output`, `Likelihood`, and `Metric` objects and raise at construction on an unsupported value; a typo never selects different math.
 - Every manifest value has one admission rule and either one lowering rule or one adapter owner that supplies lowering.
 - Gradient anchor matches direct autograd on a tiny MLP.
 - JVP anchor matches finite difference.
 - VJP anchor satisfies the dot-product identity.
 - HVP anchor matches reverse-over-reverse and finite-difference gradient checks.
 - Standard runtime builder runs gradient, JVP, VJP, and HVP from declared objectives and candidates.
-- Standard runtime builder runs dense GGNVP, FisherVP, sampled FisherVP, empirical FisherVP, metric, and inverse metric candidates over full tensor trees.
+- Standard runtime builder runs dense GGNVP, FisherVP, sampled FisherVP, empirical FisherVP, metric, metric inner product, inverse metric, and inverse metric inner product candidates over full tensor trees.
 - Standard runtime applies declared `dtype.parameter_storage`, `dtype.model_compute`, `numeric.float32_matmul_precision`, and `numeric.bf16_reduced_precision_reduction`; it preserves integer and boolean batch tensors.
 - Grad-materialization tests cover tensor-tree returns for torch.func and eager `torch.autograd.grad` rows, `.grad` materialization for `backward_materialized_grad` rows, and rejection of rows that try to override the materialization derived from the AD path.
 - Teacher-output tests cover CPU, pinned CPU, GPU, and recomputed teacher outputs, including equality rejection for recomputed teacher outputs that do not match the fixed teacher-output field.
@@ -2038,17 +2231,29 @@ Package tests:
 - Standard runtime rejects registered axes whose execution belongs to adapters.
 - `vhp` candidate path reports an HVP result and requires symmetry plus finite-difference directional checks.
 - GGNVP cross-checks dense `J^\top H Jv` against the independent JVP-Hessian-VJP anchor on a tiny model.
-- GGNVP rejects mismatched output-Hessian shape, nonfinite loss Hessians, nonsymmetric metric Hessians, indefinite metric Hessians, and missing dot-product checks when `loss_geometry="psd_metric"`.
+- GGNVP enforces PSD on the output-space loss Hessian: it rejects mismatched output-Hessian shape, nonfinite loss Hessians, nonsymmetric loss Hessians, indefinite loss Hessians, and missing dot-product checks. A non-PSD output Hessian, whether from a non-convex `vp.loss.from_scalar(...)` or from `vp.loss.declared_psd(...)`, fails admission with "GGN requires a PSD output-space metric."
 - FisherVP anchor computes exact score-gradient outer products from the declared per-example score objective and rejects mismatched precomputed matrices.
 - Exact categorical NLL Fisher is expressed by GGNVP and covered by GGNVP dense and JVP-Hessian-VJP tests.
 - Sampled FisherVP uses declared fixed sample table or fixed seed and sample count, repeats exactly for the same source, rejects mismatched sampled-score matrices, and runs exact-Fisher comparison only when a sampling-bound formula is declared.
 - EmpiricalFisherVP anchor computes per-example-gradient outer products from the declared per-example loss objective and rejects mismatched precomputed matrices.
 - EmpiricalFisherVP standard runtime has both loop and `vmap(grad)` per-example-gradient paths, and `vmap_chunk_size` is honored only on the vmap path.
-- Standard dense metric materialization returns one object with metric multiply, inverse multiply, and metric inner product. Materialized `metric` defaults to multiply; materialized `inverse_metric` defaults to inverse multiply.
-- Metric tests cover dense, diagonal, block-diagonal, KFAC, low-rank, and GGN-derived representations; every factored representation supplies its required fields through `representation`, reconstructs a dense reference from those fields, and matches dense multiply, solve, and inner-product references.
+- Standard dense metric materialization returns one object with metric multiply, inverse multiply, and metric inner product. Materialized `metric_vp` defaults to multiply; materialized `inverse_metric_vp` defaults to inverse multiply.
+- Metric tests cover dense, diagonal, block-diagonal, KFAC, low-rank, and GGN-derived metrics; every factored metric supplies its required fields through the typed `Metric`, reconstructs a dense reference from those fields, and matches dense multiply, solve, and inner-product references.
 - Inverse-metric tests cover every solve path, every preconditioner, factor reuse, block schedules, and rejection of `inverse_metric.iteration_budget` on direct solve rows.
 - Composition reference checks run child operator anchors and write child reference rows linked by ordered child reference descriptors from the parent row.
-- Composition tests declare ordered children through `vp.composition(..., children=...)`, derive family dependencies from that ordered list, reject any separately supplied composition dependency list, and cover `selected_child_rows`, `inline_child_lowering`, `validate_each_child`, and `validate_composed_output`.
+- Composition tests declare children through `vp.composition(..., children=..., combine=...)`, derive dependencies from the child-name leaves of the `combine` expression, reject any separately supplied composition dependency list, and cover `selected_child_rows`, `inline_child_lowering`, `validate_each_child`, and `validate_composed_output`.
+- Composition combinator tests cover `vp.compose` lowering to `sequential_composition`, `vp.linear_combination` lowering to `linear_combination` with the declared coefficients and a `vp.scaled_identity` leaf, `vp.source` seeding a vector-valued composition called as `composition(batch)`, nested expressions, rejection of a `vp.source` in a non-seed position, and rejection of shape-incompatible `vp.compose` adjacencies and `vp.linear_combination` terms.
+- Positive-definiteness tests reject `inverse_metric_vp(vp.metric.matrix_free(operator=ggn), damping=vp.damping.scalar(0.0))` on a `conjugate_gradient`, `cholesky_solve`, `eigh_solve`, or `svd_solve` row, and accept it for `vp.damping.scalar(lam)` with `lam > 0`.
+- EKFAC metric tests cover `vp.metric.ekfac` multiply and `factorized_solve` in the Kronecker eigenbasis against a dense reference.
+- Square-root tests cover `sqrt_metric_vp` and `inverse_sqrt_metric_vp` for KFAC, EKFAC, dense, block, and matrix-free metrics, and verify the factor round-trip $L(L^\top v)$ matches $Mv$ on a reference (the symmetric $M^{1/2}(M^{1/2}v)$ only on an eigenbasis path).
+- Metric inner-product tests cover `metric_inner_vp` and `inverse_metric_inner_vp` for dense, KFAC, EKFAC, low-rank, GGN-derived, and matrix-free metrics: the $k\times k$ Gram matches the dense reference for `multiply_then_reduce`/`solve_then_reduce`, `factored_gram`, and `sqrt_apply_reduce`; a block right-hand side matches the single-column Gram; an `as_norm=True` row admits only `sqrt_apply_reduce`, its same-vector diagonal is nonnegative, and it rejects `multiply_then_reduce`, `solve_then_reduce`, and `factored_gram`.
+- Per-example gradient tests cover `vp.per_example_gradient` against a loop reference and confirm `empirical_fisher_vp` equals its outer-product reduction.
+- Typed damping tests cover `vp.damping.scalar`, `vp.damping.per_group`, and `vp.damping.kfac_pi`.
+- Solver-tolerance tests cover `tol` on an iterative inverse row (`conjugate_gradient`) setting both the CG stopping criterion and the accepted inverse residual.
+- Cohort-input tests pin `layout.vector`/`dtype.vector` across several products through `cohort_constraints` and reject a plan whose products disagree on the pinned axes.
+- Multi-RHS tests cover `inverse_metric.multi_rhs=block` against the single-column solve, and `Operator.bind(batch=...)` producing a `(vector,)`-arity callable whose compiled row reuses across calls.
+- Typed-object validation tests reject a typo in any closed-set field of `Loss`, `Likelihood`, `Metric`, `SampleSource`, and `Damping`, and reject a `from_scalar`/`declared_psd_matrix_free` loss whose probe $H_\ell$ is non-PSD.
+- Replay tests cover the new identity fields: a `matrix_free` metric distinguished by its wrapped product, a `from_scalar` callable distinguished by its value version, a composition distinguished by a `linear_combination` coefficient, a sampled Fisher distinguished by its sample seed, an inner product distinguished by its `as_norm` setting, and an iterative inverse row distinguished by its `tol` value.
 - KFAC metric multiply, inverse, and inner product match dense references.
 - Metric and inverse-metric checks reject nonsymmetric and indefinite dense metrics.
 - Threshold logic covers over-threshold failure, abs-or-rel passing, derived numeric error bounds, zero-denominator relative error, and nonfinite values.
@@ -2077,7 +2282,7 @@ Package tests:
 - Transformer adapter tests cover model identity, eager, SDPA, FlashAttention, FlexAttention, paged attention, registered Transformers attention, admission setting ownership, `output_attentions=True` rejection, softcap signatures, mask semantics, dropout policy, and full-size agreement gates for non-math Transformers attention rows.
 - Distributed adapter tests cover rank agreement, global max memory, per-rank failure propagation, FSDP hook entry, FSDP policy axes, admission setting ownership, DTensor gradient placement, and mode-specific layout admission for tensor, sequence, and context parallel rows.
 - Selected-plan validation follows stored family order, receives materialized dependency context, writes per-family validation rows named `selected_plan_validation`, writes `summaries/selected_plan_validation.json`, records validator identities in the plan, fails the selected settings when any selected family fails, and replay rejects missing, forged, stale, or failed validation rows and summaries.
-- Root imports expose core APIs only; adapter helpers are available through `vptune.adapters`, and extension helpers are available through `vptune.ext`.
+- Root imports expose the user-facing surface (model builders, the typed math objects, the operator constructors, `space`, `search`, `cuda`, `tune`, and the lower-layer `problem`, `autotune`, and replay functions) and never `Candidate`, `RuntimeConfig`, or the axis machinery; adapter helpers are available through `vptune.adapters`, and extension helpers are available through `vptune.ext`.
 
 Pilot adapter tests:
 
@@ -2138,7 +2343,7 @@ vptune/
 
 1. Axis manifest with every key, value domain, owner, Class C group, merge rule, admission rule, and lowering owner from this spec.
 2. Core data classes, JSON schemas, replay fields, and direct-field replay checks.
-3. Standard runtime lowering for gradient, JVP, VJP, HVP, GGNVP, FisherVP, sampled FisherVP, empirical FisherVP, metric multiply, inverse metric multiply, and composition.
+3. Standard runtime lowering for gradient, JVP, VJP, HVP, GGNVP, FisherVP, sampled FisherVP, empirical FisherVP, per-example gradient, metric multiply, metric inner product, metric square-root multiply, inverse metric multiply, inverse metric inner product, inverse metric square-root multiply, and composition.
 4. Package-owned anchors and full-size gates.
 5. Measurement, memory sampling, failure rows, selection, and shared selector reuse for tuning and replay.
 6. Search strategies: `admission`, `smoke`, `fast`, `balanced`, `thorough`, and `exhaustive`.

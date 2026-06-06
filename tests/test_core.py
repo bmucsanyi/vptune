@@ -9175,22 +9175,12 @@ def test_operator_constructors_declare_kind_and_aggregation() -> None:
         "metric",
         "retain",
         aggregation="mean",
-        loss_geometry="psd_metric",
-    )
-    linear_ggn = vp.ggnvp(
-        "metric",
-        "retain",
-        aggregation="mean",
-        loss_geometry="linear_map",
     )
 
     assert ggn.kind == "ggnvp"
+    assert ggn.semantics == {"loss_geometry": "psd_metric"}
     assert ggn.batch_inputs == {
         "reference": ("loss_hessian", "symmetry_vector"),
-        "operation": ("loss_hessian",),
-    }
-    assert linear_ggn.batch_inputs == {
-        "reference": ("loss_hessian",),
         "operation": ("loss_hessian",),
     }
     assert vp.gradient("grad", "loss", aggregation="sum").kind == "gradient"
@@ -9256,7 +9246,7 @@ def test_operator_constructors_reject_unknown_semantic_values() -> None:
     with pytest.raises(vp.MaterializationError, match="aggregation"):
         vp.gradient("grad", "loss", aggregation="summ")
 
-    with pytest.raises(vp.MaterializationError, match="loss_geometry"):
+    with pytest.raises(TypeError, match="loss_geometry"):
         vp.ggnvp(
             "ggn",
             "model_output",
