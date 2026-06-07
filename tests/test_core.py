@@ -6736,11 +6736,47 @@ def test_problem_signature_includes_axis_registry_identity() -> None:
     assert first.input_signature() != second.input_signature()
 
 
-def test_package_version_matches_project_metadata() -> None:
+def test_package_metadata_matches_current_pypa_fields() -> None:
     pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
     pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    project = pyproject["project"]
+    sdist_include = set(
+        pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
+    )
 
-    assert pyproject["project"]["version"] == PACKAGE_VERSION
+    assert project["version"] == PACKAGE_VERSION
+    assert project["license"] == "Apache-2.0"
+    assert project["license-files"] == ["LICENSE"]
+    assert project["import-names"] == ["vptune"]
+    assert "numpy" in project["dependencies"]
+    assert "torch>=2.12,<2.13" in project["dependencies"]
+    assert not any(
+        classifier.startswith("License ::") for classifier in project["classifiers"]
+    )
+    assert pyproject["build-system"]["requires"] == ["hatchling==1.30.1"]
+    assert (
+        pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["core-metadata-version"]
+        == "2.4"
+    )
+    assert (
+        pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]["core-metadata-version"]
+        == "2.4"
+    )
+    assert "/.github" in sdist_include
+    assert "/SECURITY.md" in sdist_include
+
+
+def test_repository_security_files_are_declared() -> None:
+    root = Path(__file__).parents[1]
+    security = (root / "SECURITY.md").read_text(encoding="utf-8")
+    owners = (root / ".github" / "CODEOWNERS").read_text(encoding="utf-8")
+    dependabot = (root / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+
+    assert "https://github.com/bmucsanyi/vptune/security/advisories/new" in security
+    assert "Do not report suspected vulnerabilities in public issues" in security
+    assert owners == "* @bmucsanyi\n"
+    assert 'package-ecosystem: "uv"' in dependabot
+    assert 'package-ecosystem: "pre-commit"' in dependabot
 
 
 def test_package_owned_identities_use_package_version(
@@ -6797,6 +6833,11 @@ def test_package_owned_identities_use_package_version(
         == "9.9.9"
     )
     assert runtime.materializer.identity()["materializer_version"] == "9.9.9"
+
+
+def test_settings_product_rejects_empty_axis_values() -> None:
+    with pytest.raises(vp.AdmissionError, match="candidate axis has no values: axis"):
+        candidates_module.settings_product("family", {"axis": ()})
 
 
 def test_target_admission_rejects_disallowed_settings() -> None:

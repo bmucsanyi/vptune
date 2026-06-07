@@ -3481,6 +3481,10 @@ def settings_product(
 
         axis_name, values = items[index]
 
+        if not values:
+            message = f"candidate axis has no values: {axis_name}"
+            raise AdmissionError(message)
+
         for value in values:
             changed_settings = _settings_for_axis_value(
                 axis_name,

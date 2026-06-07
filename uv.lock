@@ -1209,6 +1209,7 @@ version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "autobatch" },
+    { name = "numpy" },
     { name = "torch" },
 ]
 
@@ -1227,11 +1228,12 @@ transformers = [
 [package.metadata]
 requires-dist = [
     { name = "autobatch", git = "https://github.com/bmucsanyi/autobatch.git?rev=a0663ac586c61c4593e9b9c6031f43f464f61139" },
+    { name = "numpy" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "torch" },
+    { name = "torch", specifier = ">=2.12,<2.13" },
     { name = "transformers", marker = "extra == 'transformers'" },
     { name = "ty", marker = "extra == 'dev'" },
 ]

@@ -4,7 +4,7 @@ Autotuning for matrix-free derivative-vector products in PyTorch.
 
 ## Install
 
-`vptune` requires Python 3.12 through 3.14.
+`vptune` requires Python 3.12 through 3.14, NumPy, and PyTorch 2.12.x.
 
 From a checkout:
 

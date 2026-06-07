@@ -62,6 +62,7 @@ ruff-check:
 lint:
 	make ruff-format-check
 	make ruff-check
+	@uv run --no-sync ty check src tests
 
 .PHONY: lint-fix
 

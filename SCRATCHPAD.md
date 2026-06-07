@@ -1,5 +1,5 @@
 # Scratchpad
-Branch: codex-implement-spec @ 38d7f77
+Branch: codex-implement-spec @ b3f5851
 
 ## TODO
 - [x] Read SPEC.md in full.
@@ -20,7 +20,16 @@ Branch: codex-implement-spec @ 38d7f77
 - [x] Verify build/install from a fresh environment.
 - [x] Review test warnings and decide whether they require code changes.
 - [x] Decide handling for untracked audit docs and scratchpad state.
-- [ ] Rerun lint, tests, and any required hardware checks after changes.
+- [x] Rerun lint, tests, and any required hardware checks after changes.
+- [x] Build a 2026 source-backed engineering checklist for this specific package.
+- [ ] Poll final Ferranti job `398529` until it completes.
+- [ ] Audit public API, data normalization, and replay path with file/line findings.
+- [ ] Audit admission, lowering, measurement, and selection for hidden behavior.
+- [ ] Audit packaging, dependency, warning, and release behavior beyond build success.
+- [x] Patch confirmed defects with focused tests.
+- [ ] Rerun local lint/test gates and required Ferranti gates after final code edit.
+- [ ] Rebuild final wheel/sdist and run `twine check`.
+- [ ] Fresh-install final wheel/sdist and run import/workflow checks.
 
 ## Open questions for the user
 
@@ -79,3 +88,22 @@ Branch: codex-implement-spec @ 38d7f77
 - Ferranti checkout `/home/hennig/hmx900/repos/vptune` fast-forwarded to `4fc34c1`.
 - Ferranti pinned-memory job `398527` on `h100-ferranti` passed 3 tests in 4.24s; Slurm state COMPLETED 0:0.
 - Ferranti 2-GPU hardware job `398526` on `h100-ferranti` is still pending by priority and must finish before production-ready certification.
+- Commit `b3f5851` adds exact PyTorch warning filters and was pushed to origin/codex-implement-spec. Ferranti checkout fast-forwarded to `b3f5851`.
+- Replaced pending 2-GPU job `398526` with final job `398529`, which prints `git rev-parse --short HEAD` before running hardware tests.
+- Final `b3f5851` package build passed: `twine check` passed for wheel and sdist, sdist excludes cache/scratchpad/audit docs, and wheel contains only package plus dist-info.
+- Fresh final wheel and sdist installs passed into `/private/tmp/vptune-prod-wheel-venv-b3f5851` and `/private/tmp/vptune-prod-sdist-venv-b3f5851`; both installed workflows printed `1.0.0` and expected gradient; both `uv pip check` commands passed.
+- Final wheel environment import check passed for root, extension, and adapter modules. Final wheel environment `pip-audit` found no known vulnerabilities in PyPI packages; it skipped local/direct packages `vptune` and `autobatch`.
+- User rejected the earlier audit as too shallow. Corrective move: source-backed engineering checklist, module-by-module review, concrete file/line findings, patches for real defects.
+- External source basis now includes NIST SSDF, PyPA packaging specs, SLSA, OpenSSF Scorecard, pytest warning docs, Python warning docs, Ruff docs, mypy docs, and pip-audit docs.
+- Final Ferranti job `398529` is still pending by priority as of the latest poll.
+- Confirmed packaging metadata defect: legacy license table plus missing `import-names` left wheel/sdist below current PyPA metadata fields. Patched `pyproject.toml` and `tests/test_core.py`.
+- Build backend is now pinned as `hatchling==1.30.1`, and both wheel and sdist metadata are forced to Core Metadata 2.5 so `Import-Name` is emitted.
+- Added `SECURITY.md`, `.github/CODEOWNERS`, and `.github/dependabot.yml`; `pyproject.toml` now ships them in the sdist.
+- Focused repo/package tests passed: `test_package_metadata_matches_current_pypa_fields` and `test_repository_security_files_are_declared`.
+- Rebuilt `/private/tmp/vptune-audit-metadata-build-5`; sdist includes `SECURITY.md`, `.github/CODEOWNERS`, and `.github/dependabot.yml`.
+- Confirmed candidate helper bug: `settings_product` with an empty extension axis reached an unbound local. Patched it to raise `AdmissionError` and added `test_settings_product_rejects_empty_axis_values`.
+- Confirmed dependency metadata gap: spec is grounded in PyTorch 2.12 but package declared plain `torch`. Patched dependency to `torch>=2.12,<2.13`, updated README and `uv.lock`, and verified wheel metadata emits `Requires-Dist: torch<2.13,>=2.12`.
+- Aligned `make lint` with `make lint-fix` by adding `ty check src tests` to the non-mutating lint gate.
+- Twine 6.2.0 rewrites `packaging.metadata._VALID_METADATA_VERSIONS` at import time and rejects Core Metadata 2.5 even when the installed `packaging` accepts it. Final emitted metadata must stay at 2.4 until Twine accepts 2.5.
+- `pyproject.toml` still declares `import-names = ["vptune"]`, but the wheel cannot emit `Import-Name` while `twine check` requires Core Metadata 2.4.
+- Final current-code local gates still need rerun after lowering emitted metadata to 2.4.

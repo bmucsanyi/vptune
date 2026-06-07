@@ -12,7 +12,6 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Information Technology",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
     "Natural Language :: English",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Information Analysis",
@@ -24,12 +23,15 @@ classifiers = [
 ]
 dependencies = [
     "autobatch @ git+https://github.com/bmucsanyi/autobatch.git@a0663ac586c61c4593e9b9c6031f43f464f61139",
-    "torch",
+    "numpy",
+    "torch>=2.12,<2.13",
 ]
 version = "1.0.0"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.15"
+import-names = ["vptune"]
 
 [project.optional-dependencies]
 dev = ["ruff", "pre-commit", "pytest", "ty", "pytest-cov"]
@@ -39,14 +41,16 @@ transformers = ["transformers"]
 # See https://peps.python.org/pep-0518/
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.30.1"]
 build-backend = "hatchling.build"
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.sdist]
+core-metadata-version = "2.4"
 include = [
+    "/.github",
     "/.gitignore",
     "/.pre-commit-config.yaml",
     "/BLOCKERS.md",
@@ -54,6 +58,7 @@ include = [
     "/LICENSE",
     "/Makefile",
     "/README.md",
+    "/SECURITY.md",
     "/SPEC.md",
     "/pyproject.toml",
     "/src",
@@ -62,6 +67,7 @@ include = [
 ]
 
 [tool.hatch.build.targets.wheel]
+core-metadata-version = "2.4"
 packages = ["src/vptune"]
 
 # Testing Configuration
@@ -71,8 +77,6 @@ packages = ["src/vptune"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 filterwarnings = [
-    # torch emits this when numpy is absent; vptune neither imports nor depends on numpy
-    "ignore:Failed to initialize NumPy:UserWarning",
     # torch 2.12 emits these from internal code paths exercised by required JVP,
     # forward-AD, attention, and compile tests.
     "ignore:`torch\\.jit\\.script` is deprecated\\. Please switch to `torch\\.compile` or `torch\\.export`\\.:DeprecationWarning:torch\\.jit\\._script",
