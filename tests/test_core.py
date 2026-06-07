@@ -2376,15 +2376,36 @@ def test_matrix_free_lanczos_requires_declared_iterations() -> None:
 
 def test_matrix_free_preconditioner_rejected_until_sibling_product_lowered() -> None:
     registry = vpx.standard_axis_registry()
-    candidate = vpx.Candidate(
+    missing_product = vpx.Candidate(
         "inverse_metric",
         "matrix-free-preconditioner",
         {"inverse_metric.preconditioner": "matrix_free"},
     )
+    admitted = vpx.Candidate(
+        "inverse_metric",
+        "matrix-free-preconditioner",
+        {
+            "inverse_metric.preconditioner": "matrix_free",
+            "inverse_metric.preconditioner_product": "preconditioner",
+        },
+    )
+    stray_product = vpx.Candidate(
+        "inverse_metric",
+        "stray-preconditioner-product",
+        {
+            "inverse_metric.preconditioner": "none",
+            "inverse_metric.preconditioner_product": "preconditioner",
+        },
+    )
 
-    assert registry.admit(candidate).admission_error == (
-        "inverse_metric.preconditioner=matrix_free requires named sibling product "
-        "lowering"
+    assert registry.admit(missing_product).admission_error == (
+        "inverse_metric.preconditioner=matrix_free requires "
+        "inverse_metric.preconditioner_product"
+    )
+    assert registry.admit(admitted).admission_status == "passed"
+    assert registry.admit(stray_product).admission_error == (
+        "inverse_metric.preconditioner_product applies only to matrix_free "
+        "preconditioner"
     )
 
 
@@ -3889,6 +3910,58 @@ def test_candidate_rows_reject_sampled_fisher_exact_check_without_bound() -> Non
     assert rows[0].admission_error == (
         "sampled_fisher exact-Fisher check requires declared sampling_bound"
     )
+
+
+@pytest.mark.parametrize(
+    "sampling_bound",
+    [
+        {
+            "kind": "matrix_bernstein",
+            "failure_probability": 0.5,
+            "norm_floor": 1e-12,
+        },
+        {
+            "kind": "hutchinson_relative_variance",
+            "failure_probability": 0.5,
+            "norm_floor": 1e-12,
+        },
+    ],
+)
+def test_candidate_rows_accept_sampled_fisher_named_bounds(
+    sampling_bound: Mapping[str, object],
+) -> None:
+    runtime = runtime_config(
+        (
+            vpx.Candidate(
+                "sampled",
+                "exact-check",
+                {"sampled_fisher.exact_fisher_check": "enabled_with_sampling_bound"},
+                admission_status="passed",
+            ),
+        ),
+        constant_operation_factory,
+        passing_reference_check,
+        materialize_candidate,
+        None,
+        {
+            "runtime": "standard",
+            "operator": ops.sampled_fisher_vp(
+                "sampled",
+                "scores",
+                aggregation="mean_per_example",
+                distribution="explicit_score_gradients",
+                label_policy="sampled_labels",
+                sample_count=2,
+                sample_source="fixed_seed_and_count",
+                sampling_bound=sampling_bound,
+                score_reduction="none",
+                denominator="num_examples",
+            ).signature(),
+        },
+    )
+    rows = tuple(run_module._candidate_rows(runtime))
+
+    assert rows[0].admission_status == "passed"
 
 
 def test_candidate_rows_reject_stateful_module_without_module() -> None:

@@ -366,6 +366,7 @@ def sqrt_metric(
         aggregation=aggregation,
         representation=representation,
         damping=None,
+        tol=None,
         randomness=randomness,
         thresholds=thresholds,
     )
@@ -378,6 +379,7 @@ def inverse_sqrt_metric(
     aggregation: str,
     representation: Mapping[str, Any],
     damping: float = 0.0,
+    tol: float | None = None,
     randomness: Mapping[str, Any] | None = None,
     thresholds: Mapping[str, float] | None = None,
 ) -> OperatorSpec:
@@ -389,6 +391,7 @@ def inverse_sqrt_metric(
         aggregation=aggregation,
         representation=representation,
         damping=damping,
+        tol=tol,
         randomness=randomness,
         thresholds=thresholds,
     )
@@ -454,6 +457,7 @@ def _sqrt_metric_operator(
     aggregation: str,
     representation: Mapping[str, Any],
     damping: float | None,
+    tol: float | None,
     randomness: Mapping[str, Any] | None,
     thresholds: Mapping[str, float] | None,
 ) -> OperatorSpec:
@@ -463,13 +467,19 @@ def _sqrt_metric_operator(
         message = "metric square-root damping must be nonnegative"
         raise MaterializationError(message)
 
+    _require_metric_tol(tol)
     representation_fields = _metric_representation_inputs(representation)
+    semantics = _sqrt_metric_semantics(representation, damping)
+
+    if tol is not None:
+        semantics["tol"] = tol
+
     return OperatorSpec(
         family,
         kind,
         objective_id,
         aggregation=aggregation,
-        semantics=_sqrt_metric_semantics(representation, damping),
+        semantics=semantics,
         batch_inputs={
             "reference": representation_fields,
             "operation": representation_fields,
@@ -684,8 +694,24 @@ def _sampling_bound(sampling_bound: Mapping[str, Any]) -> dict[str, object]:
     if sampling_bound.get("kind") == "disabled":
         return {"kind": "disabled"}
 
+    if sampling_bound.get("kind") in {
+        "matrix_bernstein",
+        "hutchinson_relative_variance",
+    }:
+        return {
+            "kind": str(sampling_bound["kind"]),
+            "failure_probability": _sampling_bound_probability(
+                sampling_bound,
+                "failure_probability",
+            ),
+            "norm_floor": _sampling_bound_float(sampling_bound, "norm_floor"),
+        }
+
     if sampling_bound.get("kind") != "abs_or_rel":
-        message = "sampled Fisher sampling_bound.kind must be disabled or abs_or_rel"
+        message = (
+            "sampled Fisher sampling_bound.kind must be disabled, abs_or_rel, "
+            "matrix_bernstein, or hutchinson_relative_variance"
+        )
         raise MaterializationError(message)
 
     return {
@@ -699,14 +725,27 @@ def _sampling_bound(sampling_bound: Mapping[str, Any]) -> dict[str, object]:
 def _sampling_bound_float(sampling_bound: Mapping[str, Any], key: str) -> float:
     value = sampling_bound.get(key)
 
-    if not isinstance(value, int | float):
+    if not isinstance(value, int | float) or isinstance(value, bool):
         message = f"sampled Fisher sampling_bound.{key} must be numeric"
         raise MaterializationError(message)
 
     result = float(value)
 
-    if result < 0.0:
-        message = f"sampled Fisher sampling_bound.{key} must be nonnegative"
+    if not math.isfinite(result) or result < 0.0:
+        message = f"sampled Fisher sampling_bound.{key} must be finite and nonnegative"
         raise MaterializationError(message)
 
     return result
+
+
+def _sampling_bound_probability(
+    sampling_bound: Mapping[str, Any],
+    key: str,
+) -> float:
+    result = _sampling_bound_float(sampling_bound, key)
+
+    if 0.0 < result < 1.0:
+        return result
+
+    message = f"sampled Fisher sampling_bound.{key} must be in (0, 1)"
+    raise MaterializationError(message)

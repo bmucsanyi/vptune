@@ -1342,11 +1342,23 @@ def test_typed_inverse_metric_tol_rejects_non_iterative_public_paths() -> None:
             tol=1e-4,
         )
 
-    with pytest.raises(vp.MaterializationError, match="inverse_sqrt_metric tol"):
+    inverse_sqrt = vp.inverse_sqrt_metric_vp(
+        model,
+        matrix_free_metric,
+        damping=vp.damping.scalar(0.5),
+        tol=1e-4,
+    )
+
+    assert inverse_sqrt.spec.semantics["tol"] == pytest.approx(1e-4)
+    assert inverse_sqrt.default_settings["sqrt_metric.factor_path"] == (
+        "matrix_free_lanczos"
+    )
+
+    with pytest.raises(vp.MaterializationError, match="matrix_free Lanczos"):
         vp.inverse_sqrt_metric_vp(
             model,
-            matrix_free_metric,
-            damping=vp.damping.scalar(0.5),
+            metric,
+            damping=vp.damping.eigenvalue_floor(0.1),
             tol=1e-4,
         )
 
@@ -2292,10 +2304,40 @@ def test_typed_sampled_fisher_fixed_seed_repeats() -> None:
         "seed": 17,
         "count": 3,
     }
+    assert operator.spec.semantics["sampling_bound"] == {"kind": "disabled"}
     torch.testing.assert_close(first["weight"], second["weight"])
 
     with pytest.raises(AssertionError):
         torch.testing.assert_close(first["weight"], other["weight"])
+
+
+def test_typed_sampled_fisher_sampling_bound_enters_identity() -> None:
+    model = typed_metric_model()
+    likelihood = vp.likelihood.gaussian(
+        output="logits",
+        target="target",
+        noise=1.5,
+    )
+    source = vp.samples.fixed_seed(
+        seed=17,
+        count=3,
+        sampling_bound={
+            "kind": "matrix_bernstein",
+            "failure_probability": 0.25,
+            "norm_floor": 1e-12,
+        },
+    )
+    operator = vp.sampled_fisher_vp(model, likelihood, samples=source)
+
+    assert operator.spec.semantics["sampling_bound"] == {
+        "kind": "matrix_bernstein",
+        "failure_probability": pytest.approx(0.25),
+        "norm_floor": pytest.approx(1e-12),
+    }
+    assert (
+        operator.spec.semantics["sample_source_identity"]["sampling_bound"]
+        == operator.spec.semantics["sampling_bound"]
+    )
 
 
 def test_typed_sample_source_validation() -> None:
@@ -2310,6 +2352,17 @@ def test_typed_sample_source_validation() -> None:
 
     with pytest.raises(vp.MaterializationError, match="JSON-compatible"):
         vp.samples.table(table=torch.ones(2, 1), identity=object())
+
+    with pytest.raises(vp.MaterializationError, match="failure_probability"):
+        vp.samples.fixed_seed(
+            seed=1,
+            count=2,
+            sampling_bound={
+                "kind": "hutchinson_relative_variance",
+                "failure_probability": 1.0,
+                "norm_floor": 1e-12,
+            },
+        )
 
 
 def test_typed_categorical_fisher_routes_to_ggn() -> None:

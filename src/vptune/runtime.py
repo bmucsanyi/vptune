@@ -98,6 +98,7 @@ MATRIX_FREE_RUNTIME_BINDINGS = ContextVar[
     "vptune_matrix_free_runtime_bindings",
     default=None,
 )
+MIN_SAMPLED_FISHER_FORMULA_BOUND_SAMPLES = 2
 
 BOUND_OPERATOR_VECTOR_STEP_FAMILIES = (
     "jvp",
@@ -308,6 +309,7 @@ SPEC_ADDITIONAL_RUNTIME_SETTINGS = (
     "call.return_type",
     "inverse_metric.iteration_budget",
     "inverse_metric.preconditioner",
+    "inverse_metric.preconditioner_product",
     "inverse_metric.factor_reuse",
     "inverse_metric.block_schedule",
     "inverse_metric.multi_rhs",
@@ -11687,12 +11689,47 @@ def _lanczos_matrix_free_metric_square_root_product(
             execution.candidate.settings,
         )
 
-    return _lanczos_matrix_function_product_from_apply(
+    result, residual = _lanczos_matrix_function_product_with_residual_from_apply(
         apply,
         vector,
         iterations,
         transform,
     )
+    _require_inverse_sqrt_lanczos_tolerance(execution, result, residual, inverse)
+
+    return result
+
+
+def _require_inverse_sqrt_lanczos_tolerance(
+    execution: StandardExecution,
+    result: torch.Tensor,
+    residual: torch.Tensor,
+    inverse: bool,
+) -> None:
+    if not inverse:
+        return
+
+    tolerance = _inverse_metric_tolerance(execution.operator)
+
+    if tolerance is None:
+        return
+
+    result_norm = result.norm()
+
+    if torch.equal(result_norm, torch.zeros_like(result_norm)):
+        if float(residual.item()) <= tolerance:
+            return
+
+        message = "inverse_sqrt_metric Lanczos residual exceeded tol"
+        raise MaterializationError(message)
+
+    scaled_residual = residual / result_norm
+
+    if float(scaled_residual.item()) <= tolerance:
+        return
+
+    message = "inverse_sqrt_metric Lanczos residual exceeded tol"
+    raise MaterializationError(message)
 
 
 def _lanczos_sqrt_transform(
@@ -11735,10 +11772,28 @@ def _lanczos_matrix_function_product_from_apply(
     iterations: int,
     transform: Callable[[torch.Tensor], torch.Tensor],
 ) -> torch.Tensor:
+    result, _ = _lanczos_matrix_function_product_with_residual_from_apply(
+        apply,
+        vector,
+        iterations,
+        transform,
+    )
+
+    return result
+
+
+def _lanczos_matrix_function_product_with_residual_from_apply(
+    apply: Callable[[torch.Tensor], torch.Tensor],
+    vector: torch.Tensor,
+    iterations: int,
+    transform: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
     norm = vector.norm()
 
     if torch.equal(norm, torch.zeros_like(norm)):
-        return torch.zeros_like(vector)
+        residual = torch.zeros((), dtype=vector.dtype, device=vector.device)
+
+        return torch.zeros_like(vector), residual
 
     basis = []
     alphas = []
@@ -11768,11 +11823,11 @@ def _lanczos_matrix_function_product_from_apply(
     q_matrix = torch.stack(tuple(basis), dim=1)
     tri = _lanczos_tridiagonal(alphas, betas)
     eigenvalues, eigenvectors = torch.linalg.eigh(tri)
-    first = torch.zeros(len(alphas), dtype=vector.dtype, device=vector.device)
-    first[0] = norm
-    projected = eigenvectors @ (transform(eigenvalues) * (eigenvectors.T @ first))
+    projected = eigenvectors @ (transform(eigenvalues) * eigenvectors[0] * norm)
+    result = q_matrix @ projected
+    residual = torch.abs(beta * projected[-1])
 
-    return q_matrix @ projected
+    return result, residual
 
 
 def _lanczos_tridiagonal(
@@ -12426,6 +12481,7 @@ def _conjugate_gradient_inverse_metric_batch_solve(
         residual,
         preconditioner,
         execution.candidate.settings,
+        MATRIX_FREE_RUNTIME_BINDINGS.get(),
     )
     direction = preconditioned
     residual_dot = _batched_dot_runtime(
@@ -12465,6 +12521,7 @@ def _conjugate_gradient_inverse_metric_batch_solve(
             residual,
             preconditioner,
             execution.candidate.settings,
+            MATRIX_FREE_RUNTIME_BINDINGS.get(),
         )
         next_residual_dot = _batched_dot_runtime(
             execution.candidate.settings,
@@ -12573,6 +12630,8 @@ def _apply_inverse_metric_preconditioner(
     residual: torch.Tensor,
     preconditioner: str,
     settings: Mapping[str, Any],
+    matrix_free_operators: Mapping[str, Callable[[Batch, TensorTree], TensorTree]]
+    | None,
 ) -> torch.Tensor:
     residual_tree = _wrap_flat_vector(template, residual)
 
@@ -12596,6 +12655,15 @@ def _apply_inverse_metric_preconditioner(
         result = _flatten_vector(
             _factorized_metric_preconditioner(operator, batch, residual_tree, settings)
         )
+    elif preconditioner == "matrix_free":
+        result = _flatten_vector(
+            _matrix_free_preconditioner(
+                batch,
+                residual_tree,
+                settings,
+                matrix_free_operators,
+            )
+        )
     else:
         message = f"inverse metric preconditioner is unsupported: {preconditioner}"
         raise MaterializationError(message)
@@ -12612,6 +12680,8 @@ def _apply_inverse_metric_preconditioner_batch(
     residual_batch: torch.Tensor,
     preconditioner: str,
     settings: Mapping[str, Any],
+    matrix_free_operators: Mapping[str, Callable[[Batch, TensorTree], TensorTree]]
+    | None,
 ) -> torch.Tensor:
     parts = [
         _apply_inverse_metric_preconditioner(
@@ -12621,6 +12691,7 @@ def _apply_inverse_metric_preconditioner_batch(
             residual,
             preconditioner,
             settings,
+            matrix_free_operators,
         )
         for residual in residual_batch
     ]
@@ -12662,6 +12733,30 @@ def _factorized_metric_preconditioner(
     )
 
 
+def _matrix_free_preconditioner(
+    batch: Batch,
+    vector: TensorTree,
+    settings: Mapping[str, Any],
+    matrix_free_operators: Mapping[str, Callable[[Batch, TensorTree], TensorTree]]
+    | None,
+) -> TensorTree:
+    product = _inverse_metric_preconditioner_product(settings)
+    bindings = matrix_free_operators
+
+    if bindings is None:
+        bindings = MATRIX_FREE_RUNTIME_BINDINGS.get()
+
+    operation = None if bindings is None else bindings.get(product)
+
+    if operation is None:
+        message = (
+            f"matrix_free preconditioner requires selected sibling product: {product}"
+        )
+        raise MaterializationError(message)
+
+    return operation(batch, vector)
+
+
 def _inverse_metric_iteration_budget(settings: Mapping[str, Any]) -> int:
     value = settings.get("inverse_metric.iteration_budget")
 
@@ -12680,9 +12775,14 @@ def _inverse_metric_preconditioner(settings: Mapping[str, Any]) -> str:
         raise MaterializationError(message)
 
     if value == "matrix_free":
+        _inverse_metric_preconditioner_product(settings)
+
+        return value
+
+    if "inverse_metric.preconditioner_product" in settings:
         message = (
-            "inverse_metric.preconditioner=matrix_free requires named sibling "
-            "product lowering"
+            "inverse_metric.preconditioner_product applies only to matrix_free "
+            "preconditioner"
         )
         raise MaterializationError(message)
 
@@ -12691,6 +12791,19 @@ def _inverse_metric_preconditioner(settings: Mapping[str, Any]) -> str:
         raise MaterializationError(message)
 
     return value
+
+
+def _inverse_metric_preconditioner_product(settings: Mapping[str, Any]) -> str:
+    value = settings.get("inverse_metric.preconditioner_product")
+
+    if isinstance(value, str) and value:
+        return value
+
+    message = (
+        "inverse_metric.preconditioner=matrix_free requires "
+        "inverse_metric.preconditioner_product"
+    )
+    raise MaterializationError(message)
 
 
 def _dense_inverse_metric_solve(
@@ -15331,6 +15444,7 @@ def _require_sqrt_metric_operator_settings(
     settings: Mapping[str, Any],
 ) -> None:
     _require_sqrt_metric_runtime_settings(path, settings)
+    _require_inverse_sqrt_tolerance_path(operator, path)
 
     if path == SQRT_METRIC_LANCZOS_PATH:
         _require_metric_representation(operator, ("matrix_free",))
@@ -15356,6 +15470,23 @@ def _require_sqrt_metric_operator_settings(
     if _has_metric_runtime_settings(settings) or _has_inverse_metric_settings(settings):
         message = "metric solve and multiply settings do not apply to sqrt rows"
         raise MaterializationError(message)
+
+
+def _require_inverse_sqrt_tolerance_path(
+    operator: OperatorSpec,
+    path: str | None,
+) -> None:
+    if operator.kind != "inverse_sqrt_metric":
+        return
+
+    if _inverse_metric_tolerance(operator) is None:
+        return
+
+    if path == SQRT_METRIC_LANCZOS_PATH:
+        return
+
+    message = "inverse_sqrt_metric tol requires matrix_free_lanczos"
+    raise MaterializationError(message)
 
 
 def _require_metric_inner_runtime_settings(
@@ -15542,6 +15673,7 @@ def _has_inverse_metric_settings(settings: Mapping[str, Any]) -> bool:
         "inverse_metric.solve_path" in settings
         or "inverse_metric.iteration_budget" in settings
         or "inverse_metric.preconditioner" in settings
+        or "inverse_metric.preconditioner_product" in settings
         or "inverse_metric.block_schedule" in settings
     )
 
@@ -17657,6 +17789,7 @@ def _inverse_metric_anchor_settings(
     for key in (
         "inverse_metric.iteration_budget",
         "inverse_metric.preconditioner",
+        "inverse_metric.preconditioner_product",
         "inverse_metric.block_schedule",
         "inverse_metric.multi_rhs",
     ):
@@ -18454,7 +18587,6 @@ def _check_sampled_fisher_exact_bound(
         message = f"sampled_fisher.exact_fisher_check is unsupported: {exact_check}"
         raise MaterializationError(message)
 
-    bound = _sampled_fisher_sampling_bound(execution.operator)
     exact = _batch_tensor(execution.batch, "exact_fisher_vp").reshape(-1)
     _require_finite_tensor(exact, "exact FisherVP reference")
 
@@ -18462,6 +18594,7 @@ def _check_sampled_fisher_exact_bound(
         message = "exact_fisher_vp must match sampled Fisher result width"
         raise MaterializationError(message)
 
+    bound = _sampled_fisher_sampling_bound(execution, result)
     difference = (result.reshape(-1) - exact).norm()
     exact_norm = exact.norm()
     floor = torch.tensor(
@@ -18483,15 +18616,27 @@ def _check_sampled_fisher_exact_bound(
     raise MaterializationError(message)
 
 
-def _sampled_fisher_sampling_bound(operator: OperatorSpec) -> dict[str, float]:
-    raw = operator.semantics.get("sampling_bound")
+def _sampled_fisher_sampling_bound(
+    execution: StandardExecution,
+    result: torch.Tensor,
+) -> dict[str, float]:
+    raw = execution.operator.semantics.get("sampling_bound")
 
     if not isinstance(raw, Mapping):
         message = "sampled Fisher sampling_bound must be a mapping"
         raise MaterializationError(message)
 
+    if raw.get("kind") == "matrix_bernstein":
+        return _sampled_fisher_matrix_bernstein_bound(execution, raw)
+
+    if raw.get("kind") == "hutchinson_relative_variance":
+        return _sampled_fisher_hutchinson_relative_bound(execution, result, raw)
+
     if raw.get("kind") != "abs_or_rel":
-        message = "sampled Fisher sampling_bound.kind must be abs_or_rel"
+        message = (
+            "sampled Fisher sampling_bound.kind must be abs_or_rel, "
+            "matrix_bernstein, or hutchinson_relative_variance"
+        )
         raise MaterializationError(message)
 
     return {
@@ -18504,17 +18649,109 @@ def _sampled_fisher_sampling_bound(operator: OperatorSpec) -> dict[str, float]:
 def _sampling_bound_float(bound: Mapping[str, Any], key: str) -> float:
     value = bound.get(key)
 
-    if not isinstance(value, int | float):
+    if not isinstance(value, int | float) or isinstance(value, bool):
         message = f"sampled Fisher sampling_bound.{key} must be numeric"
         raise MaterializationError(message)
 
     result = float(value)
 
-    if result < 0.0:
-        message = f"sampled Fisher sampling_bound.{key} must be nonnegative"
+    if not math.isfinite(result) or result < 0.0:
+        message = f"sampled Fisher sampling_bound.{key} must be finite and nonnegative"
         raise MaterializationError(message)
 
     return result
+
+
+def _sampling_bound_probability(bound: Mapping[str, Any], key: str) -> float:
+    result = _sampling_bound_float(bound, key)
+
+    if 0.0 < result < 1.0:
+        return result
+
+    message = f"sampled Fisher sampling_bound.{key} must be in (0, 1)"
+    raise MaterializationError(message)
+
+
+def _sampled_fisher_contributions(execution: StandardExecution) -> torch.Tensor:
+    score_matrix = _sampled_fisher_score_matrix_for_bound(execution)
+    vector = _parameter_order_vector(execution)
+    normalization = _sampled_fisher_normalization(execution)
+    score_dot = _matmul_runtime(execution.candidate.settings, score_matrix, vector)
+    contributions = score_matrix * score_dot.unsqueeze(1) / normalization
+    _require_finite_tensor(contributions, "sampled Fisher bound contributions")
+
+    return contributions
+
+
+def _sampled_fisher_score_matrix_for_bound(
+    execution: StandardExecution,
+) -> torch.Tensor:
+    if "sampled_score_gradients" in execution.batch:
+        matrix = _batch_tensor(execution.batch, "sampled_score_gradients")
+    else:
+        matrix = _sampled_fisher_score_gradients(execution)
+
+    return _loss_scaled_score_matrix(execution, matrix)
+
+
+def _sampled_fisher_centered_contributions(
+    execution: StandardExecution,
+) -> torch.Tensor:
+    contributions = _sampled_fisher_contributions(execution)
+
+    if contributions.shape[0] < MIN_SAMPLED_FISHER_FORMULA_BOUND_SAMPLES:
+        message = "sampled Fisher formula bounds require at least two samples"
+        raise MaterializationError(message)
+
+    centered = contributions - contributions.mean(dim=0, keepdim=True)
+    _require_finite_tensor(centered, "sampled Fisher centered bound contributions")
+
+    return centered
+
+
+def _sampled_fisher_matrix_bernstein_bound(
+    execution: StandardExecution,
+    raw: Mapping[str, Any],
+) -> dict[str, float]:
+    centered = _sampled_fisher_centered_contributions(execution)
+    failure_probability = _sampling_bound_probability(raw, "failure_probability")
+    log_term = math.log(2.0 / failure_probability)
+    variance = float(centered.square().sum().item())
+    row_norms = centered.norm(dim=1)
+    range_bound = float(row_norms.max().item())
+    max_abs_diff = math.sqrt(2.0 * variance * log_term)
+    max_abs_diff += (2.0 / 3.0) * range_bound * log_term
+
+    return {
+        "max_abs_diff": max_abs_diff,
+        "max_rel_diff": 0.0,
+        "norm_floor": _sampling_bound_float(raw, "norm_floor"),
+    }
+
+
+def _sampled_fisher_hutchinson_relative_bound(
+    execution: StandardExecution,
+    result: torch.Tensor,
+    raw: Mapping[str, Any],
+) -> dict[str, float]:
+    centered = _sampled_fisher_centered_contributions(execution)
+    failure_probability = _sampling_bound_probability(raw, "failure_probability")
+    norm_floor = _sampling_bound_float(raw, "norm_floor")
+    result_norm = float(result.reshape(-1).norm().item())
+    denominator = max(result_norm, norm_floor)
+
+    if denominator <= 0.0:
+        message = "sampled Fisher hutchinson bound requires positive norm scale"
+        raise MaterializationError(message)
+
+    relative_variance = float(centered.square().sum().item()) / (denominator**2)
+    max_rel_diff = math.sqrt(relative_variance / failure_probability)
+
+    return {
+        "max_abs_diff": 0.0,
+        "max_rel_diff": max_rel_diff,
+        "norm_floor": norm_floor,
+    }
 
 
 def _require_sampled_fisher_semantics(execution: StandardExecution) -> None:
@@ -18542,7 +18779,21 @@ def _require_sampled_fisher_semantics(execution: StandardExecution) -> None:
         raise MaterializationError(message)
 
     if exact_check == "enabled_with_sampling_bound":
-        _sampled_fisher_sampling_bound(operator)
+        raw = operator.semantics.get("sampling_bound")
+
+        if not isinstance(raw, Mapping):
+            message = "sampled Fisher sampling_bound must be a mapping"
+            raise MaterializationError(message)
+
+        if raw.get("kind") not in {
+            "abs_or_rel",
+            "matrix_bernstein",
+            "hutchinson_relative_variance",
+        }:
+            message = (
+                "sampled Fisher exact-Fisher check requires declared sampling_bound"
+            )
+            raise MaterializationError(message)
 
     score_reduction = _operator_semantic(operator, "score_reduction")
 

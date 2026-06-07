@@ -1077,6 +1077,7 @@ class SampleSource:
     kind: str
     count: int
     identity_fields: Mapping[str, Any]
+    sampling_bound: Mapping[str, Any]
     table: torch.Tensor | None = None
 
     def signature(self) -> Mapping[str, Any]:
@@ -1085,6 +1086,7 @@ class SampleSource:
             "kind": self.kind,
             "count": self.count,
             "identity": dict(self.identity_fields),
+            "sampling_bound": dict(self.sampling_bound),
         }
 
     def runtime_sample_source(self) -> str:
@@ -2691,7 +2693,11 @@ likelihood = _LikelihoodNamespace()
 
 class _SamplesNamespace:
     @staticmethod
-    def fixed_seed(seed: int, count: int) -> SampleSource:
+    def fixed_seed(
+        seed: int,
+        count: int,
+        sampling_bound: Mapping[str, Any] | None = None,
+    ) -> SampleSource:
         """Build a fixed-seed sampled-Fisher source.
 
         Returns:
@@ -2712,10 +2718,16 @@ class _SamplesNamespace:
             kind="fixed_seed",
             count=count,
             identity_fields={"seed": seed, "count": count},
+            sampling_bound=_sampled_fisher_sampling_bound(sampling_bound),
         )
 
     @staticmethod
-    def table(*, table: torch.Tensor, identity: Any) -> SampleSource:
+    def table(
+        *,
+        table: torch.Tensor,
+        identity: Any,
+        sampling_bound: Mapping[str, Any] | None = None,
+    ) -> SampleSource:
         """Build a fixed-table sampled-Fisher source.
 
         Returns:
@@ -2746,8 +2758,86 @@ class _SamplesNamespace:
                 "identity": identity_value,
                 "table": tensor_signature(table),
             },
+            sampling_bound=_sampled_fisher_sampling_bound(sampling_bound),
             table=table,
         )
+
+
+def _sampled_fisher_sampling_bound(
+    sampling_bound: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    if sampling_bound is None:
+        return {"kind": "disabled"}
+
+    kind = sampling_bound.get("kind")
+
+    if kind == "abs_or_rel":
+        return {
+            "kind": "abs_or_rel",
+            "max_abs_diff": _sampled_fisher_bound_float(
+                sampling_bound,
+                "max_abs_diff",
+            ),
+            "max_rel_diff": _sampled_fisher_bound_float(
+                sampling_bound,
+                "max_rel_diff",
+            ),
+            "norm_floor": _sampled_fisher_bound_float(
+                sampling_bound,
+                "norm_floor",
+            ),
+        }
+
+    if kind in {"matrix_bernstein", "hutchinson_relative_variance"}:
+        return {
+            "kind": kind,
+            "failure_probability": _sampled_fisher_bound_probability(
+                sampling_bound,
+                "failure_probability",
+            ),
+            "norm_floor": _sampled_fisher_bound_float(
+                sampling_bound,
+                "norm_floor",
+            ),
+        }
+
+    message = (
+        "samples sampling_bound.kind must be abs_or_rel, matrix_bernstein, "
+        "hutchinson_relative_variance, or omitted"
+    )
+    raise MaterializationError(message)
+
+
+def _sampled_fisher_bound_float(
+    sampling_bound: Mapping[str, Any],
+    key: str,
+) -> float:
+    value = sampling_bound.get(key)
+
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        message = f"samples sampling_bound.{key} must be numeric"
+        raise MaterializationError(message)
+
+    result = float(value)
+
+    if not math.isfinite(result) or result < 0.0:
+        message = f"samples sampling_bound.{key} must be finite and nonnegative"
+        raise MaterializationError(message)
+
+    return result
+
+
+def _sampled_fisher_bound_probability(
+    sampling_bound: Mapping[str, Any],
+    key: str,
+) -> float:
+    result = _sampled_fisher_bound_float(sampling_bound, key)
+
+    if 0.0 < result < 1.0:
+        return result
+
+    message = f"samples sampling_bound.{key} must be in (0, 1)"
+    raise MaterializationError(message)
 
 
 samples = _SamplesNamespace()
@@ -3633,7 +3723,7 @@ def sampled_fisher_vp(
         label_policy="sampled_labels",
         sample_count=samples.count,
         sample_source=samples.runtime_sample_source(),
-        sampling_bound={"kind": "disabled"},
+        sampling_bound=samples.sampling_bound,
         score_reduction="none",
         denominator=_sampled_fisher_denominator(likelihood),
     )
@@ -4945,7 +5035,7 @@ def inverse_sqrt_metric_vp(
     Returns:
         Inverse metric square-root operator.
     """
-    _reject_inverse_sqrt_tol(tol)
+    tolerance = _typed_inverse_sqrt_tol(metric, tol)
     damping_payload = _damping_value(model, metric, damping)
     _require_matrix_free_positive_damping(metric, damping_payload)
     family = _operator_family(name, "inverse_sqrt_metric")
@@ -4955,6 +5045,7 @@ def inverse_sqrt_metric_vp(
         aggregation="sum",
         representation=metric.representation,
         damping=_builder_damping_value(damping_payload),
+        tol=tolerance,
     )
     spec = _operator_with_damping_identity(
         spec, model, metric, damping, damping_payload
@@ -6358,11 +6449,18 @@ def _typed_inverse_tol(metric: Metric, tol: float | None) -> float | None:
     return tol
 
 
-def _reject_inverse_sqrt_tol(tol: float | None) -> None:
+def _typed_inverse_sqrt_tol(metric: Metric, tol: float | None) -> float | None:
     if tol is None:
-        return
+        return None
 
-    message = "inverse_sqrt_metric tol has no lowered residual rule"
+    if not math.isfinite(tol) or tol <= 0.0:
+        message = "inverse_sqrt_metric tol must be positive and finite"
+        raise MaterializationError(message)
+
+    if metric.kind == "matrix_free":
+        return tol
+
+    message = "inverse_sqrt_metric tol requires a matrix_free Lanczos row"
     raise MaterializationError(message)
 
 

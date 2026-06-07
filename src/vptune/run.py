@@ -576,7 +576,11 @@ def _sampled_fisher_binding_error(
     if not isinstance(sampling_bound, Mapping):
         return "sampled_fisher exact-Fisher check requires declared sampling_bound"
 
-    if sampling_bound.get("kind") != "abs_or_rel":
+    if sampling_bound.get("kind") not in {
+        "abs_or_rel",
+        "matrix_bernstein",
+        "hutchinson_relative_variance",
+    }:
         return "sampled_fisher exact-Fisher check requires declared sampling_bound"
 
     return None

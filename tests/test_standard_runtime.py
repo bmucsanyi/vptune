@@ -1562,7 +1562,10 @@ def score_terms_sampled_fisher(
     objective_id: str,
     *,
     sample_source: str = "fixed_seed_and_count",
+    sampling_bound: Mapping[str, object] | None = None,
 ) -> vpx.OperatorSpec:
+    bound = valid_sampling_bound() if sampling_bound is None else sampling_bound
+
     return ops.sampled_fisher_vp(
         family,
         objective_id,
@@ -1571,7 +1574,7 @@ def score_terms_sampled_fisher(
         label_policy="sampled_labels",
         sample_count=2,
         sample_source=sample_source,
-        sampling_bound=valid_sampling_bound(),
+        sampling_bound=bound,
         score_reduction="none",
         denominator="num_examples",
     )
@@ -6890,6 +6893,86 @@ def test_sqrt_metric_matrix_free_lanczos_rejects_dense_backing() -> None:
         )
 
 
+def test_inverse_sqrt_metric_matrix_free_lanczos_tol_checks_residual() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[5.0, 2.0], [2.0, 2.0]], dtype=torch.float64)
+    vector = {"w": torch.tensor([1.0, 0.0], dtype=torch.float64)}
+    settings = {
+        "sqrt_metric.factor_path": "matrix_free_lanczos",
+        "sqrt_metric.lanczos_iterations": 1,
+        "metric.multiply_path": "streaming_multiply",
+        "metric.accumulation": "streaming",
+    }
+    calls = []
+
+    def curvature(
+        batch: vpx.Batch,
+        input_vector: vpx.TensorTree,
+    ) -> vpx.TensorTree:
+        assert batch == {}
+        calls.append(tree_leaves(input_vector)[0].clone())
+
+        return {"w": matrix @ tensor_mapping(input_vector)["w"]}
+
+    def bound_factory(operator: Any) -> Any:
+        runtime = runtime_module.standard_runtime_with_matrix_free_bindings(
+            vpx.standard_runtime_config(
+                operator,
+                params=params,
+                buffers={},
+                candidates=(),
+                thresholds={
+                    "max_abs_diff": 1e-12,
+                    "max_rel_diff": 1e-12,
+                    "inverse_residual": 1e-12,
+                },
+                objective_signature={"inverse_sqrt": "matrix-free-lanczos-tol"},
+                axis_registry=None,
+            ),
+            bindings={"curvature": curvature},
+            binding_signature={"curvature": {"kind": "matrix_free_metric"}},
+        )
+
+        return runtime.operation_factory
+
+    passing_operator = ops.inverse_sqrt_metric(
+        "inverse_sqrt_metric",
+        "metric",
+        aggregation="sum",
+        representation={"kind": "matrix_free", "operator": "curvature"},
+        damping=0.5,
+        tol=3.0,
+    )
+    result = bound_factory(passing_operator)(
+        passed_candidate("inverse_sqrt_metric", "passing-lanczos-tol", settings),
+        {},
+        vector,
+    )()
+    expected = vector["w"] / torch.sqrt(torch.tensor(5.5, dtype=torch.float64))
+
+    assert calls
+    torch.testing.assert_close(tensor_mapping(result)["w"], expected)
+
+    failing_operator = ops.inverse_sqrt_metric(
+        "inverse_sqrt_metric",
+        "metric",
+        aggregation="sum",
+        representation={"kind": "matrix_free", "operator": "curvature"},
+        damping=0.5,
+        tol=1e-12,
+    )
+
+    with pytest.raises(
+        vp.MaterializationError,
+        match="Lanczos residual exceeded tol",
+    ):
+        bound_factory(failing_operator)(
+            passed_candidate("inverse_sqrt_metric", "failing-lanczos-tol", settings),
+            {},
+            vector,
+        )()
+
+
 def test_metric_inner_eigenbasis_sqrt_reduce_paths_match_reference() -> None:
     params = {"w": torch.zeros(2, dtype=torch.float64)}
     matrix = torch.tensor([[5.0, 2.0], [2.0, 4.0]], dtype=torch.float64)
@@ -11211,10 +11294,11 @@ def test_inverse_metric_cg_dense_preconditioners_match_reference() -> None:
         assert reference_result.measurements["inverse_residual"] == pytest.approx(0.0)
 
 
-def test_inverse_metric_matrix_free_preconditioner_rejects_without_product() -> None:
+def test_inverse_metric_matrix_free_preconditioner_uses_sibling_product() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
+    calls = []
     operator = ops.inverse_metric(
         "inverse",
         "dense",
@@ -11222,7 +11306,81 @@ def test_inverse_metric_matrix_free_preconditioner_rejects_without_product() -> 
         representation=dense_metric_representation(),
         damping=0.25,
     )
-    factory = vpx.standard_operation_factory(
+
+    def preconditioner(
+        batch: vpx.Batch,
+        residual: vpx.TensorTree,
+    ) -> vpx.TensorTree:
+        assert batch["metric_matrix"] is matrix
+        calls.append(tree_leaves(residual)[0].clone())
+
+        return {"w": tensor_mapping(residual)["w"].clone()}
+
+    runtime = runtime_module.standard_runtime_with_matrix_free_bindings(
+        vpx.standard_runtime_config(
+            operator,
+            params=params,
+            buffers={},
+            candidates=(),
+            thresholds={
+                "max_abs_diff": 1e-12,
+                "max_rel_diff": 1e-12,
+                "symmetry_max_abs_diff": 1e-12,
+                "psd_violation": 1e-12,
+                "inverse_residual": 1e-12,
+            },
+            objective_signature={"inverse": "matrix-free-preconditioner"},
+            axis_registry=None,
+        ),
+        bindings={"identity_preconditioner": preconditioner},
+        binding_signature={"identity_preconditioner": {"kind": "identity"}},
+    )
+    factory = runtime.operation_factory
+
+    with pytest.raises(
+        vp.MaterializationError,
+        match=r"requires inverse_metric\.preconditioner_product",
+    ):
+        factory(
+            vpx.Candidate(
+                "inverse",
+                "matrix-free-preconditioner-missing-product",
+                {
+                    "inverse_metric.solve_path": "conjugate_gradient",
+                    "inverse_metric.iteration_budget": 2,
+                    "inverse_metric.preconditioner": "matrix_free",
+                    "metric.multiply_path": "dense_matmul",
+                },
+                admission_status="passed",
+            ),
+            {"metric_matrix": matrix},
+            vector,
+        )()
+
+    result = factory(
+        passed_candidate(
+            "inverse",
+            "matrix-free-preconditioner",
+            {
+                "inverse_metric.solve_path": "conjugate_gradient",
+                "inverse_metric.iteration_budget": 2,
+                "inverse_metric.preconditioner": "matrix_free",
+                "inverse_metric.preconditioner_product": "identity_preconditioner",
+                "metric.multiply_path": "dense_matmul",
+            },
+        ),
+        {"metric_matrix": matrix},
+        vector,
+    )()
+    expected = torch.linalg.solve(
+        matrix + 0.25 * torch.eye(2, dtype=torch.float64),
+        vector["w"],
+    )
+
+    assert calls
+    torch.testing.assert_close(tree_leaves(result)[0], expected)
+
+    unbound_factory = vpx.standard_operation_factory(
         operator,
         params=params,
         buffers={},
@@ -11230,9 +11388,9 @@ def test_inverse_metric_matrix_free_preconditioner_rejects_without_product() -> 
 
     with pytest.raises(
         vp.MaterializationError,
-        match="named sibling product lowering",
+        match="requires selected sibling product",
     ):
-        factory(
+        unbound_factory(
             vpx.Candidate(
                 "inverse",
                 "matrix-free-preconditioner",
@@ -11240,6 +11398,7 @@ def test_inverse_metric_matrix_free_preconditioner_rejects_without_product() -> 
                     "inverse_metric.solve_path": "conjugate_gradient",
                     "inverse_metric.iteration_budget": 2,
                     "inverse_metric.preconditioner": "matrix_free",
+                    "inverse_metric.preconditioner_product": "identity_preconditioner",
                     "metric.multiply_path": "dense_matmul",
                 },
                 admission_status="passed",
@@ -14711,6 +14870,63 @@ def test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "sampling_bound",
+    [
+        {
+            "kind": "matrix_bernstein",
+            "failure_probability": 0.5,
+            "norm_floor": 1e-12,
+        },
+        {
+            "kind": "hutchinson_relative_variance",
+            "failure_probability": 0.5,
+            "norm_floor": 1e-12,
+        },
+    ],
+)
+def test_sampled_fisher_named_exact_bounds_execute(
+    sampling_bound: Mapping[str, object],
+) -> None:
+    params = {
+        "a": torch.zeros(2, dtype=torch.float64),
+        "b": torch.zeros((2, 1), dtype=torch.float64),
+    }
+    vector = {
+        "b": torch.tensor([[3.0], [4.0]], dtype=torch.float64),
+        "a": torch.tensor([1.0, 2.0], dtype=torch.float64),
+    }
+    sampled_score_gradients = torch.eye(4, dtype=torch.float64)
+    expected_flat = torch.tensor([0.25, 0.5, 0.75, 1.0], dtype=torch.float64)
+    operator = score_terms_sampled_fisher(
+        "sampled",
+        "sampled_scores",
+        sampling_bound=sampling_bound,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = run_passed_candidate(
+        factory,
+        "sampled",
+        "named-bound",
+        sampled_fisher_settings(
+            "materialize_score_gradients",
+            exact_check="enabled_with_sampling_bound",
+        ),
+        {
+            "sampled_score_gradients": sampled_score_gradients,
+            "num_examples": 2,
+            "exact_fisher_vp": expected_flat,
+        },
+        vector,
+    )
+
+    assert_two_leaf_ordered_map(result, expected_flat)
+
+
 def test_sampled_fisher_vp_score_grad_paths_match_loop_path() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
@@ -14921,7 +15137,7 @@ def test_sampled_fisher_exact_check_requires_declared_sampling_bound() -> None:
         buffers={},
     )
 
-    with pytest.raises(vp.MaterializationError, match=r"sampling_bound\.kind"):
+    with pytest.raises(vp.MaterializationError, match="declared sampling_bound"):
         factory(
             vpx.Candidate(
                 "sampled",

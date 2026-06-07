@@ -2167,12 +2167,20 @@ def _inverse_metric_preconditioner_axis() -> AdmissionRule:
         value = candidate.settings["inverse_metric.preconditioner"]
 
         if value == "matrix_free":
-            return (
-                False,
-                (
-                    "inverse_metric.preconditioner=matrix_free requires named "
-                    "sibling product lowering"
-                ),
+            product = candidate.settings.get("inverse_metric.preconditioner_product")
+
+            if isinstance(product, str) and product:
+                return True, None
+
+            return False, (
+                "inverse_metric.preconditioner=matrix_free requires "
+                "inverse_metric.preconditioner_product"
+            )
+
+        if "inverse_metric.preconditioner_product" in candidate.settings:
+            return False, (
+                "inverse_metric.preconditioner_product applies only to "
+                "matrix_free preconditioner"
             )
 
         if value in {"none", "diagonal", "block_diagonal", "factorized_metric"}:
@@ -3459,6 +3467,7 @@ STANDARD_AXIS_ROWS = (
         "inverse_metric.preconditioner",
         ("none", "diagonal", "block_diagonal", "factorized_metric", "matrix_free"),
         _fixed_axis_rule(_inverse_metric_preconditioner_axis),
+        optional_settings_keys=("inverse_metric.preconditioner_product",),
     ),
     _single_axis_row("inverse_metric.iteration_budget", (), POSITIVE_INT_RULE),
     _single_axis_row(
