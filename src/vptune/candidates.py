@@ -1863,9 +1863,9 @@ def _storage_compute_dtype_axis(key: str) -> AdmissionRule:
     return admit
 
 
-def _fisher_score_grad_path_axis() -> AdmissionRule:
+def _score_grad_path_axis(key: str) -> AdmissionRule:
     def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings["fisher.score_grad_path"]
+        value = candidate.settings[key]
 
         if value == "torch_func_grad":
             return _admit_torch_func_path("torch_func_vjp", candidate.settings)
@@ -1874,40 +1874,6 @@ def _fisher_score_grad_path_axis() -> AdmissionRule:
             return _admit_torch_func_path(
                 "per_example_gradient_vmap", candidate.settings
             )
-
-        return True, None
-
-    return admit
-
-
-def _empirical_fisher_grad_path_axis() -> AdmissionRule:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings["empirical_fisher.grad_path"]
-
-        if value == "vmap_grad":
-            return _admit_torch_func_path(
-                "per_example_gradient_vmap", candidate.settings
-            )
-
-        if value == "torch_func_grad":
-            return _admit_torch_func_path("torch_func_vjp", candidate.settings)
-
-        return True, None
-
-    return admit
-
-
-def _per_example_gradient_grad_path_axis() -> AdmissionRule:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings["per_example_gradient.grad_path"]
-
-        if value == "vmap_grad":
-            return _admit_torch_func_path(
-                "per_example_gradient_vmap", candidate.settings
-            )
-
-        if value == "torch_func_grad":
-            return _admit_torch_func_path("torch_func_vjp", candidate.settings)
 
         return True, None
 
@@ -2068,61 +2034,41 @@ def _inverse_metric_inner_reduction_path_axis() -> AdmissionRule:
 
 
 def _metric_inner_reduction_path_error(settings: Mapping[str, Any]) -> str | None:
-    value = settings["metric_inner.reduction_path"]
-
-    if value == "multiply_then_reduce":
-        return _path_dependency_error(
-            settings,
-            required_key="metric.multiply_path",
-            required_message="multiply_then_reduce requires metric.multiply_path",
-            forbidden_keys={
-                "sqrt_metric.factor_path": (
-                    "multiply_then_reduce does not use sqrt_metric.factor_path"
-                ),
-            },
-        )
-
-    if value == "factored_gram":
-        return _path_dependency_error(
-            settings,
-            forbidden_keys={
-                "metric.multiply_path": (
-                    "factored_gram does not use metric.multiply_path"
-                ),
-                "sqrt_metric.factor_path": (
-                    "factored_gram does not use sqrt_metric.factor_path"
-                ),
-            },
-        )
-
-    if value == "sqrt_apply_reduce":
-        return _path_dependency_error(
-            settings,
-            required_key="sqrt_metric.factor_path",
-            required_message="sqrt_apply_reduce requires sqrt_metric.factor_path",
-            forbidden_keys={
-                "metric.multiply_path": (
-                    "sqrt_apply_reduce does not use metric.multiply_path"
-                ),
-            },
-        )
-
-    return None
+    return _inner_reduction_path_error(
+        settings,
+        "metric_inner.reduction_path",
+        "metric.multiply_path",
+        "multiply_then_reduce",
+    )
 
 
 def _inverse_metric_inner_reduction_path_error(
     settings: Mapping[str, Any],
 ) -> str | None:
-    value = settings["inverse_metric_inner.reduction_path"]
+    return _inner_reduction_path_error(
+        settings,
+        "inverse_metric_inner.reduction_path",
+        "inverse_metric.solve_path",
+        "solve_then_reduce",
+    )
 
-    if value == "solve_then_reduce":
+
+def _inner_reduction_path_error(
+    settings: Mapping[str, Any],
+    value_key: str,
+    primary_key: str,
+    primary_value: str,
+) -> str | None:
+    value = settings[value_key]
+
+    if value == primary_value:
         return _path_dependency_error(
             settings,
-            required_key="inverse_metric.solve_path",
-            required_message="solve_then_reduce requires inverse_metric.solve_path",
+            required_key=primary_key,
+            required_message=f"{primary_value} requires {primary_key}",
             forbidden_keys={
                 "sqrt_metric.factor_path": (
-                    "solve_then_reduce does not use sqrt_metric.factor_path"
+                    f"{primary_value} does not use sqrt_metric.factor_path"
                 ),
             },
         )
@@ -2131,9 +2077,7 @@ def _inverse_metric_inner_reduction_path_error(
         return _path_dependency_error(
             settings,
             forbidden_keys={
-                "inverse_metric.solve_path": (
-                    "factored_gram does not use inverse_metric.solve_path"
-                ),
+                primary_key: f"factored_gram does not use {primary_key}",
                 "sqrt_metric.factor_path": (
                     "factored_gram does not use sqrt_metric.factor_path"
                 ),
@@ -2146,9 +2090,7 @@ def _inverse_metric_inner_reduction_path_error(
             required_key="sqrt_metric.factor_path",
             required_message="sqrt_apply_reduce requires sqrt_metric.factor_path",
             forbidden_keys={
-                "inverse_metric.solve_path": (
-                    "sqrt_apply_reduce does not use inverse_metric.solve_path"
-                ),
+                primary_key: f"sqrt_apply_reduce does not use {primary_key}",
             },
         )
 
@@ -2211,23 +2153,6 @@ def _loss_scaling_axis() -> AdmissionRule:
 
         if error is not None:
             return False, error
-
-        return True, None
-
-    return admit
-
-
-def _sampled_fisher_score_grad_path_axis() -> AdmissionRule:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings["sampled_fisher.score_grad_path"]
-
-        if value == "torch_func_grad":
-            return _admit_torch_func_path("torch_func_vjp", candidate.settings)
-
-        if value == "vmap_grad":
-            return _admit_torch_func_path(
-                "per_example_gradient_vmap", candidate.settings
-            )
 
         return True, None
 
@@ -2771,847 +2696,592 @@ def _torch_func_axis() -> AdmissionRule:
     return admit
 
 
+StandardAxisRuleFactory = Callable[[tuple[str, ...]], AdmissionRule]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _StandardAxisRow:
+    """Input row for a standard core axis descriptor."""
+
+    name: str
+    settings_keys: tuple[str, ...]
+    allowed_values: tuple[Any, ...]
+    optional_settings_keys: tuple[str, ...] = ()
+    rule_factory: StandardAxisRuleFactory | None = None
+
+
+def _fixed_axis_rule(
+    rule_factory: Callable[[], AdmissionRule],
+) -> StandardAxisRuleFactory:
+    def build(_: tuple[str, ...]) -> AdmissionRule:
+        return rule_factory()
+
+    return build
+
+
+def _single_setting_axis_rule(
+    rule_factory: Callable[[str], AdmissionRule],
+) -> StandardAxisRuleFactory:
+    def build(settings_keys: tuple[str, ...]) -> AdmissionRule:
+        return rule_factory(settings_keys[0])
+
+    return build
+
+
+def _all_settings_axis_rule(
+    rule_factory: Callable[..., AdmissionRule],
+) -> StandardAxisRuleFactory:
+    def build(settings_keys: tuple[str, ...]) -> AdmissionRule:
+        return rule_factory(*settings_keys)
+
+    return build
+
+
+def _single_axis_row(
+    name: str,
+    allowed_values: tuple[Any, ...],
+    rule_factory: StandardAxisRuleFactory | None = None,
+    *,
+    optional_settings_keys: tuple[str, ...] = (),
+) -> _StandardAxisRow:
+    return _StandardAxisRow(
+        name,
+        (name,),
+        allowed_values,
+        optional_settings_keys,
+        rule_factory,
+    )
+
+
+def _single_axis_rows(
+    names: tuple[str, ...],
+    allowed_values: tuple[Any, ...],
+    rule_factory: StandardAxisRuleFactory | None = None,
+) -> tuple[_StandardAxisRow, ...]:
+    return tuple(_single_axis_row(name, allowed_values, rule_factory) for name in names)
+
+
+def _multi_axis_row(
+    name: str,
+    settings_keys: tuple[str, ...],
+    allowed_values: tuple[Any, ...],
+    rule_factory: StandardAxisRuleFactory | None = None,
+    *,
+    optional_settings_keys: tuple[str, ...] = (),
+) -> _StandardAxisRow:
+    return _StandardAxisRow(
+        name,
+        settings_keys,
+        allowed_values,
+        optional_settings_keys,
+        rule_factory,
+    )
+
+
+def _standard_axis_from_row(row: _StandardAxisRow) -> AxisDescriptor:
+    admission_rule = None
+
+    if row.rule_factory is not None:
+        admission_rule = row.rule_factory(row.settings_keys)
+
+    return AxisDescriptor(
+        row.name,
+        row.settings_keys,
+        row.allowed_values,
+        optional_settings_keys=row.optional_settings_keys,
+        admission_rule=admission_rule,
+    )
+
+
+LAYOUT_TREE_VALUES = (*DIRECT_LAYOUT_VALUES, *DISTRIBUTED_LAYOUT_VALUES)
+SCORE_GRAD_PATH_VALUES = (
+    "torch_autograd_grad_loop",
+    "torch_func_grad",
+    "vmap_grad",
+    "backward_materialized_grad",
+)
+HVP_PATH_VALUES = (
+    "reverse_over_reverse",
+    "autograd_functional_hvp",
+    "autograd_functional_vhp",
+    "jvp_grad",
+    "forward_ad_dual",
+    "linearize_grad",
+)
+RETAIN_OR_RECOMPUTE_VALUES = ("retain", "recompute")
+FALSE_TRUE_VALUES = ("false", "true")
+LAYER_BLOCK_VALUES = ("layer_blocks", "module_blocks", "custom_blocks")
+SINGLE_OR_BLOCK_VALUES = ("single_column", "block")
+METRIC_INNER_REDUCTION_VALUES = (
+    "multiply_then_reduce",
+    "factored_gram",
+    "sqrt_apply_reduce",
+)
+INVERSE_METRIC_INNER_REDUCTION_VALUES = (
+    "solve_then_reduce",
+    "factored_gram",
+    "sqrt_apply_reduce",
+)
+COMPILE_SETTING_RULE = _fixed_axis_rule(_compile_setting_axis)
+POSITIVE_INT_RULE = _single_setting_axis_rule(_positive_int_axis)
+STORAGE_COMPUTE_DTYPE_RULE = _single_setting_axis_rule(_storage_compute_dtype_axis)
+LAYOUT_TREE_RULE = _single_setting_axis_rule(_layout_tree_axis)
+MEMORY_OUTPUT_RULE = _single_setting_axis_rule(_memory_output_axis)
+METRIC_INNER_MULTI_RHS_RULE = _single_setting_axis_rule(_metric_inner_multi_rhs_axis)
+SCORE_GRAD_PATH_RULE = _single_setting_axis_rule(_score_grad_path_axis)
+
+STANDARD_AXIS_ROWS = (
+    *_single_axis_rows(
+        ("dtype.parameter_storage", "dtype.model_compute"),
+        SPEC_STORAGE_COMPUTE_DTYPE_VALUES,
+        STORAGE_COMPUTE_DTYPE_RULE,
+    ),
+    *_single_axis_rows(
+        (
+            "dtype.autodiff_compute",
+            "dtype.accumulation",
+            "dtype.vector",
+            "dtype.intermediate",
+            "dtype.metric_factor",
+            "dtype.output",
+        ),
+        SPEC_DTYPE_VALUES,
+    ),
+    *_single_axis_rows(
+        ("layout.params", "layout.vector", "layout.output"),
+        LAYOUT_TREE_VALUES,
+        LAYOUT_TREE_RULE,
+    ),
+    _single_axis_row("layout.contiguity", ("contiguous", "preserve_existing_strides")),
+    _single_axis_row("layout.flatten_order", ("canonical_parameter_order",)),
+    _single_axis_row("layout.vector_ops", ("python_loop", "foreach")),
+    _single_axis_row("layout.aliasing", ("preserve_tied_weight_aliases",)),
+    _single_axis_row(
+        "layout.parametrizations",
+        ("preserve_active_parametrizations",),
+    ),
+    _single_axis_row("call.path", ("functional_call", "stateful_module")),
+    _single_axis_row("call.params", ("explicit_params", "module_params")),
+    _single_axis_row("call.buffers", ("explicit_buffers", "module_buffers")),
+    _single_axis_row("call.tied_weights", ("preserve_alias_groups",)),
+    _single_axis_row("call.parametrizations", ("preserve_parametrizations",)),
+    _single_axis_row("call.buffer_mutation", ("forbidden", "declared_and_restored")),
+    _single_axis_row("call.grad_mode", ("grad_enabled",)),
+    _single_axis_row(
+        "call.return_type",
+        ("raw_tensor_tree", "model_output_object_with_declared_fields"),
+    ),
+    _single_axis_row("hvp.path", HVP_PATH_VALUES, _fixed_axis_rule(_hvp_path_axis)),
+    _single_axis_row(
+        "hvp.graph_schedule",
+        ("retain_graph_across_vectors", "rebuild_graph_per_vector"),
+    ),
+    _single_axis_row("hvp.primal_reuse", ("reuse_primal", "recompute_primal")),
+    _single_axis_row(
+        "hvp.gradient_reuse",
+        ("reuse_gradient_closure", "recompute_gradient"),
+    ),
+    _single_axis_row(
+        "gradient.path",
+        (
+            "torch_autograd_grad",
+            "torch_func_grad",
+            "torch_func_grad_and_value",
+            "backward_materialized_grad",
+        ),
+        _fixed_axis_rule(_gradient_path_axis),
+    ),
+    _single_axis_row(
+        "gradient.value_reuse",
+        ("gradient_only", "gradient_and_primal_value"),
+        _fixed_axis_rule(_gradient_value_reuse_axis),
+    ),
+    _single_axis_row("gradient.graph_schedule", ("build_once", "rebuild_per_call")),
+    _single_axis_row(
+        "jvp.path", JVP_VECTOR_LOOP_PATHS, _fixed_axis_rule(_jvp_path_axis)
+    ),
+    _single_axis_row(
+        "jvp.linearize_reuse",
+        ("none", "reuse_at_same_primal"),
+        _fixed_axis_rule(_jvp_linearize_reuse_axis),
+    ),
+    _single_axis_row(
+        "vjp.path", VJP_VECTOR_LOOP_PATHS, _fixed_axis_rule(_vjp_path_axis)
+    ),
+    _single_axis_row(
+        "vjp.closure_reuse",
+        ("none", "reuse_vjp_closure_at_same_primal"),
+        _fixed_axis_rule(_vjp_closure_reuse_axis),
+    ),
+    _single_axis_row(
+        "ggn.jvp_path",
+        JVP_VECTOR_LOOP_PATHS,
+        _fixed_axis_rule(_ggn_jvp_path_axis),
+    ),
+    _single_axis_row(
+        "ggn.loss_hessian_path",
+        ("closed_form_softmax_ce_kl", "autodiff_loss_hvp"),
+    ),
+    _single_axis_row(
+        "ggn.loss_hessian_kernel",
+        ("dense_global", "streaming_global", "two_pass_chunked_global"),
+    ),
+    _single_axis_row(
+        "ggn.vjp_path",
+        ("torch_func_vjp", "autograd_grad_outputs"),
+        _fixed_axis_rule(_ggn_vjp_path_axis),
+    ),
+    _single_axis_row("ggn.jvp_reuse", ("reuse_jvp", "recompute_jvp")),
+    _single_axis_row(
+        "ggn.cotangent_reuse",
+        ("reuse_output_cotangent", "recompute_output_cotangent"),
+    ),
+    _single_axis_row("fisher.accumulation", FISHER_VECTOR_ACCUMULATIONS),
+    _single_axis_row(
+        "fisher.expectation_path",
+        ("explicit_full_expectation_score_rows",),
+    ),
+    _single_axis_row(
+        "fisher.score_grad_path",
+        SCORE_GRAD_PATH_VALUES,
+        SCORE_GRAD_PATH_RULE,
+    ),
+    _single_axis_row("sampled_fisher.accumulation", FISHER_VECTOR_ACCUMULATIONS),
+    _single_axis_row(
+        "sampled_fisher.sample_source",
+        ("fixed_sample_table", "fixed_seed_and_count"),
+    ),
+    _single_axis_row(
+        "sampled_fisher.score_grad_path",
+        SCORE_GRAD_PATH_VALUES,
+        SCORE_GRAD_PATH_RULE,
+    ),
+    _single_axis_row(
+        "sampled_fisher.exact_fisher_check",
+        ("disabled", "enabled_with_sampling_bound"),
+    ),
+    _single_axis_row(
+        "empirical_fisher.grad_path",
+        SCORE_GRAD_PATH_VALUES,
+        SCORE_GRAD_PATH_RULE,
+    ),
+    _single_axis_row(
+        "empirical_fisher.accumulation",
+        (
+            "streaming_dot_accumulate",
+            "materialize_per_example_gradients",
+            "blockwise_gradient_matrix",
+        ),
+    ),
+    _single_axis_row(
+        "per_example_gradient.grad_path",
+        SCORE_GRAD_PATH_VALUES,
+        SCORE_GRAD_PATH_RULE,
+    ),
+    _single_axis_row(
+        "per_example_gradient.accumulation",
+        ("stacked_leading_axis", "blockwise_stacked"),
+        _fixed_axis_rule(_per_example_gradient_accumulation_axis),
+    ),
+    _multi_axis_row(
+        "forward_ad_flags",
+        FORWARD_AD_FIELDS,
+        (),
+        _all_settings_axis_rule(_bool_axis),
+    ),
+    _multi_axis_row(
+        "torch_func_admission",
+        TORCH_FUNC_AXIS_FIELDS,
+        (),
+        _fixed_axis_rule(_torch_func_axis),
+    ),
+    _single_axis_row(
+        "vectorization.mode",
+        ("single_loop", "manual_batch", "vmap"),
+        _fixed_axis_rule(_vectorization_mode_axis),
+    ),
+    _single_axis_row(
+        "vectorization.randomness",
+        ("error", "same", "different"),
+        _fixed_axis_rule(_vectorization_randomness_axis),
+    ),
+    _single_axis_row("vectorization.batch_size", (), POSITIVE_INT_RULE),
+    _single_axis_row(
+        "vectorization.vmap_chunk_size",
+        (),
+        _fixed_axis_rule(_vmap_chunk_size_axis),
+    ),
+    _single_axis_row(
+        "vectorization.in_dims",
+        (),
+        _fixed_axis_rule(_vmap_batch_in_dims_axis),
+    ),
+    _single_axis_row(
+        "batch.data_microbatch_size",
+        (),
+        _fixed_axis_rule(_gradient_accumulation_axis),
+    ),
+    *_single_axis_rows(
+        (
+            "batch.hvp_row_batch_size",
+            "batch.ggn_batch_size",
+            "batch.fisher_sample_batch_size",
+            "batch.empirical_example_batch_size",
+        ),
+        (),
+        POSITIVE_INT_RULE,
+    ),
+    _single_axis_row(
+        "batch.per_example_block_size",
+        (),
+        _fixed_axis_rule(_per_example_block_size_axis),
+    ),
+    _single_axis_row(
+        "schedule.per_example",
+        ("loop", "vmap", "manual_batch"),
+        _fixed_axis_rule(_per_example_schedule_axis),
+    ),
+    _single_axis_row(
+        "schedule.gradient_accumulation",
+        ("single_step", "microbatch_accumulate"),
+        _fixed_axis_rule(_gradient_accumulation_axis),
+    ),
+    _single_axis_row("schedule.per_token", ("loop", "packed")),
+    *_single_axis_rows(
+        ("chunk.token_block_size", "chunk.sequence_position_block_size"),
+        (),
+        POSITIVE_INT_RULE,
+    ),
+    _single_axis_row(
+        "input.batch_layout",
+        ("dense_padded", "packed_with_inverse_permutation", "variable_length"),
+    ),
+    _single_axis_row("input.length_grouping", ("none", "exact_length_bucket")),
+    _single_axis_row(
+        "input.host_to_device",
+        ("outside_measured_call", "inside_measured_call"),
+    ),
+    _single_axis_row("input.residency", ("cpu_staged", "cpu_pinned", "gpu")),
+    _single_axis_row(
+        "teacher_outputs",
+        (
+            "precomputed_cpu",
+            "precomputed_cpu_pinned",
+            "precomputed_gpu",
+            "recomputed_with_equality_check",
+        ),
+    ),
+    _single_axis_row(
+        "memory.vector_residency",
+        ("gpu", "cpu_pinned", "cpu_staged", "mmap_cpu"),
+    ),
+    _single_axis_row(
+        "memory.intermediate_residency",
+        ("gpu", "cpu_pinned", "cpu_staged"),
+        _fixed_axis_rule(_memory_intermediate_residency_axis),
+    ),
+    _single_axis_row(
+        "memory.factor_residency",
+        ("gpu", "cpu_pinned", "cpu_staged", "mmap_cpu"),
+    ),
+    _single_axis_row(
+        "memory.output_buffers",
+        ("fresh_allocation", "preallocated"),
+    ),
+    *_single_axis_rows(
+        (
+            "memory.primal_outputs",
+            "memory.jvp_outputs",
+            "memory.output_cotangents",
+        ),
+        RETAIN_OR_RECOMPUTE_VALUES,
+        MEMORY_OUTPUT_RULE,
+    ),
+    *_single_axis_rows(
+        (
+            "chunk.class_block_size_with_exact_global_normalization",
+            "chunk.output_cotangent_block_size",
+            "chunk.parameter_block_size",
+            "chunk.layer_block_size",
+            "chunk.lm_head_weight_chunk_bytes",
+        ),
+        (),
+        POSITIVE_INT_RULE,
+    ),
+    _single_axis_row("compile.enabled", FALSE_TRUE_VALUES, COMPILE_SETTING_RULE),
+    _single_axis_row(
+        "compile.boundary",
+        COMPILE_BOUNDARY_VALUES,
+        _fixed_axis_rule(_compile_boundary_axis),
+    ),
+    _single_axis_row("compile.backend", (), _fixed_axis_rule(_compile_backend_axis)),
+    _single_axis_row(
+        "compile.mode",
+        (None, "default", "max-autotune"),
+        COMPILE_SETTING_RULE,
+    ),
+    _single_axis_row("compile.fullgraph", FALSE_TRUE_VALUES, COMPILE_SETTING_RULE),
+    _single_axis_row("compile.dynamic", (None, "false", "true"), COMPILE_SETTING_RULE),
+    *_single_axis_rows(
+        (
+            "compile.compiled_autograd",
+            "compile.options.epilogue_fusion",
+            "compile.options.shape_padding",
+            "compile.cuda_graphs",
+        ),
+        FALSE_TRUE_VALUES,
+        COMPILE_SETTING_RULE,
+    ),
+    _single_axis_row(
+        "compile.cache_state",
+        ("cold_compile", "warm_cache"),
+        COMPILE_SETTING_RULE,
+    ),
+    _single_axis_row(
+        "activation.recompute",
+        (
+            "none",
+            "checkpoint_non_reentrant_by_layer",
+            "checkpoint_selective",
+            "manual_recompute",
+        ),
+    ),
+    _single_axis_row(
+        "activation.offload",
+        ("none", "saved_tensor_hooks_cpu", "custom_saved_tensor_hooks"),
+        _fixed_axis_rule(_activation_offload_axis),
+        optional_settings_keys=("activation.pack_hook", "activation.unpack_hook"),
+    ),
+    _single_axis_row(
+        "checkpoint.use_reentrant",
+        ("false",),
+        optional_settings_keys=(
+            "checkpoint.moves_to_new_device",
+            "checkpoint.uses_global_state",
+        ),
+    ),
+    *_single_axis_rows(
+        ("checkpoint.early_stop", "checkpoint.preserve_rng_state"),
+        FALSE_TRUE_VALUES,
+    ),
+    _single_axis_row("checkpoint.determinism_check", ("default", "none")),
+    _single_axis_row(
+        "checkpoint.context_fn",
+        ("none", "declared_context_pair"),
+        _fixed_axis_rule(_checkpoint_context_axis),
+        optional_settings_keys=("checkpoint.context_fn_callable",),
+    ),
+    _single_axis_row("numeric.float32_matmul_precision", MATMUL_PRECISION_VALUES),
+    _single_axis_row("autocast", ("off", "cuda_fp16", "cuda_bf16")),
+    _single_axis_row(
+        "metric.multiply_path",
+        (
+            "dense_matmul",
+            "factorized_multiply",
+            "blockwise_multiply",
+            "streaming_multiply",
+        ),
+    ),
+    _single_axis_row("metric.accumulation", ("streaming", "materialized_blocks")),
+    _single_axis_row("metric.block_schedule", LAYER_BLOCK_VALUES),
+    _single_axis_row(
+        "metric_inner.reduction_path",
+        METRIC_INNER_REDUCTION_VALUES,
+        _fixed_axis_rule(_metric_inner_reduction_path_axis),
+    ),
+    _single_axis_row(
+        "metric_inner.multi_rhs",
+        SINGLE_OR_BLOCK_VALUES,
+        METRIC_INNER_MULTI_RHS_RULE,
+    ),
+    _single_axis_row(
+        "sqrt_metric.factor_path",
+        (
+            "closed_form_factor_square_root",
+            "cholesky_factor",
+            "eigenbasis_factor",
+            "matrix_free_lanczos",
+        ),
+        _fixed_axis_rule(_sqrt_metric_factor_path_axis),
+    ),
+    _single_axis_row(
+        "sqrt_metric.lanczos_iterations",
+        (),
+        _fixed_axis_rule(_sqrt_metric_lanczos_iterations_axis),
+    ),
+    _single_axis_row("inverse_metric.solve_path", INVERSE_METRIC_VECTOR_LOOP_PATHS),
+    _single_axis_row(
+        "inverse_metric.preconditioner",
+        ("none", "diagonal", "block_diagonal", "factorized_metric", "matrix_free"),
+        _fixed_axis_rule(_inverse_metric_preconditioner_axis),
+    ),
+    _single_axis_row("inverse_metric.iteration_budget", (), POSITIVE_INT_RULE),
+    _single_axis_row(
+        "inverse_metric.factor_reuse",
+        ("refactor_each_rhs", "reuse_factor_across_rhs"),
+    ),
+    _single_axis_row("inverse_metric.block_schedule", LAYER_BLOCK_VALUES),
+    _single_axis_row(
+        "inverse_metric.multi_rhs",
+        SINGLE_OR_BLOCK_VALUES,
+        _fixed_axis_rule(_inverse_metric_multi_rhs_axis),
+    ),
+    _single_axis_row(
+        "inverse_metric_inner.reduction_path",
+        INVERSE_METRIC_INNER_REDUCTION_VALUES,
+        _fixed_axis_rule(_inverse_metric_inner_reduction_path_axis),
+    ),
+    _single_axis_row(
+        "inverse_metric_inner.multi_rhs",
+        SINGLE_OR_BLOCK_VALUES,
+        METRIC_INNER_MULTI_RHS_RULE,
+    ),
+    _single_axis_row(
+        "composition.execution",
+        (
+            "materialize_each_child",
+            "stream_child_outputs",
+            "fuse_adjacent_children",
+            "compile_whole_composition",
+        ),
+        _fixed_axis_rule(_composition_execution_axis),
+    ),
+    _single_axis_row(
+        "composition.child_evaluation",
+        ("selected_child_rows", "inline_child_lowering"),
+    ),
+    _single_axis_row(
+        "composition.validation",
+        ("validate_each_child", "validate_composed_output"),
+    ),
+    *_single_axis_rows(
+        (
+            "numeric.bf16_reduced_precision_reduction",
+            "numeric.fp16_reduced_precision_reduction",
+        ),
+        FALSE_TRUE_VALUES,
+    ),
+    _single_axis_row(
+        "fusion.norm",
+        ("model_default", "fused_rmsnorm", "fused_layernorm"),
+    ),
+    _single_axis_row("fusion.mlp", ("model_default", "fused_mlp")),
+    _single_axis_row("fusion.rope", ("model_default", "fused_rope")),
+    _single_axis_row("fusion.logits", ("model_default", "fused_logits_projection")),
+    _single_axis_row("fusion.loss", ("model_default", "fused_ce", "fused_kl")),
+    _single_axis_row("numeric.deterministic_algorithms", FALSE_TRUE_VALUES),
+    _single_axis_row(
+        "numeric.loss_scaling",
+        ("none", "static_scale_with_exact_unscale"),
+        _fixed_axis_rule(_loss_scaling_axis),
+        optional_settings_keys=("numeric.loss_scale", "numeric.loss_unscale_degree"),
+    ),
+)
+
+
 def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
     """Return standard core axis descriptors."""
-    return (
-        AxisDescriptor(
-            "dtype.parameter_storage",
-            ("dtype.parameter_storage",),
-            SPEC_STORAGE_COMPUTE_DTYPE_VALUES,
-            admission_rule=_storage_compute_dtype_axis("dtype.parameter_storage"),
-        ),
-        AxisDescriptor(
-            "dtype.model_compute",
-            ("dtype.model_compute",),
-            SPEC_STORAGE_COMPUTE_DTYPE_VALUES,
-            admission_rule=_storage_compute_dtype_axis("dtype.model_compute"),
-        ),
-        AxisDescriptor(
-            "dtype.autodiff_compute",
-            ("dtype.autodiff_compute",),
-            SPEC_DTYPE_VALUES,
-        ),
-        AxisDescriptor(
-            "dtype.accumulation",
-            ("dtype.accumulation",),
-            SPEC_DTYPE_VALUES,
-        ),
-        AxisDescriptor("dtype.vector", ("dtype.vector",), SPEC_DTYPE_VALUES),
-        AxisDescriptor(
-            "dtype.intermediate",
-            ("dtype.intermediate",),
-            SPEC_DTYPE_VALUES,
-        ),
-        AxisDescriptor(
-            "dtype.metric_factor",
-            ("dtype.metric_factor",),
-            SPEC_DTYPE_VALUES,
-        ),
-        AxisDescriptor("dtype.output", ("dtype.output",), SPEC_DTYPE_VALUES),
-        AxisDescriptor(
-            "layout.params",
-            ("layout.params",),
-            (
-                "parameter_tree",
-                "flat_contiguous",
-                "per_layer_flat",
-                "per_block_flat",
-                "per_shard",
-                "dtensor",
-            ),
-            admission_rule=_layout_tree_axis("layout.params"),
-        ),
-        AxisDescriptor(
-            "layout.vector",
-            ("layout.vector",),
-            (
-                "parameter_tree",
-                "flat_contiguous",
-                "per_layer_flat",
-                "per_block_flat",
-                "per_shard",
-                "dtensor",
-            ),
-            admission_rule=_layout_tree_axis("layout.vector"),
-        ),
-        AxisDescriptor(
-            "layout.output",
-            ("layout.output",),
-            (
-                "parameter_tree",
-                "flat_contiguous",
-                "per_layer_flat",
-                "per_block_flat",
-                "per_shard",
-                "dtensor",
-            ),
-            admission_rule=_layout_tree_axis("layout.output"),
-        ),
-        AxisDescriptor(
-            "layout.contiguity",
-            ("layout.contiguity",),
-            ("contiguous", "preserve_existing_strides"),
-        ),
-        AxisDescriptor(
-            "layout.flatten_order",
-            ("layout.flatten_order",),
-            ("canonical_parameter_order",),
-        ),
-        AxisDescriptor(
-            "layout.vector_ops",
-            ("layout.vector_ops",),
-            ("python_loop", "foreach"),
-        ),
-        AxisDescriptor(
-            "layout.aliasing",
-            ("layout.aliasing",),
-            ("preserve_tied_weight_aliases",),
-        ),
-        AxisDescriptor(
-            "layout.parametrizations",
-            ("layout.parametrizations",),
-            ("preserve_active_parametrizations",),
-        ),
-        AxisDescriptor(
-            "call.path", ("call.path",), ("functional_call", "stateful_module")
-        ),
-        AxisDescriptor(
-            "call.params", ("call.params",), ("explicit_params", "module_params")
-        ),
-        AxisDescriptor(
-            "call.buffers",
-            ("call.buffers",),
-            ("explicit_buffers", "module_buffers"),
-        ),
-        AxisDescriptor(
-            "call.tied_weights",
-            ("call.tied_weights",),
-            ("preserve_alias_groups",),
-        ),
-        AxisDescriptor(
-            "call.parametrizations",
-            ("call.parametrizations",),
-            ("preserve_parametrizations",),
-        ),
-        AxisDescriptor(
-            "call.buffer_mutation",
-            ("call.buffer_mutation",),
-            ("forbidden", "declared_and_restored"),
-        ),
-        AxisDescriptor("call.grad_mode", ("call.grad_mode",), ("grad_enabled",)),
-        AxisDescriptor(
-            "call.return_type",
-            ("call.return_type",),
-            ("raw_tensor_tree", "model_output_object_with_declared_fields"),
-        ),
-        AxisDescriptor(
-            "hvp.path",
-            ("hvp.path",),
-            (
-                "reverse_over_reverse",
-                "autograd_functional_hvp",
-                "autograd_functional_vhp",
-                "jvp_grad",
-                "forward_ad_dual",
-                "linearize_grad",
-            ),
-            admission_rule=_hvp_path_axis(),
-        ),
-        AxisDescriptor(
-            "hvp.graph_schedule",
-            ("hvp.graph_schedule",),
-            ("retain_graph_across_vectors", "rebuild_graph_per_vector"),
-        ),
-        AxisDescriptor(
-            "hvp.primal_reuse",
-            ("hvp.primal_reuse",),
-            ("reuse_primal", "recompute_primal"),
-        ),
-        AxisDescriptor(
-            "hvp.gradient_reuse",
-            ("hvp.gradient_reuse",),
-            ("reuse_gradient_closure", "recompute_gradient"),
-        ),
-        AxisDescriptor(
-            "gradient.path",
-            ("gradient.path",),
-            (
-                "torch_autograd_grad",
-                "torch_func_grad",
-                "torch_func_grad_and_value",
-                "backward_materialized_grad",
-            ),
-            admission_rule=_gradient_path_axis(),
-        ),
-        AxisDescriptor(
-            "gradient.value_reuse",
-            ("gradient.value_reuse",),
-            ("gradient_only", "gradient_and_primal_value"),
-            admission_rule=_gradient_value_reuse_axis(),
-        ),
-        AxisDescriptor(
-            "gradient.graph_schedule",
-            ("gradient.graph_schedule",),
-            ("build_once", "rebuild_per_call"),
-        ),
-        AxisDescriptor(
-            "jvp.path",
-            ("jvp.path",),
-            ("torch_func_jvp", "forward_ad_dual", "torch_func_linearize"),
-            admission_rule=_jvp_path_axis(),
-        ),
-        AxisDescriptor(
-            "jvp.linearize_reuse",
-            ("jvp.linearize_reuse",),
-            ("none", "reuse_at_same_primal"),
-            admission_rule=_jvp_linearize_reuse_axis(),
-        ),
-        AxisDescriptor(
-            "vjp.path",
-            ("vjp.path",),
-            ("torch_func_vjp", "autograd_grad_outputs", "backward_materialized_grad"),
-            admission_rule=_vjp_path_axis(),
-        ),
-        AxisDescriptor(
-            "vjp.closure_reuse",
-            ("vjp.closure_reuse",),
-            ("none", "reuse_vjp_closure_at_same_primal"),
-            admission_rule=_vjp_closure_reuse_axis(),
-        ),
-        AxisDescriptor(
-            "ggn.jvp_path",
-            ("ggn.jvp_path",),
-            ("torch_func_jvp", "forward_ad_dual", "torch_func_linearize"),
-            admission_rule=_ggn_jvp_path_axis(),
-        ),
-        AxisDescriptor(
-            "ggn.loss_hessian_path",
-            ("ggn.loss_hessian_path",),
-            ("closed_form_softmax_ce_kl", "autodiff_loss_hvp"),
-        ),
-        AxisDescriptor(
-            "ggn.loss_hessian_kernel",
-            ("ggn.loss_hessian_kernel",),
-            ("dense_global", "streaming_global", "two_pass_chunked_global"),
-        ),
-        AxisDescriptor(
-            "ggn.vjp_path",
-            ("ggn.vjp_path",),
-            ("torch_func_vjp", "autograd_grad_outputs"),
-            admission_rule=_ggn_vjp_path_axis(),
-        ),
-        AxisDescriptor(
-            "ggn.jvp_reuse",
-            ("ggn.jvp_reuse",),
-            ("reuse_jvp", "recompute_jvp"),
-        ),
-        AxisDescriptor(
-            "ggn.cotangent_reuse",
-            ("ggn.cotangent_reuse",),
-            ("reuse_output_cotangent", "recompute_output_cotangent"),
-        ),
-        AxisDescriptor(
-            "fisher.accumulation",
-            ("fisher.accumulation",),
-            (
-                "streaming_dot_accumulate",
-                "materialize_score_gradients",
-                "blockwise_score_matrix",
-            ),
-        ),
-        AxisDescriptor(
-            "fisher.expectation_path",
-            ("fisher.expectation_path",),
-            ("explicit_full_expectation_score_rows",),
-        ),
-        AxisDescriptor(
-            "fisher.score_grad_path",
-            ("fisher.score_grad_path",),
-            (
-                "torch_autograd_grad_loop",
-                "torch_func_grad",
-                "vmap_grad",
-                "backward_materialized_grad",
-            ),
-            admission_rule=_fisher_score_grad_path_axis(),
-        ),
-        AxisDescriptor(
-            "sampled_fisher.accumulation",
-            ("sampled_fisher.accumulation",),
-            (
-                "streaming_dot_accumulate",
-                "materialize_score_gradients",
-                "blockwise_score_matrix",
-            ),
-        ),
-        AxisDescriptor(
-            "sampled_fisher.sample_source",
-            ("sampled_fisher.sample_source",),
-            (
-                "fixed_sample_table",
-                "fixed_seed_and_count",
-            ),
-        ),
-        AxisDescriptor(
-            "sampled_fisher.score_grad_path",
-            ("sampled_fisher.score_grad_path",),
-            (
-                "torch_autograd_grad_loop",
-                "torch_func_grad",
-                "vmap_grad",
-                "backward_materialized_grad",
-            ),
-            admission_rule=_sampled_fisher_score_grad_path_axis(),
-        ),
-        AxisDescriptor(
-            "sampled_fisher.exact_fisher_check",
-            ("sampled_fisher.exact_fisher_check",),
-            ("disabled", "enabled_with_sampling_bound"),
-        ),
-        AxisDescriptor(
-            "empirical_fisher.grad_path",
-            ("empirical_fisher.grad_path",),
-            (
-                "torch_autograd_grad_loop",
-                "torch_func_grad",
-                "vmap_grad",
-                "backward_materialized_grad",
-            ),
-            admission_rule=_empirical_fisher_grad_path_axis(),
-        ),
-        AxisDescriptor(
-            "empirical_fisher.accumulation",
-            ("empirical_fisher.accumulation",),
-            (
-                "streaming_dot_accumulate",
-                "materialize_per_example_gradients",
-                "blockwise_gradient_matrix",
-            ),
-        ),
-        AxisDescriptor(
-            "per_example_gradient.grad_path",
-            ("per_example_gradient.grad_path",),
-            (
-                "torch_autograd_grad_loop",
-                "torch_func_grad",
-                "vmap_grad",
-                "backward_materialized_grad",
-            ),
-            admission_rule=_per_example_gradient_grad_path_axis(),
-        ),
-        AxisDescriptor(
-            "per_example_gradient.accumulation",
-            ("per_example_gradient.accumulation",),
-            ("stacked_leading_axis", "blockwise_stacked"),
-            admission_rule=_per_example_gradient_accumulation_axis(),
-        ),
-        AxisDescriptor(
-            "forward_ad_flags",
-            FORWARD_AD_FIELDS,
-            (),
-            admission_rule=_bool_axis(*FORWARD_AD_FIELDS),
-        ),
-        AxisDescriptor(
-            "torch_func_admission",
-            TORCH_FUNC_AXIS_FIELDS,
-            (),
-            admission_rule=_torch_func_axis(),
-        ),
-        AxisDescriptor(
-            "vectorization.mode",
-            ("vectorization.mode",),
-            ("single_loop", "manual_batch", "vmap"),
-            admission_rule=_vectorization_mode_axis(),
-        ),
-        AxisDescriptor(
-            "vectorization.randomness",
-            ("vectorization.randomness",),
-            ("error", "same", "different"),
-            admission_rule=_vectorization_randomness_axis(),
-        ),
-        AxisDescriptor(
-            "vectorization.batch_size",
-            ("vectorization.batch_size",),
-            (),
-            admission_rule=_positive_int_axis("vectorization.batch_size"),
-        ),
-        AxisDescriptor(
-            "vectorization.vmap_chunk_size",
-            ("vectorization.vmap_chunk_size",),
-            (),
-            admission_rule=_vmap_chunk_size_axis(),
-        ),
-        AxisDescriptor(
-            "vectorization.in_dims",
-            ("vectorization.in_dims",),
-            (),
-            admission_rule=_vmap_batch_in_dims_axis(),
-        ),
-        AxisDescriptor(
-            "batch.data_microbatch_size",
-            ("batch.data_microbatch_size",),
-            (),
-            admission_rule=_gradient_accumulation_axis(),
-        ),
-        AxisDescriptor(
-            "batch.hvp_row_batch_size",
-            ("batch.hvp_row_batch_size",),
-            (),
-            admission_rule=_positive_int_axis("batch.hvp_row_batch_size"),
-        ),
-        AxisDescriptor(
-            "batch.ggn_batch_size",
-            ("batch.ggn_batch_size",),
-            (),
-            admission_rule=_positive_int_axis("batch.ggn_batch_size"),
-        ),
-        AxisDescriptor(
-            "batch.fisher_sample_batch_size",
-            ("batch.fisher_sample_batch_size",),
-            (),
-            admission_rule=_positive_int_axis("batch.fisher_sample_batch_size"),
-        ),
-        AxisDescriptor(
-            "batch.empirical_example_batch_size",
-            ("batch.empirical_example_batch_size",),
-            (),
-            admission_rule=_positive_int_axis("batch.empirical_example_batch_size"),
-        ),
-        AxisDescriptor(
-            "batch.per_example_block_size",
-            ("batch.per_example_block_size",),
-            (),
-            admission_rule=_per_example_block_size_axis(),
-        ),
-        AxisDescriptor(
-            "schedule.per_example",
-            ("schedule.per_example",),
-            ("loop", "vmap", "manual_batch"),
-            admission_rule=_per_example_schedule_axis(),
-        ),
-        AxisDescriptor(
-            "schedule.gradient_accumulation",
-            ("schedule.gradient_accumulation",),
-            ("single_step", "microbatch_accumulate"),
-            admission_rule=_gradient_accumulation_axis(),
-        ),
-        AxisDescriptor(
-            "schedule.per_token", ("schedule.per_token",), ("loop", "packed")
-        ),
-        AxisDescriptor(
-            "chunk.token_block_size",
-            ("chunk.token_block_size",),
-            (),
-            admission_rule=_positive_int_axis("chunk.token_block_size"),
-        ),
-        AxisDescriptor(
-            "chunk.sequence_position_block_size",
-            ("chunk.sequence_position_block_size",),
-            (),
-            admission_rule=_positive_int_axis("chunk.sequence_position_block_size"),
-        ),
-        AxisDescriptor(
-            "input.batch_layout",
-            ("input.batch_layout",),
-            ("dense_padded", "packed_with_inverse_permutation", "variable_length"),
-        ),
-        AxisDescriptor(
-            "input.length_grouping",
-            ("input.length_grouping",),
-            ("none", "exact_length_bucket"),
-        ),
-        AxisDescriptor(
-            "input.host_to_device",
-            ("input.host_to_device",),
-            ("outside_measured_call", "inside_measured_call"),
-        ),
-        AxisDescriptor(
-            "input.residency",
-            ("input.residency",),
-            ("cpu_staged", "cpu_pinned", "gpu"),
-        ),
-        AxisDescriptor(
-            "teacher_outputs",
-            ("teacher_outputs",),
-            (
-                "precomputed_cpu",
-                "precomputed_cpu_pinned",
-                "precomputed_gpu",
-                "recomputed_with_equality_check",
-            ),
-        ),
-        AxisDescriptor(
-            "memory.vector_residency",
-            ("memory.vector_residency",),
-            ("gpu", "cpu_pinned", "cpu_staged", "mmap_cpu"),
-        ),
-        AxisDescriptor(
-            "memory.intermediate_residency",
-            ("memory.intermediate_residency",),
-            ("gpu", "cpu_pinned", "cpu_staged"),
-            admission_rule=_memory_intermediate_residency_axis(),
-        ),
-        AxisDescriptor(
-            "memory.factor_residency",
-            ("memory.factor_residency",),
-            ("gpu", "cpu_pinned", "cpu_staged", "mmap_cpu"),
-        ),
-        AxisDescriptor(
-            "memory.output_buffers",
-            ("memory.output_buffers",),
-            ("fresh_allocation", "preallocated"),
-        ),
-        AxisDescriptor(
-            "memory.primal_outputs",
-            ("memory.primal_outputs",),
-            ("retain", "recompute"),
-            admission_rule=_memory_output_axis("memory.primal_outputs"),
-        ),
-        AxisDescriptor(
-            "memory.jvp_outputs",
-            ("memory.jvp_outputs",),
-            ("retain", "recompute"),
-            admission_rule=_memory_output_axis("memory.jvp_outputs"),
-        ),
-        AxisDescriptor(
-            "memory.output_cotangents",
-            ("memory.output_cotangents",),
-            ("retain", "recompute"),
-            admission_rule=_memory_output_axis("memory.output_cotangents"),
-        ),
-        AxisDescriptor(
-            "chunk.class_block_size_with_exact_global_normalization",
-            ("chunk.class_block_size_with_exact_global_normalization",),
-            (),
-            admission_rule=_positive_int_axis(
-                "chunk.class_block_size_with_exact_global_normalization",
-            ),
-        ),
-        AxisDescriptor(
-            "chunk.output_cotangent_block_size",
-            ("chunk.output_cotangent_block_size",),
-            (),
-            admission_rule=_positive_int_axis("chunk.output_cotangent_block_size"),
-        ),
-        AxisDescriptor(
-            "chunk.parameter_block_size",
-            ("chunk.parameter_block_size",),
-            (),
-            admission_rule=_positive_int_axis("chunk.parameter_block_size"),
-        ),
-        AxisDescriptor(
-            "chunk.layer_block_size",
-            ("chunk.layer_block_size",),
-            (),
-            admission_rule=_positive_int_axis("chunk.layer_block_size"),
-        ),
-        AxisDescriptor(
-            "chunk.lm_head_weight_chunk_bytes",
-            ("chunk.lm_head_weight_chunk_bytes",),
-            (),
-            admission_rule=_positive_int_axis("chunk.lm_head_weight_chunk_bytes"),
-        ),
-        AxisDescriptor(
-            "compile.enabled",
-            ("compile.enabled",),
-            ("false", "true"),
-            admission_rule=_compile_setting_axis(),
-        ),
-        AxisDescriptor(
-            "compile.boundary",
-            ("compile.boundary",),
-            COMPILE_BOUNDARY_VALUES,
-            admission_rule=_compile_boundary_axis(),
-        ),
-        AxisDescriptor(
-            "compile.backend",
-            ("compile.backend",),
-            (),
-            admission_rule=_compile_backend_axis(),
-        ),
-        AxisDescriptor(
-            "compile.mode",
-            ("compile.mode",),
-            (None, "default", "max-autotune"),
-            admission_rule=_compile_setting_axis(),
-        ),
-        AxisDescriptor(
-            "compile.fullgraph",
-            ("compile.fullgraph",),
-            ("false", "true"),
-            admission_rule=_compile_setting_axis(),
-        ),
-        AxisDescriptor(
-            "compile.dynamic",
-            ("compile.dynamic",),
-            (None, "false", "true"),
-            admission_rule=_compile_setting_axis(),
-        ),
-        AxisDescriptor(
-            "compile.compiled_autograd",
-            ("compile.compiled_autograd",),
-            ("false", "true"),
-            admission_rule=_compile_setting_axis(),
-        ),
-        AxisDescriptor(
-            "compile.options.epilogue_fusion",
-            ("compile.options.epilogue_fusion",),
-            ("false", "true"),
-            admission_rule=_compile_setting_axis(),
-        ),
-        AxisDescriptor(
-            "compile.options.shape_padding",
-            ("compile.options.shape_padding",),
-            ("false", "true"),
-            admission_rule=_compile_setting_axis(),
-        ),
-        AxisDescriptor(
-            "compile.cuda_graphs",
-            ("compile.cuda_graphs",),
-            ("false", "true"),
-            admission_rule=_compile_setting_axis(),
-        ),
-        AxisDescriptor(
-            "compile.cache_state",
-            ("compile.cache_state",),
-            ("cold_compile", "warm_cache"),
-            admission_rule=_compile_setting_axis(),
-        ),
-        AxisDescriptor(
-            "activation.recompute",
-            ("activation.recompute",),
-            (
-                "none",
-                "checkpoint_non_reentrant_by_layer",
-                "checkpoint_selective",
-                "manual_recompute",
-            ),
-        ),
-        AxisDescriptor(
-            "activation.offload",
-            ("activation.offload",),
-            ("none", "saved_tensor_hooks_cpu", "custom_saved_tensor_hooks"),
-            optional_settings_keys=("activation.pack_hook", "activation.unpack_hook"),
-            admission_rule=_activation_offload_axis(),
-        ),
-        AxisDescriptor(
-            "checkpoint.use_reentrant",
-            ("checkpoint.use_reentrant",),
-            ("false",),
-            optional_settings_keys=(
-                "checkpoint.moves_to_new_device",
-                "checkpoint.uses_global_state",
-            ),
-        ),
-        AxisDescriptor(
-            "checkpoint.early_stop",
-            ("checkpoint.early_stop",),
-            ("false", "true"),
-        ),
-        AxisDescriptor(
-            "checkpoint.preserve_rng_state",
-            ("checkpoint.preserve_rng_state",),
-            ("false", "true"),
-        ),
-        AxisDescriptor(
-            "checkpoint.determinism_check",
-            ("checkpoint.determinism_check",),
-            ("default", "none"),
-        ),
-        AxisDescriptor(
-            "checkpoint.context_fn",
-            ("checkpoint.context_fn",),
-            ("none", "declared_context_pair"),
-            optional_settings_keys=("checkpoint.context_fn_callable",),
-            admission_rule=_checkpoint_context_axis(),
-        ),
-        AxisDescriptor(
-            "numeric.float32_matmul_precision",
-            ("numeric.float32_matmul_precision",),
-            MATMUL_PRECISION_VALUES,
-        ),
-        AxisDescriptor(
-            "autocast",
-            ("autocast",),
-            ("off", "cuda_fp16", "cuda_bf16"),
-        ),
-        AxisDescriptor(
-            "metric.multiply_path",
-            ("metric.multiply_path",),
-            (
-                "dense_matmul",
-                "factorized_multiply",
-                "blockwise_multiply",
-                "streaming_multiply",
-            ),
-        ),
-        AxisDescriptor(
-            "metric.accumulation",
-            ("metric.accumulation",),
-            ("streaming", "materialized_blocks"),
-        ),
-        AxisDescriptor(
-            "metric.block_schedule",
-            ("metric.block_schedule",),
-            ("layer_blocks", "module_blocks", "custom_blocks"),
-        ),
-        AxisDescriptor(
-            "metric_inner.reduction_path",
-            ("metric_inner.reduction_path",),
-            ("multiply_then_reduce", "factored_gram", "sqrt_apply_reduce"),
-            admission_rule=_metric_inner_reduction_path_axis(),
-        ),
-        AxisDescriptor(
-            "metric_inner.multi_rhs",
-            ("metric_inner.multi_rhs",),
-            ("single_column", "block"),
-            admission_rule=_metric_inner_multi_rhs_axis("metric_inner.multi_rhs"),
-        ),
-        AxisDescriptor(
-            "sqrt_metric.factor_path",
-            ("sqrt_metric.factor_path",),
-            (
-                "closed_form_factor_square_root",
-                "cholesky_factor",
-                "eigenbasis_factor",
-                "matrix_free_lanczos",
-            ),
-            admission_rule=_sqrt_metric_factor_path_axis(),
-        ),
-        AxisDescriptor(
-            "sqrt_metric.lanczos_iterations",
-            ("sqrt_metric.lanczos_iterations",),
-            (),
-            admission_rule=_sqrt_metric_lanczos_iterations_axis(),
-        ),
-        AxisDescriptor(
-            "inverse_metric.solve_path",
-            ("inverse_metric.solve_path",),
-            (
-                "dense_solve",
-                "cholesky_solve",
-                "eigh_solve",
-                "svd_solve",
-                "conjugate_gradient",
-                "factorized_solve",
-                "blockwise_solve",
-                "woodbury_low_rank_solve",
-            ),
-        ),
-        AxisDescriptor(
-            "inverse_metric.preconditioner",
-            ("inverse_metric.preconditioner",),
-            ("none", "diagonal", "block_diagonal", "factorized_metric", "matrix_free"),
-            admission_rule=_inverse_metric_preconditioner_axis(),
-        ),
-        AxisDescriptor(
-            "inverse_metric.iteration_budget",
-            ("inverse_metric.iteration_budget",),
-            (),
-            admission_rule=_positive_int_axis("inverse_metric.iteration_budget"),
-        ),
-        AxisDescriptor(
-            "inverse_metric.factor_reuse",
-            ("inverse_metric.factor_reuse",),
-            ("refactor_each_rhs", "reuse_factor_across_rhs"),
-        ),
-        AxisDescriptor(
-            "inverse_metric.block_schedule",
-            ("inverse_metric.block_schedule",),
-            ("layer_blocks", "module_blocks", "custom_blocks"),
-        ),
-        AxisDescriptor(
-            "inverse_metric.multi_rhs",
-            ("inverse_metric.multi_rhs",),
-            ("single_column", "block"),
-            admission_rule=_inverse_metric_multi_rhs_axis(),
-        ),
-        AxisDescriptor(
-            "inverse_metric_inner.reduction_path",
-            ("inverse_metric_inner.reduction_path",),
-            ("solve_then_reduce", "factored_gram", "sqrt_apply_reduce"),
-            admission_rule=_inverse_metric_inner_reduction_path_axis(),
-        ),
-        AxisDescriptor(
-            "inverse_metric_inner.multi_rhs",
-            ("inverse_metric_inner.multi_rhs",),
-            ("single_column", "block"),
-            admission_rule=_metric_inner_multi_rhs_axis(
-                "inverse_metric_inner.multi_rhs"
-            ),
-        ),
-        AxisDescriptor(
-            "composition.execution",
-            ("composition.execution",),
-            (
-                "materialize_each_child",
-                "stream_child_outputs",
-                "fuse_adjacent_children",
-                "compile_whole_composition",
-            ),
-            admission_rule=_composition_execution_axis(),
-        ),
-        AxisDescriptor(
-            "composition.child_evaluation",
-            ("composition.child_evaluation",),
-            ("selected_child_rows", "inline_child_lowering"),
-        ),
-        AxisDescriptor(
-            "composition.validation",
-            ("composition.validation",),
-            ("validate_each_child", "validate_composed_output"),
-        ),
-        AxisDescriptor(
-            "numeric.bf16_reduced_precision_reduction",
-            ("numeric.bf16_reduced_precision_reduction",),
-            ("false", "true"),
-        ),
-        AxisDescriptor(
-            "numeric.fp16_reduced_precision_reduction",
-            ("numeric.fp16_reduced_precision_reduction",),
-            ("false", "true"),
-        ),
-        AxisDescriptor(
-            "fusion.norm",
-            ("fusion.norm",),
-            ("model_default", "fused_rmsnorm", "fused_layernorm"),
-        ),
-        AxisDescriptor(
-            "fusion.mlp",
-            ("fusion.mlp",),
-            ("model_default", "fused_mlp"),
-        ),
-        AxisDescriptor(
-            "fusion.rope",
-            ("fusion.rope",),
-            ("model_default", "fused_rope"),
-        ),
-        AxisDescriptor(
-            "fusion.logits",
-            ("fusion.logits",),
-            ("model_default", "fused_logits_projection"),
-        ),
-        AxisDescriptor(
-            "fusion.loss",
-            ("fusion.loss",),
-            ("model_default", "fused_ce", "fused_kl"),
-        ),
-        AxisDescriptor(
-            "numeric.deterministic_algorithms",
-            ("numeric.deterministic_algorithms",),
-            ("false", "true"),
-        ),
-        AxisDescriptor(
-            "numeric.loss_scaling",
-            ("numeric.loss_scaling",),
-            ("none", "static_scale_with_exact_unscale"),
-            optional_settings_keys=(
-                "numeric.loss_scale",
-                "numeric.loss_unscale_degree",
-            ),
-            admission_rule=_loss_scaling_axis(),
-        ),
-    )
+    return tuple(_standard_axis_from_row(row) for row in STANDARD_AXIS_ROWS)
 
 
 def standard_axis_registry(*, exclude: Sequence[str] = ()) -> AxisRegistry:

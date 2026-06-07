@@ -1041,25 +1041,29 @@ class _ScalarLossObjective:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class _SoftmaxCrossEntropyObjective:
+class _LossObjective:
     model: Model
+    kind: str
+    mode: str
     output: str
-    labels: str
+    target_key: str
+    target: str
     mask: str | None
     reduction: str
     denominator: str
 
     def identity(self) -> Mapping[str, Any]:
-        """Return stable scalar objective identity fields."""
-        return {
-            "kind": "loss.softmax_cross_entropy",
-            "output": self.output,
-            "labels": self.labels,
-            "mask": self.mask,
-            "reduction": self.reduction,
-            "denominator": self.denominator,
-            "model": self.model.signature(),
-        }
+        """Return stable loss objective identity fields."""
+        return _loss_identity_fields(
+            self._identity_kind(),
+            self.output,
+            self.target_key,
+            self.target,
+            self.mask,
+            self.reduction,
+            self.denominator,
+            model=self.model,
+        )
 
     def __call__(
         self,
@@ -1068,18 +1072,53 @@ class _SoftmaxCrossEntropyObjective:
         batch: Batch,
         context: Any,
     ) -> torch.Tensor:
-        """Evaluate softmax cross entropy over the declared model output.
+        """Evaluate a typed loss objective.
 
         Returns:
-            Scalar CE loss tensor.
+            Scalar or per-example loss tensor.
+
+        Raises:
+            MaterializationError: If the private loss lowering state is unsupported.
         """
         _ = context
-        output = _call_model(self.model, params, buffers, batch)
-        logits = _single_tensor_output(
-            _select_model_output(self.model, output, self.output),
-            self.output,
-        )
-        labels = _batch_long_tensor(batch, self.labels)
+
+        if self.mode == "per_example":
+            if self.kind != "softmax_cross_entropy":
+                message = f"loss kind has no per-example lowering: {self.kind}"
+                raise MaterializationError(message)
+
+            return self._softmax_cross_entropy_per_example(
+                params,
+                buffers,
+                batch,
+            )
+
+        if self.kind == "softmax_cross_entropy":
+            return self._softmax_cross_entropy(params, buffers, batch)
+
+        if self.kind == "kl":
+            return self._kl(params, buffers, batch)
+
+        if self.kind == "mse":
+            return self._mse(params, buffers, batch)
+
+        message = f"loss kind is not lowered: {self.kind}"
+        raise MaterializationError(message)
+
+    def _identity_kind(self) -> str:
+        if self.mode == "per_example":
+            return "loss.softmax_cross_entropy.per_example"
+
+        return f"loss.{self.kind}"
+
+    def _softmax_cross_entropy(
+        self,
+        params: ParameterTree,
+        buffers: BufferTree,
+        batch: Batch,
+    ) -> torch.Tensor:
+        logits = _model_output_tensor(self.model, params, buffers, batch, self.output)
+        labels = _batch_long_tensor(batch, self.target)
         losses = _softmax_cross_entropy_losses(logits, labels)
         mask = _loss_mask(batch, self.mask, labels.shape)
 
@@ -1094,46 +1133,31 @@ class _SoftmaxCrossEntropyObjective:
             denominator=self.denominator,
         )
 
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class _KLLossObjective:
-    model: Model
-    output: str
-    target: str
-    mask: str | None
-    reduction: str
-    denominator: str
-
-    def identity(self) -> Mapping[str, Any]:
-        """Return stable scalar objective identity fields."""
-        return {
-            "kind": "loss.kl",
-            "output": self.output,
-            "target": self.target,
-            "mask": self.mask,
-            "reduction": self.reduction,
-            "denominator": self.denominator,
-            "model": self.model.signature(),
-        }
-
-    def __call__(
+    def _softmax_cross_entropy_per_example(
         self,
         params: ParameterTree,
         buffers: BufferTree,
         batch: Batch,
-        context: Any,
     ) -> torch.Tensor:
-        """Evaluate KL divergence over the declared model output.
+        logits = _model_output_tensor(self.model, params, buffers, batch, self.output)
+        labels = _batch_long_tensor(batch, self.target)
+        losses = _softmax_cross_entropy_losses(logits, labels)
+        mask = _loss_mask(batch, self.mask, labels.shape)
 
-        Returns:
-            Scalar KL loss tensor.
-        """
-        _ = context
-        output = _call_model(self.model, params, buffers, batch)
-        logits = _single_tensor_output(
-            _select_model_output(self.model, output, self.output),
-            self.output,
+        return _per_example_reduce_losses(
+            losses,
+            mask=mask,
+            reduction=self.reduction,
+            denominator=self.denominator,
         )
+
+    def _kl(
+        self,
+        params: ParameterTree,
+        buffers: BufferTree,
+        batch: Batch,
+    ) -> torch.Tensor:
+        logits = _model_output_tensor(self.model, params, buffers, batch, self.output)
         target = _batch_tensor(batch, self.target)
         losses = _kl_token_losses(logits, target)
         mask = _loss_mask(batch, self.mask, losses.shape)
@@ -1149,45 +1173,14 @@ class _KLLossObjective:
             denominator=self.denominator,
         )
 
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class _MSELossObjective:
-    model: Model
-    output: str
-    target: str
-    mask: str | None
-    reduction: str
-    denominator: str
-
-    def identity(self) -> Mapping[str, Any]:
-        """Return stable scalar objective identity fields."""
-        return {
-            "kind": "loss.mse",
-            "output": self.output,
-            "target": self.target,
-            "mask": self.mask,
-            "reduction": self.reduction,
-            "denominator": self.denominator,
-            "model": self.model.signature(),
-        }
-
-    def __call__(
+    def _mse(
         self,
         params: ParameterTree,
         buffers: BufferTree,
         batch: Batch,
-        context: Any,
     ) -> torch.Tensor:
-        """Evaluate squared error over the declared model output.
-
-        Returns:
-            Scalar squared-error loss tensor.
-        """
-        _ = context
-        output = _call_model(self.model, params, buffers, batch)
-        prediction = _single_tensor_output(
-            _select_model_output(self.model, output, self.output),
-            self.output,
+        prediction = _model_output_tensor(
+            self.model, params, buffers, batch, self.output
         )
         target = _batch_tensor(batch, self.target)
         losses = _mse_element_losses(prediction, target)
@@ -1197,57 +1190,6 @@ class _MSELossObjective:
             losses = losses * _mse_element_mask(mask, prediction)
 
         return _reduce_mse_losses(
-            losses,
-            mask=mask,
-            reduction=self.reduction,
-            denominator=self.denominator,
-        )
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class _SoftmaxCrossEntropyPerExampleObjective:
-    model: Model
-    output: str
-    labels: str
-    mask: str | None
-    reduction: str
-    denominator: str
-
-    def identity(self) -> Mapping[str, Any]:
-        """Return stable per-example objective identity fields."""
-        return {
-            "kind": "loss.softmax_cross_entropy.per_example",
-            "output": self.output,
-            "labels": self.labels,
-            "mask": self.mask,
-            "reduction": self.reduction,
-            "denominator": self.denominator,
-            "model": self.model.signature(),
-        }
-
-    def __call__(
-        self,
-        params: ParameterTree,
-        buffers: BufferTree,
-        batch: Batch,
-        context: Any,
-    ) -> torch.Tensor:
-        """Evaluate per-example CE losses.
-
-        Returns:
-            One loss value per leading batch example.
-        """
-        _ = context
-        output = _call_model(self.model, params, buffers, batch)
-        logits = _single_tensor_output(
-            _select_model_output(self.model, output, self.output),
-            self.output,
-        )
-        labels = _batch_long_tensor(batch, self.labels)
-        losses = _softmax_cross_entropy_losses(logits, labels)
-        mask = _loss_mask(batch, self.mask, labels.shape)
-
-        return _per_example_reduce_losses(
             losses,
             mask=mask,
             reduction=self.reduction,
@@ -1267,37 +1209,17 @@ class _GaussianScoreGradientBatch:
 
         Returns:
             Batch with score_gradients and num_examples fields.
-
-        Raises:
-            MaterializationError: If the batch does not match the likelihood.
         """
         with torch.enable_grad():
-            output = _call_model(
+            score_rows = _gaussian_score_terms(
                 self.model,
                 self.model.parameter_values,
                 self.model.buffers,
                 batch,
-            )
-            prediction = _single_tensor_output(
-                _select_model_output(self.model, output, self.output),
                 self.output,
+                self.target,
+                self.noise,
             )
-            target = _batch_tensor(batch, self.target).to(
-                device=prediction.device,
-                dtype=prediction.dtype,
-            )
-
-            if target.shape != prediction.shape:
-                message = "gaussian likelihood target shape must match output"
-                raise MaterializationError(message)
-
-            if prediction.ndim == 0:
-                message = "gaussian likelihood requires a leading example axis"
-                raise MaterializationError(message)
-
-            residual = target - prediction
-            scores = -0.5 * (residual / prediction.new_tensor(self.noise)).square()
-            score_rows = scores.reshape(scores.shape[0], -1).sum(dim=1)
             score_gradients = _score_gradient_rows(
                 score_rows,
                 self.model.parameter_values,
@@ -1334,34 +1256,47 @@ class _GaussianScoreTermsObjective:
         batch: Batch,
         context: Any,
     ) -> torch.Tensor:
-        """Return one score term per example.
-
-        Raises:
-            MaterializationError: If the batch shape is incompatible.
-        """
+        """Return one score term per example."""
         _ = context
-        output = _call_model(self.model, params, buffers, batch)
-        prediction = _single_tensor_output(
-            _select_model_output(self.model, output, self.output),
+
+        return _gaussian_score_terms(
+            self.model,
+            params,
+            buffers,
+            batch,
             self.output,
-        )
-        target = _batch_tensor(batch, self.target).to(
-            device=prediction.device,
-            dtype=prediction.dtype,
+            self.target,
+            self.noise,
         )
 
-        if target.shape != prediction.shape:
-            message = "gaussian likelihood target shape must match output"
-            raise MaterializationError(message)
 
-        if prediction.ndim == 0:
-            message = "gaussian likelihood requires a leading example axis"
-            raise MaterializationError(message)
+def _gaussian_score_terms(
+    model: Model,
+    params: ParameterTree,
+    buffers: BufferTree,
+    batch: Batch,
+    output: str,
+    target: str,
+    noise: float,
+) -> torch.Tensor:
+    prediction = _model_output_tensor(model, params, buffers, batch, output)
+    target_tensor = _batch_tensor(batch, target).to(
+        device=prediction.device,
+        dtype=prediction.dtype,
+    )
 
-        residual = target - prediction
-        scores = -0.5 * (residual / prediction.new_tensor(self.noise)).square()
+    if target_tensor.shape != prediction.shape:
+        message = "gaussian likelihood target shape must match output"
+        raise MaterializationError(message)
 
-        return scores.reshape(scores.shape[0], -1).sum(dim=1)
+    if prediction.ndim == 0:
+        message = "gaussian likelihood requires a leading example axis"
+        raise MaterializationError(message)
+
+    residual = target_tensor - prediction
+    scores = -0.5 * (residual / prediction.new_tensor(noise)).square()
+
+    return scores.reshape(scores.shape[0], -1).sum(dim=1)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1377,14 +1312,9 @@ class _SampledFisherScoreGradientBatch:
             Batch with sampled_score_gradients and denominator fields.
         """
         with torch.enable_grad():
-            output = _call_model(
+            prediction = _current_model_output_tensor(
                 self.model,
-                self.model.parameter_values,
-                self.model.buffers,
                 batch,
-            )
-            prediction = _single_tensor_output(
-                _select_model_output(self.model, output, self.likelihood.output),
                 self.likelihood.output,
             )
             scores, denominator_fields = _sampled_likelihood_scores(
@@ -1463,68 +1393,62 @@ class _ModelFieldObjective:
             Selected tensor output.
         """
         _ = context
-        output = _call_model(self.model, params, buffers, batch)
 
-        return _select_model_output(self.model, output, self.field)
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class _SoftmaxCrossEntropyLossHessianBatch:
-    model: Model
-    output: str
-    labels: str
-    mask: str | None
-    reduction: str
-    denominator: str
-
-    def __call__(self, batch: Batch) -> Batch:
-        output = _call_model(
-            self.model,
-            self.model.parameter_values,
-            self.model.buffers,
-            batch,
-        )
-        logits = _single_tensor_output(
-            _select_model_output(self.model, output, self.output),
-            self.output,
-        )
-        labels = _batch_long_tensor(batch, self.labels)
-        _require_softmax_cross_entropy_shapes(logits, labels)
-        mask = _loss_mask(batch, self.mask, labels.shape)
-        loss_hessian = _softmax_cross_entropy_loss_hessian(
-            logits,
-            mask=mask,
-            reduction=self.reduction,
-            denominator=self.denominator,
-        )
-
-        return {**batch, "loss_hessian": loss_hessian}
+        return _model_output_tree(self.model, params, buffers, batch, self.field)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class _KLLossHessianBatch:
+class _LossHessianBatch:
     model: Model
+    kind: str
     output: str
+    target_key: str
     target: str
     mask: str | None
     reduction: str
     denominator: str
 
     def __call__(self, batch: Batch) -> Batch:
-        output = _call_model(
+        if self.kind == "softmax_cross_entropy":
+            loss_hessian = self._softmax_cross_entropy(batch)
+        elif self.kind == "kl":
+            loss_hessian = self._kl(batch)
+        elif self.kind == "mse":
+            loss_hessian = self._mse(batch)
+        else:
+            message = f"loss kind has no output-Hessian lowering: {self.kind}"
+            raise MaterializationError(message)
+
+        return {**batch, "loss_hessian": loss_hessian}
+
+    def _softmax_cross_entropy(self, batch: Batch) -> torch.Tensor:
+        logits = _current_model_output_tensor(
             self.model,
-            self.model.parameter_values,
-            self.model.buffers,
             batch,
+            self.output,
         )
-        logits = _single_tensor_output(
-            _select_model_output(self.model, output, self.output),
+        labels = _batch_long_tensor(batch, self.target)
+        _require_softmax_cross_entropy_shapes(logits, labels)
+        mask = _loss_mask(batch, self.mask, labels.shape)
+
+        return _softmax_cross_entropy_loss_hessian(
+            logits,
+            mask=mask,
+            reduction=self.reduction,
+            denominator=self.denominator,
+        )
+
+    def _kl(self, batch: Batch) -> torch.Tensor:
+        logits = _current_model_output_tensor(
+            self.model,
+            batch,
             self.output,
         )
         target = _batch_tensor(batch, self.target)
         _require_same_shape(logits, target, "loss.kl target")
         mask = _loss_mask(batch, self.mask, logits.shape[:-1])
-        loss_hessian = _kl_loss_hessian(
+
+        return _kl_loss_hessian(
             logits,
             target,
             mask=mask,
@@ -1532,40 +1456,22 @@ class _KLLossHessianBatch:
             denominator=self.denominator,
         )
 
-        return {**batch, "loss_hessian": loss_hessian}
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class _MSELossHessianBatch:
-    model: Model
-    output: str
-    target: str
-    mask: str | None
-    reduction: str
-    denominator: str
-
-    def __call__(self, batch: Batch) -> Batch:
-        output = _call_model(
+    def _mse(self, batch: Batch) -> torch.Tensor:
+        prediction = _current_model_output_tensor(
             self.model,
-            self.model.parameter_values,
-            self.model.buffers,
             batch,
-        )
-        prediction = _single_tensor_output(
-            _select_model_output(self.model, output, self.output),
             self.output,
         )
         target = _batch_tensor(batch, self.target)
         _require_same_shape(prediction, target, "loss.mse target")
         mask = _mse_mask(batch, self.mask, prediction.shape)
-        loss_hessian = _mse_loss_hessian(
+
+        return _mse_loss_hessian(
             prediction,
             mask=mask,
             reduction=self.reduction,
             denominator=self.denominator,
         )
-
-        return {**batch, "loss_hessian": loss_hessian}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1575,14 +1481,9 @@ class _DeclaredPSDLossHessianBatch:
     factor: torch.Tensor
 
     def __call__(self, batch: Batch) -> Batch:
-        output = _call_model(
+        value = _current_model_output_tensor(
             self.model,
-            self.model.parameter_values,
-            self.model.buffers,
             batch,
-        )
-        value = _single_tensor_output(
-            _select_model_output(self.model, output, self.output),
             self.output,
         )
         loss_hessian = _declared_psd_loss_hessian(self.factor, value)
@@ -1597,14 +1498,9 @@ class _DeclaredPSDMatrixFreeLossHessianBatch:
     matvec: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
     def __call__(self, batch: Batch) -> Batch:
-        output = _call_model(
+        value = _current_model_output_tensor(
             self.model,
-            self.model.parameter_values,
-            self.model.buffers,
             batch,
-        )
-        value = _single_tensor_output(
-            _select_model_output(self.model, output, self.output),
             self.output,
         )
         loss_hessian = _declared_psd_matrix_free_loss_hessian(self.matvec, value)
@@ -1972,6 +1868,45 @@ def _checked_tensor_tree(value: object, name: str) -> TensorTree:
     raise MaterializationError(message)
 
 
+def _model_output_tree(
+    model: Model,
+    params: ParameterTree,
+    buffers: BufferTree,
+    batch: Batch,
+    field: str,
+) -> TensorTree:
+    output = _call_model(model, params, buffers, batch)
+
+    return _select_model_output(model, output, field)
+
+
+def _model_output_tensor(
+    model: Model,
+    params: ParameterTree,
+    buffers: BufferTree,
+    batch: Batch,
+    field: str,
+) -> torch.Tensor:
+    return _single_tensor_output(
+        _model_output_tree(model, params, buffers, batch, field),
+        field,
+    )
+
+
+def _current_model_output_tensor(
+    model: Model,
+    batch: Batch,
+    field: str,
+) -> torch.Tensor:
+    return _model_output_tensor(
+        model,
+        model.parameter_values,
+        model.buffers,
+        batch,
+        field,
+    )
+
+
 def _is_tensor_tree(value: object) -> TypeGuard[TensorTree]:
     if isinstance(value, torch.Tensor):
         return True
@@ -1988,6 +1923,78 @@ def _is_tensor_tree(value: object) -> TypeGuard[TensorTree]:
     return False
 
 
+def _field_loss(
+    *,
+    kind: str,
+    identity_kind: str,
+    output: str,
+    field_key: str,
+    field_value: str,
+    mask: str | None,
+    reduction: str,
+    denominator: str,
+    require_denominator: Callable[[str, str], None],
+) -> Loss:
+    _require_nonempty_string(output, "loss output")
+    _require_nonempty_string(field_value, f"loss {field_key}")
+
+    if mask is not None:
+        _require_nonempty_string(mask, "loss mask")
+
+    _require_loss_reduction(reduction)
+    require_denominator(reduction, denominator)
+
+    return Loss(
+        kind=kind,
+        output=output,
+        objective=None,
+        identity_fields=_loss_identity_fields(
+            identity_kind,
+            output,
+            field_key,
+            field_value,
+            mask,
+            reduction,
+            denominator,
+        ),
+    )
+
+
+def _loss_identity_fields(
+    kind: str,
+    output: str,
+    target_key: str,
+    target: str,
+    mask: str | None,
+    reduction: str,
+    denominator: str,
+    *,
+    model: Model | None = None,
+) -> Mapping[str, Any]:
+    fields = {
+        "kind": kind,
+        "output": output,
+        target_key: target,
+        "mask": mask,
+        "reduction": reduction,
+        "denominator": denominator,
+    }
+
+    if model is not None:
+        return {**fields, "model": model.signature()}
+
+    return fields
+
+
+def _require_softmax_cross_entropy_denominator(
+    _: str,
+    denominator: str,
+) -> None:
+    if denominator != "num_tokens":
+        message = f"softmax_cross_entropy denominator is unsupported: {denominator}"
+        raise MaterializationError(message)
+
+
 class _LossNamespace:
     @staticmethod
     def softmax_cross_entropy(
@@ -2002,34 +2009,17 @@ class _LossNamespace:
 
         Returns:
             Loss declaration with package-owned CE objective lowering.
-
-        Raises:
-            MaterializationError: If a closed-set field is invalid.
         """
-        _require_nonempty_string(output, "loss output")
-        _require_nonempty_string(labels, "loss labels")
-
-        if mask is not None:
-            _require_nonempty_string(mask, "loss mask")
-
-        _require_loss_reduction(reduction)
-
-        if denominator != "num_tokens":
-            message = f"softmax_cross_entropy denominator is unsupported: {denominator}"
-            raise MaterializationError(message)
-
-        return Loss(
+        return _field_loss(
             kind="softmax_cross_entropy",
+            identity_kind="loss.softmax_cross_entropy",
             output=output,
-            objective=None,
-            identity_fields={
-                "kind": "loss.softmax_cross_entropy",
-                "output": output,
-                "labels": labels,
-                "mask": mask,
-                "reduction": reduction,
-                "denominator": denominator,
-            },
+            field_key="labels",
+            field_value=labels,
+            mask=mask,
+            reduction=reduction,
+            denominator=denominator,
+            require_denominator=_require_softmax_cross_entropy_denominator,
         )
 
     @staticmethod
@@ -2046,27 +2036,16 @@ class _LossNamespace:
         Returns:
             Loss declaration with package-owned KL objective lowering.
         """
-        _require_nonempty_string(output, "loss output")
-        _require_nonempty_string(target, "loss target")
-
-        if mask is not None:
-            _require_nonempty_string(mask, "loss mask")
-
-        _require_loss_reduction(reduction)
-        _require_token_mean_denominator(reduction, denominator)
-
-        return Loss(
+        return _field_loss(
             kind="kl",
+            identity_kind="loss.kl",
             output=output,
-            objective=None,
-            identity_fields={
-                "kind": "loss.kl",
-                "output": output,
-                "target": target,
-                "mask": mask,
-                "reduction": reduction,
-                "denominator": denominator,
-            },
+            field_key="target",
+            field_value=target,
+            mask=mask,
+            reduction=reduction,
+            denominator=denominator,
+            require_denominator=_require_token_mean_denominator,
         )
 
     @staticmethod
@@ -2083,27 +2062,16 @@ class _LossNamespace:
         Returns:
             Loss declaration with package-owned MSE objective lowering.
         """
-        _require_nonempty_string(output, "loss output")
-        _require_nonempty_string(target, "loss target")
-
-        if mask is not None:
-            _require_nonempty_string(mask, "loss mask")
-
-        _require_loss_reduction(reduction)
-        _require_mse_denominator(reduction, denominator)
-
-        return Loss(
+        return _field_loss(
             kind="mse",
+            identity_kind="loss.mse",
             output=output,
-            objective=None,
-            identity_fields={
-                "kind": "loss.mse",
-                "output": output,
-                "target": target,
-                "mask": mask,
-                "reduction": reduction,
-                "denominator": denominator,
-            },
+            field_key="target",
+            field_value=target,
+            mask=mask,
+            reduction=reduction,
+            denominator=denominator,
+            require_denominator=_require_mse_denominator,
         )
 
     @staticmethod
@@ -3762,37 +3730,42 @@ def _loss_scalar_objective(model: Model, typed_loss: Loss) -> ScalarObjective:
         return typed_loss.objective
 
     if typed_loss.kind == "softmax_cross_entropy":
-        return _SoftmaxCrossEntropyObjective(
-            model=model,
-            output=typed_loss.output,
-            labels=_loss_string_field(typed_loss, "labels"),
-            mask=_loss_optional_string_field(typed_loss, "mask"),
-            reduction=_loss_string_field(typed_loss, "reduction"),
-            denominator=_loss_string_field(typed_loss, "denominator"),
+        return _LossObjective(
+            mode="scalar",
+            **_loss_lowering_fields(model, typed_loss, "labels"),
         )
 
     if typed_loss.kind == "kl":
-        return _KLLossObjective(
-            model=model,
-            output=typed_loss.output,
-            target=_loss_string_field(typed_loss, "target"),
-            mask=_loss_optional_string_field(typed_loss, "mask"),
-            reduction=_loss_string_field(typed_loss, "reduction"),
-            denominator=_loss_string_field(typed_loss, "denominator"),
+        return _LossObjective(
+            mode="scalar",
+            **_loss_lowering_fields(model, typed_loss, "target"),
         )
 
     if typed_loss.kind == "mse":
-        return _MSELossObjective(
-            model=model,
-            output=typed_loss.output,
-            target=_loss_string_field(typed_loss, "target"),
-            mask=_loss_optional_string_field(typed_loss, "mask"),
-            reduction=_loss_string_field(typed_loss, "reduction"),
-            denominator=_loss_string_field(typed_loss, "denominator"),
+        return _LossObjective(
+            mode="scalar",
+            **_loss_lowering_fields(model, typed_loss, "target"),
         )
 
     message = f"loss kind is not lowered: {typed_loss.kind}"
     raise MaterializationError(message)
+
+
+def _loss_lowering_fields(
+    model: Model,
+    typed_loss: Loss,
+    target_field: str,
+) -> dict[str, Any]:
+    return {
+        "model": model,
+        "kind": typed_loss.kind,
+        "output": typed_loss.output,
+        "target_key": target_field,
+        "target": _loss_string_field(typed_loss, target_field),
+        "mask": _loss_optional_string_field(typed_loss, "mask"),
+        "reduction": _loss_string_field(typed_loss, "reduction"),
+        "denominator": _loss_string_field(typed_loss, "denominator"),
+    }
 
 
 def _loss_per_example_objective(
@@ -3800,13 +3773,9 @@ def _loss_per_example_objective(
     typed_loss: Loss,
 ) -> FunctionObjective:
     if typed_loss.kind == "softmax_cross_entropy":
-        return _SoftmaxCrossEntropyPerExampleObjective(
-            model=model,
-            output=typed_loss.output,
-            labels=_loss_string_field(typed_loss, "labels"),
-            mask=_loss_optional_string_field(typed_loss, "mask"),
-            reduction=_loss_string_field(typed_loss, "reduction"),
-            denominator=_loss_string_field(typed_loss, "denominator"),
+        return _LossObjective(
+            mode="per_example",
+            **_loss_lowering_fields(model, typed_loss, "labels"),
         )
 
     message = f"loss kind has no per-example lowering: {typed_loss.kind}"
@@ -3818,34 +3787,13 @@ def _loss_hessian_batch_transform(
     typed_loss: Loss,
 ) -> Callable[[Batch], Batch]:
     if typed_loss.kind == "softmax_cross_entropy":
-        return _SoftmaxCrossEntropyLossHessianBatch(
-            model=model,
-            output=typed_loss.output,
-            labels=_loss_string_field(typed_loss, "labels"),
-            mask=_loss_optional_string_field(typed_loss, "mask"),
-            reduction=_loss_string_field(typed_loss, "reduction"),
-            denominator=_loss_string_field(typed_loss, "denominator"),
-        )
+        return _LossHessianBatch(**_loss_lowering_fields(model, typed_loss, "labels"))
 
     if typed_loss.kind == "kl":
-        return _KLLossHessianBatch(
-            model=model,
-            output=typed_loss.output,
-            target=_loss_string_field(typed_loss, "target"),
-            mask=_loss_optional_string_field(typed_loss, "mask"),
-            reduction=_loss_string_field(typed_loss, "reduction"),
-            denominator=_loss_string_field(typed_loss, "denominator"),
-        )
+        return _LossHessianBatch(**_loss_lowering_fields(model, typed_loss, "target"))
 
     if typed_loss.kind == "mse":
-        return _MSELossHessianBatch(
-            model=model,
-            output=typed_loss.output,
-            target=_loss_string_field(typed_loss, "target"),
-            mask=_loss_optional_string_field(typed_loss, "mask"),
-            reduction=_loss_string_field(typed_loss, "reduction"),
-            denominator=_loss_string_field(typed_loss, "denominator"),
-        )
+        return _LossHessianBatch(**_loss_lowering_fields(model, typed_loss, "target"))
 
     if typed_loss.kind == "declared_psd":
         if typed_loss.hessian_factor is None:
@@ -4615,18 +4563,13 @@ def _typed_jvp(model: Model, typed_output: Output, name: str | None) -> Operator
         aggregation="sum",
     )
 
-    return Operator(
+    return _typed_model_field_operator(
         model=model,
         spec=spec,
-        call_inputs=("batch", "vector"),
-        default_settings={
-            "jvp.path": "torch_func_jvp",
-            **_torch_func_settings(requires_forward_ad=True),
-        },
-        function_objectives={
-            typed_output.field: _ModelFieldObjective(model, typed_output.field)
-        },
-        changed_axes=("jvp.path",),
+        typed_output=typed_output,
+        path_key="jvp.path",
+        path_value="torch_func_jvp",
+        requires_forward_ad=True,
     )
 
 
@@ -4638,18 +4581,37 @@ def _typed_vjp(model: Model, typed_output: Output, name: str | None) -> Operator
         aggregation="sum",
     )
 
+    return _typed_model_field_operator(
+        model=model,
+        spec=spec,
+        typed_output=typed_output,
+        path_key="vjp.path",
+        path_value="torch_func_vjp",
+        requires_forward_ad=False,
+    )
+
+
+def _typed_model_field_operator(
+    *,
+    model: Model,
+    spec: Any,
+    typed_output: Output,
+    path_key: str,
+    path_value: str,
+    requires_forward_ad: bool,
+) -> Operator:
     return Operator(
         model=model,
         spec=spec,
         call_inputs=("batch", "vector"),
         default_settings={
-            "vjp.path": "torch_func_vjp",
-            **_torch_func_settings(requires_forward_ad=False),
+            path_key: path_value,
+            **_torch_func_settings(requires_forward_ad=requires_forward_ad),
         },
         function_objectives={
             typed_output.field: _ModelFieldObjective(model, typed_output.field)
         },
-        changed_axes=("vjp.path",),
+        changed_axes=(path_key,),
     )
 
 
@@ -4681,12 +4643,12 @@ def metric_vp(model: Model, metric: Metric, name: str | None = None) -> Operator
         representation=metric.representation,
     )
 
-    return Operator(
-        model=model,
+    return _typed_metric_operator(
+        model,
+        metric,
         spec=spec,
         call_inputs=_metric_vector_call_inputs(metric),
         default_settings=_metric_default_settings(metric),
-        metric=metric,
     )
 
 
@@ -4704,12 +4666,12 @@ def sqrt_metric_vp(model: Model, metric: Metric, name: str | None = None) -> Ope
         representation=metric.representation,
     )
 
-    return Operator(
-        model=model,
+    return _typed_metric_operator(
+        model,
+        metric,
         spec=spec,
         call_inputs=_metric_vector_call_inputs(metric),
         default_settings=_sqrt_metric_default_settings(model, metric),
-        metric=metric,
     )
 
 
@@ -4740,12 +4702,12 @@ def inverse_metric_vp(
     )
     spec = _operator_with_damping_identity(spec, metric, damping)
 
-    return Operator(
-        model=model,
+    return _typed_metric_operator(
+        model,
+        metric,
         spec=spec,
         call_inputs=_metric_vector_call_inputs(metric),
         default_settings=_inverse_metric_default_settings(model, metric),
-        metric=metric,
     )
 
 
@@ -4775,12 +4737,12 @@ def inverse_sqrt_metric_vp(
     )
     spec = _operator_with_damping_identity(spec, metric, damping)
 
-    return Operator(
-        model=model,
+    return _typed_metric_operator(
+        model,
+        metric,
         spec=spec,
         call_inputs=_metric_vector_call_inputs(metric),
         default_settings=_sqrt_metric_default_settings(model, metric),
-        metric=metric,
     )
 
 
@@ -4805,12 +4767,12 @@ def metric_inner_vp(
         as_norm=as_norm,
     )
 
-    return Operator(
-        model=model,
+    return _typed_metric_operator(
+        model,
+        metric,
         spec=spec,
         call_inputs=_metric_inner_call_inputs(metric),
         default_settings=_metric_inner_default_settings(model, metric, as_norm),
-        metric=metric,
     )
 
 
@@ -4843,11 +4805,28 @@ def inverse_metric_inner_vp(
     )
     spec = _operator_with_damping_identity(spec, metric, damping)
 
-    return Operator(
-        model=model,
+    return _typed_metric_operator(
+        model,
+        metric,
         spec=spec,
         call_inputs=_metric_inner_call_inputs(metric),
         default_settings=_inverse_metric_inner_default_settings(model, metric, as_norm),
+    )
+
+
+def _typed_metric_operator(
+    model: Model,
+    metric: Metric,
+    *,
+    spec: Any,
+    call_inputs: tuple[str, ...],
+    default_settings: Mapping[str, Any],
+) -> Operator:
+    return Operator(
+        model=model,
+        spec=spec,
+        call_inputs=call_inputs,
+        default_settings=default_settings,
         metric=metric,
     )
 

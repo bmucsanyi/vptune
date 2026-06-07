@@ -2,7 +2,7 @@
 
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeGuard
 
 import torch
 
@@ -98,6 +98,63 @@ DISTRIBUTED_STRATEGY_ADMISSION_SETTINGS = (
     "fsdp.bottom_up_order",
     "fsdp.mutated_modules",
     "fsdp.collectives",
+)
+DISTRIBUTED_COMMON_STRING_DOMAIN_FIELDS = (
+    ("distributed.launch", ("single_process", "torchrun")),
+    ("distributed.process_group_backend", ("gloo", "nccl", "ucc_when_available")),
+    ("distributed.local_rank_binding", ("cuda_local_rank", "explicit_device_map")),
+)
+FSDP2_POLICY_FIELDS = (
+    "fsdp.hook_entry_policy",
+    "fsdp.wrap_granularity",
+    "fsdp.forward_prefetch",
+    "fsdp.backward_prefetch",
+    "fsdp.reshard_after_forward",
+    "fsdp.shard_placement_fn",
+    "fsdp.mp_policy.param_dtype",
+    "fsdp.mp_policy.reduce_dtype",
+    "fsdp.mp_policy.output_dtype",
+    "fsdp.mp_policy.cast_forward_inputs",
+    "fsdp.offload_policy",
+)
+DTENSOR_POLICY_FIELDS = (
+    "dtensor.module_class",
+    "dtensor.to_local_grad_placement",
+    "dtensor.from_local_check",
+    "dtensor.uneven_shard_handling",
+    "dtensor.async_local_tensor_handling",
+    "dtensor.redistribute_schedule",
+)
+TENSOR_PARALLEL_POLICY_FIELDS = (
+    "tp.plan",
+    "tp.qkv_projection",
+    "tp.output_projection",
+    "tp.mlp_up_gate",
+    "tp.mlp_down",
+    "tp.embedding",
+    "tp.lm_head",
+    "tp.prepare_module_input",
+    "tp.prepare_module_output",
+    "tp.loss_parallel",
+)
+SEQUENCE_PARALLEL_POLICY_FIELDS = (
+    "sequence_parallel.enabled",
+    "sequence_parallel.norm_modules",
+    "sequence_parallel.output_placement_policy",
+)
+CONTEXT_PARALLEL_POLICY_FIELDS = (
+    "context_parallel.enabled",
+    "context_parallel.rotate_method",
+    "context_parallel.sequence_dim",
+)
+LAYOUT_MODE_POLICY_FIELDS = {
+    "tensor_parallel": ("tensor_parallel", TENSOR_PARALLEL_POLICY_FIELDS),
+    "sequence_parallel": ("sequence_parallel", SEQUENCE_PARALLEL_POLICY_FIELDS),
+    "context_parallel": ("context_parallel", CONTEXT_PARALLEL_POLICY_FIELDS),
+}
+COMMUNICATION_STRING_DOMAIN_FIELDS = (
+    ("comm.overlap", ("none", "all_gather_overlap", "reduce_scatter_overlap", "both")),
+    ("comm.prefetch", ("none", "forward", "backward", "both")),
 )
 
 
@@ -236,57 +293,41 @@ class _DistributedRedistribution:
     placements: Mapping[str, Any]
 
     def before_forward_params(self, params: ParameterTree) -> ParameterTree:
-        if self.settings.get("dtensor.redistribute_schedule") != "before_forward":
-            return params
-
-        return _distributed_tree_map(
-            lambda value: self.redistribute(value, "dtensor.params_placement"),
+        return self._scheduled_tree(
             params,
+            "before_forward",
+            "dtensor.params_placement",
         )
 
     def before_forward_batch(self, batch: Batch) -> Batch:
-        if self.settings.get("dtensor.redistribute_schedule") != "before_forward":
-            return batch
-
-        return self._batch_slots(batch, ("logits",))
+        return self._scheduled_batch_slots(batch, "before_forward", ("logits",))
 
     def before_forward_vector(self, vector: TensorTree) -> TensorTree:
-        if self.settings.get("dtensor.redistribute_schedule") != "before_forward":
-            return vector
-
-        return _distributed_tree_map(
-            lambda value: self.redistribute(value, "dtensor.vector_placement"),
+        return self._scheduled_tree(
             vector,
+            "before_forward",
+            "dtensor.vector_placement",
         )
 
     def before_backward_vector(self, vector: TensorTree) -> TensorTree:
-        if self.settings.get("dtensor.redistribute_schedule") != "before_backward":
-            return vector
-
-        return _distributed_tree_map(
-            lambda value: self.redistribute(value, "dtensor.cotangent_placement"),
+        return self._scheduled_tree(
             vector,
+            "before_backward",
+            "dtensor.cotangent_placement",
         )
 
     def between_operator_parts(self, tree: TensorTree) -> TensorTree:
-        if (
-            self.settings.get("dtensor.redistribute_schedule")
-            != "between_operator_parts"
-        ):
-            return tree
-
-        return _distributed_tree_map(
-            lambda value: self.redistribute(value, "dtensor.tangent_placement"),
+        return self._scheduled_tree(
             tree,
+            "between_operator_parts",
+            "dtensor.tangent_placement",
         )
 
     def before_output(self, output: TensorTree) -> TensorTree:
-        if self.settings.get("dtensor.redistribute_schedule") != "before_output":
-            return output
-
-        return _distributed_tree_map(
-            lambda value: self.redistribute(value, "dtensor.output_placement"),
+        return self._scheduled_tree(
             output,
+            "before_output",
+            "dtensor.output_placement",
         )
 
     def redistribute(self, value: Any, placement_key: str) -> Any:
@@ -318,6 +359,31 @@ class _DistributedRedistribution:
 
         return result
 
+    def _scheduled_tree(
+        self,
+        value: Any,
+        schedule: str,
+        placement_key: str,
+    ) -> Any:
+        if self.settings.get("dtensor.redistribute_schedule") != schedule:
+            return value
+
+        return _distributed_tree_map(
+            lambda item: self.redistribute(item, placement_key),
+            value,
+        )
+
+    def _scheduled_batch_slots(
+        self,
+        batch: Batch,
+        schedule: str,
+        slots: tuple[str, ...],
+    ) -> Batch:
+        if self.settings.get("dtensor.redistribute_schedule") != schedule:
+            return batch
+
+        return self._batch_slots(batch, slots)
+
 
 def _distributed_tree_map(fn: Callable[[Any], Any], value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -344,11 +410,7 @@ class _BoundDistributedStrategyApplier:
 def distributed_strategy_applier(
     bindings: DistributedStrategyBindings,
 ) -> DistributedStrategyApplier:
-    """Return an applier that lowers distributed row settings.
-
-    Returns:
-        Distributed strategy applier.
-    """
+    """Return an applier that lowers distributed row settings."""
     return _BoundDistributedStrategyApplier(bindings)
 
 
@@ -362,7 +424,7 @@ def build_device_mesh(
     """Build a PyTorch DeviceMesh.
 
     Returns:
-        DeviceMesh returned by the supplied PyTorch entry point.
+        DeviceMesh.
     """
     return init_device_mesh(
         device_type,
@@ -413,7 +475,7 @@ def initialize_process_group(
     """Initialize the PyTorch distributed process group.
 
     Returns:
-        Return value from the supplied `init_process_group` entry point.
+        Process group initialization result.
     """
     return init_process_group(
         backend=backend,
@@ -429,7 +491,7 @@ def initialize_process_group(
 
 def apply_fsdp2(
     fully_shard: Callable[..., torch.nn.Module],
-    module: torch.nn.Module,
+    module: torch.nn.Module | list[torch.nn.Module],
     *,
     mesh: Any,
     reshard_after_forward: bool | int | None,
@@ -439,10 +501,10 @@ def apply_fsdp2(
     ignored_params: Sequence[torch.nn.Parameter],
     dp_mesh_dims: Any,
 ) -> torch.nn.Module:
-    """Apply PyTorch FSDP2 to a module.
+    """Apply PyTorch FSDP2 to a module or declared module group.
 
     Returns:
-        Module returned by the supplied `fully_shard` entry point.
+        FSDP-wrapped module.
     """
     return fully_shard(
         module,
@@ -496,9 +558,10 @@ def apply_fsdp2_group(
     """Apply PyTorch FSDP2 to a declared module group.
 
     Returns:
-        Module returned by the supplied `fully_shard` entry point.
+        FSDP-wrapped module group.
     """
-    return fully_shard(
+    return apply_fsdp2(
+        fully_shard,
         modules,
         mesh=mesh,
         reshard_after_forward=reshard_after_forward,
@@ -521,7 +584,7 @@ def build_fsdp_mixed_precision_policy(
     """Build a PyTorch FSDP2 mixed-precision policy.
 
     Returns:
-        Policy returned by the supplied constructor.
+        Mixed-precision policy.
     """
     return mixed_precision_policy(
         param_dtype=param_dtype,
@@ -565,7 +628,7 @@ def build_fsdp_dp_mesh_dims(
     """Build PyTorch FSDP2 data-parallel mesh dimensions.
 
     Returns:
-        Data-parallel mesh dimension object returned by the supplied constructor.
+        Data-parallel mesh dimensions.
     """
     return data_parallel_mesh_dims(shard=shard, replicate=replicate)
 
@@ -581,7 +644,7 @@ def apply_tensor_parallel(
     """Apply PyTorch tensor parallelism to a module.
 
     Returns:
-        Module returned by the supplied `parallelize_module` entry point.
+        Tensor-parallel module.
     """
     return parallelize_module(
         module,
@@ -601,7 +664,7 @@ def build_colwise_parallel(
     """Build a PyTorch column-wise tensor-parallel style.
 
     Returns:
-        Parallel style returned by the supplied constructor.
+        Column-wise parallel style.
     """
     return colwise_parallel(
         input_layouts=input_layouts,
@@ -620,13 +683,19 @@ def build_rowwise_parallel(
     """Build a PyTorch row-wise tensor-parallel style.
 
     Returns:
-        Parallel style returned by the supplied constructor.
+        Row-wise parallel style.
     """
     return rowwise_parallel(
         input_layouts=input_layouts,
         output_layouts=output_layouts,
         use_local_output=use_local_output,
     )
+
+
+TENSOR_PARALLEL_STYLE_BUILDERS = {
+    "colwise": build_colwise_parallel,
+    "rowwise": build_rowwise_parallel,
+}
 
 
 def build_sequence_parallel(
@@ -638,7 +707,7 @@ def build_sequence_parallel(
     """Build a PyTorch sequence-parallel style.
 
     Returns:
-        Parallel style returned by the supplied constructor.
+        Sequence-parallel style.
     """
     return sequence_parallel(
         sequence_dim=sequence_dim,
@@ -658,7 +727,7 @@ def build_prepare_module_input(
     """Build a PyTorch input-layout preparation style.
 
     Returns:
-        Parallel style returned by the supplied constructor.
+        Input preparation style.
     """
     return prepare_module_input(
         input_layouts=input_layouts,
@@ -679,7 +748,7 @@ def build_prepare_module_output(
     """Build a PyTorch output-layout preparation style.
 
     Returns:
-        Parallel style returned by the supplied constructor.
+        Output preparation style.
     """
     return prepare_module_output(
         output_layouts=output_layouts,
@@ -755,7 +824,7 @@ def redistribute_dtensor(
     """Redistribute a DTensor at a declared operator boundary.
 
     Returns:
-        DTensor returned by `redistribute`.
+        Redistributed DTensor.
     """
     return dtensor.redistribute(
         device_mesh=device_mesh,
@@ -778,7 +847,7 @@ def apply_context_parallel(
     """Apply PyTorch context parallelism.
 
     Returns:
-        Return value from the supplied `context_parallel` entry point.
+        Context-parallel application result.
     """
     return context_parallel(
         mesh,
@@ -800,7 +869,7 @@ def collective_all_gather_into_tensor(
     """Run `torch.distributed.all_gather_into_tensor`.
 
     Returns:
-        Return value from the supplied collective entry point.
+        Collective result.
     """
     return all_gather_into_tensor(
         output_tensor,
@@ -822,7 +891,7 @@ def collective_reduce_scatter_tensor(
     """Run `torch.distributed.reduce_scatter_tensor`.
 
     Returns:
-        Return value from the supplied collective entry point.
+        Collective result.
     """
     return reduce_scatter_tensor(
         output_tensor,
@@ -846,7 +915,7 @@ def collective_all_to_all_single(
     """Run `torch.distributed.all_to_all_single`.
 
     Returns:
-        Return value from the supplied collective entry point.
+        Collective result.
     """
     return all_to_all_single(
         output_tensor,
@@ -862,7 +931,7 @@ def wait_collective(work: Any) -> Any:
     """Wait for an async distributed work handle.
 
     Returns:
-        Return value from `work.wait()`.
+        Wait result.
     """
     return work.wait()
 
@@ -878,44 +947,16 @@ def _apply_distributed_strategy(
     _configure_distributed_communication(settings, bindings)
     strategy = _required_string_setting(settings, "distributed.strategy")
 
-    if strategy == "single_gpu":
-        return module
-
-    if strategy in {"fsdp2", "hsdp"}:
-        return _apply_declared_fsdp(module, settings, mesh, bindings)
-
-    if strategy == "tensor_parallel":
-        return _apply_declared_tensor_parallel(
-            module,
-            settings,
-            mesh,
-            placements,
-            bindings,
-        )
-
-    if strategy == "sequence_parallel":
-        return _apply_declared_sequence_parallel(
-            module,
-            settings,
-            mesh,
-            placements,
-            bindings,
-        )
-
-    if strategy == "context_parallel":
-        return _apply_declared_context_parallel(
-            module,
-            settings,
-            mesh,
-            placements,
-            bindings,
-        )
-
-    if strategy == "hybrid":
-        return _apply_declared_hybrid(module, settings, mesh, placements, bindings)
-
-    message = f"unsupported distributed strategy: {strategy}"
-    raise MaterializationError(message)
+    return _apply_declared_distributed_stage(
+        strategy,
+        module,
+        settings,
+        mesh,
+        placements,
+        bindings,
+        appliers=DISTRIBUTED_STRATEGY_APPLIERS,
+        error_prefix="unsupported distributed strategy",
+    )
 
 
 def _initialize_distributed_process_group(
@@ -1045,30 +1086,18 @@ def _apply_declared_fsdp(
     wrap_granularity = _required_string_setting(settings, "fsdp.wrap_granularity")
 
     if wrap_granularity == "root":
-        sharded = apply_fsdp2(
-            fsdp.fully_shard,
-            module,
-            mesh=mesh,
-            reshard_after_forward=reshard_after_forward,
-            shard_placement_fn=shard_placement_fn,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            ignored_params=ignored_params,
-            dp_mesh_dims=dp_mesh_dims,
+        target = module
+    else:
+        target = list(
+            named_modules_for_distributed_wrap(
+                module,
+                _fsdp_hook_module_names(settings),
+            )
         )
 
-        return _configure_fsdp_prefetch(sharded, settings, fsdp)
-
-    modules = list(
-        named_modules_for_distributed_wrap(
-            module,
-            _fsdp_hook_module_names(settings),
-        )
-    )
-
-    sharded = apply_fsdp2_group(
+    sharded = apply_fsdp2(
         fsdp.fully_shard,
-        modules,
+        target,
         mesh=mesh,
         reshard_after_forward=reshard_after_forward,
         shard_placement_fn=shard_placement_fn,
@@ -1094,13 +1123,7 @@ def _apply_declared_tensor_parallel(
     )
     plan = _tensor_parallel_plan(settings, placements, tensor_parallel)
 
-    return apply_tensor_parallel(
-        tensor_parallel.parallelize_module,
-        module,
-        device_mesh=mesh,
-        parallelize_plan=plan,
-        src_data_rank=tensor_parallel.src_data_rank,
-    )
+    return _apply_tensor_parallel_plan(module, mesh, tensor_parallel, plan)
 
 
 def _apply_declared_sequence_parallel(
@@ -1133,12 +1156,21 @@ def _apply_declared_sequence_parallel(
     for module_name in _tuple_of_strings(settings, "sequence_parallel.norm_modules"):
         plan[module_name] = sequence_style
 
+    return _apply_tensor_parallel_plan(module, mesh, tensor_parallel, plan)
+
+
+def _apply_tensor_parallel_plan(
+    module: torch.nn.Module,
+    mesh: Any,
+    bindings: DistributedTensorParallelBindings,
+    plan: Mapping[str, Any],
+) -> torch.nn.Module:
     return apply_tensor_parallel(
-        tensor_parallel.parallelize_module,
+        bindings.parallelize_module,
         module,
         device_mesh=mesh,
         parallelize_plan=plan,
-        src_data_rank=tensor_parallel.src_data_rank,
+        src_data_rank=bindings.src_data_rank,
     )
 
 
@@ -1206,41 +1238,83 @@ def _apply_declared_hybrid(
     result = module
 
     for stage in bindings.hybrid_order:
-        if stage == "tensor_parallel":
-            result = _apply_declared_tensor_parallel(
-                result,
-                settings,
-                mesh,
-                placements,
-                bindings,
-            )
-        elif stage == "fsdp2":
-            result = _apply_declared_fsdp(result, settings, mesh, bindings)
-        elif stage == "sequence_parallel":
-            result = _apply_declared_sequence_parallel(
-                result,
-                settings,
-                mesh,
-                placements,
-                bindings,
-            )
-        elif stage == "context_parallel":
-            result = _apply_declared_context_parallel(
-                result,
-                settings,
-                mesh,
-                placements,
-                bindings,
-            )
-        else:
-            message = f"unsupported hybrid distributed stage: {stage}"
-            raise MaterializationError(message)
+        result = _apply_declared_distributed_stage(
+            stage,
+            result,
+            settings,
+            mesh,
+            placements,
+            bindings,
+            appliers=HYBRID_STAGE_APPLIERS,
+            error_prefix="unsupported hybrid distributed stage",
+        )
 
     if not bindings.hybrid_order:
         message = "hybrid distributed strategy requires a non-empty hybrid_order"
         raise MaterializationError(message)
 
     return result
+
+
+def _apply_declared_distributed_stage(
+    stage: str,
+    module: torch.nn.Module,
+    settings: Mapping[str, Any],
+    mesh: Any,
+    placements: Mapping[str, Any],
+    bindings: DistributedStrategyBindings,
+    *,
+    appliers: Mapping[str, Callable[..., torch.nn.Module]],
+    error_prefix: str,
+) -> torch.nn.Module:
+    applier = appliers.get(stage)
+
+    if applier is None:
+        message = f"{error_prefix}: {stage}"
+        raise MaterializationError(message)
+
+    return applier(module, settings, mesh, placements, bindings)
+
+
+def _apply_single_gpu_stage(
+    module: torch.nn.Module,
+    settings: Mapping[str, Any],
+    mesh: Any,
+    placements: Mapping[str, Any],
+    bindings: DistributedStrategyBindings,
+) -> torch.nn.Module:
+    _ = settings, mesh, placements, bindings
+
+    return module
+
+
+def _apply_fsdp_stage(
+    module: torch.nn.Module,
+    settings: Mapping[str, Any],
+    mesh: Any,
+    placements: Mapping[str, Any],
+    bindings: DistributedStrategyBindings,
+) -> torch.nn.Module:
+    _ = placements
+
+    return _apply_declared_fsdp(module, settings, mesh, bindings)
+
+
+DISTRIBUTED_STRATEGY_APPLIERS = {
+    "single_gpu": _apply_single_gpu_stage,
+    "fsdp2": _apply_fsdp_stage,
+    "hsdp": _apply_fsdp_stage,
+    "tensor_parallel": _apply_declared_tensor_parallel,
+    "sequence_parallel": _apply_declared_sequence_parallel,
+    "context_parallel": _apply_declared_context_parallel,
+    "hybrid": _apply_declared_hybrid,
+}
+HYBRID_STAGE_APPLIERS = {
+    "tensor_parallel": _apply_declared_tensor_parallel,
+    "fsdp2": _apply_fsdp_stage,
+    "sequence_parallel": _apply_declared_sequence_parallel,
+    "context_parallel": _apply_declared_context_parallel,
+}
 
 
 def _tensor_parallel_plan(
@@ -1287,31 +1361,15 @@ def _tensor_parallel_style(
         value = "colwise"
 
     spec = _required_mapping(bindings.style_specs, key)
+    builder = TENSOR_PARALLEL_STYLE_BUILDERS.get(value)
+    constructor = {
+        "colwise": bindings.colwise_parallel,
+        "rowwise": bindings.rowwise_parallel,
+    }.get(value)
 
-    if value == "colwise":
-        return build_colwise_parallel(
-            bindings.colwise_parallel,
-            input_layouts=_placement_spec_value(
-                spec,
-                "input_layouts",
-                placements,
-                key,
-            ),
-            output_layouts=_placement_spec_value(
-                spec,
-                "output_layouts",
-                placements,
-                key,
-            ),
-            use_local_output=_required_bool_value(
-                spec.get("use_local_output"),
-                f"{key}.use_local_output",
-            ),
-        )
-
-    if value == "rowwise":
-        return build_rowwise_parallel(
-            bindings.rowwise_parallel,
+    if builder is not None and constructor is not None:
+        return builder(
+            constructor,
             input_layouts=_placement_spec_value(
                 spec,
                 "input_layouts",
@@ -1340,42 +1398,16 @@ def _add_prepare_module_input_style(
     placements: Mapping[str, Any],
     bindings: DistributedTensorParallelBindings,
 ) -> None:
-    value = _required_string_setting(settings, "tp.prepare_module_input")
-    spec = _required_mapping(bindings.prepare_input_specs, value)
-    module_path = _required_string_value(
-        spec.get("module_path"),
-        "tp.prepare_module_input.module_path",
-    )
-    plan[module_path] = build_prepare_module_input(
+    _add_prepare_module_style(
+        settings,
+        plan,
+        placements,
+        "tp.prepare_module_input",
+        bindings.prepare_input_specs,
+        build_prepare_module_input,
         bindings.prepare_module_input,
-        input_layouts=_placement_spec_value(
-            spec,
-            "input_layouts",
-            placements,
-            "tp.prepare_module_input",
-        ),
-        desired_input_layouts=_placement_spec_value(
-            spec,
-            "desired_input_layouts",
-            placements,
-            "tp.prepare_module_input",
-        ),
-        input_kwarg_layouts=_placement_spec_mapping(
-            spec,
-            "input_kwarg_layouts",
-            placements,
-            "tp.prepare_module_input",
-        ),
-        desired_input_kwarg_layouts=_placement_spec_mapping(
-            spec,
-            "desired_input_kwarg_layouts",
-            placements,
-            "tp.prepare_module_input",
-        ),
-        use_local_output=_required_bool_value(
-            spec.get("use_local_output"),
-            "tp.prepare_module_input.use_local_output",
-        ),
+        ("input_layouts", "desired_input_layouts"),
+        ("input_kwarg_layouts", "desired_input_kwarg_layouts"),
     )
 
 
@@ -1385,31 +1417,49 @@ def _add_prepare_module_output_style(
     placements: Mapping[str, Any],
     bindings: DistributedTensorParallelBindings,
 ) -> None:
-    value = _required_string_setting(settings, "tp.prepare_module_output")
-    spec = _required_mapping(bindings.prepare_output_specs, value)
+    _add_prepare_module_style(
+        settings,
+        plan,
+        placements,
+        "tp.prepare_module_output",
+        bindings.prepare_output_specs,
+        build_prepare_module_output,
+        bindings.prepare_module_output,
+        ("output_layouts", "desired_output_layouts"),
+        (),
+    )
+
+
+def _add_prepare_module_style(
+    settings: Mapping[str, Any],
+    plan: dict[str, Any],
+    placements: Mapping[str, Any],
+    setting_key: str,
+    specs: Mapping[str, Mapping[str, Any]],
+    style_builder: Callable[..., Any],
+    constructor: Callable[..., Any],
+    placement_fields: tuple[str, ...],
+    placement_mapping_fields: tuple[str, ...],
+) -> None:
+    value = _required_string_setting(settings, setting_key)
+    spec = _required_mapping(specs, value)
     module_path = _required_string_value(
         spec.get("module_path"),
-        "tp.prepare_module_output.module_path",
+        f"{setting_key}.module_path",
     )
-    plan[module_path] = build_prepare_module_output(
-        bindings.prepare_module_output,
-        output_layouts=_placement_spec_value(
-            spec,
-            "output_layouts",
-            placements,
-            "tp.prepare_module_output",
-        ),
-        desired_output_layouts=_placement_spec_value(
-            spec,
-            "desired_output_layouts",
-            placements,
-            "tp.prepare_module_output",
-        ),
-        use_local_output=_required_bool_value(
-            spec.get("use_local_output"),
-            "tp.prepare_module_output.use_local_output",
-        ),
+    kwargs = {
+        field: _placement_spec_value(spec, field, placements, setting_key)
+        for field in placement_fields
+    }
+
+    for field in placement_mapping_fields:
+        kwargs[field] = _placement_spec_mapping(spec, field, placements, setting_key)
+
+    kwargs["use_local_output"] = _required_bool_value(
+        spec.get("use_local_output"),
+        f"{setting_key}.use_local_output",
     )
+    plan[module_path] = style_builder(constructor, **kwargs)
 
 
 def _placement_spec_value(
@@ -1502,20 +1552,27 @@ def _configure_fsdp_prefetch(
     settings: Mapping[str, Any],
     bindings: DistributedFSDPBindings,
 ) -> torch.nn.Module:
-    forward_prefetch = _required_string_setting(settings, "fsdp.forward_prefetch")
-    backward_prefetch = _required_string_setting(settings, "fsdp.backward_prefetch")
+    for key, enabled_value, configure, label in (
+        (
+            "fsdp.forward_prefetch",
+            "next-forward",
+            bindings.configure_forward_prefetch,
+            "forward",
+        ),
+        (
+            "fsdp.backward_prefetch",
+            "backward-pre",
+            bindings.configure_backward_prefetch,
+            "backward",
+        ),
+    ):
+        value = _required_string_setting(settings, key)
 
-    if forward_prefetch == "next-forward":
-        bindings.configure_forward_prefetch(module, forward_prefetch)
-    elif forward_prefetch != "disabled":
-        message = f"unsupported FSDP forward prefetch setting: {forward_prefetch}"
-        raise MaterializationError(message)
-
-    if backward_prefetch == "backward-pre":
-        bindings.configure_backward_prefetch(module, backward_prefetch)
-    elif backward_prefetch != "disabled":
-        message = f"unsupported FSDP backward prefetch setting: {backward_prefetch}"
-        raise MaterializationError(message)
+        if value == enabled_value:
+            configure(module, value)
+        elif value != "disabled":
+            message = f"unsupported FSDP {label} prefetch setting: {value}"
+            raise MaterializationError(message)
 
     return module
 
@@ -1640,7 +1697,7 @@ def _required_declared_setting(settings: Mapping[str, Any], key: str) -> Any:
 def _required_int_setting(settings: Mapping[str, Any], key: str) -> int:
     value = settings.get(key)
 
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+    if not _positive_int_value(value):
         message = f"{key} must be a positive integer"
         raise MaterializationError(message)
 
@@ -1650,14 +1707,7 @@ def _required_int_setting(settings: Mapping[str, Any], key: str) -> int:
 def _tuple_of_ints(settings: Mapping[str, Any], key: str) -> tuple[int, ...]:
     value = settings.get(key)
 
-    if not isinstance(value, tuple) or not value:
-        message = f"{key} must be a non-empty tuple of positive integers"
-        raise MaterializationError(message)
-
-    if not all(
-        isinstance(item, int) and not isinstance(item, bool) and item > 0
-        for item in value
-    ):
+    if not _positive_int_tuple_value(value):
         message = f"{key} must be a non-empty tuple of positive integers"
         raise MaterializationError(message)
 
@@ -1667,11 +1717,7 @@ def _tuple_of_ints(settings: Mapping[str, Any], key: str) -> tuple[int, ...]:
 def _tuple_of_strings(settings: Mapping[str, Any], key: str) -> tuple[str, ...]:
     value = settings.get(key)
 
-    if not isinstance(value, tuple):
-        message = f"{key} must be a tuple of strings"
-        raise MaterializationError(message)
-
-    if not all(isinstance(item, str) and item for item in value):
+    if not _string_tuple_value(value):
         message = f"{key} must be a tuple of strings"
         raise MaterializationError(message)
 
@@ -1708,7 +1754,7 @@ def _required_mapping_value(value: Any, name: str) -> Mapping[str, Any]:
 
 
 def _required_string_value(value: Any, name: str) -> str:
-    if not isinstance(value, str) or not value:
+    if not _non_empty_string_value(value):
         message = f"{name} must be a non-empty string"
         raise MaterializationError(message)
 
@@ -1738,7 +1784,7 @@ def _optional_string(value: Any, name: str) -> str | None:
     if value is None:
         return None
 
-    if not isinstance(value, str) or not value:
+    if not _non_empty_string_value(value):
         message = f"{name} must be a non-empty string"
         raise MaterializationError(message)
 
@@ -2070,6 +2116,184 @@ def _distributed_space_common_settings(
     }
 
 
+def _distributed_axis_row(
+    axis_key: str,
+    allowed_values: tuple[Any, ...],
+    rule_factory: Callable[[str], Callable[[Candidate], tuple[bool, str | None]]]
+    | None = None,
+) -> tuple[Any, ...]:
+    return axis_key, allowed_values, rule_factory
+
+
+def _distributed_axis_rows(
+    axis_keys: tuple[str, ...],
+    allowed_values: tuple[Any, ...],
+    rule_factory: Callable[[str], Callable[[Candidate], tuple[bool, str | None]]]
+    | None = None,
+) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        _distributed_axis_row(axis_key, allowed_values, rule_factory)
+        for axis_key in axis_keys
+    )
+
+
+def _distributed_value_axis(
+    value_message: str,
+    validate: Callable[[Any], bool],
+) -> Callable[[str], Callable[[Candidate], tuple[bool, str | None]]]:
+    def build(axis_key: str) -> Callable[[Candidate], tuple[bool, str | None]]:
+        def admit(candidate: Candidate) -> tuple[bool, str | None]:
+            value = candidate.settings[axis_key]
+
+            if validate(value):
+                return True, None
+
+            return False, f"{axis_key} must be {value_message}"
+
+        return admit
+
+    return build
+
+
+def _positive_int_value(value: Any) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _nonnegative_int_value(value: Any) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _positive_int_tuple_value(value: Any) -> TypeGuard[tuple[int, ...]]:
+    return (
+        isinstance(value, tuple)
+        and bool(value)
+        and all(_positive_int_value(item) for item in value)
+    )
+
+
+def _non_empty_string_value(value: Any) -> TypeGuard[str]:
+    return isinstance(value, str) and bool(value)
+
+
+def _string_tuple_value(value: Any) -> TypeGuard[tuple[str, ...]]:
+    return isinstance(value, tuple) and all(
+        _non_empty_string_value(item) for item in value
+    )
+
+
+def _non_empty_string_tuple_value(value: Any) -> TypeGuard[tuple[str, ...]]:
+    return isinstance(value, tuple) and bool(value) and _string_tuple_value(value)
+
+
+POSITIVE_INT_AXIS = _distributed_value_axis("a positive integer", _positive_int_value)
+NONNEGATIVE_INT_AXIS = _distributed_value_axis(
+    "a non-negative integer", _nonnegative_int_value
+)
+POSITIVE_INT_TUPLE_AXIS = _distributed_value_axis(
+    "a positive integer tuple", _positive_int_tuple_value
+)
+NON_EMPTY_STRING_AXIS = _distributed_value_axis(
+    "a non-empty string", _non_empty_string_value
+)
+STRING_TUPLE_AXIS = _distributed_value_axis("a tuple of strings", _string_tuple_value)
+NON_EMPTY_STRING_TUPLE_AXIS = _distributed_value_axis(
+    "a non-empty tuple of strings", _non_empty_string_tuple_value
+)
+DTENSOR_PLACEMENT_VALUES = ("replicate", "shard_dim", "partial")
+DTENSOR_REDISTRIBUTE_SCHEDULE_VALUES = (
+    "none",
+    "before_forward",
+    "before_backward",
+    "between_operator_parts",
+    "before_output",
+)
+DISTRIBUTED_AXIS_ROWS = (
+    _distributed_axis_row("distributed.launch", ("single_process", "torchrun")),
+    _distributed_axis_row(
+        "distributed.process_group_backend",
+        ("nccl", "gloo", "ucc_when_available"),
+    ),
+    _distributed_axis_row(
+        "distributed.local_rank_binding",
+        ("cuda_local_rank", "explicit_device_map"),
+    ),
+    _distributed_axis_row("distributed.mesh_shape", (), POSITIVE_INT_TUPLE_AXIS),
+    _distributed_axis_row(
+        "distributed.mesh_dim_names",
+        (),
+        NON_EMPTY_STRING_TUPLE_AXIS,
+    ),
+    *_distributed_axis_rows(DTENSOR_PLACEMENT_KEYS, DTENSOR_PLACEMENT_VALUES),
+    _distributed_axis_row(
+        "dtensor.redistribute_schedule",
+        DTENSOR_REDISTRIBUTE_SCHEDULE_VALUES,
+    ),
+    _distributed_axis_row(
+        "fsdp.wrap_granularity",
+        ("root", "transformer_block", "block_group"),
+    ),
+    _distributed_axis_row(
+        "fsdp.reshard_after_forward",
+        FSDP_RESHARD_AFTER_FORWARD_DOMAIN,
+    ),
+    _distributed_axis_row("fsdp.shard_placement_fn", ("none", "declared_fn")),
+    *_distributed_axis_rows(
+        (
+            "fsdp.mp_policy.param_dtype",
+            "fsdp.mp_policy.reduce_dtype",
+            "fsdp.mp_policy.output_dtype",
+        ),
+        ("fp32", "bf16", "fp16"),
+    ),
+    _distributed_axis_row("fsdp.mp_policy.cast_forward_inputs", ("false", "true")),
+    _distributed_axis_row("fsdp.offload_policy", ("none", "cpu")),
+    _distributed_axis_row("fsdp.ignored_params", (), STRING_TUPLE_AXIS),
+    _distributed_axis_row("fsdp.dp_mesh_dims", (), NON_EMPTY_STRING_TUPLE_AXIS),
+    _distributed_axis_row("tp.plan", (), NON_EMPTY_STRING_AXIS),
+    _distributed_axis_row("tp.qkv_projection", ("colwise", "rowwise", "replicated")),
+    _distributed_axis_row(
+        "tp.output_projection",
+        ("rowwise", "colwise", "replicated"),
+    ),
+    _distributed_axis_row("tp.mlp_up_gate", ("colwise", "rowwise", "replicated")),
+    _distributed_axis_row("tp.mlp_down", ("rowwise", "colwise", "replicated")),
+    _distributed_axis_row("tp.embedding", ("replicated", "rowwise", "colwise")),
+    _distributed_axis_row("tp.lm_head", ("replicated", "vocab_sharded")),
+    *_distributed_axis_rows(
+        ("tp.prepare_module_input", "tp.prepare_module_output"),
+        (),
+        NON_EMPTY_STRING_AXIS,
+    ),
+    _distributed_axis_row("tp.loss_parallel", ("false", "true")),
+    _distributed_axis_row("sequence_parallel.enabled", ("false", "true")),
+    _distributed_axis_row(
+        "sequence_parallel.norm_modules",
+        (),
+        NON_EMPTY_STRING_TUPLE_AXIS,
+    ),
+    _distributed_axis_row(
+        "sequence_parallel.output_placement_policy",
+        ("preserve_sequence_shard", "redistribute_to_declared_output"),
+    ),
+    _distributed_axis_row("context_parallel.enabled", ("false", "true")),
+    _distributed_axis_row(
+        "context_parallel.rotate_method",
+        ("all_gather", "all_to_all"),
+    ),
+    _distributed_axis_row(
+        "context_parallel.sequence_dim",
+        (),
+        NONNEGATIVE_INT_AXIS,
+    ),
+    _distributed_axis_row(
+        "comm.overlap",
+        ("none", "all_gather_overlap", "reduce_scatter_overlap", "both"),
+    ),
+    _distributed_axis_row("comm.prefetch", ("none", "forward", "backward", "both")),
+    _distributed_axis_row("comm.collective_bucket_size", (), POSITIVE_INT_AXIS),
+)
+
+
 def distributed_axis_descriptors(
     strategies: Sequence[str],
     *,
@@ -2078,124 +2302,7 @@ def distributed_axis_descriptors(
     """Return adapter-owned distributed axis descriptors."""
     return (
         distributed_strategy_axis(strategies, policy=policy),
-        _distributed_axis(
-            "distributed.launch",
-            ("single_process", "torchrun"),
-        ),
-        _distributed_axis(
-            "distributed.process_group_backend",
-            ("nccl", "gloo", "ucc_when_available"),
-        ),
-        _distributed_axis(
-            "distributed.local_rank_binding",
-            ("cuda_local_rank", "explicit_device_map"),
-        ),
-        _distributed_axis(
-            "distributed.mesh_shape",
-            (),
-            admission_rule=_positive_int_tuple_axis("distributed.mesh_shape"),
-        ),
-        _distributed_axis(
-            "distributed.mesh_dim_names",
-            (),
-            admission_rule=_non_empty_string_tuple_axis(
-                "distributed.mesh_dim_names",
-            ),
-        ),
-        *tuple(
-            _distributed_axis(
-                key,
-                ("replicate", "shard_dim", "partial"),
-            )
-            for key in DTENSOR_PLACEMENT_KEYS
-        ),
-        _distributed_axis(
-            "dtensor.redistribute_schedule",
-            (
-                "none",
-                "before_forward",
-                "before_backward",
-                "between_operator_parts",
-                "before_output",
-            ),
-        ),
-        _distributed_axis(
-            "fsdp.wrap_granularity",
-            ("root", "transformer_block", "block_group"),
-        ),
-        _distributed_axis(
-            "fsdp.reshard_after_forward",
-            FSDP_RESHARD_AFTER_FORWARD_DOMAIN,
-        ),
-        _distributed_axis("fsdp.shard_placement_fn", ("none", "declared_fn")),
-        _distributed_axis("fsdp.mp_policy.param_dtype", ("fp32", "bf16", "fp16")),
-        _distributed_axis("fsdp.mp_policy.reduce_dtype", ("fp32", "bf16", "fp16")),
-        _distributed_axis("fsdp.mp_policy.output_dtype", ("fp32", "bf16", "fp16")),
-        _distributed_axis("fsdp.mp_policy.cast_forward_inputs", ("false", "true")),
-        _distributed_axis("fsdp.offload_policy", ("none", "cpu")),
-        _distributed_axis(
-            "fsdp.ignored_params",
-            (),
-            admission_rule=_string_tuple_axis("fsdp.ignored_params"),
-        ),
-        _distributed_axis(
-            "fsdp.dp_mesh_dims",
-            (),
-            admission_rule=_non_empty_string_tuple_axis("fsdp.dp_mesh_dims"),
-        ),
-        _distributed_axis(
-            "tp.plan",
-            (),
-            admission_rule=_non_empty_string_axis("tp.plan"),
-        ),
-        _distributed_axis("tp.qkv_projection", ("colwise", "rowwise", "replicated")),
-        _distributed_axis("tp.output_projection", ("rowwise", "colwise", "replicated")),
-        _distributed_axis("tp.mlp_up_gate", ("colwise", "rowwise", "replicated")),
-        _distributed_axis("tp.mlp_down", ("rowwise", "colwise", "replicated")),
-        _distributed_axis("tp.embedding", ("replicated", "rowwise", "colwise")),
-        _distributed_axis("tp.lm_head", ("replicated", "vocab_sharded")),
-        _distributed_axis(
-            "tp.prepare_module_input",
-            (),
-            admission_rule=_non_empty_string_axis("tp.prepare_module_input"),
-        ),
-        _distributed_axis(
-            "tp.prepare_module_output",
-            (),
-            admission_rule=_non_empty_string_axis("tp.prepare_module_output"),
-        ),
-        _distributed_axis("tp.loss_parallel", ("false", "true")),
-        _distributed_axis("sequence_parallel.enabled", ("false", "true")),
-        _distributed_axis(
-            "sequence_parallel.norm_modules",
-            (),
-            admission_rule=_non_empty_string_tuple_axis(
-                "sequence_parallel.norm_modules",
-            ),
-        ),
-        _distributed_axis(
-            "sequence_parallel.output_placement_policy",
-            ("preserve_sequence_shard", "redistribute_to_declared_output"),
-        ),
-        _distributed_axis("context_parallel.enabled", ("false", "true")),
-        _distributed_axis(
-            "context_parallel.rotate_method", ("all_gather", "all_to_all")
-        ),
-        _distributed_axis(
-            "context_parallel.sequence_dim",
-            (),
-            admission_rule=_nonnegative_int_axis("context_parallel.sequence_dim"),
-        ),
-        _distributed_axis(
-            "comm.overlap",
-            ("none", "all_gather_overlap", "reduce_scatter_overlap", "both"),
-        ),
-        _distributed_axis("comm.prefetch", ("none", "forward", "backward", "both")),
-        _distributed_axis(
-            "comm.collective_bucket_size",
-            (),
-            admission_rule=_positive_int_axis("comm.collective_bucket_size"),
-        ),
+        *_distributed_axes(DISTRIBUTED_AXIS_ROWS),
     )
 
 
@@ -2240,6 +2347,17 @@ def _distributed_axis(
     )
 
 
+def _distributed_axes(rows: Sequence[tuple[Any, ...]]) -> tuple[AxisDescriptor, ...]:
+    return tuple(
+        _distributed_axis(
+            axis_key,
+            allowed_values,
+            admission_rule=None if rule_factory is None else rule_factory(axis_key),
+        )
+        for axis_key, allowed_values, rule_factory in rows
+    )
+
+
 def _distributed_axis_rule(
     axis_key: str,
     admission_rule: Callable[[Candidate], tuple[bool, str | None]] | None,
@@ -2252,100 +2370,6 @@ def _distributed_axis_rule(
             return True, None
 
         return admission_rule(candidate)
-
-    return admit
-
-
-def _positive_int_axis(axis_key: str) -> Callable[[Candidate], tuple[bool, str | None]]:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings[axis_key]
-
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            return False, f"{axis_key} must be a positive integer"
-
-        return True, None
-
-    return admit
-
-
-def _nonnegative_int_axis(
-    axis_key: str,
-) -> Callable[[Candidate], tuple[bool, str | None]]:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings[axis_key]
-
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            return False, f"{axis_key} must be a non-negative integer"
-
-        return True, None
-
-    return admit
-
-
-def _positive_int_tuple_axis(
-    axis_key: str,
-) -> Callable[[Candidate], tuple[bool, str | None]]:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings[axis_key]
-
-        if not isinstance(value, tuple) or not value:
-            return False, f"{axis_key} must be a positive integer tuple"
-
-        if not all(
-            isinstance(item, int) and not isinstance(item, bool) and item > 0
-            for item in value
-        ):
-            return False, f"{axis_key} must be a positive integer tuple"
-
-        return True, None
-
-    return admit
-
-
-def _non_empty_string_axis(
-    axis_key: str,
-) -> Callable[[Candidate], tuple[bool, str | None]]:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings[axis_key]
-
-        if not isinstance(value, str) or not value:
-            return False, f"{axis_key} must be a non-empty string"
-
-        return True, None
-
-    return admit
-
-
-def _string_tuple_axis(
-    axis_key: str,
-) -> Callable[[Candidate], tuple[bool, str | None]]:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings[axis_key]
-
-        if not isinstance(value, tuple):
-            return False, f"{axis_key} must be a tuple of strings"
-
-        if not all(isinstance(item, str) and item for item in value):
-            return False, f"{axis_key} must be a tuple of strings"
-
-        return True, None
-
-    return admit
-
-
-def _non_empty_string_tuple_axis(
-    axis_key: str,
-) -> Callable[[Candidate], tuple[bool, str | None]]:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings[axis_key]
-
-        if not isinstance(value, tuple) or not value:
-            return False, f"{axis_key} must be a non-empty tuple of strings"
-
-        if not all(isinstance(item, str) and item for item in value):
-            return False, f"{axis_key} must be a non-empty tuple of strings"
-
-        return True, None
 
     return admit
 
@@ -2395,50 +2419,30 @@ def _strategy_validation_error(
 
 def _distributed_common_validation_error(settings: Mapping[str, Any]) -> str | None:
     return _first_error((
-        _distributed_launch_error(settings),
-        _process_group_backend_error(settings),
-        _local_rank_binding_error(settings),
-        _mesh_shape_error(settings),
+        *(
+            _required_string_domain_error(settings, key, values)
+            for key, values in DISTRIBUTED_COMMON_STRING_DOMAIN_FIELDS
+        ),
+        _required_value_error(
+            settings,
+            "distributed.mesh_shape",
+            _positive_int_tuple_value,
+            "a non-empty tuple of positive integers",
+        ),
         _mesh_dim_names_error(settings),
         _communication_settings_error(settings),
     ))
 
 
-def _distributed_launch_error(settings: Mapping[str, Any]) -> str | None:
-    value = settings.get("distributed.launch")
+def _required_string_domain_error(
+    settings: Mapping[str, Any],
+    key: str,
+    values: tuple[str, ...],
+) -> str | None:
+    value = settings.get(key)
 
-    if value not in {"single_process", "torchrun"}:
-        return f"distributed.launch is unsupported: {value}"
-
-    return None
-
-
-def _process_group_backend_error(settings: Mapping[str, Any]) -> str | None:
-    value = settings.get("distributed.process_group_backend")
-
-    if value not in {"gloo", "nccl", "ucc_when_available"}:
-        return f"distributed.process_group_backend is unsupported: {value}"
-
-    return None
-
-
-def _local_rank_binding_error(settings: Mapping[str, Any]) -> str | None:
-    value = settings.get("distributed.local_rank_binding")
-
-    if value not in {"cuda_local_rank", "explicit_device_map"}:
-        return f"distributed.local_rank_binding is unsupported: {value}"
-
-    return None
-
-
-def _mesh_shape_error(settings: Mapping[str, Any]) -> str | None:
-    value = settings.get("distributed.mesh_shape")
-
-    if not isinstance(value, tuple) or not value:
-        return "distributed.mesh_shape must be a non-empty tuple of positive integers"
-
-    if not all(isinstance(dim, int) and dim > 0 for dim in value):
-        return "distributed.mesh_shape must be a non-empty tuple of positive integers"
+    if value not in values:
+        return f"{key} is unsupported: {value}"
 
     return None
 
@@ -2447,10 +2451,7 @@ def _mesh_dim_names_error(settings: Mapping[str, Any]) -> str | None:
     value = settings.get("distributed.mesh_dim_names")
     mesh_shape = settings.get("distributed.mesh_shape")
 
-    if not isinstance(value, tuple) or not value:
-        return "distributed.mesh_dim_names must be a non-empty tuple of strings"
-
-    if not all(isinstance(name, str) and name for name in value):
+    if not _non_empty_string_tuple_value(value):
         return "distributed.mesh_dim_names must be a non-empty tuple of strings"
 
     if isinstance(mesh_shape, tuple) and len(value) != len(mesh_shape):
@@ -2461,24 +2462,27 @@ def _mesh_dim_names_error(settings: Mapping[str, Any]) -> str | None:
 
 def _communication_settings_error(settings: Mapping[str, Any]) -> str | None:
     return _first_error((
-        _optional_string_domain_error(
-            settings,
-            "comm.overlap",
-            {"none", "all_gather_overlap", "reduce_scatter_overlap", "both"},
+        *(
+            _optional_string_domain_error(
+                settings,
+                key,
+                values,
+            )
+            for key, values in COMMUNICATION_STRING_DOMAIN_FIELDS
         ),
-        _optional_string_domain_error(
+        _optional_value_error(
             settings,
-            "comm.prefetch",
-            {"none", "forward", "backward", "both"},
+            "comm.collective_bucket_size",
+            _positive_int_value,
+            "a positive integer",
         ),
-        _optional_positive_int_error(settings, "comm.collective_bucket_size"),
     ))
 
 
 def _optional_string_domain_error(
     settings: Mapping[str, Any],
     key: str,
-    values: set[str],
+    values: Sequence[str],
 ) -> str | None:
     if key not in settings:
         return None
@@ -2491,59 +2495,15 @@ def _optional_string_domain_error(
     return None
 
 
-def _optional_positive_int_error(
-    settings: Mapping[str, Any],
-    key: str,
-) -> str | None:
-    if key not in settings:
-        return None
-
-    value = settings.get(key)
-
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        return f"{key} must be a positive integer"
-
-    return None
-
-
 def _fsdp2_validation_error(
     settings: Mapping[str, Any],
     policy: DistributedAdmissionPolicy,
 ) -> str | None:
     return _first_error((
-        _non_empty_string_sequence(settings, "fsdp.hook_entry_points"),
-        _fsdp2_policy_error(settings, policy),
-        _string_sequence(settings, "fsdp.ignored_params"),
-        _non_empty_string_sequence(settings, "fsdp.dp_mesh_dims"),
-        _fsdp2_hook_bypass_error(settings),
-        _required_bool(settings, "fsdp.bypasses_hooks"),
-        _required_bool(settings, "fsdp.bottom_up_order"),
-        _string_sequence(settings, "fsdp.mutated_modules"),
-        _non_empty_mapping(settings, "fsdp.collectives"),
+        _required_value_rows_error(settings, FSDP2_PRE_POLICY_VALUE_ROWS),
+        _policy_fields_error(settings, policy.fsdp2, FSDP2_POLICY_FIELDS),
+        _required_value_rows_error(settings, FSDP2_POST_POLICY_VALUE_ROWS),
     ))
-
-
-def _fsdp2_policy_error(
-    settings: Mapping[str, Any],
-    policy: DistributedAdmissionPolicy,
-) -> str | None:
-    return _policy_fields_error(
-        settings,
-        policy.fsdp2,
-        (
-            "fsdp.hook_entry_policy",
-            "fsdp.wrap_granularity",
-            "fsdp.forward_prefetch",
-            "fsdp.backward_prefetch",
-            "fsdp.reshard_after_forward",
-            "fsdp.shard_placement_fn",
-            "fsdp.mp_policy.param_dtype",
-            "fsdp.mp_policy.reduce_dtype",
-            "fsdp.mp_policy.output_dtype",
-            "fsdp.mp_policy.cast_forward_inputs",
-            "fsdp.offload_policy",
-        ),
-    )
 
 
 def _policy_fields_error(
@@ -2556,13 +2516,6 @@ def _policy_fields_error(
 
         if policy_error is not None:
             return policy_error
-
-    return None
-
-
-def _fsdp2_hook_bypass_error(settings: Mapping[str, Any]) -> str | None:
-    if settings.get("fsdp.bypasses_hooks") is not False:
-        return "fsdp2 candidates must not bypass FSDP hooks"
 
     return None
 
@@ -2582,7 +2535,11 @@ def _hybrid_validation_error(
     return _first_error((
         _fsdp2_validation_error(settings, policy),
         _layout_common_error(settings, policy),
-        _tensor_parallel_policy_error(settings, policy),
+        _policy_fields_error(
+            settings,
+            policy.tensor_parallel,
+            TENSOR_PARALLEL_POLICY_FIELDS,
+        ),
     ))
 
 
@@ -2605,18 +2562,7 @@ def _layout_common_error(
     if placement_error is not None:
         return placement_error
 
-    policy_error = _policy_fields_error(
-        settings,
-        policy.dtensor,
-        (
-            "dtensor.module_class",
-            "dtensor.to_local_grad_placement",
-            "dtensor.from_local_check",
-            "dtensor.uneven_shard_handling",
-            "dtensor.async_local_tensor_handling",
-            "dtensor.redistribute_schedule",
-        ),
-    )
+    policy_error = _policy_fields_error(settings, policy.dtensor, DTENSOR_POLICY_FIELDS)
 
     if policy_error is not None:
         return policy_error
@@ -2658,15 +2604,14 @@ def _higher_order_diff_status_keys(settings: Mapping[str, Any]) -> tuple[str, ..
 
 def _layout_placement_error(settings: Mapping[str, Any]) -> str | None:
     for key in DTENSOR_PLACEMENT_KEYS:
-        placement_error = _required_string(settings, key)
+        placement_error = _required_string_domain_value_error(
+            settings,
+            key,
+            DTENSOR_PLACEMENT_VALUES,
+        )
 
         if placement_error is not None:
             return placement_error
-
-        value = settings.get(key)
-
-        if value not in {"replicate", "shard_dim", "partial"}:
-            return f"{key} is unsupported: {value}"
 
     return None
 
@@ -2677,106 +2622,116 @@ def _layout_mode_error(
 ) -> str | None:
     strategy = settings.get("distributed.strategy")
 
-    if strategy == "tensor_parallel":
-        return _tensor_parallel_policy_error(settings, policy)
+    if not isinstance(strategy, str):
+        return f"unsupported layout distributed strategy: {strategy}"
 
-    if strategy == "sequence_parallel":
+    row = LAYOUT_MODE_POLICY_FIELDS.get(strategy)
+
+    if row is not None:
+        policy_name, fields = row
+
         return _policy_fields_error(
             settings,
-            policy.sequence_parallel,
-            (
-                "sequence_parallel.enabled",
-                "sequence_parallel.norm_modules",
-                "sequence_parallel.output_placement_policy",
-            ),
-        )
-
-    if strategy == "context_parallel":
-        return _policy_fields_error(
-            settings,
-            policy.context_parallel,
-            (
-                "context_parallel.enabled",
-                "context_parallel.rotate_method",
-                "context_parallel.sequence_dim",
-            ),
+            getattr(policy, policy_name),
+            fields,
         )
 
     return f"unsupported layout distributed strategy: {strategy}"
 
 
-def _tensor_parallel_policy_error(
-    settings: Mapping[str, Any],
-    policy: DistributedAdmissionPolicy,
-) -> str | None:
-    return _policy_fields_error(
-        settings,
-        policy.tensor_parallel,
-        (
-            "tp.plan",
-            "tp.qkv_projection",
-            "tp.output_projection",
-            "tp.mlp_up_gate",
-            "tp.mlp_down",
-            "tp.embedding",
-            "tp.lm_head",
-            "tp.prepare_module_input",
-            "tp.prepare_module_output",
-            "tp.loss_parallel",
-        ),
-    )
+def _false_value(value: Any) -> bool:
+    return value is False
 
 
-def _non_empty_string_sequence(
+def _bool_value(value: Any) -> bool:
+    return isinstance(value, bool)
+
+
+def _non_empty_mapping_value(value: Any) -> bool:
+    return isinstance(value, Mapping) and bool(value)
+
+
+def _required_value_error(
     settings: Mapping[str, Any],
     key: str,
+    validate: Callable[[Any], bool],
+    value_message: str,
 ) -> str | None:
     value = settings.get(key)
 
-    if not isinstance(value, tuple) or not value:
-        return f"{key} must be a non-empty tuple of strings"
-
-    if not all(isinstance(item, str) and item for item in value):
-        return f"{key} must be a non-empty tuple of strings"
+    if not validate(value):
+        return f"{key} must be {value_message}"
 
     return None
 
 
-def _required_string(settings: Mapping[str, Any], key: str) -> str | None:
+def _optional_value_error(
+    settings: Mapping[str, Any],
+    key: str,
+    validate: Callable[[Any], bool],
+    value_message: str,
+) -> str | None:
+    if key not in settings:
+        return None
+
+    return _required_value_error(settings, key, validate, value_message)
+
+
+def _required_string_domain_value_error(
+    settings: Mapping[str, Any],
+    key: str,
+    values: Sequence[str],
+) -> str | None:
+    value_error = _required_value_error(
+        settings,
+        key,
+        _non_empty_string_value,
+        "a non-empty string",
+    )
+
+    if value_error is not None:
+        return value_error
+
     value = settings.get(key)
 
-    if not isinstance(value, str) or not value:
-        return f"{key} must be a non-empty string"
+    if value not in values:
+        return f"{key} is unsupported: {value}"
 
     return None
 
 
-def _string_sequence(settings: Mapping[str, Any], key: str) -> str | None:
-    value = settings.get(key)
+def _required_value_rows_error(
+    settings: Mapping[str, Any],
+    rows: Sequence[tuple[str, Callable[[Any], bool], str]],
+) -> str | None:
+    for key, validate, value_message in rows:
+        row_error = _required_value_error(settings, key, validate, value_message)
 
-    if not isinstance(value, tuple):
-        return f"{key} must be a tuple of strings"
-
-    if not all(isinstance(item, str) and item for item in value):
-        return f"{key} must be a tuple of strings"
-
-    return None
-
-
-def _non_empty_mapping(settings: Mapping[str, Any], key: str) -> str | None:
-    value = settings.get(key)
-
-    if not isinstance(value, Mapping) or not value:
-        return f"{key} must be a non-empty mapping"
+        if row_error is not None:
+            return row_error
 
     return None
 
 
-def _required_bool(settings: Mapping[str, Any], key: str) -> str | None:
-    if not isinstance(settings.get(key), bool):
-        return f"{key} must be a bool"
-
-    return None
+FSDP2_PRE_POLICY_VALUE_ROWS = (
+    (
+        "fsdp.hook_entry_points",
+        _non_empty_string_tuple_value,
+        "a non-empty tuple of strings",
+    ),
+)
+FSDP2_POST_POLICY_VALUE_ROWS = (
+    ("fsdp.ignored_params", _string_tuple_value, "a tuple of strings"),
+    (
+        "fsdp.dp_mesh_dims",
+        _non_empty_string_tuple_value,
+        "a non-empty tuple of strings",
+    ),
+    ("fsdp.bypasses_hooks", _false_value, "false"),
+    ("fsdp.bottom_up_order", _bool_value, "a bool"),
+    ("fsdp.mutated_modules", _string_tuple_value, "a tuple of strings"),
+    ("fsdp.collectives", _non_empty_mapping_value, "a non-empty mapping"),
+)
 
 
 def _allowed_policy(
@@ -3170,30 +3125,29 @@ def distributed_runtime_config(
     function_objectives: Mapping[str, FunctionObjective] | None = None,
 ) -> RuntimeConfig:
     """Return a distributed runtime config for standard operators."""
+    standard_kwargs = {
+        "params": params,
+        "buffers": buffers,
+        "parameter_surface": parameter_surface,
+        "scalar_objectives": scalar_objectives,
+        "function_objectives": function_objectives,
+    }
     operation_factory = distributed_operation_factory(
         operator,
         model=model,
-        params=params,
-        buffers=buffers,
         module_call=module_call,
         strategy_applier=strategy_applier,
         strategy_bindings=strategy_bindings,
         loss_parallel=loss_parallel,
-        parameter_surface=parameter_surface,
-        scalar_objectives=scalar_objectives,
-        function_objectives=function_objectives,
+        **standard_kwargs,
     )
     reference_check = distributed_reference_check(
         operator,
         reference_model=reference_model,
-        params=params,
-        buffers=buffers,
         module_call=module_call,
         thresholds=thresholds,
-        parameter_surface=parameter_surface,
         numeric_bound_fields=numeric_bound_fields,
-        scalar_objectives=scalar_objectives,
-        function_objectives=function_objectives,
+        **standard_kwargs,
     )
     runtime_signature = {
         "runtime": "distributed",

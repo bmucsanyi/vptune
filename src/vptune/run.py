@@ -183,6 +183,21 @@ class _CandidateProbeRows:
     check_records: tuple[CheckRecord, ...]
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ProbeContext:
+    runtime: RuntimeConfig
+    reference_batch: Batch
+    reference_vector: TensorTree
+    probe_inputs: tuple[tuple[Batch, TensorTree], ...]
+    input_signature: dict[str, Any]
+    timing_policy: TimingPolicy
+    selection_policy: SelectionPolicy
+    memory_backend: MemoryBackend
+    clock: Callable[[], float]
+    run_dir: Path | None
+    run_cache: _RunDirCache
+
+
 def _reference_input(problem: Problem) -> tuple[Batch, TensorTree]:
     family = problem.operator.family
 
@@ -1884,20 +1899,9 @@ def _admission_probe_result(
 
 
 def _probe_candidate_rows(
-    *,
-    runtime: RuntimeConfig,
+    context: _ProbeContext,
     candidates: tuple[Candidate, ...],
-    reference_batch: Batch,
-    reference_vector: TensorTree,
-    probe_inputs: tuple[tuple[Batch, TensorTree], ...],
-    input_signature: dict[str, Any],
-    timing_policy: TimingPolicy,
-    selection_policy: SelectionPolicy,
-    compile_call_horizons: tuple[int, ...],
-    memory_backend: MemoryBackend,
-    clock: Callable[[], float],
-    run_dir: Path | None,
-    run_cache: _RunDirCache,
+    compile_call_horizons: tuple[int, ...] = (),
 ) -> _CandidateProbeRows:
     candidate_rows = []
     records = []
@@ -1905,47 +1909,53 @@ def _probe_candidate_rows(
 
     for candidate in candidates:
         outcome = _reference_outcome(
-            runtime,
+            context.runtime,
             candidate,
-            reference_batch,
-            reference_vector,
-            input_signature,
-            run_dir,
-            run_cache,
+            context.reference_batch,
+            context.reference_vector,
+            context.input_signature,
+            context.run_dir,
+            context.run_cache,
             include_full_size=True,
         )
         candidate_rows.extend(outcome.candidates)
         check_records.extend(outcome.check_records)
-        if run_dir is not None and not outcome.cached:
+        if context.run_dir is not None and not outcome.cached:
             for check_record in outcome.check_records:
-                _write_check(run_dir, check_record)
+                _write_check(context.run_dir, check_record)
 
         if outcome.full_size_record is not None:
             records.append(outcome.full_size_record)
-            if run_dir is not None and not outcome.cached:
-                _write_full_size(run_dir, records[-1])
+            if context.run_dir is not None and not outcome.cached:
+                _write_full_size(context.run_dir, records[-1])
 
             continue
 
-        operation = _measured_operation(runtime, candidate, probe_inputs)
+        operation = _measured_operation(
+            context.runtime, candidate, context.probe_inputs
+        )
         record = run_candidate(
             candidate,
-            input_signature,
+            context.input_signature,
             operation,
-            timing_policy=timing_policy,
-            memory_backend=memory_backend,
-            clock=clock,
+            timing_policy=context.timing_policy,
+            memory_backend=context.memory_backend,
+            clock=context.clock,
             reference_passed=True,
-            full_size_check=_full_size_check(runtime, candidate, probe_inputs),
+            full_size_check=_full_size_check(
+                context.runtime,
+                candidate,
+                context.probe_inputs,
+            ),
         )
         record = _record_with_compile_horizon_scores(
             record,
-            selection_policy,
+            context.selection_policy,
             compile_call_horizons,
         )
         records.append(record)
-        if run_dir is not None:
-            _write_full_size(run_dir, records[-1])
+        if context.run_dir is not None:
+            _write_full_size(context.run_dir, records[-1])
 
     return _CandidateProbeRows(
         candidate_rows=tuple(candidate_rows),
@@ -1986,57 +1996,24 @@ def _record_with_compile_horizon_scores(
 
 
 def _probe_fast_candidate_rows(
-    *,
-    runtime: RuntimeConfig,
+    context: _ProbeContext,
     candidates: tuple[Candidate, ...],
-    reference_batch: Batch,
-    reference_vector: TensorTree,
-    probe_inputs: tuple[tuple[Batch, TensorTree], ...],
-    input_signature: dict[str, Any],
-    timing_policy: TimingPolicy,
-    selection_policy: SelectionPolicy,
-    memory_backend: MemoryBackend,
-    clock: Callable[[], float],
-    run_dir: Path | None,
-    run_cache: _RunDirCache,
 ) -> tuple[tuple[Candidate, ...], _CandidateProbeRows]:
     eager_candidates = _fast_eager_candidate_rows(candidates)
     eager_rows = _probe_candidate_rows(
-        runtime=runtime,
+        context,
         candidates=eager_candidates,
-        reference_batch=reference_batch,
-        reference_vector=reference_vector,
-        probe_inputs=probe_inputs,
-        input_signature=input_signature,
-        timing_policy=timing_policy,
-        selection_policy=selection_policy,
-        compile_call_horizons=(),
-        memory_backend=memory_backend,
-        clock=clock,
-        run_dir=run_dir,
-        run_cache=run_cache,
     )
     top_eager = _near_fastest_candidates(
         eager_candidates,
         eager_rows.full_size_records,
-        input_signature=input_signature,
-        policy=selection_policy,
+        input_signature=context.input_signature,
+        policy=context.selection_policy,
     )
     compile_candidates = _fast_compile_candidate_rows(candidates, top_eager)
     compile_rows = _probe_candidate_rows(
-        runtime=runtime,
+        context,
         candidates=compile_candidates,
-        reference_batch=reference_batch,
-        reference_vector=reference_vector,
-        probe_inputs=probe_inputs,
-        input_signature=input_signature,
-        timing_policy=timing_policy,
-        selection_policy=selection_policy,
-        compile_call_horizons=(),
-        memory_backend=memory_backend,
-        clock=clock,
-        run_dir=run_dir,
-        run_cache=run_cache,
     )
 
     return (
@@ -2053,21 +2030,11 @@ def _probe_fast_candidate_rows(
 
 
 def _probe_balanced_candidate_rows(
-    *,
-    runtime: RuntimeConfig,
+    context: _ProbeContext,
     candidates: tuple[Candidate, ...],
-    reference_batch: Batch,
-    reference_vector: TensorTree,
-    probe_inputs: tuple[tuple[Batch, TensorTree], ...],
-    input_signature: dict[str, Any],
-    timing_policy: TimingPolicy,
-    selection_policy: SelectionPolicy,
+    *,
     retained_top_count: int | None,
-    compile_call_horizons: tuple[int, ...],
-    memory_backend: MemoryBackend,
-    clock: Callable[[], float],
-    run_dir: Path | None,
-    run_cache: _RunDirCache,
+    compile_call_horizons: tuple[int, ...] = (),
 ) -> tuple[tuple[Candidate, ...], _CandidateProbeRows]:
     if retained_top_count is None:
         message = "balanced search requires retained_top_count"
@@ -2076,19 +2043,9 @@ def _probe_balanced_candidate_rows(
     baseline = _single_admitted_baseline(candidates, strategy="balanced")
     grouped = _balanced_group_candidates(candidates)
     baseline_rows = _probe_candidate_rows(
-        runtime=runtime,
+        context,
         candidates=(baseline,),
-        reference_batch=reference_batch,
-        reference_vector=reference_vector,
-        probe_inputs=probe_inputs,
-        input_signature=input_signature,
-        timing_policy=timing_policy,
-        selection_policy=selection_policy,
         compile_call_horizons=compile_call_horizons,
-        memory_backend=memory_backend,
-        clock=clock,
-        run_dir=run_dir,
-        run_cache=run_cache,
     )
     retained = {}
     group_candidate_rows = []
@@ -2096,19 +2053,9 @@ def _probe_balanced_candidate_rows(
 
     for group_key, group_candidates in grouped.items():
         group_rows = _probe_balanced_group_rows(
-            runtime=runtime,
+            context,
             candidates=group_candidates,
-            reference_batch=reference_batch,
-            reference_vector=reference_vector,
-            probe_inputs=probe_inputs,
-            input_signature=input_signature,
-            timing_policy=timing_policy,
-            selection_policy=selection_policy,
             retained_top_count=retained_top_count,
-            memory_backend=memory_backend,
-            clock=clock,
-            run_dir=run_dir,
-            run_cache=run_cache,
         )
         retained[group_key] = group_rows.retained
         group_candidate_rows.extend(group_rows.candidate_rows)
@@ -2121,46 +2068,24 @@ def _probe_balanced_candidate_rows(
         if candidate.generator_id == "balanced"
     )
 
-    if run_dir is not None:
+    if context.run_dir is not None:
         for candidate in synthetic_cross:
-            _write_candidate(run_dir, input_signature, candidate)
+            _write_candidate(context.run_dir, context.input_signature, candidate)
 
     cross_rows = _probe_candidate_rows(
-        runtime=runtime,
+        context,
         candidates=cross_candidates,
-        reference_batch=reference_batch,
-        reference_vector=reference_vector,
-        probe_inputs=probe_inputs,
-        input_signature=input_signature,
-        timing_policy=timing_policy,
-        selection_policy=selection_policy,
-        compile_call_horizons=(),
-        memory_backend=memory_backend,
-        clock=clock,
-        run_dir=run_dir,
-        run_cache=run_cache,
     )
     top_cross = _near_fastest_candidates(
         cross_candidates,
         cross_rows.full_size_records,
-        input_signature=input_signature,
-        policy=selection_policy,
+        input_signature=context.input_signature,
+        policy=context.selection_policy,
     )
     compile_candidates = _fast_compile_candidate_rows(candidates, top_cross)
     compile_rows = _probe_candidate_rows(
-        runtime=runtime,
+        context,
         candidates=compile_candidates,
-        reference_batch=reference_batch,
-        reference_vector=reference_vector,
-        probe_inputs=probe_inputs,
-        input_signature=input_signature,
-        timing_policy=timing_policy,
-        selection_policy=selection_policy,
-        compile_call_horizons=(),
-        memory_backend=memory_backend,
-        clock=clock,
-        run_dir=run_dir,
-        run_cache=run_cache,
     )
 
     return (
@@ -2189,43 +2114,23 @@ def _probe_balanced_candidate_rows(
 
 
 def _probe_thorough_candidate_rows(
-    *,
-    runtime: RuntimeConfig,
+    context: _ProbeContext,
     candidates: tuple[Candidate, ...],
-    reference_batch: Batch,
-    reference_vector: TensorTree,
-    probe_inputs: tuple[tuple[Batch, TensorTree], ...],
-    input_signature: dict[str, Any],
-    timing_policy: TimingPolicy,
-    selection_policy: SelectionPolicy,
+    *,
     retained_top_count: int | None,
     compile_call_horizons: tuple[int, ...],
-    memory_backend: MemoryBackend,
-    clock: Callable[[], float],
-    run_dir: Path | None,
-    run_cache: _RunDirCache,
 ) -> tuple[tuple[Candidate, ...], _CandidateProbeRows]:
     balanced_candidates, balanced_rows = _probe_balanced_candidate_rows(
-        runtime=runtime,
+        context,
         candidates=candidates,
-        reference_batch=reference_batch,
-        reference_vector=reference_vector,
-        probe_inputs=probe_inputs,
-        input_signature=input_signature,
-        timing_policy=timing_policy,
-        selection_policy=selection_policy,
         retained_top_count=retained_top_count,
         compile_call_horizons=compile_call_horizons,
-        memory_backend=memory_backend,
-        clock=clock,
-        run_dir=run_dir,
-        run_cache=run_cache,
     )
     top_balanced = _near_fastest_candidates(
         balanced_candidates,
         balanced_rows.full_size_records,
-        input_signature=input_signature,
-        policy=selection_policy,
+        input_signature=context.input_signature,
+        policy=context.selection_policy,
     )
     expanded_candidates = _thorough_expanded_candidate_rows(
         candidates,
@@ -2233,19 +2138,9 @@ def _probe_thorough_candidate_rows(
         measured_candidates=balanced_candidates,
     )
     expanded_rows = _probe_candidate_rows(
-        runtime=runtime,
+        context,
         candidates=expanded_candidates,
-        reference_batch=reference_batch,
-        reference_vector=reference_vector,
-        probe_inputs=probe_inputs,
-        input_signature=input_signature,
-        timing_policy=timing_policy,
-        selection_policy=selection_policy,
         compile_call_horizons=compile_call_horizons,
-        memory_backend=memory_backend,
-        clock=clock,
-        run_dir=run_dir,
-        run_cache=run_cache,
     )
 
     return (
@@ -2319,22 +2214,12 @@ def _thorough_group_expansion_candidates(
 
 
 def _probe_balanced_group_rows(
-    *,
-    runtime: RuntimeConfig,
+    context: _ProbeContext,
     candidates: tuple[Candidate, ...],
-    reference_batch: Batch,
-    reference_vector: TensorTree,
-    probe_inputs: tuple[tuple[Batch, TensorTree], ...],
-    input_signature: dict[str, Any],
-    timing_policy: TimingPolicy,
-    selection_policy: SelectionPolicy,
+    *,
     retained_top_count: int,
-    memory_backend: MemoryBackend,
-    clock: Callable[[], float],
-    run_dir: Path | None,
-    run_cache: _RunDirCache,
 ) -> _BalancedGroupRows:
-    if not probe_inputs:
+    if not context.probe_inputs:
         message = "balanced search requires at least one full-size probe input"
         raise MaterializationError(message)
 
@@ -2345,21 +2230,21 @@ def _probe_balanced_group_rows(
 
     for candidate in candidates:
         outcome = _reference_outcome(
-            runtime,
+            context.runtime,
             candidate,
-            reference_batch,
-            reference_vector,
-            input_signature,
-            run_dir,
-            run_cache,
+            context.reference_batch,
+            context.reference_vector,
+            context.input_signature,
+            context.run_dir,
+            context.run_cache,
             include_full_size=True,
         )
         candidate_rows.extend(outcome.candidates)
         check_records.extend(outcome.check_records)
 
-        if run_dir is not None and not outcome.cached:
+        if context.run_dir is not None and not outcome.cached:
             for check_record in outcome.check_records:
-                _write_check(run_dir, check_record)
+                _write_check(context.run_dir, check_record)
 
         if outcome.full_size_record is not None:
             records_by_id[candidate.candidate_id] = outcome.full_size_record
@@ -2367,7 +2252,7 @@ def _probe_balanced_group_rows(
         elif outcome.passed:
             contenders.append(candidate)
 
-    for stage_index, probe_input in enumerate(probe_inputs):
+    for stage_index, probe_input in enumerate(context.probe_inputs):
         if not contenders:
             break
 
@@ -2380,16 +2265,20 @@ def _probe_balanced_group_rows(
                 stage_records.append((candidate, previous))
                 continue
 
-            operation = _measured_operation(runtime, candidate, (probe_input,))
+            operation = _measured_operation(context.runtime, candidate, (probe_input,))
             record = run_candidate(
                 candidate,
-                input_signature,
+                context.input_signature,
                 operation,
-                timing_policy=timing_policy,
-                memory_backend=memory_backend,
-                clock=clock,
+                timing_policy=context.timing_policy,
+                memory_backend=context.memory_backend,
+                clock=context.clock,
                 reference_passed=True,
-                full_size_check=_full_size_check(runtime, candidate, (probe_input,)),
+                full_size_check=_full_size_check(
+                    context.runtime,
+                    candidate,
+                    (probe_input,),
+                ),
             )
             record = _balanced_accumulated_record(
                 previous,
@@ -2398,14 +2287,14 @@ def _probe_balanced_group_rows(
             records_by_id[candidate.candidate_id] = record
             stage_records.append((candidate, record))
 
-            if run_dir is not None:
-                _write_full_size(run_dir, record)
+            if context.run_dir is not None:
+                _write_full_size(context.run_dir, record)
 
         contenders = list(
             _balanced_stage_survivors(
                 tuple(stage_records),
-                input_signature=input_signature,
-                policy=selection_policy,
+                input_signature=context.input_signature,
+                policy=context.selection_policy,
                 retained_top_count=retained_top_count,
             )
         )
@@ -2416,8 +2305,8 @@ def _probe_balanced_group_rows(
     retained = _balanced_top_candidates(
         tuple(contenders),
         records_by_id,
-        input_signature=input_signature,
-        policy=selection_policy,
+        input_signature=context.input_signature,
+        policy=context.selection_policy,
         retained_top_count=retained_top_count,
     )
 
@@ -2826,6 +2715,19 @@ def _probe_problem(
     input_signature = _input_signature(problem, backend)
     timing_policy = _timing_policy_for_search(problem.target)
     run_cache = _run_dir_cache(run_dir)
+    context = _ProbeContext(
+        runtime=runtime,
+        reference_batch=reference_batch,
+        reference_vector=reference_vector,
+        probe_inputs=probe_inputs,
+        input_signature=input_signature,
+        timing_policy=timing_policy,
+        selection_policy=problem.target.selection_policy,
+        memory_backend=backend,
+        clock=clock,
+        run_dir=run_dir,
+        run_cache=run_cache,
+    )
     candidate_rows = list(candidates)
 
     if run_dir is not None:
@@ -2834,71 +2736,29 @@ def _probe_problem(
 
     if problem.target.search_policy.strategy == "fast":
         measured_candidates, probed = _probe_fast_candidate_rows(
-            runtime=runtime,
+            context,
             candidates=candidates,
-            reference_batch=reference_batch,
-            reference_vector=reference_vector,
-            probe_inputs=probe_inputs,
-            input_signature=input_signature,
-            timing_policy=timing_policy,
-            selection_policy=problem.target.selection_policy,
-            memory_backend=backend,
-            clock=clock,
-            run_dir=run_dir,
-            run_cache=run_cache,
         )
     elif problem.target.search_policy.strategy == "balanced":
         measured_candidates, probed = _probe_balanced_candidate_rows(
-            runtime=runtime,
+            context,
             candidates=candidates,
-            reference_batch=reference_batch,
-            reference_vector=reference_vector,
-            probe_inputs=probe_inputs,
-            input_signature=input_signature,
-            timing_policy=timing_policy,
-            selection_policy=problem.target.selection_policy,
             retained_top_count=problem.target.search_policy.retained_top_count,
-            compile_call_horizons=(),
-            memory_backend=backend,
-            clock=clock,
-            run_dir=run_dir,
-            run_cache=run_cache,
         )
     elif problem.target.search_policy.strategy == "thorough":
         measured_candidates, probed = _probe_thorough_candidate_rows(
-            runtime=runtime,
+            context,
             candidates=candidates,
-            reference_batch=reference_batch,
-            reference_vector=reference_vector,
-            probe_inputs=probe_inputs,
-            input_signature=input_signature,
-            timing_policy=timing_policy,
-            selection_policy=problem.target.selection_policy,
             retained_top_count=problem.target.search_policy.retained_top_count,
             compile_call_horizons=problem.target.search_policy.compile_call_horizons,
-            memory_backend=backend,
-            clock=clock,
-            run_dir=run_dir,
-            run_cache=run_cache,
         )
     else:
         measured_candidates = _measured_candidates_for_search(
             candidates, problem.target
         )
         probed = _probe_candidate_rows(
-            runtime=runtime,
+            context,
             candidates=measured_candidates,
-            reference_batch=reference_batch,
-            reference_vector=reference_vector,
-            probe_inputs=probe_inputs,
-            input_signature=input_signature,
-            timing_policy=timing_policy,
-            selection_policy=problem.target.selection_policy,
-            compile_call_horizons=(),
-            memory_backend=backend,
-            clock=clock,
-            run_dir=run_dir,
-            run_cache=run_cache,
         )
 
     candidate_rows.extend(probed.candidate_rows)
