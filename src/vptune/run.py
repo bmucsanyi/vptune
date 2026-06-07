@@ -725,6 +725,159 @@ def _module_call_binding_error(
     return None
 
 
+METRIC_FACTORIZED_REPRESENTATIONS = {
+    "diagonal_tree",
+    "low_rank_factors",
+    "kfac_factors",
+    "ekfac_factors",
+    "ggn_derived_factors",
+}
+METRIC_STREAMING_REPRESENTATIONS = {
+    "diagonal_tree",
+    "block_diagonal",
+    "low_rank_factors",
+    "kfac_factors",
+    "ekfac_factors",
+    "ggn_derived_factors",
+}
+INVERSE_DENSE_SOLVE_PATHS = {
+    "dense_solve",
+    "cholesky_solve",
+    "eigh_solve",
+    "svd_solve",
+}
+SQRT_CLOSED_FORM_REPRESENTATIONS = {
+    "diagonal_tree",
+    "low_rank_factors",
+    "kfac_factors",
+    "ekfac_factors",
+    "ggn_derived_factors",
+}
+
+
+def _metric_representation_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    kind = _runtime_metric_representation_kind(runtime_signature)
+
+    if kind is None:
+        return None
+
+    metric_error = _metric_multiply_path_binding_error(settings, kind)
+
+    if metric_error is not None:
+        return metric_error
+
+    inverse_error = _inverse_metric_path_binding_error(settings, kind)
+
+    if inverse_error is not None:
+        return inverse_error
+
+    return _sqrt_metric_path_binding_error(settings, kind)
+
+
+def _runtime_metric_representation_kind(
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    operator = runtime_signature.get("operator")
+
+    if not isinstance(operator, Mapping):
+        return None
+
+    semantics = operator.get("semantics")
+
+    if not isinstance(semantics, Mapping):
+        return None
+
+    representation = semantics.get("representation")
+
+    if not isinstance(representation, Mapping):
+        return None
+
+    kind = representation.get("kind")
+
+    if not isinstance(kind, str):
+        return None
+
+    return kind
+
+
+def _metric_multiply_path_binding_error(
+    settings: Mapping[str, Any],
+    kind: str,
+) -> str | None:
+    value = settings.get("metric.multiply_path")
+    error = None
+
+    if kind == "matrix_free" and value is not None and value != "streaming_multiply":
+        error = "matrix_free metric requires streaming_multiply"
+    elif value == "dense_matmul" and kind != "dense_matrix":
+        error = f"metric representation kind is not supported by path: {kind}"
+    elif (
+        value == "factorized_multiply" and kind not in METRIC_FACTORIZED_REPRESENTATIONS
+    ):
+        error = f"factorized metric path is not lowered for representation: {kind}"
+    elif value == "blockwise_multiply" and kind != "block_diagonal":
+        error = f"metric representation kind is not supported by path: {kind}"
+    elif (
+        value == "streaming_multiply"
+        and kind != "matrix_free"
+        and kind not in METRIC_STREAMING_REPRESENTATIONS
+    ):
+        error = f"metric streaming path is not lowered for representation: {kind}"
+
+    return error
+
+
+def _inverse_metric_path_binding_error(
+    settings: Mapping[str, Any],
+    kind: str,
+) -> str | None:
+    value = settings.get("inverse_metric.solve_path")
+
+    if value is None:
+        return None
+
+    if value in INVERSE_DENSE_SOLVE_PATHS and kind != "dense_matrix":
+        return f"metric representation kind is not supported by path: {kind}"
+
+    if value == "factorized_solve" and kind not in METRIC_FACTORIZED_REPRESENTATIONS:
+        return f"factorized inverse path is not lowered for representation: {kind}"
+
+    if value == "blockwise_solve" and kind != "block_diagonal":
+        return f"metric representation kind is not supported by path: {kind}"
+
+    if value == "woodbury_low_rank_solve" and kind != "low_rank_factors":
+        return f"metric representation kind is not supported by path: {kind}"
+
+    return None
+
+
+def _sqrt_metric_path_binding_error(
+    settings: Mapping[str, Any],
+    kind: str,
+) -> str | None:
+    value = settings.get("sqrt_metric.factor_path")
+
+    if value is None:
+        return None
+
+    if value == "matrix_free_lanczos" and kind != "matrix_free":
+        return f"metric representation kind is not supported by path: {kind}"
+
+    if value == "closed_form_factor_square_root":
+        if kind in SQRT_CLOSED_FORM_REPRESENTATIONS:
+            return None
+
+        return f"metric representation kind is not supported by path: {kind}"
+
+    if value in {"cholesky_factor", "eigenbasis_factor"} and kind == "matrix_free":
+        return "metric representation has no dense reference: matrix_free"
+
+    return None
+
+
 _RUNTIME_BINDING_RULES = (
     _fusion_binding_error,
     _batch_layout_binding_error,
@@ -737,6 +890,7 @@ _RUNTIME_BINDING_RULES = (
     _teacher_objective_binding_error,
     _call_core_settings_binding_error,
     _module_call_binding_error,
+    _metric_representation_binding_error,
 )
 
 
@@ -3222,7 +3376,7 @@ def _prerequisite_failed_records(
     materializers: Mapping[str, Any],
     constraints: tuple[CohortConstraint, ...],
     family_names: tuple[str, ...],
-    run_dir: Path,
+    run_dir: Path | None,
 ) -> _PrerequisiteRows:
     available_dependencies = tuple(
         dependency for dependency in family.dependencies if dependency in selected
@@ -3246,7 +3400,7 @@ def _prerequisite_failed_records(
 
 def _write_prerequisite_failed_records(
     problem: Problem,
-    run_dir: Path,
+    run_dir: Path | None,
 ) -> _PrerequisiteRows:
     input_signature = problem.input_signature()
     candidates = []
@@ -3255,7 +3409,10 @@ def _write_prerequisite_failed_records(
     for candidate in _candidate_rows(_runtime(problem)):
         admitted = _admit_target(candidate, problem.target)
         candidates.append(admitted)
-        _write_candidate(run_dir, input_signature, admitted)
+
+        if run_dir is not None:
+            _write_candidate(run_dir, input_signature, admitted)
+
         record = failed_record(
             admitted,
             input_signature,
@@ -3264,7 +3421,9 @@ def _write_prerequisite_failed_records(
             reference_passed=False,
         )
         records.append(record)
-        _write_full_size(run_dir, record)
+
+        if run_dir is not None:
+            _write_full_size(run_dir, record)
 
     return _PrerequisiteRows(
         candidates=tuple(candidates),
@@ -3279,7 +3438,7 @@ def _tune_cohort_assignment(
     ordered_families: tuple[Family, ...],
     family_names: tuple[str, ...],
     problems_by_family: Mapping[str, Problem],
-    run_dir: Path,
+    run_dir: Path | None,
     memory_backend: MemoryBackend | None,
     clock: Callable[[], float],
     probe_cache: MutableMapping[str, _ProbeResult],
@@ -3411,7 +3570,7 @@ def _probe_cache_key(
 def tune_run(
     run: TuningRun,
     *,
-    run_dir: Path,
+    run_dir: Path | None = None,
     memory_backend: MemoryBackend | None = None,
     clock: Callable[[], float] = time.perf_counter,
 ) -> Plan:
@@ -3512,14 +3671,17 @@ def tune_run(
         run_dir=run_dir,
     )
 
-    _write_summary(run_dir, plan)
+    if run_dir is not None:
+        _write_summary(run_dir, plan)
 
     if run.validators:
         plan = dataclasses.replace(
             plan,
             validation_records=validate_plan(plan, run.validators, run_dir=run_dir),
         )
-        _write_summary(run_dir, plan)
+
+        if run_dir is not None:
+            _write_summary(run_dir, plan)
 
     return plan
 
@@ -3528,7 +3690,7 @@ def _tune_run_admission(
     *,
     run: TuningRun,
     index: _RunProblemIndex,
-    run_dir: Path,
+    run_dir: Path | None,
     memory_backend: MemoryBackend | None,
 ) -> Plan:
     candidate_rows = ()
@@ -3573,12 +3735,13 @@ def _tune_run_admission(
         run_dir=run_dir,
     )
 
-    _write_summary(run_dir, plan)
+    if run_dir is not None:
+        _write_summary(run_dir, plan)
 
     return plan
 
 
-def _run_problem_index(run: TuningRun, run_dir: Path) -> _RunProblemIndex:
+def _run_problem_index(run: TuningRun, run_dir: Path | None) -> _RunProblemIndex:
     if not run.problems:
         message = f"run adapter is required for TuningRun: {run.run_id} at {run_dir}"
         raise MaterializationError(message)

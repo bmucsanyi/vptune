@@ -153,6 +153,9 @@ class Case:
     vector: TensorTree | None = None
 
 
+ProbeInput = Case | tuple[Batch, TensorTree]
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class DeterminismPolicy:
     """Typed deterministic-execution policy."""
@@ -226,8 +229,10 @@ class SearchSpace:
         fixed_settings = _operator_search_space_fixed_settings(self, operator)
         axes = _operator_search_space_axes(self, operator)
         axis_registry = _search_space_axis_registry(self)
+        row_groups = _operator_search_space_setting_row_groups(self, operator)
+        setting_rows = _setting_row_combinations(row_groups)
 
-        if not axes:
+        if not axes and not row_groups:
             return {
                 f"{operator.spec.family}:typed_reference": _merge_search_settings(
                     default_settings,
@@ -235,22 +240,40 @@ class SearchSpace:
                 )
             }
 
-        candidates = settings_product(
-            operator.spec.family,
-            axes,
-            axis_registry=axis_registry,
-            generator_id="vptune.public.space",
-            generator_version=PACKAGE_VERSION,
-        )
-
-        return {
-            candidate.candidate_id: _merge_search_settings(
-                default_settings,
-                fixed_settings,
-                candidate.settings,
+        if axes:
+            candidates = tuple(
+                (
+                    candidate.candidate_id,
+                    candidate.settings,
+                )
+                for candidate in settings_product(
+                    operator.spec.family,
+                    axes,
+                    axis_registry=axis_registry,
+                    generator_id="vptune.public.space",
+                    generator_version=PACKAGE_VERSION,
+                )
             )
-            for candidate in candidates
-        }
+        else:
+            candidates = ((f"{operator.spec.family}:typed_reference", {}),)
+
+        settings_by_id = {}
+
+        for base_id, candidate_settings in candidates:
+            for setting_row in setting_rows:
+                candidate_id = (
+                    f"{operator.spec.family}:{len(settings_by_id)}"
+                    if row_groups
+                    else base_id
+                )
+                settings_by_id[candidate_id] = _merge_search_settings(
+                    default_settings,
+                    fixed_settings,
+                    candidate_settings,
+                    setting_row,
+                )
+
+        return settings_by_id
 
     def with_attention(self, adapter_space: Any) -> "SearchSpace":
         """Return a search space extended with adapter-owned attention axes."""
@@ -529,11 +552,7 @@ class Compile:
             message = "Compile enabled values must be unique"
             raise MaterializationError(message)
 
-        if len(values) > 1:
-            message = "Compile cannot mix enabled and disabled rows in one component"
-            raise MaterializationError(message)
-
-        if values == (True,) and not self.boundaries:
+        if True in values and not self.boundaries:
             message = "Compile enabled rows require boundaries"
             raise MaterializationError(message)
 
@@ -541,6 +560,9 @@ class Compile:
         """Return compile axes."""
         _ = operator
         enabled_value = self.enabled[0]
+
+        if len(self.enabled) > 1:
+            return {}
 
         if not enabled_value:
             return {"compile.enabled": ("false",)}
@@ -564,6 +586,43 @@ class Compile:
             "compile.cuda_graphs": (_bool_setting(self.cuda_graphs),),
             "compile.cache_state": (self.cache_state,),
         }
+
+    def setting_rows_for(self, operator: "Operator") -> tuple[Mapping[str, Any], ...]:
+        """Return row-conditioned compile settings."""
+        _ = operator
+        rows = []
+
+        for enabled in self.enabled:
+            if not enabled:
+                rows.append({"compile.enabled": "false"})
+                continue
+
+            rows.extend(
+                {
+                    "compile.enabled": "true",
+                    "compile.boundary": boundary,
+                    "compile.backend": self.backend,
+                    "compile.mode": self.mode,
+                    "compile.fullgraph": _bool_setting(self.fullgraph),
+                    "compile.dynamic": (
+                        None if self.dynamic is None else _bool_setting(self.dynamic)
+                    ),
+                    "compile.compiled_autograd": _bool_setting(self.compiled_autograd),
+                    "compile.options.epilogue_fusion": _bool_setting(
+                        self.epilogue_fusion
+                    ),
+                    "compile.options.shape_padding": _bool_setting(self.shape_padding),
+                    "compile.cuda_graphs": _bool_setting(self.cuda_graphs),
+                    "compile.cache_state": self.cache_state,
+                }
+                for boundary in _axis_values_for_domain(
+                    "compile.boundary",
+                    self.boundaries,
+                    "Compile boundaries",
+                )
+            )
+
+        return tuple(rows)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -633,6 +692,9 @@ def _operator_search_space_axes(
     axes = {key: tuple(values) for key, values in space.axes.items()}
 
     for component in space.components:
+        if _component_uses_setting_rows(component):
+            continue
+
         component_axes = _component_axes_for_operator(component, operator)
 
         for key, values in component_axes.items():
@@ -660,6 +722,36 @@ def _operator_search_space_fixed_settings(
     return settings
 
 
+def _operator_search_space_setting_row_groups(
+    space: SearchSpace,
+    operator: "Operator",
+) -> tuple[tuple[Mapping[str, Any], ...], ...]:
+    groups = []
+
+    for component in space.components:
+        if not _component_uses_setting_rows(component):
+            continue
+
+        groups.append(_component_setting_rows_for_operator(component, operator))
+
+    return tuple(groups)
+
+
+def _setting_row_combinations(
+    row_groups: Sequence[Sequence[Mapping[str, Any]]],
+) -> tuple[Mapping[str, Any], ...]:
+    if not row_groups:
+        return ({},)
+
+    return tuple(
+        itertools.starmap(_merge_search_settings, itertools.product(*row_groups))
+    )
+
+
+def _component_uses_setting_rows(component: Any) -> bool:
+    return getattr(component, "setting_rows_for", None) is not None
+
+
 def _component_axes_for_operator(
     component: Any,
     operator: "Operator",
@@ -677,6 +769,39 @@ def _component_axes_for_operator(
         raise MaterializationError(message)
 
     return axes
+
+
+def _component_setting_rows_for_operator(
+    component: Any,
+    operator: "Operator",
+) -> tuple[Mapping[str, Any], ...]:
+    setting_rows_for = getattr(component, "setting_rows_for", None)
+
+    if setting_rows_for is None:
+        message = (
+            "search-space component does not define setting rows: "
+            f"{type(component).__name__}"
+        )
+        raise MaterializationError(message)
+
+    rows = tuple(setting_rows_for(operator))
+
+    if not rows:
+        message = (
+            "search-space component returned no setting rows: "
+            f"{type(component).__name__}"
+        )
+        raise MaterializationError(message)
+
+    for row in rows:
+        if not isinstance(row, Mapping):
+            message = (
+                "search-space component returned invalid setting row: "
+                f"{type(component).__name__}"
+            )
+            raise MaterializationError(message)
+
+    return rows
 
 
 def _component_settings_for_operator(
@@ -1527,6 +1652,7 @@ class Operator:
     changed_axes: tuple[str, ...] | None = None
     plan: Plan | None = None
     bound_batch: Batch | None = None
+    bound_selected: Any | None = None
 
     def __call__(self, *call_inputs: Any) -> Any:
         """Run the operator through its declared reference row.
@@ -1557,7 +1683,10 @@ class Operator:
         batch = _prepared_operator_batch(self, batch)
 
         if self.plan is not None:
-            selected = self.plan.materialize(name=self.spec.family)
+            selected = self.bound_selected
+
+            if selected is None:
+                selected = self.plan.materialize(name=self.spec.family)
 
             return selected(batch, vector)
 
@@ -1602,7 +1731,7 @@ class Operator:
         search: SearchStrategy,
         run_dir: Path | None = None,
         reference: Case | None = None,
-        probes: Sequence[tuple[Batch, TensorTree]] | None = None,
+        probes: Sequence[ProbeInput] | None = None,
         memory_backend: MemoryBackend | None = None,
         clock: Callable[[], float] = time.perf_counter,
     ) -> "Operator":
@@ -1635,7 +1764,13 @@ class Operator:
             message = "operator.tune requires a search strategy that selects a row"
             raise MaterializationError(message)
 
-        return dataclasses.replace(self, plan=selected_plan)
+        tuned_operator = dataclasses.replace(
+            self,
+            plan=selected_plan,
+            bound_selected=None,
+        )
+
+        return _operator_with_bound_selected(tuned_operator)
 
     def load(
         self,
@@ -1654,7 +1789,13 @@ class Operator:
             memory_backend=memory_backend,
         )
 
-        return dataclasses.replace(self, plan=selected_plan)
+        loaded_operator = dataclasses.replace(
+            self,
+            plan=selected_plan,
+            bound_selected=None,
+        )
+
+        return _operator_with_bound_selected(loaded_operator)
 
     def bind(self, *, batch: Batch) -> "Operator":
         """Bind a batch for repeated vector calls.
@@ -1665,17 +1806,27 @@ class Operator:
         Raises:
             MaterializationError: If the operator has no batch input.
         """
-        if "batch" not in self.call_inputs:
-            message = f"{self.spec.kind} has no batch input to bind"
+        if self.call_inputs != ("batch", "vector"):
+            message = f"{self.spec.kind} bind requires call_inputs ('batch', 'vector')"
             raise MaterializationError(message)
 
-        return dataclasses.replace(
+        bound_operator = dataclasses.replace(
             self,
-            call_inputs=tuple(
-                input_name for input_name in self.call_inputs if input_name != "batch"
-            ),
+            call_inputs=("vector",),
             bound_batch=batch,
+            bound_selected=None,
         )
+
+        return _operator_with_bound_selected(bound_operator)
+
+
+def _operator_with_bound_selected(operator: Operator) -> Operator:
+    if operator.plan is None or operator.bound_batch is None:
+        return operator
+
+    selected = operator.plan.materialize(name=operator.spec.family)
+
+    return dataclasses.replace(operator, bound_selected=selected)
 
 
 def torch_model(
@@ -3180,6 +3331,8 @@ def tune(
     search: SearchStrategy,
     cohort_constraints: Sequence[CohortConstraint] = (),
     run_dir: Path | None = None,
+    reference: Case | None = None,
+    probes: Sequence[ProbeInput] | None = None,
     memory_backend: MemoryBackend | None = None,
     clock: Callable[[], float] = time.perf_counter,
 ) -> "Run":
@@ -3212,6 +3365,8 @@ def tune(
             search=search,
             cohort_constraints=cohort_constraints,
             run_dir=run_dir,
+            reference=reference,
+            probes=probes,
             memory_backend=memory_backend,
             clock=clock,
         )
@@ -3234,6 +3389,8 @@ def tune(
         space=space,
         search=search,
         run_dir=run_dir,
+        reference=reference,
+        probes=probes,
         memory_backend=memory_backend,
         clock=clock,
     )
@@ -3252,13 +3409,11 @@ def _tune_public_run(
     search: SearchStrategy,
     cohort_constraints: Sequence[CohortConstraint],
     run_dir: Path | None,
+    reference: Case | None,
+    probes: Sequence[ProbeInput] | None,
     memory_backend: MemoryBackend | None,
     clock: Callable[[], float],
 ) -> "Run":
-    if run_dir is None:
-        message = "vp.tune multi-product or cohort runs require run_dir"
-        raise MaterializationError(message)
-
     lower_run = _LowerTuningRun(
         target=target.lower(search),
         families=tuple(
@@ -3277,8 +3432,8 @@ def _tune_public_run(
                 target=target,
                 space=space,
                 search=search,
-                reference=None,
-                probes=None,
+                reference=reference,
+                probes=probes,
             )
             for product in products
         ),
@@ -3295,7 +3450,13 @@ def _tune_public_run(
     return Run(
         plan=selected_plan,
         operators={
-            product.spec.family: dataclasses.replace(product, plan=selected_plan)
+            product.spec.family: _operator_with_bound_selected(
+                dataclasses.replace(
+                    product,
+                    plan=selected_plan,
+                    bound_selected=None,
+                )
+            )
             for product in products
         },
     )
@@ -4826,6 +4987,7 @@ class _PublicDataProvider:
             if self.reference is None or self.reference.batch is None
             else _tree_signature(self.reference.batch),
             "probe_batches": tuple(_tree_signature(batch) for batch, _ in self.probes),
+            "bound_operator": _bound_operator_signature(self.operator),
             "operator": self.operator.spec.signature(),
         }
 
@@ -4843,6 +5005,9 @@ class _PublicDataProvider:
 
         if self.batches:
             return _prepared_operator_batch(self.operator, self.batches[0])
+
+        if self.operator.bound_batch is not None:
+            return _prepared_operator_batch(self.operator, {})
 
         if _operator_requires_batch(self.operator):
             message = f"public tune data is required for {self.operator.spec.family}"
@@ -4869,6 +5034,9 @@ class _PublicDataProvider:
                 _prepared_operator_batch(self.operator, batch) for batch in self.batches
             )
 
+        if self.operator.bound_batch is not None:
+            return (_prepared_operator_batch(self.operator, {}),)
+
         if _operator_requires_batch(self.operator):
             message = f"public tune data is required for {self.operator.spec.family}"
             raise MaterializationError(message)
@@ -4879,6 +5047,47 @@ class _PublicDataProvider:
         if family != self.operator.spec.family:
             message = f"public data requested unknown family: {family}"
             raise MaterializationError(message)
+
+
+def _bound_operator_signature(operator: Operator) -> Mapping[str, Any]:
+    if operator.bound_batch is None:
+        return {"is_bound": False, "batch": None}
+
+    return {"is_bound": True, "batch": _tree_signature(operator.bound_batch)}
+
+
+def _probe_inputs_from_public(
+    probes: Sequence[ProbeInput] | None,
+) -> tuple[tuple[Batch, TensorTree], ...]:
+    if probes is None:
+        return ()
+
+    return tuple(_probe_input_from_public(probe) for probe in probes)
+
+
+def _probe_input_from_public(probe: ProbeInput) -> tuple[Batch, TensorTree]:
+    if isinstance(probe, Case):
+        if probe.batch is None or probe.vector is None:
+            message = "probe case requires both batch and vector"
+            raise MaterializationError(message)
+
+        return dict(probe.batch), probe.vector
+
+    if not isinstance(probe, tuple):
+        message = "probe input must be a Case or a (batch, vector) tuple"
+        raise MaterializationError(message)
+
+    try:
+        batch, vector = probe
+    except ValueError as error:
+        message = "probe input must be a Case or a (batch, vector) tuple"
+        raise MaterializationError(message) from error
+
+    if not isinstance(batch, Mapping):
+        message = "probe input batch must be a mapping"
+        raise MaterializationError(message)
+
+    return dict(batch), _checked_tensor_tree(vector, "probe input vector")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -4968,7 +5177,7 @@ def _operator_problem(
     space: SearchSpace,
     search: SearchStrategy,
     reference: Case | None,
-    probes: Sequence[tuple[Batch, TensorTree]] | None,
+    probes: Sequence[ProbeInput] | None,
 ) -> _LowerProblem:
     if operator.spec.kind == "composition":
         return _composition_problem(
@@ -4982,7 +5191,7 @@ def _operator_problem(
             probes=probes,
         )
 
-    probe_inputs = () if probes is None else tuple(probes)
+    probe_inputs = _probe_inputs_from_public(probes)
     data_provider = _PublicDataProvider(
         operator=operator,
         batches=() if data is None else tuple(data),
@@ -5038,9 +5247,9 @@ def _composition_problem(
     space: SearchSpace,
     search: SearchStrategy,
     reference: Case | None,
-    probes: Sequence[tuple[Batch, TensorTree]] | None,
+    probes: Sequence[ProbeInput] | None,
 ) -> _LowerProblem:
-    probe_inputs = () if probes is None else tuple(probes)
+    probe_inputs = _probe_inputs_from_public(probes)
     data_provider = _PublicDataProvider(
         operator=operator,
         batches=() if data is None else tuple(data),
@@ -5214,6 +5423,14 @@ def _require_saved_operator_matches_live(
             message = f"Operator.load saved {key} identity differs"
             raise MaterializationError(message)
 
+    data_signature = input_signature.get("data")
+
+    if not isinstance(data_signature, Mapping) or to_json_value(
+        data_signature.get("bound_operator")
+    ) != to_json_value(_bound_operator_signature(operator)):
+        message = "Operator.load saved bound operator identity differs"
+        raise MaterializationError(message)
+
 
 def _operator_runtime_config(operator: Operator) -> Any:
     return standard_runtime_config(
@@ -5254,6 +5471,11 @@ def _operator_thresholds(operator: Operator) -> Mapping[str, float]:
             "directional_abs_diff": STANDARD_THRESHOLDS["directional_abs_diff"],
             "directional_rel_diff": STANDARD_THRESHOLDS["directional_rel_diff"],
         })
+
+    if operator.spec.kind == "hvp":
+        thresholds["symmetry_max_abs_diff"] = STANDARD_THRESHOLDS[
+            "symmetry_max_abs_diff"
+        ]
 
     if operator.spec.kind == "vjp":
         thresholds["inner_abs_diff"] = STANDARD_THRESHOLDS["inner_abs_diff"]
@@ -5722,8 +5944,10 @@ def _per_group_damping_values(
     metric: Metric,
     damping: Damping,
 ) -> dict[str, float]:
-    if metric.kind not in {"block_diagonal", "kfac_factors"}:
-        message = "per_group damping requires a block-diagonal or KFAC metric"
+    if metric.kind not in {"diagonal_tree", "block_diagonal", "kfac_factors"}:
+        message = (
+            "per_group damping requires a diagonal, block-diagonal, or KFAC metric"
+        )
         raise MaterializationError(message)
 
     values = _per_group_damping_mapping(damping.value)
@@ -5771,6 +5995,20 @@ def _per_group_damping_mapping(
 
 
 def _per_group_metric_names(metric: Metric) -> tuple[str, ...]:
+    if metric.kind == "diagonal_tree":
+        value = metric.batch.get("metric_diagonal")
+
+        if not isinstance(value, Mapping) or not value:
+            message = "diagonal metric requires named leaves for per_group damping"
+            raise MaterializationError(message)
+
+        for key, item in value.items():
+            if not isinstance(key, str) or not isinstance(item, torch.Tensor):
+                message = "diagonal metric leaves must be named tensors"
+                raise MaterializationError(message)
+
+        return tuple(value)
+
     if metric.kind == "block_diagonal":
         value = metric.representation.get("block_names")
 

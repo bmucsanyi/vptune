@@ -99,6 +99,20 @@ VECTOR_OPERATOR_FAMILIES = (
     "inverse_metric",
     "inverse_metric_inner",
 )
+BOUND_OPERATOR_VECTOR_STEP_FAMILIES = (
+    "jvp",
+    "vjp",
+    "hvp",
+    "ggnvp",
+    "fisher_vp",
+    "sampled_fisher_vp",
+    "empirical_fisher_vp",
+    "metric",
+    "sqrt_metric",
+    "inverse_sqrt_metric",
+    "inverse_metric",
+    "composition",
+)
 
 PACKED_ATTENTION_MERGE_RULE = (
     "attention.partition=packed_tokens merges attention_dispatch with input_schedule"
@@ -158,12 +172,12 @@ COMPILE_BOUNDARY_VALUES = (
     "fisher_score_grad",
     "sampled_fisher_score_grad",
     "empirical_fisher_example_grad",
-    "per_example_gradient",
     "metric_multiply",
     "metric_inner_reduce",
     "metric_sqrt_multiply",
     "inverse_metric_solve",
     "inverse_metric_inner_reduce",
+    "per_example_gradient",
     "bound_operator_vector_step",
     "composition_child",
     "whole_operator",
@@ -204,6 +218,7 @@ MICROBATCH_OPERATOR_PATH_KEYS = (
     "sampled_fisher.accumulation",
     "empirical_fisher.grad_path",
 )
+INTERNAL_ADMISSION_AXES = ("forward_ad_flags", "torch_func_admission")
 OWNER_EXACT = {
     "teacher_outputs": "input_schedule",
     "autocast": "numeric_backend",
@@ -299,6 +314,110 @@ CLASS_C_PREFIX = {
     "inverse_metric": "inverse_solve",
     "inverse_metric_inner": "inverse_solve",
 }
+OPERATOR_REFERENCE_CHECKS = {
+    "gradient": (
+        "direct_autograd_anchor",
+        "finite_difference_directional",
+    ),
+    "jvp": (
+        "jvp_anchor",
+        "finite_difference_directional",
+        "jvp_vjp_dot_identity",
+    ),
+    "vjp": (
+        "vjp_anchor",
+        "jvp_vjp_dot_identity",
+    ),
+    "hvp": (
+        "reverse_over_reverse_anchor",
+        "autograd_functional_anchor",
+        "hvp_symmetry",
+        "finite_difference_gradient_directional",
+    ),
+    "ggn": (
+        "dense_jacobian_ggn_anchor",
+        "jvp_hessian_vjp_cross_check",
+        "loss_hessian_symmetry",
+        "loss_hessian_psd",
+    ),
+    "fisher": (
+        "explicit_score_outer_product_anchor",
+        "dense_fisher_anchor",
+    ),
+    "sampled_fisher": (
+        "fixed_sample_source_check",
+        "explicit_sampled_score_outer_product_anchor",
+        "dense_sampled_fisher_anchor",
+    ),
+    "empirical_fisher": (
+        "per_example_gradient_loop_anchor",
+        "dense_empirical_fisher_anchor",
+    ),
+    "per_example_gradient": (
+        "per_example_gradient_loop_anchor",
+        "empirical_fisher_outer_product_check",
+    ),
+    "metric": (
+        "dense_metric_reference",
+        "metric_symmetry_check",
+        "metric_psd_check",
+    ),
+    "metric_inner": (
+        "dense_metric_gram_reference",
+        "metric_inner_diagonal_nonnegative_check",
+    ),
+    "sqrt_metric": (
+        "dense_factor_check",
+        "matrix_free_covariance_check",
+    ),
+    "inverse_metric": (
+        "dense_inverse_reference",
+        "inverse_residual_check",
+    ),
+    "inverse_metric_inner": (
+        "dense_inverse_gram_reference",
+        "inverse_inner_residual_check",
+    ),
+    "composition": (
+        "child_anchor_checks",
+        "dense_composed_output_check",
+        "dependency_identity_equality",
+    ),
+}
+SHARED_REFERENCE_CHECKS = {
+    "attention": ("attention_backend_equality",),
+    "batch": ("segmentation_invariance",),
+    "chunk": ("segmentation_invariance",),
+    "schedule": ("segmentation_invariance",),
+    "input": ("input_representation_equality",),
+    "teacher_outputs": ("teacher_output_equality",),
+    "activation": ("recompute_or_offload_equality",),
+    "checkpoint": ("checkpoint_recompute_equality",),
+    "dtype": ("dtype_reference_agreement",),
+    "numeric": ("numeric_error_bound_check",),
+    "autocast": ("dtype_reference_agreement",),
+    "fusion": ("fused_kernel_reference_agreement",),
+    "layout": ("layout_roundtrip_reference",),
+    "dtensor": ("distributed_logical_output_agreement",),
+    "distributed": ("distributed_logical_output_agreement",),
+    "fsdp": ("distributed_logical_output_agreement",),
+    "tp": ("distributed_logical_output_agreement",),
+    "sequence_parallel": ("distributed_logical_output_agreement",),
+    "context_parallel": ("distributed_logical_output_agreement",),
+    "comm": ("distributed_logical_output_agreement",),
+}
+FULL_SIZE_CHECK_PREFIXES = {
+    "attention",
+    "compile",
+    "fusion",
+    "dtensor",
+    "distributed",
+    "fsdp",
+    "tp",
+    "sequence_parallel",
+    "context_parallel",
+    "comm",
+}
 OPERATOR_PREFIX = {
     "gradient": ("gradient",),
     "jvp": ("jvp",),
@@ -336,8 +455,19 @@ AXIS_TABLE_DOMAIN_OVERRIDES = {
     "attention.custom_kernel_id": REGISTERED_DOMAIN,
     "attention.mask_formatter_id": REGISTERED_DOMAIN,
     "compile.backend": ("inductor", "registered_backend"),
+    "distributed.mesh_shape": INTEGER_TUPLE_DOMAIN,
+    "distributed.mesh_dim_names": DECLARED_DOMAIN,
+    "fsdp.reshard_after_forward": FSDP_RESHARD_AFTER_FORWARD_DOMAIN,
+    "fsdp.ignored_params": DECLARED_DOMAIN,
+    "fsdp.dp_mesh_dims": DECLARED_DOMAIN,
     "inverse_metric.iteration_budget": INTEGER_DOMAIN,
     "sqrt_metric.lanczos_iterations": INTEGER_DOMAIN,
+    "tp.plan": REGISTERED_DOMAIN,
+    "tp.prepare_module_input": DECLARED_DOMAIN,
+    "tp.prepare_module_output": DECLARED_DOMAIN,
+    "sequence_parallel.norm_modules": DECLARED_DOMAIN,
+    "context_parallel.sequence_dim": DECLARED_DOMAIN,
+    "comm.collective_bucket_size": INTEGER_DOMAIN,
 }
 
 
@@ -375,7 +505,9 @@ def axis_manifest() -> AxisManifest:
 
 def _axis_table_axes() -> tuple["AxisDescriptor", ...]:
     standard_axes = tuple(
-        _axis_table_axis_from_descriptor(axis) for axis in standard_axis_descriptors()
+        _axis_table_axis_from_descriptor(axis)
+        for axis in standard_axis_descriptors()
+        if axis.axis_key not in INTERNAL_ADMISSION_AXES
     )
     adapter_axes = tuple(
         _axis_table_axis_from_descriptor(axis)
@@ -414,6 +546,13 @@ def _axis_table_axis_from_descriptor(axis: "AxisDescriptor") -> "AxisDescriptor"
         adapter_id=_adapter_id(axis_key),
         adapter_version=axis.adapter_version,
         admission_rule=axis.admission_rule,
+        admission_rule_id=_axis_admission_rule_id(axis_key, axis),
+        lowering_rule_id=_axis_lowering_rule_id(axis_key),
+        alias_normalization_rule=_axis_alias_normalization_rule(axis_key),
+        required_reference_checks=_axis_required_reference_checks(axis_key),
+        required_full_size_checks=_axis_required_full_size_checks(axis_key),
+        admission_settings_keys=_axis_admission_settings_keys(axis_key, axis),
+        settings_keys_written=axis.settings_keys,
         identity=axis.identity,
     )
 
@@ -685,6 +824,76 @@ def _adapter_id(axis_key: str) -> str:
         return "vptune.attention_or_adapter"
 
     return ""
+
+
+def _axis_admission_rule_id(axis_key: str, axis: "AxisDescriptor") -> str:
+    if axis.admission_rule is None:
+        return f"allowed_values:{axis_key}"
+
+    return f"callable:{axis_key}"
+
+
+def _axis_lowering_rule_id(axis_key: str) -> str:
+    adapter_id = _adapter_id(axis_key)
+
+    if adapter_id:
+        return f"{adapter_id}:{axis_key}"
+
+    return f"vptune.standard_runtime:{_owner_id(axis_key)}"
+
+
+def _axis_alias_normalization_rule(axis_key: str) -> str:
+    if axis_key.startswith("compile."):
+        return "compile_alias_normalization"
+
+    if axis_key == "attention.sdpa_kernel":
+        return "sdpa_priority_list_normalization"
+
+    return "none"
+
+
+def _axis_required_reference_checks(axis_key: str) -> tuple[str, ...]:
+    prefix = axis_key.split(".", 1)[0]
+    operator_checks = OPERATOR_REFERENCE_CHECKS.get(prefix)
+
+    if operator_checks is not None:
+        return operator_checks
+
+    shared_checks = SHARED_REFERENCE_CHECKS.get(axis_key)
+
+    if shared_checks is not None:
+        return shared_checks
+
+    shared_checks = SHARED_REFERENCE_CHECKS.get(prefix)
+
+    if shared_checks is not None:
+        return shared_checks
+
+    return ()
+
+
+def _axis_required_full_size_checks(axis_key: str) -> tuple[str, ...]:
+    prefix = axis_key.split(".", 1)[0]
+
+    if prefix in FULL_SIZE_CHECK_PREFIXES:
+        return ("full_size_agreement",)
+
+    return ()
+
+
+def _axis_admission_settings_keys(
+    axis_key: str,
+    axis: "AxisDescriptor",
+) -> tuple[str, ...]:
+    keys = dict.fromkeys((*axis.settings_keys, *axis.optional_settings_keys))
+
+    if axis_key == "compile.enabled":
+        keys.update(dict.fromkeys(COMPILE_REQUIRED_ENABLED_SETTINGS))
+
+    if axis_key == "attention.frontend":
+        keys.update(dict.fromkeys(("attention.sdpa_kernel",)))
+
+    return tuple(keys)
 
 
 def _positive_integer_value_error(axis_key: str, value: Any) -> str | None:
@@ -967,6 +1176,13 @@ class AxisDescriptor:
     adapter_id: str = "core"
     adapter_version: str = dataclasses.field(default_factory=lambda: PACKAGE_VERSION)
     admission_rule: AdmissionRule | None = None
+    admission_rule_id: str = ""
+    lowering_rule_id: str = ""
+    alias_normalization_rule: str = "none"
+    required_reference_checks: tuple[str, ...] = ()
+    required_full_size_checks: tuple[str, ...] = ()
+    admission_settings_keys: tuple[str, ...] = ()
+    settings_keys_written: tuple[str, ...] = ()
     identity: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
@@ -1014,6 +1230,13 @@ class AxisDescriptor:
             "adapter_id": self.adapter_id,
             "adapter_version": self.adapter_version,
             "has_admission_rule": self.admission_rule is not None,
+            "admission_rule_id": self.admission_rule_id,
+            "lowering_rule_id": self.lowering_rule_id,
+            "alias_normalization_rule": self.alias_normalization_rule,
+            "required_reference_checks": self.required_reference_checks,
+            "required_full_size_checks": self.required_full_size_checks,
+            "admission_settings_keys": self.admission_settings_keys,
+            "settings_keys_written": self.settings_keys_written,
             "identity": dict(self.identity),
         }
 
@@ -1344,14 +1567,33 @@ def _memory_output_axis(key: str) -> AdmissionRule:
             return True, None
 
         if value == "recompute":
-            return (
-                False,
-                f"{key}=recompute requires package-owned output recompute lowering",
-            )
+            if _memory_output_recompute_has_lowering(key, candidate.settings):
+                return True, None
+
+            return False, f"{key}=recompute requires matching recompute settings"
 
         return False, f"{key} is unsupported: {value}"
 
     return admit
+
+
+def _memory_output_recompute_has_lowering(
+    key: str,
+    settings: Mapping[str, Any],
+) -> bool:
+    if key == "memory.primal_outputs":
+        return (
+            settings.get("hvp.path") == "reverse_over_reverse"
+            and settings.get("hvp.primal_reuse") == "recompute_primal"
+        )
+
+    if key == "memory.jvp_outputs":
+        return settings.get("ggn.jvp_reuse") == "recompute_jvp"
+
+    if key == "memory.output_cotangents":
+        return settings.get("ggn.cotangent_reuse") == "recompute_output_cotangent"
+
+    return False
 
 
 def _memory_intermediate_residency_axis() -> AdmissionRule:
@@ -1527,6 +1769,9 @@ def _direct_compile_boundary_supported(
 
     if boundary == "loss_closure":
         return operator_kind in {"gradient", "hvp"}
+
+    if boundary == "bound_operator_vector_step":
+        return operator_kind in BOUND_OPERATOR_VECTOR_STEP_FAMILIES
 
     return None
 
@@ -2802,9 +3047,9 @@ SCORE_GRAD_PATH_VALUES = (
 )
 HVP_PATH_VALUES = (
     "reverse_over_reverse",
+    "jvp_grad",
     "autograd_functional_hvp",
     "autograd_functional_vhp",
-    "jvp_grad",
     "forward_ad_dual",
     "linearize_grad",
 )

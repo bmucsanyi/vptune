@@ -32,6 +32,7 @@ SDPA_BACKENDS = {
     "cudnn_attention": SDPBackend.CUDNN_ATTENTION,
     "overrideable": SDPBackend.OVERRIDEABLE,
 }
+SDPA_KERNEL_VALUES = (*SDPA_BACKENDS, "priority_list")
 CORE_ATTENTION_FRONTENDS = (
     "pytorch_sdpa_direct",
     "patched_eager",
@@ -257,7 +258,7 @@ def core_attention_axis_descriptors(
         core_attention_axis(frontends),
         _attention_axis(
             "attention.sdpa_kernel",
-            tuple(SDPA_BACKENDS),
+            SDPA_KERNEL_VALUES,
         ),
         _attention_axis("attention.partition", ATTENTION_PARTITIONS),
         _attention_axis("attention.padding", ATTENTION_PADDING),

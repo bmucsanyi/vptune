@@ -1,6 +1,6 @@
 import copy
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, TypeGuard
 
@@ -11,6 +11,7 @@ import vptune as vp
 import vptune.ext as vpx
 import vptune.public as public_module
 import vptune.run as run_module
+import vptune.runtime as runtime_module
 
 
 def test_root_import_surface_exposes_front_door_and_hides_extensions() -> None:
@@ -104,6 +105,10 @@ def declared_psd_matrix_free_output_matvec(
 
 def non_callable_value() -> Any:
     return "bad"
+
+
+def non_combine_value() -> Any:
+    return {"child": "curvature"}
 
 
 def typed_left_vector() -> dict[str, torch.Tensor]:
@@ -442,6 +447,52 @@ def test_typed_diagonal_metric_products_execute_against_reference() -> None:
     torch.testing.assert_close(
         inverse_inner,
         (left["weight"] * vector["weight"] / (diagonal["weight"] + lam)).sum(),
+    )
+
+
+def test_typed_diagonal_metric_per_group_damping_executes_by_parameter() -> None:
+    model = typed_metric_model()
+    diagonal = {
+        "weight": torch.tensor(
+            [[2.0, 3.0], [5.0, 7.0]],
+            dtype=torch.float64,
+        )
+    }
+    metric = vp.metric.diagonal(diag=diagonal)
+    damping = vp.damping.per_group({"weight": 0.25})
+    vector = typed_vector()
+    left = typed_left_vector()
+    denominator = diagonal["weight"] + 0.25
+
+    inverse_operator = vp.inverse_metric_vp(model, metric, damping=damping)
+    inverse_inner_operator = vp.inverse_metric_inner_vp(
+        model,
+        metric,
+        damping=damping,
+    )
+    inverse_sqrt_operator = vp.inverse_sqrt_metric_vp(
+        model,
+        metric,
+        damping=damping,
+    )
+
+    inverse_product = inverse_operator(vector)
+    inverse_inner = inverse_inner_operator(left, vector)
+    inverse_square_root = inverse_sqrt_operator(vector)
+
+    assert inverse_operator.spec.semantics["damping_kind"] == "per_group"
+    assert inverse_operator.spec.semantics["damping"] == {"weight": 0.25}
+    torch.testing.assert_close(
+        inverse_product["weight"],
+        vector["weight"] / denominator,
+    )
+    torch.testing.assert_close(
+        inverse_inner,
+        (left["weight"] * vector["weight"] / denominator).sum(),
+    )
+    torch.testing.assert_close(
+        inverse_square_root["weight"],
+        torch.rsqrt(denominator) * vector["weight"],
     )
 
 
@@ -791,6 +842,7 @@ def test_per_group_damping_requires_named_block_metric_groups() -> None:
     model = typed_metric_model()
     matrix = torch.eye(4, dtype=torch.float64)
     dense_metric = vp.metric.dense(matrix=matrix)
+    diagonal_metric = vp.metric.diagonal(diag={"weight": torch.ones((2, 2))})
     block_metric = vp.metric.block_diagonal(
         blocks={
             "first": torch.eye(2, dtype=torch.float64),
@@ -798,11 +850,18 @@ def test_per_group_damping_requires_named_block_metric_groups() -> None:
         }
     )
 
-    with pytest.raises(vp.MaterializationError, match="block-diagonal or KFAC"):
+    with pytest.raises(vp.MaterializationError, match="diagonal, block-diagonal"):
         vp.inverse_metric_vp(
             model,
             dense_metric,
             damping=vp.damping.per_group({"weight": 0.1}),
+        )
+
+    with pytest.raises(vp.MaterializationError, match="keys must match"):
+        vp.inverse_metric_vp(
+            model,
+            diagonal_metric,
+            damping=vp.damping.per_group({"other": 0.1}),
         )
 
     with pytest.raises(vp.MaterializationError, match="keys must match"):
@@ -947,6 +1006,41 @@ def test_typed_composition_validates_combine_children_and_source_positions() -> 
         )
 
 
+def test_typed_composition_validates_public_combinator_inputs() -> None:
+    model = typed_metric_model()
+
+    with pytest.raises(vp.MaterializationError, match="compose requires"):
+        vp.compose()
+
+    with pytest.raises(vp.MaterializationError, match="linear_combination requires"):
+        vp.linear_combination()
+
+    with pytest.raises(vp.MaterializationError, match="coefficient-expression pairs"):
+        vp.linear_combination(non_callable_value())
+
+    with pytest.raises(vp.MaterializationError, match="coefficient"):
+        vp.linear_combination((non_callable_value(), "curvature"))
+
+    with pytest.raises(vp.MaterializationError, match="coefficient"):
+        vp.scaled_identity(non_callable_value())
+
+    with pytest.raises(vp.MaterializationError, match="unsupported"):
+        vp.compose(non_combine_value())
+
+    with pytest.raises(vp.MaterializationError, match="source child"):
+        vp.source("")
+
+    with pytest.raises(vp.MaterializationError, match="children must be nonempty"):
+        vp.composition(model, children=(), combine="curvature")
+
+    with pytest.raises(vp.MaterializationError, match="children must be unique"):
+        vp.composition(
+            model,
+            children=("curvature", "curvature"),
+            combine="curvature",
+        )
+
+
 def test_typed_loss_from_scalar_gradient_and_hvp_execute_reference() -> None:
     model = typed_metric_model()
     scale = torch.tensor(
@@ -982,6 +1076,130 @@ def test_typed_loss_from_scalar_gradient_and_hvp_execute_reference() -> None:
         hvp_output["weight"],
         vector["weight"] * scale.square(),
     )
+
+
+def test_public_bind_rejects_product_without_batch_vector_inputs() -> None:
+    model = typed_metric_model()
+    loss = vp.loss.from_scalar(
+        squared_weight_loss,
+        output="logits",
+        version="squared-weight-v1",
+    )
+    dense_metric = vp.metric.dense(
+        matrix=torch.eye(4, dtype=torch.float64),
+    )
+
+    with pytest.raises(vp.MaterializationError, match="bind requires"):
+        vp.gradient(model, loss).bind(batch={})
+
+    with pytest.raises(vp.MaterializationError, match="bind requires"):
+        vp.metric_vp(model, dense_metric).bind(batch={})
+
+
+def test_public_bound_operator_compiles_vector_step_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events = []
+
+    def compile_recorder(
+        operation: Callable[..., Any],
+        *,
+        backend: str,
+        mode: str | None,
+        fullgraph: bool,
+        dynamic: bool | None,
+        options: Mapping[str, object] | None,
+    ) -> Callable[..., Any]:
+        assert backend == "inductor"
+        assert mode == "default"
+        assert fullgraph is False
+        assert dynamic is None
+        assert options is None
+        events.append(("compile",))
+
+        def compiled(*args: Any, **kwargs: Any) -> Any:
+            events.append(("call", len(args)))
+
+            return operation(*args, **kwargs)
+
+        return compiled
+
+    monkeypatch.setattr(runtime_module.torch, "compile", compile_recorder)
+    model = typed_metric_model()
+    loss = vp.loss.from_scalar(
+        squared_weight_loss,
+        output="logits",
+        version="squared-weight-v1",
+    )
+    batch = {
+        "x": torch.tensor([[1.0, 2.0]], dtype=torch.float64),
+        "symmetry_vector": typed_left_vector(),
+    }
+    vector = typed_vector()
+    other_vector = {"weight": -0.25 * vector["weight"]}
+    product = vp.hvp(model, loss, name="bound_hvp")
+    bound = product.bind(batch=batch)
+    space = vp.space.standard(
+        compile=vp.Compile(
+            enabled=(True,),
+            boundaries=("bound_operator_vector_step",),
+        )
+    )
+
+    tuned = bound.tune(
+        vectors=(vector,),
+        target=public_cpu_target(),
+        space=space,
+        search=vp.search.exhaustive(),
+        run_dir=tmp_path,
+    )
+    events.clear()
+    first = tuned(vector)
+    second = tuned(other_vector)
+
+    assert bound.call_inputs == ("vector",)
+    assert tuned.call_inputs == ("vector",)
+    assert tuned.plan is not None
+    bound_signature = tuned.plan.input_signature["data"]["bound_operator"]
+    assert bound_signature["is_bound"] is True
+    assert bound_signature["batch"]["x"] == {
+        "shape": (1, 2),
+        "dtype": "float64",
+        "device": "cpu",
+        "requires_grad": False,
+    }
+    assert bound_signature["batch"]["symmetry_vector"]["weight"]["shape"] == (2, 2)
+    assert events == [
+        ("compile",),
+        ("call", 1),
+        ("call", 1),
+        ("call", 1),
+    ]
+    torch.testing.assert_close(first["weight"], 2.0 * vector["weight"])
+    torch.testing.assert_close(second["weight"], 2.0 * other_vector["weight"])
+
+    loaded = product.bind(batch=batch).load(tmp_path)
+    events.clear()
+    loaded_output = loaded(vector)
+    stale_batch = {
+        "x": torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0]],
+            dtype=torch.float64,
+        ),
+        "symmetry_vector": typed_left_vector(),
+    }
+
+    assert loaded.call_inputs == ("vector",)
+    assert events == [
+        ("compile",),
+        ("call", 1),
+        ("call", 1),
+    ]
+    torch.testing.assert_close(loaded_output["weight"], 2.0 * vector["weight"])
+
+    with pytest.raises(vp.MaterializationError, match="bound operator identity"):
+        product.bind(batch=stale_batch).load(tmp_path)
 
 
 def test_typed_softmax_cross_entropy_gradient_and_hvp_match_reference() -> None:
@@ -1239,11 +1457,22 @@ def test_public_matrix_free_metric_tunes_selected_curvature_product(
     curvature = vp.ggnvp(model, loss, name="curvature")
     metric = vp.metric.matrix_free(operator=curvature)
     metric_product = vp.metric_vp(model, metric, name="curvature_metric")
+    metric_inner = vp.metric_inner_vp(
+        model,
+        metric,
+        name="curvature_metric_inner",
+    )
     damping = 0.5
     inverse_product = vp.inverse_metric_vp(
         model,
         metric,
         name="curvature_inverse",
+        damping=vp.damping.scalar(damping),
+    )
+    inverse_inner = vp.inverse_metric_inner_vp(
+        model,
+        metric,
+        name="curvature_inverse_inner",
         damping=vp.damping.scalar(damping),
     )
 
@@ -1259,17 +1488,27 @@ def test_public_matrix_free_metric_tunes_selected_curvature_product(
         )
 
     run = vp.tune(
-        products=(curvature, metric_product, inverse_product),
+        products=(
+            curvature,
+            metric_product,
+            metric_inner,
+            inverse_product,
+            inverse_inner,
+        ),
         model=model,
         data={
             "curvature": (batch,),
             "curvature_metric": (batch,),
+            "curvature_metric_inner": (batch,),
             "curvature_inverse": (batch,),
+            "curvature_inverse_inner": (batch,),
         },
         vectors={
             "curvature": (vector,),
             "curvature_metric": (vector,),
+            "curvature_metric_inner": ((typed_left_vector(), vector),),
             "curvature_inverse": (vector,),
+            "curvature_inverse_inner": ((typed_left_vector(), vector),),
         },
         target=public_cpu_target(),
         space=vp.space.standard(),
@@ -1277,23 +1516,43 @@ def test_public_matrix_free_metric_tunes_selected_curvature_product(
         run_dir=tmp_path,
     )
     metric_output = run["curvature_metric"](batch, vector)
+    metric_inner_output = run["curvature_metric_inner"](
+        batch,
+        typed_left_vector(),
+        vector,
+    )
     inverse_output = run["curvature_inverse"](batch, vector)
+    inverse_inner_output = run["curvature_inverse_inner"](
+        batch,
+        typed_left_vector(),
+        vector,
+    )
     dense_matrix = dense_weight_operator_matrix(curvature, batch, vector)
     damped = dense_matrix + damping * torch.eye(
         dense_matrix.shape[0],
         dtype=dense_matrix.dtype,
     )
+    flat_left = flat_weight(typed_left_vector())
     expected_inverse = torch.linalg.solve(damped, flat_weight(vector))
 
     assert metric_product.call_inputs == ("batch", "vector")
+    assert metric_inner.call_inputs == ("batch", "left", "right")
     assert inverse_product.call_inputs == ("batch", "vector")
+    assert inverse_inner.call_inputs == ("batch", "left", "right")
     assert run.plan.dependencies_by_family["curvature_metric"] == ("curvature",)
+    assert run.plan.dependencies_by_family["curvature_metric_inner"] == ("curvature",)
     assert run.plan.dependencies_by_family["curvature_inverse"] == ("curvature",)
+    assert run.plan.dependencies_by_family["curvature_inverse_inner"] == ("curvature",)
     assert "matrix_free_bindings" in run.plan.runtime_identities["curvature_metric"]
     torch.testing.assert_close(
         flat_weight(metric_output), flat_weight(curvature(batch, vector))
     )
+    torch.testing.assert_close(
+        metric_inner_output,
+        flat_left @ flat_weight(metric_output),
+    )
     torch.testing.assert_close(flat_weight(inverse_output), expected_inverse)
+    torch.testing.assert_close(inverse_inner_output, flat_left @ expected_inverse)
 
 
 def test_public_matrix_free_metric_square_roots_tune_selected_curvature_product(
@@ -1870,6 +2129,51 @@ def test_public_tune_returns_run_with_tuned_product(tmp_path: Path) -> None:
     torch.testing.assert_close(run["grad_product"](batch)["weight"], expected["weight"])
 
 
+def test_public_tune_accepts_case_reference_and_probe_inputs(
+    tmp_path: Path,
+) -> None:
+    model = typed_metric_model()
+    scale = torch.full_like(model.parameter_values["weight"], 2.0)
+    probe_scale = torch.full_like(model.parameter_values["weight"], 3.0)
+    data_batch = {"scale": torch.full_like(model.parameter_values["weight"], 4.0)}
+    reference_batch = {"scale": scale, "symmetry_vector": typed_left_vector()}
+    probe_batch = {"scale": probe_scale}
+    vector = typed_vector()
+
+    def quadratic(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        _ = buffers, context
+
+        return 0.5 * (params["weight"] * batch["scale"]).square().sum()
+
+    loss = vp.loss.from_scalar(quadratic, output="logits", version="quadratic-v1")
+    product = vp.hvp(model, loss, name="hvp_product")
+    run = vp.tune(
+        products=(product,),
+        model=model,
+        data=(data_batch,),
+        vectors=(vector,),
+        target=public_cpu_target(),
+        space=vp.space.standard(),
+        search=vp.search.exhaustive(),
+        run_dir=tmp_path,
+        reference=vp.case(batch=reference_batch, vector=vector),
+        probes=(vp.case(batch=probe_batch, vector=vector),),
+    )
+    data_signature = run.plan.input_signature["data"]
+    vector_signature = run.plan.input_signature["vectors"]
+    result = run["hvp_product"](reference_batch, vector)
+
+    assert data_signature["reference"]["scale"]["shape"] == (2, 2)
+    assert data_signature["probe_batches"][0]["scale"]["shape"] == (2, 2)
+    assert vector_signature["probe_vectors"][0]["weight"]["shape"] == (2, 2)
+    torch.testing.assert_close(result["weight"], vector["weight"] * scale.square())
+
+
 def test_public_tune_returns_run_with_two_products(tmp_path: Path) -> None:
     model = typed_metric_model()
     loss = vp.loss.from_scalar(
@@ -1895,6 +2199,149 @@ def test_public_tune_returns_run_with_two_products(tmp_path: Path) -> None:
     expected = {"weight": 2.0 * model.parameter_values["weight"]}
 
     assert tuple(run) == ("first_grad", "second_grad")
+    torch.testing.assert_close(run["first_grad"](batch)["weight"], expected["weight"])
+    torch.testing.assert_close(run["second_grad"](batch)["weight"], expected["weight"])
+
+
+def test_public_tune_guards_root_product_set_arguments() -> None:
+    model = typed_metric_model()
+    loss = vp.loss.from_scalar(
+        squared_weight_loss,
+        output="logits",
+        version="squared-weight-v1",
+    )
+    product = vp.gradient(model, loss, name="grad_product")
+    duplicate = vp.gradient(model, loss, name="grad_product")
+    mismatched_model = vp.torch_model(
+        model.module,
+        parameters=model.parameters,
+        call=vp.module_call(args=("x",), kwargs={}, output="other_logits"),
+    )
+    batch = {"x": torch.tensor([[1.0, 2.0]], dtype=torch.float64)}
+    vector = typed_vector()
+
+    with pytest.raises(vp.MaterializationError, match="at least one product"):
+        vp.tune(
+            products=(),
+            model=model,
+            data=(),
+            vectors=(),
+            target=public_cpu_target(),
+            space=vp.space.standard(),
+            search=vp.search.exhaustive(),
+        )
+
+    with pytest.raises(vp.MaterializationError, match="names must be unique"):
+        vp.tune(
+            products=(product, duplicate),
+            model=model,
+            data={"grad_product": (batch,)},
+            vectors={"grad_product": (vector,)},
+            target=public_cpu_target(),
+            space=vp.space.standard(),
+            search=vp.search.exhaustive(),
+        )
+
+    with pytest.raises(vp.MaterializationError, match="product model differs"):
+        vp.tune(
+            products=(product,),
+            model=mismatched_model,
+            data=(batch,),
+            vectors=(vector,),
+            target=public_cpu_target(),
+            space=vp.space.standard(),
+            search=vp.search.exhaustive(),
+        )
+
+
+def test_public_tune_guards_root_product_data_and_vector_arguments() -> None:
+    model = typed_metric_model()
+    loss = vp.loss.from_scalar(
+        squared_weight_loss,
+        output="logits",
+        version="squared-weight-v1",
+    )
+    first = vp.gradient(model, loss, name="first_grad")
+    second = vp.gradient(model, loss, name="second_grad")
+    batch = {"x": torch.tensor([[1.0, 2.0]], dtype=torch.float64)}
+    vector = typed_vector()
+
+    with pytest.raises(vp.MaterializationError, match="data is missing product"):
+        vp.tune(
+            products=(first, second),
+            model=model,
+            data={"first_grad": (batch,)},
+            vectors={"first_grad": (vector,), "second_grad": (vector,)},
+            target=public_cpu_target(),
+            space=vp.space.standard(),
+            search=vp.search.exhaustive(),
+        )
+
+    with pytest.raises(vp.MaterializationError, match="vectors are missing product"):
+        vp.tune(
+            products=(first, second),
+            model=model,
+            data={"first_grad": (batch,), "second_grad": (batch,)},
+            vectors={"first_grad": (vector,)},
+            target=public_cpu_target(),
+            space=vp.space.standard(),
+            search=vp.search.exhaustive(),
+        )
+
+    with pytest.raises(vp.MaterializationError, match="vectors must be keyed"):
+        vp.tune(
+            products=(first, second),
+            model=model,
+            data={"first_grad": (batch,), "second_grad": (batch,)},
+            vectors=(vector,),
+            target=public_cpu_target(),
+            space=vp.space.standard(),
+            search=vp.search.exhaustive(),
+        )
+
+
+def test_public_tune_multi_product_cohort_without_run_dir() -> None:
+    model = typed_metric_model()
+    loss = vp.loss.from_scalar(
+        squared_weight_loss,
+        output="logits",
+        version="squared-weight-v1",
+    )
+    first = vp.gradient(model, loss, name="first_grad")
+    second = vp.gradient(model, loss, name="second_grad")
+    batch = {"x": torch.tensor([[1.0, 2.0]], dtype=torch.float64)}
+    vector = typed_vector()
+    space = vp.SearchSpace(axes={"layout.params": ("parameter_tree",)})
+    run = vp.tune(
+        products=(first, second),
+        model=model,
+        data={
+            "first_grad": (batch,),
+            "second_grad": (batch,),
+        },
+        vectors={
+            "first_grad": (vector,),
+            "second_grad": (vector,),
+        },
+        target=public_cpu_target(),
+        space=space,
+        search=vp.search.exhaustive(),
+        cohort_constraints=(vp.cohort.layout_coherence(("layout.params",)),),
+        run_dir=None,
+        reference=vp.case(batch=batch, vector=vector),
+        probes=(vp.case(batch=batch, vector=vector),),
+    )
+    expected = {"weight": 2.0 * model.parameter_values["weight"]}
+
+    assert run.plan.run_dir is None
+    assert run.plan.cohort_assignment is not None
+    assert set(run.plan.selected) == {"first_grad", "second_grad"}
+    assert run.plan.input_signature["first_grad"]["data"]["reference"]["x"][
+        "shape"
+    ] == (1, 2)
+    assert run.plan.input_signature["second_grad"]["vectors"]["probe_vectors"][0][
+        "weight"
+    ]["shape"] == (2, 2)
     torch.testing.assert_close(run["first_grad"](batch)["weight"], expected["weight"])
     torch.testing.assert_close(run["second_grad"](batch)["weight"], expected["weight"])
 
@@ -2153,8 +2600,43 @@ def test_public_space_components_generate_admitted_settings() -> None:
     with pytest.raises(vp.MaterializationError, match="manual_batch"):
         vp.Vectorization(modes=("manual_batch",))
 
-    with pytest.raises(vp.MaterializationError, match="cannot mix"):
-        vp.Compile(enabled=(False, True), boundaries=("whole_operator",))
+    with pytest.raises(vp.MaterializationError, match="boundaries"):
+        vp.Compile(enabled=(True,))
+
+
+def test_public_space_compile_component_generates_conditional_rows() -> None:
+    model = typed_metric_model()
+    product = vp.gradient(
+        model,
+        vp.loss.from_scalar(
+            squared_weight_loss,
+            output="logits",
+            version="squared-weight-v1",
+        ),
+        name="grad_product",
+    )
+    space = vp.space.standard(
+        compile=vp.Compile(
+            enabled=(False, True),
+            boundaries=("gradient_closure",),
+        ),
+    )
+    settings_by_id = space.candidate_settings(product)
+    rows = tuple(settings_by_id.values())
+    eager = next(row for row in rows if row["compile.enabled"] == "false")
+    compiled = next(row for row in rows if row["compile.enabled"] == "true")
+    registry = vpx.standard_axis_registry()
+
+    assert len(rows) == 2
+    assert "compile.boundary" not in eager
+    assert compiled["compile.boundary"] == "gradient_closure"
+    assert compiled["compile.backend"] == "inductor"
+    assert compiled["compile.mode"] == "default"
+
+    for row in rows:
+        candidate = vpx.Candidate("grad_product", "public-compile", row)
+
+        assert registry.admit(candidate).admission_status == "passed"
 
 
 def test_public_space_with_attention_generates_admitted_adapter_settings() -> None:

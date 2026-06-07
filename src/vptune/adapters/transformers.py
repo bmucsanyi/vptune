@@ -82,10 +82,18 @@ CUSTOM_ATTENTION_FRONTENDS = (
     "registered_transformers_attention",
 )
 TRANSFORMERS_ATTENTION_FRONTENDS = (
-    *EAGER_ATTENTION_FRONTENDS,
-    *SDPA_ATTENTION_FRONTENDS,
-    *FLASH_ATTENTION_FRONTENDS,
-    *CUSTOM_ATTENTION_FRONTENDS,
+    "transformers_eager",
+    "transformers_sdpa",
+    "transformers_flash_attention_2",
+    "transformers_flash_attention_3",
+    "transformers_flash_attention_4",
+    "transformers_flex_attention",
+    "paged|eager",
+    "paged|sdpa",
+    "paged|flash_attention_2",
+    "paged|flash_attention_3",
+    "paged|flash_attention_4",
+    "registered_transformers_attention",
 )
 PUBLIC_ATTENTION_FRONTEND_ALIASES = {
     "eager": "transformers_eager",

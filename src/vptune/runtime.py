@@ -75,7 +75,7 @@ from vptune.data import (
     VectorProvider,
 )
 from vptune.errors import AdmissionError, MaterializationError, ReferenceFailedError
-from vptune.identities import stable_hash, to_json_value
+from vptune.identities import stable_hash, tensor_signature, to_json_value
 from vptune.tensor_tree import (
     TensorTree,
     tree_add_foreach,
@@ -97,6 +97,34 @@ MATRIX_FREE_RUNTIME_BINDINGS = ContextVar[
 ](
     "vptune_matrix_free_runtime_bindings",
     default=None,
+)
+
+BOUND_OPERATOR_VECTOR_STEP_FAMILIES = (
+    "jvp",
+    "vjp",
+    "hvp",
+    "ggnvp",
+    "fisher_vp",
+    "sampled_fisher_vp",
+    "empirical_fisher_vp",
+    "metric",
+    "sqrt_metric",
+    "inverse_sqrt_metric",
+    "inverse_metric",
+    "composition",
+)
+COMPILE_SETTING_KEYS = (
+    "compile.enabled",
+    "compile.boundary",
+    "compile.backend",
+    "compile.mode",
+    "compile.fullgraph",
+    "compile.dynamic",
+    "compile.compiled_autograd",
+    "compile.options.epilogue_fusion",
+    "compile.options.shape_padding",
+    "compile.cuda_graphs",
+    "compile.cache_state",
 )
 
 GRADIENT_PATH = "autograd_grad"
@@ -2054,6 +2082,177 @@ def _matrix_free_inverse_reference_measurements(
     }
 
 
+def _inverse_metric_inner_reference_measurements(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    batch: Batch,
+    vector: TensorTree,
+    params: ParameterTree,
+) -> dict[str, float]:
+    if operator.kind != "inverse_metric_inner":
+        return {}
+
+    if (
+        candidate.settings.get("inverse_metric_inner.reduction_path")
+        != "solve_then_reduce"
+    ):
+        return {}
+
+    _, right = _metric_inner_vectors(vector)
+    inverse_path = _inverse_metric_runtime_path_from_settings(candidate.settings)
+    execution = _inverse_metric_inner_reference_execution(
+        operator,
+        candidate,
+        inverse_path,
+        batch,
+        right,
+        params,
+    )
+    right_matrix = _inverse_metric_inner_right_matrix(execution, right)
+    solution_matrix = _inverse_metric_inner_solution_matrix(
+        execution,
+        right,
+        inverse_path,
+    )
+    measurements = {
+        "inverse_residual": _inverse_metric_inner_residual(
+            operator,
+            candidate,
+            batch,
+            params,
+            right_matrix,
+            solution_matrix,
+        )
+    }
+    damping = _inverse_metric_damping(operator)
+
+    if damping > 0.0:
+        measurements["damping_min"] = damping
+
+    if _metric_representation_kind(operator) != "matrix_free":
+        inverse_matrix = _inverse_metric_matrix(
+            operator,
+            _metric_dense_matrix(operator, batch, params),
+            batch,
+        )
+        measurements["condition_number_max"] = _matrix_condition_number(inverse_matrix)
+
+    return measurements
+
+
+def _inverse_metric_inner_reference_execution(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    path: str,
+    batch: Batch,
+    vector: TensorTree,
+    params: ParameterTree,
+) -> "StandardExecution":
+    return StandardExecution(
+        operator=operator,
+        candidate=candidate,
+        path=path,
+        batch=batch,
+        vector=vector,
+        params=params,
+        buffers={},
+        parameter_surface=None,
+        context=ObjectiveContext(
+            family=operator.family,
+            candidate_id=candidate.candidate_id,
+            settings=dict(candidate.settings),
+        ),
+        scalar_objectives={},
+        function_objectives={},
+    )
+
+
+def _inverse_metric_inner_right_matrix(
+    execution: "StandardExecution",
+    right: TensorTree,
+) -> torch.Tensor:
+    block_mode = _metric_inner_block_mode(
+        execution,
+        "inverse_metric_inner.multi_rhs",
+    )
+
+    if block_mode is None:
+        return _flatten_vector(right).unsqueeze(0)
+
+    return _metric_inner_flat_block(execution, right, 1)
+
+
+def _inverse_metric_inner_solution_matrix(
+    execution: "StandardExecution",
+    right: TensorTree,
+    inverse_path: str,
+) -> torch.Tensor:
+    block_mode = _metric_inner_block_mode(
+        execution,
+        "inverse_metric_inner.multi_rhs",
+    )
+
+    if block_mode is None:
+        product = _inverse_metric_solve_by_path(execution)
+
+        return _flatten_vector(product).unsqueeze(0)
+
+    right_execution = _metric_inner_side_execution(
+        execution,
+        right,
+        1,
+        path=inverse_path,
+    )
+    product = _run_inverse_metric_rhs_batch(right_execution)
+
+    return _metric_inner_flat_leading_block(execution, product)
+
+
+def _inverse_metric_inner_residual(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    batch: Batch,
+    params: ParameterTree,
+    right_matrix: torch.Tensor,
+    solution_matrix: torch.Tensor,
+) -> float:
+    damping = _inverse_metric_damping(operator)
+
+    if _metric_representation_kind(operator) == "matrix_free":
+        metric_path = _metric_runtime_path_from_settings(candidate.settings)
+        applied = _metric_apply_flat_batch(
+            operator,
+            batch,
+            params,
+            solution_matrix,
+            damping,
+            metric_path,
+            candidate.settings,
+        )
+    else:
+        inverse_matrix = _inverse_metric_matrix(
+            operator,
+            _metric_dense_matrix(operator, batch, params),
+            batch,
+        )
+        applied = _matmul_runtime(
+            candidate.settings,
+            solution_matrix,
+            inverse_matrix.T,
+        )
+
+    residual = applied - right_matrix
+    residual_norm = torch.linalg.vector_norm(residual, dim=1)
+    denominator = torch.linalg.vector_norm(right_matrix, dim=1)
+    scaled = torch.where(
+        denominator == 0,
+        residual_norm,
+        residual_norm / denominator,
+    )
+
+    return float(torch.max(scaled).item())
+
+
 def _first_order_reference_measurements(
     operator: OperatorSpec,
     candidate: Candidate,
@@ -2320,7 +2519,15 @@ def _per_group_damped_metric_matrix(
 ) -> torch.Tensor:
     kind = _metric_representation_kind(operator)
 
-    if kind == "block_diagonal":
+    if kind == "diagonal_tree":
+        damping = _flatten_vector(
+            _diagonal_group_damping_tree(
+                operator,
+                _batch_tree(batch, "metric_diagonal"),
+            )
+        )
+        damped = matrix + torch.diag(damping)
+    elif kind == "block_diagonal":
         blocks = _metric_blocks(batch)
         damped = torch.block_diag(
             *starmap(
@@ -2443,11 +2650,57 @@ def _diagonal_inverse_metric_multiply(
     vector: TensorTree,
     settings: Mapping[str, Any],
 ) -> TensorTree:
-    damping = _inverse_metric_damping(operator)
     diagonal = _metric_diagonal_tree(batch, vector)
-    denominator = _tree_add_scalar_runtime(settings, diagonal, damping)
+    denominator = _diagonal_inverse_denominator(operator, diagonal, settings)
     result = _tree_elementwise_div_runtime(settings, vector, denominator)
     _require_finite_tree(result, "inverse metric result")
+
+    return result
+
+
+def _diagonal_inverse_denominator(
+    operator: OperatorSpec,
+    diagonal: TensorTree,
+    settings: Mapping[str, Any],
+) -> TensorTree:
+    if _inverse_metric_damping_kind(operator) != "per_group":
+        return _tree_add_scalar_runtime(
+            settings,
+            diagonal,
+            _inverse_metric_damping(operator),
+        )
+
+    runtime_diagonal = _runtime_intermediate_tree(diagonal, settings)
+    damping_tree = _diagonal_group_damping_tree(operator, runtime_diagonal)
+
+    if _layout_vector_ops(settings) == "foreach":
+        return tree_add_foreach(runtime_diagonal, damping_tree)
+
+    return tree_map2(torch.add, runtime_diagonal, damping_tree)
+
+
+def _diagonal_group_damping_tree(
+    operator: OperatorSpec,
+    diagonal: TensorTree,
+) -> TensorTree:
+    values = _inverse_metric_damping_values(operator)
+
+    if not _is_tensor_tree_dict(diagonal) or not diagonal:
+        message = "diagonal per_group damping requires named tensor leaves"
+        raise MaterializationError(message)
+
+    if set(diagonal) != set(values):
+        message = "diagonal per_group damping keys must match metric leaves"
+        raise MaterializationError(message)
+
+    result = {}
+
+    for key, value in diagonal.items():
+        if not isinstance(key, str) or not isinstance(value, torch.Tensor):
+            message = "diagonal per_group damping requires named tensor leaves"
+            raise MaterializationError(message)
+
+        result[key] = torch.full_like(value, values[key])
 
     return result
 
@@ -2455,10 +2708,15 @@ def _diagonal_inverse_metric_multiply(
 def _diagonal_inverse_metric_multiply_batch(
     execution: "StandardExecution",
 ) -> TensorTree:
-    damping = _inverse_metric_damping(execution.operator)
-    diagonal = _flatten_vector(_metric_diagonal_tree(execution.batch, execution.params))
+    denominator = _flatten_vector(
+        _diagonal_inverse_denominator(
+            execution.operator,
+            _metric_diagonal_tree(execution.batch, execution.params),
+            execution.candidate.settings,
+        )
+    )
     vector_batch = _flat_inverse_metric_vector_batch(execution)
-    result = vector_batch / (diagonal + damping)
+    result = vector_batch / denominator
     _require_finite_tensor(result, "batched diagonal inverse metric result")
 
     return _wrap_flat_vector_batch(execution.params, result)
@@ -3764,6 +4022,7 @@ class StandardExecution:
     flat_parameter_vector: torch.Tensor | None = None
     flat_parameter_vector_batch: torch.Tensor | None = None
     compiled_inner: CandidateOperation | None = None
+    compiled_vector_step: Callable[[TensorTree], TensorTree] | None = None
     compiled_model_forward: Callable[[Batch], object] | None = None
     compiled_scalar_function: Callable[[ParameterTree], torch.Tensor] | None = None
     compiled_score_matrix: Callable[[], torch.Tensor] | None = None
@@ -4052,6 +4311,12 @@ def _prepare_enabled_compile_boundary_execution(
     if special_builder is not None:
         return special_builder()
 
+    if boundary == "bound_operator_vector_step":
+        return _prepare_bound_operator_vector_step_compile_boundary(
+            execution,
+            settings,
+        )
+
     inner_builders = {
         ("gradient", "gradient_closure"): lambda: _run_gradient_by_path(execution),
         ("jvp", "jvp_closure"): lambda: _run_jvp_by_path(execution),
@@ -4216,6 +4481,30 @@ def _prepare_inner_compile_boundary(
     return dataclasses.replace(
         execution,
         compiled_inner=compiled_inner,
+    )
+
+
+def _prepare_bound_operator_vector_step_compile_boundary(
+    execution: StandardExecution,
+    settings: Mapping[str, Any],
+) -> StandardExecution:
+    _require_compiled_execution(execution, settings)
+    step_execution = dataclasses.replace(execution, compiled_vector_step=None)
+
+    def vector_step(vector: TensorTree) -> TensorTree:
+        vector_execution = _execution_with_vector(step_execution, vector)
+
+        return _run_standard_operation(vector_execution)
+
+    compiled_vector_step = _compiled_bound_vector_step(
+        settings,
+        vector_step,
+        execution.vector,
+    )
+
+    return dataclasses.replace(
+        execution,
+        compiled_vector_step=compiled_vector_step,
     )
 
 
@@ -4580,7 +4869,10 @@ def _compile_boundary_runs_inside_operator(
     operator_kind: str,
     settings: Mapping[str, Any],
 ) -> bool:
-    if settings.get("compile.boundary") == "model_forward":
+    if settings.get("compile.boundary") in {
+        "model_forward",
+        "bound_operator_vector_step",
+    }:
         return True
 
     return (operator_kind, settings.get("compile.boundary")) in {
@@ -4619,6 +4911,21 @@ def _compiled_operation(
         use_backend_settings=True,
     )
     _warm_compiled_cache(settings, compiled_operation)
+
+    return compiled_operation
+
+
+def _compiled_bound_vector_step(
+    settings: Mapping[str, Any],
+    operation: Callable[[TensorTree], TensorTree],
+    warm_vector: TensorTree,
+) -> Callable[[TensorTree], TensorTree]:
+    compiled_operation = _compiled_callable(
+        settings,
+        operation,
+        use_backend_settings=True,
+    )
+    _warm_compiled_cache(settings, compiled_operation, warm_vector)
 
     return compiled_operation
 
@@ -4895,6 +5202,9 @@ def _direct_compile_boundary_supported(
 
     if boundary == "loss_closure":
         return operator_kind in {"gradient", "hvp"}
+
+    if boundary == "bound_operator_vector_step":
+        return operator_kind in BOUND_OPERATOR_VECTOR_STEP_FAMILIES
 
     return None
 
@@ -5453,6 +5763,15 @@ def _standard_reference_measurements(
         )
     )
     measurements.update(
+        _inverse_metric_inner_reference_measurements(
+            operator,
+            candidate,
+            batch,
+            vector,
+            params,
+        )
+    )
+    measurements.update(
         _ggn_inner_product_measurements(
             operator,
             candidate,
@@ -5895,6 +6214,9 @@ def _standard_changed_axes(
 
 
 def _run_standard_operation(execution: StandardExecution) -> TensorTree:
+    if execution.compiled_vector_step is not None:
+        return execution.compiled_vector_step(execution.vector)
+
     _require_loss_scaling_settings(execution.operator, execution.candidate.settings)
     runner = STANDARD_RUNNERS.get(execution.operator.kind)
 
@@ -10888,14 +11210,21 @@ def _closed_form_metric_square_root_apply(
         )
 
     _require_metric_representation(execution.operator, ("diagonal_tree",))
-    diagonal = _flatten_vector(_metric_diagonal_tree(execution.batch, execution.vector))
+    diagonal = _metric_diagonal_tree(execution.batch, execution.vector)
 
     if inverse:
-        damping = _inverse_metric_damping(execution.operator)
-        factors = torch.rsqrt(diagonal + damping)
+        denominator = _flatten_vector(
+            _diagonal_inverse_denominator(
+                execution.operator,
+                diagonal,
+                execution.candidate.settings,
+            )
+        )
+        factors = torch.rsqrt(denominator)
     else:
-        _require_positive_spectrum(diagonal, "diagonal metric square root")
-        factors = torch.sqrt(diagonal)
+        flat_diagonal = _flatten_vector(diagonal)
+        _require_positive_spectrum(flat_diagonal, "diagonal metric square root")
+        factors = torch.sqrt(flat_diagonal)
 
     flat_result = factors * _flatten_vector(execution.vector)
     _require_finite_tensor(flat_result, "closed-form metric square-root result")
@@ -12772,6 +13101,45 @@ def _standard_materializer(
                 mmap_residency=mmap_residency_callback,
             )
 
+        if candidate.settings.get("compile.boundary") == "bound_operator_vector_step":
+            eager_candidate = _candidate_without_compile_settings(candidate)
+            compiled_vector_step = None
+            bound_batch_signature = None
+
+            def selected(batch: Batch, vector: TensorTree) -> TensorTree:
+                nonlocal bound_batch_signature, compiled_vector_step
+
+                current_batch_signature = _batch_signature(batch)
+
+                if bound_batch_signature is None:
+                    bound_batch_signature = current_batch_signature
+                elif current_batch_signature != bound_batch_signature:
+                    message = (
+                        "compile.boundary=bound_operator_vector_step requires a "
+                        "fixed batch signature"
+                    )
+                    raise MaterializationError(message)
+
+                if compiled_vector_step is None:
+                    fixed_batch = dict(batch)
+
+                    def vector_step(step_vector: TensorTree) -> TensorTree:
+                        return operation_factory(
+                            eager_candidate,
+                            fixed_batch,
+                            step_vector,
+                        )()
+
+                    compiled_vector_step = _compiled_bound_vector_step(
+                        candidate.settings,
+                        vector_step,
+                        vector,
+                    )
+
+                return compiled_vector_step(vector)
+
+            return selected
+
         def selected(batch: Batch, vector: TensorTree) -> TensorTree:
             return operation_factory(candidate, batch, vector)()
 
@@ -12784,6 +13152,33 @@ def _standard_materializer(
         {"callback": "_standard_materializer.callback"},
         callback,
     )
+
+
+def _candidate_without_compile_settings(candidate: Candidate) -> Candidate:
+    return dataclasses.replace(
+        candidate,
+        settings={
+            key: value
+            for key, value in candidate.settings.items()
+            if key not in COMPILE_SETTING_KEYS
+        },
+    )
+
+
+def _batch_signature(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return tensor_signature(value)
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _batch_signature(nested)
+            for key, nested in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return tuple(_batch_signature(item) for item in value)
+
+    return to_json_value(value)
 
 
 def standard_runtime_with_matrix_free_bindings(
@@ -14266,7 +14661,7 @@ def _require_memory_residency_settings(
 
 
 def _require_memory_recompute_settings(
-    _: OperatorSpec,
+    operator: OperatorSpec,
     settings: Mapping[str, Any],
 ) -> None:
     for key in (
@@ -14280,13 +14675,42 @@ def _require_memory_recompute_settings(
             continue
 
         if value == "recompute":
-            message = (
-                f"{key}=recompute requires package-owned output recompute lowering"
-            )
-            raise MaterializationError(message)
+            _require_memory_recompute_lowering(operator, settings, key)
+            continue
 
         message = f"{key} is unsupported: {value}"
         raise MaterializationError(message)
+
+
+def _require_memory_recompute_lowering(
+    operator: OperatorSpec,
+    settings: Mapping[str, Any],
+    key: str,
+) -> None:
+    if (
+        key == "memory.primal_outputs"
+        and operator.kind == "hvp"
+        and settings.get("hvp.path") == HVP_REFERENCE_PATH
+        and settings.get("hvp.primal_reuse") == "recompute_primal"
+    ):
+        return
+
+    if (
+        key == "memory.jvp_outputs"
+        and operator.kind == "ggnvp"
+        and settings.get("ggn.jvp_reuse") == "recompute_jvp"
+    ):
+        return
+
+    if (
+        key == "memory.output_cotangents"
+        and operator.kind == "ggnvp"
+        and settings.get("ggn.cotangent_reuse") == "recompute_output_cotangent"
+    ):
+        return
+
+    message = f"{key}=recompute requires matching package-owned recompute settings"
+    raise MaterializationError(message)
 
 
 def _require_gradient_graph_schedule_settings(
@@ -16853,8 +17277,172 @@ def _anchor_settings(
     settings.update(_sampled_fisher_anchor_settings(operator, candidate, path))
     settings.update(_per_example_gradient_anchor_settings(operator, path))
     settings.update(_ggn_anchor_settings(operator, path))
+    settings.update(_metric_inner_anchor_settings(operator, candidate, path))
+    settings.update(_inverse_metric_inner_anchor_settings(operator, candidate, path))
 
     settings.update(_anchor_admission_settings(path))
+
+    return settings
+
+
+def _metric_inner_anchor_settings(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    path: str,
+) -> dict[str, Any]:
+    if operator.kind != "metric_inner":
+        return {}
+
+    if path == METRIC_INNER_MULTIPLY_REDUCE_PATH:
+        settings = _metric_multiply_anchor_settings(operator, candidate)
+    elif path == METRIC_INNER_SQRT_REDUCE_PATH:
+        settings = _sqrt_metric_anchor_settings(operator, candidate)
+    else:
+        settings = {}
+
+    settings["metric_inner.multi_rhs"] = _inner_multi_rhs_anchor_value(
+        candidate,
+        "metric_inner.multi_rhs",
+    )
+
+    return settings
+
+
+def _inverse_metric_inner_anchor_settings(
+    operator: OperatorSpec,
+    candidate: Candidate,
+    path: str,
+) -> dict[str, Any]:
+    if operator.kind != "inverse_metric_inner":
+        return {}
+
+    if path == INVERSE_METRIC_INNER_SOLVE_REDUCE_PATH:
+        settings = _inverse_metric_anchor_settings(operator, candidate)
+    elif path == INVERSE_METRIC_INNER_SQRT_REDUCE_PATH:
+        settings = _sqrt_metric_anchor_settings(operator, candidate)
+    else:
+        settings = {}
+
+    settings["inverse_metric_inner.multi_rhs"] = _inner_multi_rhs_anchor_value(
+        candidate,
+        "inverse_metric_inner.multi_rhs",
+    )
+
+    return settings
+
+
+def _inner_multi_rhs_anchor_value(candidate: Candidate, key: str) -> str:
+    value = candidate.settings.get(key)
+
+    if isinstance(value, str):
+        return value
+
+    return "single_column"
+
+
+def _metric_multiply_anchor_settings(
+    operator: OperatorSpec,
+    candidate: Candidate,
+) -> dict[str, Any]:
+    value = candidate.settings.get("metric.multiply_path")
+
+    if not isinstance(value, str):
+        value = _metric_multiply_anchor_value(operator)
+
+    settings = {"metric.multiply_path": value}
+
+    if value == "dense_matmul":
+        return settings
+
+    accumulation = candidate.settings.get("metric.accumulation")
+
+    if not isinstance(accumulation, str):
+        accumulation = (
+            "streaming" if value == "streaming_multiply" else "materialized_blocks"
+        )
+
+    settings["metric.accumulation"] = accumulation
+
+    return settings
+
+
+def _metric_multiply_anchor_value(operator: OperatorSpec) -> str:
+    kind = _metric_representation_kind(operator)
+
+    if kind == "dense_matrix":
+        return "dense_matmul"
+
+    if kind == "block_diagonal":
+        return "blockwise_multiply"
+
+    if kind == "matrix_free":
+        return "streaming_multiply"
+
+    return "factorized_multiply"
+
+
+def _inverse_metric_anchor_settings(
+    operator: OperatorSpec,
+    candidate: Candidate,
+) -> dict[str, Any]:
+    value = candidate.settings.get("inverse_metric.solve_path")
+
+    if not isinstance(value, str):
+        value = _inverse_metric_anchor_value(operator)
+
+    settings = {"inverse_metric.solve_path": value}
+
+    for key in (
+        "inverse_metric.iteration_budget",
+        "inverse_metric.preconditioner",
+        "inverse_metric.block_schedule",
+        "inverse_metric.multi_rhs",
+    ):
+        if key in candidate.settings:
+            settings[key] = candidate.settings[key]
+
+    if value == "conjugate_gradient":
+        settings.update(_metric_multiply_anchor_settings(operator, candidate))
+
+    return settings
+
+
+def _inverse_metric_anchor_value(operator: OperatorSpec) -> str:
+    kind = _metric_representation_kind(operator)
+
+    if kind == "dense_matrix":
+        return "dense_solve"
+
+    if kind == "matrix_free":
+        return "conjugate_gradient"
+
+    if kind == "block_diagonal":
+        return "blockwise_solve"
+
+    if kind == "low_rank_factors":
+        return "woodbury_low_rank_solve"
+
+    return "factorized_solve"
+
+
+def _sqrt_metric_anchor_settings(
+    operator: OperatorSpec,
+    candidate: Candidate,
+) -> dict[str, Any]:
+    value = candidate.settings.get("sqrt_metric.factor_path")
+
+    if not isinstance(value, str):
+        return {}
+
+    settings = {"sqrt_metric.factor_path": value}
+
+    if "sqrt_metric.lanczos_iterations" in candidate.settings:
+        settings["sqrt_metric.lanczos_iterations"] = candidate.settings[
+            "sqrt_metric.lanczos_iterations"
+        ]
+
+    if value == "matrix_free_lanczos":
+        settings.update(_metric_multiply_anchor_settings(operator, candidate))
 
     return settings
 

@@ -1,6 +1,7 @@
 import contextlib
 import dataclasses
 import math
+import re
 import types
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
@@ -61,6 +62,731 @@ from vptune.tensor_tree import (
     tree_mul_foreach,
     tree_signature,
 )
+
+MANIFEST_AXIS_BULLET = re.compile(r"^- `([^`]+)`(?:: (.*))?$")
+MANIFEST_AXIS_KEY_ALLOWLIST = {"autocast", "teacher_outputs"}
+SPEC_MANIFEST_START = "The package manifest must include these operator-owned axes:"
+SPEC_MANIFEST_END = "These manifest rules reject contradictory rows:"
+SPEC_ACCEPTANCE_START = "## Acceptance Tests"
+SPEC_ACCEPTANCE_END = "## Package Layout"
+SPEC_SYMBOLIC_AXIS_DOMAINS = {
+    "compile.backend": ("inductor", "registered_backend"),
+    "vectorization.in_dims": candidates_module.DECLARED_DOMAIN,
+    "attention.custom_kernel_id": candidates_module.REGISTERED_DOMAIN,
+    "attention.mask_formatter_id": candidates_module.REGISTERED_DOMAIN,
+    "distributed.mesh_dim_names": candidates_module.DECLARED_DOMAIN,
+    "fsdp.reshard_after_forward": (candidates_module.FSDP_RESHARD_AFTER_FORWARD_DOMAIN),
+    "fsdp.ignored_params": candidates_module.DECLARED_DOMAIN,
+    "fsdp.dp_mesh_dims": candidates_module.DECLARED_DOMAIN,
+    "tp.plan": candidates_module.REGISTERED_DOMAIN,
+    "tp.prepare_module_input": candidates_module.DECLARED_DOMAIN,
+    "tp.prepare_module_output": candidates_module.DECLARED_DOMAIN,
+    "sequence_parallel.norm_modules": candidates_module.DECLARED_DOMAIN,
+    "context_parallel.sequence_dim": candidates_module.DECLARED_DOMAIN,
+}
+MANIFEST_SYMBOLIC_VALUE_TEST_COVERAGE = {
+    ("layout.vector_ops", "python_loop"): (
+        "test_standard_runtime_executes_foreach_vector_ops_for_diagonal_metric",
+    ),
+    ("hvp.gradient_reuse", "recompute_gradient"): (
+        "test_hvp_reverse_reuse_vector_policies",
+    ),
+    ("gradient.value_reuse", "gradient_only"): (
+        "test_gradient_reference_check_records_directional_agreement",
+    ),
+    ("vectorization.batch_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_jvp_and_vjp_manual_batch_vectorization_validate_batch_size",
+    ),
+    ("vectorization.vmap_chunk_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_hvp_vmap_vectorization_runs_linearized_batched_vectors",
+    ),
+    ("batch.data_microbatch_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_standard_runtime_accepts_direct_input_schedule_settings",
+    ),
+    ("batch.hvp_row_batch_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_hvp_row_batch_size_executes_reverse_rows",
+    ),
+    ("batch.ggn_batch_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_ggnvp_chunks_output_cotangent_vjp",
+    ),
+    ("batch.fisher_sample_batch_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_fisher_family_vectorization_runs_batched_vectors",
+    ),
+    ("batch.empirical_example_batch_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_empirical_fisher_vmap_path_matches_loop_path",
+    ),
+    ("batch.per_example_block_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_per_example_gradient_stacked_and_blockwise_execute_declared_rows",
+    ),
+    ("chunk.token_block_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_ggnvp_closed_form_ce_kl_token_blocks_match_dense_loss_hessian",
+    ),
+    ("chunk.sequence_position_block_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_attention_operation_uses_candidate_sequence_block_size",
+    ),
+    (
+        "chunk.class_block_size_with_exact_global_normalization",
+        candidates_module.INTEGER_DOMAIN[0],
+    ): ("test_ggnvp_closed_form_ce_kl_token_blocks_match_dense_loss_hessian",),
+    ("chunk.output_cotangent_block_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_ggnvp_chunks_output_cotangent_vjp",
+    ),
+    ("chunk.parameter_block_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_parameter_block_size_rejects_non_dense_parameter_matrix_path",
+    ),
+    ("chunk.layer_block_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_layer_block_size_requires_declared_layer_groups",
+    ),
+    ("chunk.lm_head_weight_chunk_bytes", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_standard_runtime_executes_lm_head_chunker_binding",
+    ),
+    ("compile.boundary", "metric_inner_reduce"): (
+        "test_standard_runtime_compiles_metric_tree_boundary_only",
+    ),
+    ("compile.boundary", "metric_sqrt_multiply"): (
+        "test_standard_runtime_compiles_metric_tree_boundary_only",
+    ),
+    ("compile.boundary", "inverse_metric_inner_reduce"): (
+        "test_standard_runtime_compiles_metric_tree_boundary_only",
+    ),
+    ("sqrt_metric.lanczos_iterations", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_matrix_free_lanczos_requires_declared_iterations",
+    ),
+    ("inverse_metric.iteration_budget", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_inverse_metric_cg_stops_at_declared_tol",
+    ),
+    ("attention.frontend", "paged|eager"): (
+        "test_transformers_attention_axis_uses_core_and_adapter_admission_fields",
+    ),
+    ("attention.frontend", "paged|sdpa"): (
+        "test_transformers_attention_axis_uses_core_and_adapter_admission_fields",
+    ),
+    ("distributed.mesh_shape", candidates_module.INTEGER_TUPLE_DOMAIN[0]): (
+        "test_distributed_identity_records_mesh_and_communication",
+    ),
+    (
+        "fsdp.reshard_after_forward",
+        candidates_module.FSDP_RESHARD_AFTER_FORWARD_DOMAIN[0],
+    ): ("test_distributed_adapter_registry_admits_direct_fsdp_reshard_group_sizes",),
+    ("comm.collective_bucket_size", candidates_module.INTEGER_DOMAIN[0]): (
+        "test_distributed_strategy_applier_lowers_fsdp2_row_settings",
+    ),
+}
+MANIFEST_CHECK_TEST_COVERAGE = {
+    "attention_backend_equality": (
+        "test_attention_operation_factory_and_reference_check_execute_core_row",
+    ),
+    "autograd_functional_anchor": (
+        "test_hvp_reference_check_accepts_functional_hvp_path",
+    ),
+    "checkpoint_recompute_equality": (
+        "test_standard_runtime_executes_selective_checkpoint_with_context_pair",
+    ),
+    "child_anchor_checks": ("test_composition_reference_check_runs_child_anchor",),
+    "dense_composed_output_check": (
+        "test_composition_validate_composed_output_skips_child_anchor",
+    ),
+    "dense_empirical_fisher_anchor": (
+        "test_per_example_gradient_reference_check_and_empirical_outer_product",
+    ),
+    "dense_factor_check": ("test_sqrt_metric_cholesky_paths_match_reference",),
+    "dense_fisher_anchor": (
+        "test_fisher_references_use_declared_per_example_objectives",
+    ),
+    "dense_inverse_gram_reference": (
+        "test_inverse_metric_inner_solve_path_matches_reference",
+    ),
+    "dense_inverse_reference": (
+        "test_inverse_metric_reference_check_records_inverse_residual",
+    ),
+    "dense_jacobian_ggn_anchor": (
+        "test_ggnvp_reference_check_records_dense_anchor_errors",
+    ),
+    "dense_metric_gram_reference": ("test_metric_inner_dense_paths_match_reference",),
+    "dense_metric_reference": (
+        "test_metric_reference_check_rejects_nonsymmetric_metric",
+    ),
+    "dense_sampled_fisher_anchor": (
+        "test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order",
+    ),
+    "dependency_identity_equality": ("test_tune_run_uses_family_dag_order",),
+    "direct_autograd_anchor": (
+        "test_gradient_reference_check_records_directional_agreement",
+    ),
+    "distributed_logical_output_agreement": (
+        "test_distributed_reference_check_uses_single_device_anchor",
+    ),
+    "dtype_reference_agreement": (
+        "test_standard_reference_check_low_precision_anchor",
+    ),
+    "empirical_fisher_outer_product_check": (
+        "test_per_example_gradient_reference_check_and_empirical_outer_product",
+    ),
+    "explicit_sampled_score_outer_product_anchor": (
+        "test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order",
+    ),
+    "explicit_score_outer_product_anchor": (
+        "test_fisher_references_use_declared_per_example_objectives",
+    ),
+    "finite_difference_directional": (
+        "test_jvp_reference_check_records_finite_difference_agreement",
+    ),
+    "finite_difference_gradient_directional": (
+        "test_gradient_reference_check_records_directional_agreement",
+    ),
+    "fixed_sample_source_check": ("test_typed_sampled_fisher_fixed_seed_repeats",),
+    "full_size_agreement": ("test_tune_measures_every_probe_input",),
+    "fused_kernel_reference_agreement": (
+        "test_composition_fuse_adjacent_children_reference_validates_fused_output",
+    ),
+    "hvp_symmetry": ("test_hvp_reference_check_records_symmetry_error",),
+    "input_representation_equality": (
+        "test_standard_runtime_executes_packed_input_layout_binding",
+    ),
+    "inverse_inner_residual_check": (
+        "test_inverse_metric_inner_cg_uses_declared_tol_before_reduction",
+    ),
+    "inverse_residual_check": (
+        "test_inverse_metric_reference_check_records_inverse_residual",
+    ),
+    "jvp_anchor": ("test_jvp_reference_check_records_finite_difference_agreement",),
+    "jvp_hessian_vjp_cross_check": (
+        "test_ggnvp_reference_check_uses_jvp_hessian_vjp_anchor",
+    ),
+    "jvp_vjp_dot_identity": ("test_vjp_reference_check_records_dot_identity",),
+    "layout_roundtrip_reference": (
+        "test_standard_runtime_executes_layout_output_flat_contiguous",
+    ),
+    "loss_hessian_psd": ("test_ggnvp_reference_check_rejects_indefinite_loss_hessian",),
+    "loss_hessian_symmetry": (
+        "test_ggnvp_reference_check_rejects_nonsymmetric_loss_hessian",
+    ),
+    "matrix_free_covariance_check": (
+        "test_public_matrix_free_metric_square_roots_tune_selected_curvature_product",
+    ),
+    "metric_inner_diagonal_nonnegative_check": (
+        "test_metric_inner_norm_requires_sqrt_apply_reduce",
+    ),
+    "metric_psd_check": ("test_metric_reference_check_rejects_indefinite_metric",),
+    "metric_symmetry_check": (
+        "test_metric_reference_check_rejects_nonsymmetric_metric",
+    ),
+    "numeric_error_bound_check": (
+        "test_standard_reference_check_applies_numeric_error_bound_fields",
+    ),
+    "per_example_gradient_loop_anchor": (
+        "test_per_example_gradient_reference_check_and_empirical_outer_product",
+    ),
+    "recompute_or_offload_equality": (
+        "test_activation_offload_preserves_higher_order_hvp",
+    ),
+    "reverse_over_reverse_anchor": ("test_gradient_jvp_vjp_hvp_anchors",),
+    "segmentation_invariance": (
+        "test_segmented_forward_ad_attention_matches_full_attention_tangent",
+    ),
+    "teacher_output_equality": (
+        "test_standard_runtime_rejects_mismatched_recomputed_teacher_outputs",
+    ),
+    "vjp_anchor": ("test_vjp_reference_check_records_dot_identity",),
+}
+ACCEPTANCE_TEST_COVERAGE = {
+    "Axis manifest contains every key and value": (
+        "test_axis_manifest_matches_spec_key_and_value_domains",
+        "test_axis_manifest_keys_match_features_and_spec",
+        "test_axis_manifest_carries_lowering_and_check_identity_fields",
+    ),
+    "Axis manifest rejects contradictory rows for packing": (
+        "test_standard_axis_registry_validates_core_axes",
+        "test_core_attention_axis_rejects_invalid_rows",
+        "test_build_dtensor_placement_rejects_contradictory_fields",
+    ),
+    "Axis manifest rejects `compile.options.*=true`": (
+        "test_standard_axis_registry_validates_core_axes",
+        "test_standard_runtime_executes_dtype_and_backend_axes",
+    ),
+    "Axis manifest rejects metric and inverse-metric rows": (
+        "test_candidate_rows_reject_metric_representation_path_mismatches",
+        "test_non_dense_metric_paths_require_accumulation",
+        "test_standard_runtime_executes_metric_factor_residency_axis",
+    ),
+    "`vp.problem(...)` and `vp.autotune(...)` reject composition": (
+        "test_standard_problem_rejects_composition_without_tuning_run",
+    ),
+    "Operator constructors validate the closed-set fields": (
+        "test_typed_softmax_cross_entropy_rejects_invalid_fields",
+        "test_typed_sample_source_validation",
+        "test_typed_kfac_rejects_invalid_factor_declarations",
+    ),
+    "Every manifest value has one admission rule": (
+        "test_axis_manifest_values_and_checks_have_test_coverage",
+    ),
+    "Gradient anchor matches direct autograd": ("test_gradient_jvp_vjp_hvp_anchors",),
+    "JVP anchor matches finite difference": (
+        "test_jvp_reference_check_records_finite_difference_agreement",
+    ),
+    "VJP anchor satisfies the dot-product identity": (
+        "test_vjp_reference_check_records_dot_identity",
+    ),
+    "HVP anchor matches reverse-over-reverse": (
+        "test_gradient_jvp_vjp_hvp_anchors",
+        "test_gradient_reference_check_records_directional_agreement",
+    ),
+    "Standard runtime builder runs gradient, JVP": (
+        "test_standard_operation_factory_runs_core_derivative_products",
+    ),
+    "Standard runtime builder runs dense GGNVP": (
+        "test_standard_operation_factory_runs_dense_metric_and_fisher_families",
+    ),
+    "Standard runtime applies declared `dtype.parameter_storage`": (
+        "test_standard_runtime_executes_dtype_and_backend_axes",
+        "test_standard_runtime_executes_split_model_and_autodiff_compute_dtypes",
+    ),
+    "Grad-materialization tests cover tensor-tree returns": (
+        "test_standard_operation_factory_runs_core_derivative_products",
+        "test_standard_runtime_executes_stateful_module_gradient",
+    ),
+    "Teacher-output tests cover CPU": (
+        "test_standard_runtime_executes_precomputed_cpu_teacher_outputs",
+        "test_standard_runtime_executes_precomputed_pinned_teacher_outputs",
+        "test_standard_runtime_executes_precomputed_gpu_teacher_outputs",
+        "test_standard_runtime_rejects_mismatched_recomputed_teacher_outputs",
+    ),
+    "Numeric loss-scaling tests cover degree-one unscale": (
+        "test_numeric_loss_scaling_scales_gradient_source_and_unscales_output",
+        "test_numeric_loss_scaling_unscales_degree_two_fisher_family_output",
+        "test_numeric_loss_scaling_rejects_wrong_operator_degree",
+    ),
+    "Fusion tests cover every `fusion.*` axis value": (
+        "test_standard_runtime_accepts_model_default_fusion_settings",
+        "test_standard_runtime_executes_fused_row_with_registered_rewriter",
+        "test_standard_runtime_executes_fused_rows_for_higher_order_families",
+        "test_composition_fuse_adjacent_children_reference_validates_fused_output",
+    ),
+    "Activation-offload tests cover CPU saved-tensor hooks": (
+        "test_standard_runtime_executes_cpu_saved_tensor_hooks",
+        "test_standard_runtime_executes_custom_saved_tensor_hooks",
+        "test_activation_offload_preserves_higher_order_hvp",
+    ),
+    "Layout tests cover `layout.vector_ops=foreach`": (
+        "test_standard_runtime_executes_foreach_vector_ops_for_diagonal_metric",
+        "test_standard_runtime_executes_layout_contiguity_axis",
+        "test_standard_runtime_preserves_tied_parameter_aliases_during_dtype_cast",
+        "test_distributed_operation_factory_delegates_dtensor_layout_to_strategy",
+    ),
+    "Standard runtime rejects registered axes whose execution belongs": (
+        "test_distributed_layout_values_require_distributed_adapter",
+        "test_standard_compile_boundary_rejects_transformer_block_without_adapter",
+    ),
+    "`vhp` candidate path reports an HVP result": (
+        "test_vhp_reference_check_requires_symmetry_and_directional_checks",
+        "test_hvp_vhp_path_supports_parameter_tree_order",
+    ),
+    "GGNVP cross-checks dense": (
+        "test_ggnvp_reference_check_uses_jvp_hessian_vjp_anchor",
+        "test_ggnvp_reference_check_cross_checks_jvp_path_with_dense_anchor",
+    ),
+    "GGNVP enforces PSD on the output-space loss Hessian": (
+        "test_ggnvp_reference_check_rejects_nonsymmetric_loss_hessian",
+        "test_ggnvp_reference_check_rejects_indefinite_loss_hessian",
+        "test_typed_declared_psd_matrix_free_rejects_indefinite_matvec",
+    ),
+    "FisherVP anchor computes exact score-gradient outer products": (
+        "test_fisher_references_use_declared_per_example_objectives",
+    ),
+    "Exact categorical NLL Fisher is expressed by GGNVP": (
+        "test_typed_categorical_fisher_routes_to_ggn",
+        "test_ggnvp_reference_check_uses_jvp_hessian_vjp_anchor",
+    ),
+    "Sampled FisherVP uses declared fixed sample table": (
+        "test_typed_sampled_fisher_fixed_seed_repeats",
+        "test_sampled_fisher_vp_rejects_inconsistent_rows",
+        "test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order",
+    ),
+    "EmpiricalFisherVP anchor computes per-example-gradient": (
+        "test_per_example_gradient_reference_check_and_empirical_outer_product",
+    ),
+    "EmpiricalFisherVP standard runtime has both loop": (
+        "test_empirical_fisher_vmap_path_matches_loop_path",
+        "test_empirical_fisher_vmap_path_rejects_invalid_batch_shape",
+    ),
+    "Standard dense metric materialization returns one object": (
+        "test_standard_metric_materializer_returns_metric_object",
+        "test_inverse_metric_materializer_calls_inverse_by_default",
+    ),
+    "Metric tests cover dense, diagonal, block-diagonal": (
+        "test_typed_dense_metric_products_execute_against_reference",
+        "test_typed_diagonal_metric_products_execute_against_reference",
+        "test_typed_block_metric_products_execute_against_reference",
+        "test_typed_kfac_metric_products_execute_against_reference",
+        "test_typed_low_rank_metric_products_execute_against_reference",
+        "test_typed_ggn_derived_metric_products_execute_against_reference",
+    ),
+    "Inverse-metric tests cover every solve path": (
+        "test_inverse_metric_dense_direct_solve_paths_match_dense_solve",
+        "test_inverse_metric_cg_dense_preconditioners_match_reference",
+        "test_inverse_metric_direct_solve_rejects_iteration_budget",
+    ),
+    "Composition reference checks run child operator anchors": (
+        "test_composition_reference_check_runs_child_anchor",
+        "test_composition_tune_writes_child_reference_rows",
+    ),
+    "Composition tests declare children through": (
+        "test_typed_composition_records_sequential_combine_and_runtime_order",
+        "test_public_tune_composition_uses_selected_child_rows",
+        "test_composition_materialize_each_child_rejects_inline_child_lowering",
+        "test_composition_validate_composed_output_skips_child_anchor",
+    ),
+    "Composition combinator tests cover `vp.compose`": (
+        "test_public_tune_linear_combination_composition_executes_scaled_identity",
+        "test_public_tune_source_composition_executes_batch_to_vector_child",
+        "test_typed_composition_validates_combine_children_and_source_positions",
+    ),
+    "Positive-definiteness tests reject": (
+        "test_inverse_metric_rejects_ill_conditioned_undamped_solve",
+        "test_typed_inverse_metric_tol_lowers_to_matrix_free_cg",
+    ),
+    "EKFAC metric tests cover": (
+        "test_typed_ekfac_metric_products_execute_against_reference",
+        "test_ekfac_inverse_metric_factorized_solve_matches_dense_reference",
+    ),
+    "Square-root tests cover": (
+        "test_sqrt_metric_cholesky_paths_match_reference",
+        "test_ekfac_closed_form_square_root_paths_match_reference",
+        "test_public_matrix_free_metric_square_roots_tune_selected_curvature_product",
+    ),
+    "Metric inner-product tests cover": (
+        "test_metric_inner_dense_paths_match_reference",
+        "test_typed_ekfac_metric_inner_products_execute_against_reference",
+        "test_metric_inner_norm_requires_sqrt_apply_reduce",
+        "test_metric_inner_block_rhs_matches_single_column_gram",
+    ),
+    "Per-example gradient tests cover": (
+        "test_typed_softmax_cross_entropy_per_example_gradient_matches_reference",
+        "test_typed_softmax_cross_entropy_empirical_fisher_matches_reference",
+        "test_per_example_gradient_stacked_and_blockwise_execute_declared_rows",
+    ),
+    "Typed damping tests cover": (
+        "test_typed_block_metric_per_group_damping_executes_by_block",
+        "test_typed_kfac_metric_per_group_damping_executes_by_parameter",
+        "test_typed_kfac_pi_damping_uses_factored_shift",
+    ),
+    "Solver-tolerance tests cover": (
+        "test_inverse_metric_cg_stops_at_declared_tol",
+        "test_inverse_metric_reference_check_uses_declared_tol_threshold",
+    ),
+    "Cohort-input tests pin": (
+        "test_public_tune_multi_product_cohort_without_run_dir",
+        "test_tune_run_selects_complete_dtype_cohort",
+    ),
+    "Multi-RHS tests cover": (
+        "test_inverse_metric_multi_rhs_controls_cholesky_rhs_batching",
+        "test_public_bound_operator_compiles_vector_step_once",
+    ),
+    "Typed-object validation tests reject": (
+        "test_typed_softmax_cross_entropy_rejects_invalid_fields",
+        "test_typed_sample_source_validation",
+        "test_typed_declared_psd_matrix_free_rejects_indefinite_matvec",
+    ),
+    "Replay tests cover the new identity fields": (
+        "test_public_problem_autotune_and_operator_load_replay",
+        "test_public_operator_load_rejects_stale_model_identity",
+        "test_typed_inverse_metric_tol_lowers_to_matrix_free_cg",
+    ),
+    "KFAC metric multiply, inverse, and inner product": (
+        "test_typed_kfac_metric_products_execute_against_reference",
+    ),
+    "Metric and inverse-metric checks reject nonsymmetric": (
+        "test_metric_reference_check_rejects_nonsymmetric_metric",
+        "test_metric_reference_check_rejects_indefinite_metric",
+        "test_inverse_metric_reference_check_rejects_indefinite_metric",
+    ),
+    "Threshold logic covers": (
+        "test_threshold_logic",
+        "test_standard_reference_check_honors_strict_thresholds",
+        "test_standard_reference_check_applies_numeric_error_bound_fields",
+    ),
+    "Compile tests cover disabled eager rows": (
+        "test_public_space_compile_component_generates_conditional_rows",
+        "test_standard_runtime_runs_real_torch_compile_whole_operator",
+        "test_standard_runtime_enables_compiled_autograd_for_backward_operator",
+        "test_standard_runtime_warms_compile_cache",
+        "test_run_candidate_records_measured_recompile_count",
+    ),
+    "Attention tests cover every frontend listed": (
+        "test_transformers_attention_axis_uses_core_and_adapter_admission_fields",
+        "test_sdpa_kernel_values_enter_declared_context",
+        "test_sdpa_priority_list_enters_priority_context",
+        "test_transformers_registered_attention_row_selects_runtime_backend",
+    ),
+    "Attention executor tests cover a non-Transformers module": (
+        "test_mapping_attention_location_executes_non_transformers_attention",
+        "test_pytorch_sdpa_direct_matches_exact_attention",
+        "test_packed_exact_attention_restores_token_order",
+        "test_blockwise_exact_attention_matches_full_attention",
+    ),
+    "Distributed tests cover every distributed axis": (
+        "test_distributed_adapter_registry_admits_owned_axes_and_strategy_fields",
+        "test_distributed_operation_factory_applies_strategy_and_runs_module",
+        "test_distributed_reference_check_uses_single_device_anchor",
+        "test_reduce_rank_statuses_records_global_failure",
+    ),
+    "Search tests cover": (
+        "test_tune_admission_strategy_returns_candidate_table_only",
+        "test_tune_smoke_strategy_measures_baseline_and_class_c_rows",
+        "test_tune_fast_strategy_compiles_near_fastest_eager_rows",
+        "test_tune_balanced_strategy_crosses_retained_group_winners",
+        "test_tune_thorough_strategy_uses_declared_repeat_count",
+    ),
+    "Autobatch tests cover": (
+        "test_autobatch_bridge_selects_candidate_by_positive_index_domain",
+        "test_tune_fast_strategy_delegates_autobatch_domain_to_autobatch_find",
+        "test_autobatch_domain_filters_reference_failures_before_probe",
+        "test_plan_replay_preserves_autobatch_selected_value",
+    ),
+    "JSON schema validation rejects stale direct identity fields": (
+        "test_record_current_rejects_stale_candidate_and_full_size_status",
+        "test_check_record_current_rejects_stale_status_and_thresholds",
+        "test_plan_replay_rejects_stale_context_and_materializer",
+    ),
+    "Saved reference and full-size rows carry schema-valid": (
+        "test_tune_writes_admission_failure_rows_without_measurement",
+        "test_plan_replay_recomputes_family_selection",
+    ),
+    "Saved-run replay materializes the selected plan": (
+        "test_plan_replay_recomputes_family_selection",
+        "test_public_problem_autotune_and_operator_load_replay",
+    ),
+    "Memory stability rejects post-call reserved growth": ("test_memory_stability",),
+    "Measurement records required memory fields": (
+        "test_measurement_timing_policy",
+        "test_tune_writes_admission_failure_rows_without_measurement",
+        "test_measurement_cleans_memory_backend_after_runtime_failure",
+        "test_measurement_reuses_long_probe_as_measured_sample",
+    ),
+    "Selection chooses lower memory within": (
+        "test_within_family_selection",
+        "test_cohort_selection_prefers_lower_memory_near_fastest",
+    ),
+    "Selection tests cover cohort comparison": (
+        "test_cohort_selection_sums_compiled_row_scores",
+        "test_selection_scores_compiled_distributed_rows_by_global_compile_fields",
+    ),
+    "Dtype coherence is expressed through a": (
+        "test_tune_run_selects_complete_dtype_cohort",
+    ),
+    "Cohort selection supports generic single-key": (
+        "test_tune_run_uses_generic_multi_key_cohort_constraint",
+        "test_tune_run_cohort_subset_handles_cross_boundary_dependencies",
+    ),
+    "Blocked descendants write": (
+        "test_tune_run_propagates_candidate_validation_errors_inside_cohort",
+    ),
+    "Failed rows from non-selected cohort assignments": (
+        "test_tune_run_cohort_subset_handles_cross_boundary_dependencies",
+    ),
+    "Plan replay rejects stale target": (
+        "test_plan_replay_rejects_stale_context_and_materializer",
+        "test_plan_replay_rejects_changed_memory_backend_identity",
+    ),
+    "Selection rejects stale signatures": (
+        "test_selection_rejects_invalid_rows",
+        "test_selection_requires_full_size_agreement",
+    ),
+    "`functional_call` tests cover": (
+        "test_standard_runtime_executes_explicit_functional_call_settings",
+        "test_standard_runtime_preserves_tied_parameter_aliases_during_dtype_cast",
+        "test_standard_runtime_rejects_forbidden_functional_buffer_mutation",
+    ),
+    "`torch.func` tests cover": (
+        "test_standard_axis_registry_validates_core_axes",
+        "test_torch_func_admission_rejects_transform_limitations",
+        "test_torch_func_admission_rejects_forward_ad_coverage_failure",
+    ),
+    "Checkpoint tests cover": (
+        "test_checkpoint_operation_preserves_rng_state",
+        "test_standard_runtime_executes_selective_checkpoint_with_context_pair",
+    ),
+    "Transformer adapter tests cover": (
+        "test_transformers_operation_factory_sets_attention_and_runs_module",
+        "test_transformers_sdpa_rows_enter_declared_kernel_context",
+        "test_transformers_registered_attention_row_selects_runtime_backend",
+        "test_transformers_model_identity_changes_with_replay_inputs",
+    ),
+    "Distributed adapter tests cover": (
+        "test_distributed_selected_settings_must_match_across_ranks",
+        "test_distributed_record_contains_memory_surface_and_settings",
+        "test_fsdp2_admission_requires_hook_entry_and_rejects_bypass",
+        "test_layout_admission_uses_mode_specific_fields",
+    ),
+    "Selected-plan validation follows stored family order": (
+        "test_validate_plan_materializes_in_validation_order",
+        "test_tune_run_executes_declared_selected_plan_validators",
+        "test_selected_plan_validation_writes_failed_record",
+    ),
+    "Root imports expose the user-facing surface": (
+        "test_root_import_surface_exposes_front_door_and_hides_extensions",
+    ),
+    "Each pilot family can be expressed": (
+        "test_pilot_lower_validates_family_problem_match",
+    ),
+    "Pilot selected settings can be produced": (
+        "test_pilot_readiness_and_selected_settings",
+    ),
+    "Pilot selected-plan validation passes": (
+        "test_pilot_selected_settings_require_validation_rows_when_plan_requires_them",
+    ),
+    "Downstream pilot stages accept": (
+        "test_pilot_lowered_run_feeds_downstream_readiness_consumer",
+    ),
+}
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def axis_manifest_section(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    start = text.index(SPEC_MANIFEST_START)
+    end = text.index(SPEC_MANIFEST_END, start)
+
+    return text[start:end]
+
+
+def feature_axis_source(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    start = text.index("## Operator-Owned Axes")
+    end = text.index("## Search Space Factoring", start)
+
+    return text[start:end]
+
+
+def acceptance_bullets_from_spec(path: Path) -> tuple[str, ...]:
+    text = path.read_text(encoding="utf-8")
+    start = text.index(SPEC_ACCEPTANCE_START)
+    end = text.index(SPEC_ACCEPTANCE_END, start)
+
+    return tuple(
+        line[2:] for line in text[start:end].splitlines() if line.startswith("- ")
+    )
+
+
+def is_manifest_axis_key(key: str) -> bool:
+    return ("." in key and "=" not in key) or key in MANIFEST_AXIS_KEY_ALLOWLIST
+
+
+def axis_keys_from_markdown(source: str) -> tuple[str, ...]:
+    keys = []
+
+    for line in source.splitlines():
+        match = MANIFEST_AXIS_BULLET.match(line)
+
+        if match is None:
+            continue
+
+        key = match.group(1)
+
+        if is_manifest_axis_key(key):
+            keys.append(key)
+
+    return tuple(dict.fromkeys(keys))
+
+
+def axis_domains_from_spec(path: Path) -> Mapping[str, tuple[object, ...]]:
+    domains = {}
+
+    for line in axis_manifest_section(path).splitlines():
+        match = MANIFEST_AXIS_BULLET.match(line)
+
+        if match is None:
+            continue
+
+        key = match.group(1)
+
+        if is_manifest_axis_key(key):
+            domains[key] = spec_axis_domain(key, match.group(2) or "")
+
+    return domains
+
+
+def spec_axis_domain(key: str, tail: str) -> tuple[object, ...]:
+    symbolic_domain = SPEC_SYMBOLIC_AXIS_DOMAINS.get(key)
+
+    if symbolic_domain is not None:
+        domain = symbolic_domain
+    else:
+        values = tuple(
+            spec_axis_value(value) for value in re.findall(r"`([^`]+)`", tail)
+        )
+
+        if values:
+            domain = values
+        elif "positive integer tuple" in tail:
+            domain = candidates_module.INTEGER_TUPLE_DOMAIN
+        elif "positive integer" in tail:
+            domain = candidates_module.INTEGER_DOMAIN
+        elif "registered" in tail:
+            domain = candidates_module.REGISTERED_DOMAIN
+        elif "declared" in tail:
+            domain = candidates_module.DECLARED_DOMAIN
+        else:
+            domain = candidates_module.DECLARED_DOMAIN
+
+    return domain
+
+
+def spec_axis_value(value: str) -> object:
+    if value == "None":
+        return None
+
+    return value
+
+
+def source_text_for_tests() -> str:
+    return "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((repo_root() / "tests").glob("test_*.py"))
+    )
+
+
+def behavior_source_text_for_tests() -> str:
+    source = source_text_for_tests()
+    value_map_pattern = (
+        r"MANIFEST_SYMBOLIC_VALUE_TEST_COVERAGE = \{.*?\n\}\n"
+        r"MANIFEST_CHECK_TEST_COVERAGE = "
+    )
+    source = re.sub(
+        value_map_pattern,
+        "MANIFEST_CHECK_TEST_COVERAGE = ",
+        source,
+        flags=re.DOTALL,
+    )
+    source = re.sub(
+        r"MANIFEST_CHECK_TEST_COVERAGE = \{.*?\n\}\n\n\ndef repo_root",
+        "def repo_root",
+        source,
+        flags=re.DOTALL,
+    )
+
+    return source
+
+
+def suite_test_names() -> set[str]:
+    source = source_text_for_tests()
+
+    return set(re.findall(r"def (test_[a-zA-Z0-9_]+)\(", source))
+
+
+def manifest_value_literal_covered(value: object, source: str) -> bool:
+    return str(value) in source
+
+
+def assert_named_tests_exist(
+    names: Sequence[str],
+    existing_names: set[str],
+) -> None:
+    assert names
+    assert set(names).issubset(existing_names)
 
 
 class OneBatchData:
@@ -1403,6 +2129,147 @@ def test_axis_manifest_adapter_axes_use_adapter_admission_rules() -> None:
     )
 
 
+def test_axis_manifest_carries_lowering_and_check_identity_fields() -> None:
+    manifest = vpx.axis_manifest()
+
+    for axis in manifest.axes:
+        signature = axis.signature()
+        setting_keys = set(axis.settings_keys)
+
+        assert axis.admission_rule_id
+        assert axis.lowering_rule_id
+        assert axis.alias_normalization_rule
+        assert axis.settings_keys_written == axis.settings_keys
+        assert setting_keys.issubset(set(axis.admission_settings_keys))
+        assert isinstance(axis.required_reference_checks, tuple)
+        assert isinstance(axis.required_full_size_checks, tuple)
+        assert signature["admission_rule_id"] == axis.admission_rule_id
+        assert signature["lowering_rule_id"] == axis.lowering_rule_id
+        assert signature["required_reference_checks"] == axis.required_reference_checks
+        assert signature["required_full_size_checks"] == axis.required_full_size_checks
+        assert signature["admission_settings_keys"] == axis.admission_settings_keys
+        assert signature["settings_keys_written"] == axis.settings_keys_written
+
+        if axis.adapter_id:
+            assert axis.lowering_rule_id.startswith(axis.adapter_id)
+        else:
+            assert axis.lowering_rule_id.startswith("vptune.standard_runtime:")
+
+
+def test_axis_manifest_matches_spec_key_and_value_domains() -> None:
+    expected_domains = axis_domains_from_spec(repo_root() / "SPEC.md")
+    actual_domains = {
+        key: axis.value_domain for key, axis in vpx.axis_manifest().by_key().items()
+    }
+
+    assert actual_domains == expected_domains
+
+
+def test_axis_manifest_keys_match_features_and_spec() -> None:
+    spec_keys = tuple(axis_domains_from_spec(repo_root() / "SPEC.md"))
+    feature_keys = axis_keys_from_markdown(
+        feature_axis_source(repo_root() / "FEATURES.md")
+    )
+
+    assert set(spec_keys) == set(feature_keys)
+
+
+def test_axis_manifest_values_and_checks_have_test_coverage() -> None:
+    source = behavior_source_text_for_tests()
+    existing_names = suite_test_names()
+    value_gaps = []
+
+    for axis in vpx.axis_manifest().axes:
+        for value in axis.value_domain:
+            if manifest_value_literal_covered(value, source):
+                continue
+
+            key = (axis.name, value)
+            test_names = MANIFEST_SYMBOLIC_VALUE_TEST_COVERAGE.get(key)
+
+            if test_names is None:
+                value_gaps.append(key)
+                continue
+
+            assert_named_tests_exist(test_names, existing_names)
+
+    required_checks = {
+        check_id
+        for axis in vpx.axis_manifest().axes
+        for check_id in (
+            *axis.required_reference_checks,
+            *axis.required_full_size_checks,
+        )
+    }
+
+    assert value_gaps == []
+    assert set(MANIFEST_CHECK_TEST_COVERAGE) == required_checks
+
+    for test_names in MANIFEST_CHECK_TEST_COVERAGE.values():
+        assert_named_tests_exist(test_names, existing_names)
+
+
+def test_spec_acceptance_tests_have_named_test_coverage() -> None:
+    bullets = acceptance_bullets_from_spec(repo_root() / "SPEC.md")
+    existing_names = suite_test_names()
+    covered_prefixes = set()
+    unmatched = []
+    ambiguous = []
+
+    for bullet in bullets:
+        matches = tuple(
+            prefix for prefix in ACCEPTANCE_TEST_COVERAGE if bullet.startswith(prefix)
+        )
+
+        if not matches:
+            unmatched.append(bullet)
+            continue
+
+        if len(matches) > 1:
+            ambiguous.append((bullet, matches))
+            continue
+
+        prefix = matches[0]
+        covered_prefixes.add(prefix)
+        assert_named_tests_exist(ACCEPTANCE_TEST_COVERAGE[prefix], existing_names)
+
+    assert unmatched == []
+    assert ambiguous == []
+    assert covered_prefixes == set(ACCEPTANCE_TEST_COVERAGE)
+
+
+@pytest.mark.parametrize(
+    ("setting_key", "paired_settings"),
+    [
+        (
+            "memory.primal_outputs",
+            {
+                "hvp.path": "reverse_over_reverse",
+                "hvp.primal_reuse": "recompute_primal",
+            },
+        ),
+        ("memory.jvp_outputs", {"ggn.jvp_reuse": "recompute_jvp"}),
+        (
+            "memory.output_cotangents",
+            {"ggn.cotangent_reuse": "recompute_output_cotangent"},
+        ),
+    ],
+)
+def test_memory_output_recompute_admits_matching_lowering(
+    setting_key: str,
+    paired_settings: Mapping[str, object],
+) -> None:
+    registry = vpx.standard_axis_registry()
+    candidate = vpx.Candidate(
+        "hvp",
+        "memory-output-recompute",
+        {setting_key: "recompute", **paired_settings},
+    )
+    admitted = registry.admit(candidate)
+
+    assert admitted.admission_status == "passed"
+
+
 @pytest.mark.parametrize(
     "setting_key",
     [
@@ -1411,7 +2278,9 @@ def test_axis_manifest_adapter_axes_use_adapter_admission_rules() -> None:
         "memory.output_cotangents",
     ],
 )
-def test_memory_output_recompute_rejected_until_lowered(setting_key: str) -> None:
+def test_memory_output_recompute_rejects_unmatched_settings(
+    setting_key: str,
+) -> None:
     registry = vpx.standard_axis_registry()
     candidate = vpx.Candidate(
         "hvp",
@@ -1422,7 +2291,7 @@ def test_memory_output_recompute_rejected_until_lowered(setting_key: str) -> Non
 
     assert admitted.admission_status == "failed"
     assert admitted.admission_error == (
-        f"{setting_key}=recompute requires package-owned output recompute lowering"
+        f"{setting_key}=recompute requires matching recompute settings"
     )
 
 
@@ -2806,6 +3675,96 @@ def test_candidate_rows_reject_missing_runtime_bindings() -> None:
     for candidate_id, candidate in rows.items():
         if candidate_id not in {"baseline", "manual"}:
             assert candidate.admission_status == "failed"
+
+
+def test_candidate_rows_reject_metric_representation_path_mismatches() -> None:
+    def rows_for(
+        operator_kind: str,
+        representation_kind: str,
+        rows: Sequence[tuple[str, Mapping[str, Any]]],
+    ) -> Mapping[str, vpx.Candidate]:
+        runtime = runtime_config(
+            passed_candidates(operator_kind, rows),
+            constant_operation_factory,
+            passing_reference_check,
+            materialize_candidate,
+            None,
+            {
+                "runtime": "standard",
+                "operator": {
+                    "kind": operator_kind,
+                    "semantics": {
+                        "representation": {"kind": representation_kind},
+                    },
+                },
+            },
+        )
+
+        return {
+            candidate.candidate_id: candidate
+            for candidate in run_module._candidate_rows(runtime)
+        }
+
+    dense_metric_rows = rows_for(
+        "metric",
+        "dense_matrix",
+        (
+            ("dense-ok", {"metric.multiply_path": "dense_matmul"}),
+            ("dense-factorized", {"metric.multiply_path": "factorized_multiply"}),
+            ("dense-streaming", {"metric.multiply_path": "streaming_multiply"}),
+        ),
+    )
+    matrix_free_rows = rows_for(
+        "metric",
+        "matrix_free",
+        (
+            ("streaming-ok", {"metric.multiply_path": "streaming_multiply"}),
+            ("matrix-free-dense", {"metric.multiply_path": "dense_matmul"}),
+        ),
+    )
+    diagonal_inverse_rows = rows_for(
+        "inverse_metric",
+        "diagonal_tree",
+        (
+            ("factorized-ok", {"inverse_metric.solve_path": "factorized_solve"}),
+            ("dense-inverse", {"inverse_metric.solve_path": "dense_solve"}),
+        ),
+    )
+    dense_sqrt_rows = rows_for(
+        "sqrt_metric",
+        "dense_matrix",
+        (
+            ("cholesky-ok", {"sqrt_metric.factor_path": "cholesky_factor"}),
+            ("lanczos", {"sqrt_metric.factor_path": "matrix_free_lanczos"}),
+            (
+                "closed-form",
+                {"sqrt_metric.factor_path": "closed_form_factor_square_root"},
+            ),
+        ),
+    )
+
+    assert dense_metric_rows["dense-ok"].admission_status == "passed"
+    assert dense_metric_rows["dense-factorized"].admission_error == (
+        "factorized metric path is not lowered for representation: dense_matrix"
+    )
+    assert dense_metric_rows["dense-streaming"].admission_error == (
+        "metric streaming path is not lowered for representation: dense_matrix"
+    )
+    assert matrix_free_rows["streaming-ok"].admission_status == "passed"
+    assert matrix_free_rows["matrix-free-dense"].admission_error == (
+        "matrix_free metric requires streaming_multiply"
+    )
+    assert diagonal_inverse_rows["factorized-ok"].admission_status == "passed"
+    assert diagonal_inverse_rows["dense-inverse"].admission_error == (
+        "metric representation kind is not supported by path: diagonal_tree"
+    )
+    assert dense_sqrt_rows["cholesky-ok"].admission_status == "passed"
+    assert dense_sqrt_rows["lanczos"].admission_error == (
+        "metric representation kind is not supported by path: dense_matrix"
+    )
+    assert dense_sqrt_rows["closed-form"].admission_error == (
+        "metric representation kind is not supported by path: dense_matrix"
+    )
 
 
 def test_candidate_rows_admit_declared_parameter_groups() -> None:
@@ -5474,8 +6433,34 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "passed",
         ),
         (
+            "valid-bound-operator-boundary",
+            {
+                **compile_axis_settings,
+                "compile.boundary": "bound_operator_vector_step",
+            },
+            "passed",
+        ),
+        (
             "invalid-compile-boundary",
             {**compile_axis_settings, "compile.boundary": "unknown_boundary"},
+            "failed",
+        ),
+        (
+            "invalid-bound-operator-kind-boundary",
+            {
+                "gradient.path": "autograd_grad",
+                "compile.enabled": "true",
+                "compile.boundary": "bound_operator_vector_step",
+                "compile.backend": "inductor",
+                "compile.mode": "default",
+                "compile.fullgraph": "false",
+                "compile.dynamic": None,
+                "compile.compiled_autograd": "false",
+                "compile.options.epilogue_fusion": "false",
+                "compile.options.shape_padding": "false",
+                "compile.cuda_graphs": "false",
+                "compile.cache_state": "warm_cache",
+            },
             "failed",
         ),
         (
@@ -5499,15 +6484,6 @@ def test_standard_axis_registry_validates_core_axes() -> None:
         admitted = registry.admit(candidate(candidate_id, settings))
         assert admitted.admission_status == expected_status
 
-    bound_operator_rejection = registry.admit(
-        candidate(
-            "unlowered-bound-operator-boundary",
-            {**compile_axis_settings, "compile.boundary": "bound_operator_vector_step"},
-        )
-    )
-    assert bound_operator_rejection.admission_status == "failed"
-    assert bound_operator_rejection.admission_error is not None
-    assert "bound_operator_vector_step" in bound_operator_rejection.admission_error
     assert (
         registry.axes["dtype.model_compute"].admit(
             candidate("bad-dtype", {"dtype.model_compute": "float64"})

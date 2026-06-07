@@ -5887,6 +5887,50 @@ def test_inverse_metric_reference_check_uses_declared_damping() -> None:
         )
 
 
+def test_inverse_metric_inner_reference_check_records_inverse_residual() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    damping = 0.5
+    left = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
+    right = {"w": torch.tensor([3.0, -1.0], dtype=torch.float64)}
+    check = vpx.standard_reference_check(
+        ops.inverse_metric_inner(
+            "inverse_inner",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "inverse_residual": 1e-12,
+            "damping_min": 0.4,
+            "condition_number_max": 3.0,
+        },
+    )
+    result = check(
+        vpx.Candidate(
+            "inverse_inner",
+            "row",
+            {
+                "inverse_metric_inner.reduction_path": "solve_then_reduce",
+                "inverse_metric_inner.multi_rhs": "single_column",
+                **inverse_metric_settings(),
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )
+
+    assert result.measurements["inverse_residual"] == pytest.approx(0.0)
+    assert result.measurements["damping_min"] == pytest.approx(damping)
+    assert result.measurements["condition_number_max"] < 3.0
+
+
 def test_inverse_metric_dense_direct_solve_paths_match_dense_solve() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
@@ -8009,34 +8053,55 @@ def test_standard_runtime_accepts_retained_memory_outputs() -> None:
     assert torch.equal(result_map["w"], torch.tensor([6.0], dtype=torch.float64))
 
 
-def test_standard_runtime_rejects_hvp_memory_recompute_with_primal_reuse() -> None:
+def test_standard_runtime_recomputes_hvp_primal_outputs() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
-    vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
-    factory = quadratic_hvp_factory(params)
+    vector = {"w": torch.tensor([[3.0], [4.0]], dtype=torch.float64)}
+    calls = {"scalar": 0}
 
-    with pytest.raises(
-        vp.MaterializationError,
-        match="package-owned output recompute lowering",
-    ):
-        factory(
-            passed_candidate(
-                "hvp",
-                "recompute-primal-memory",
-                {
-                    "hvp.path": "reverse_over_reverse",
-                    "hvp.primal_reuse": "recompute_primal",
-                    "memory.primal_outputs": "recompute",
-                },
-            ),
-            {"scale": 1.0},
-            vector,
-        )
+    def scalar(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        calls["scalar"] += 1
+
+        return quadratic_scalar(params, buffers, batch, context)
+
+    factory = vpx.standard_operation_factory(
+        ops.hvp("hvp", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        scalar_objectives={"loss": scalar},
+    )
+    result = factory(
+        passed_candidate(
+            "hvp",
+            "recompute-primal-memory",
+            {
+                "hvp.path": "reverse_over_reverse",
+                "hvp.primal_reuse": "recompute_primal",
+                "memory.primal_outputs": "recompute",
+                "vectorization.mode": "single_loop",
+                "vectorization.in_dims": {"w": 0},
+            },
+        ),
+        {"scale": 1.0},
+        vector,
+    )()
+
+    torch.testing.assert_close(tree_leaves(result)[0], vector["w"] * 2.0)
+    assert calls == {"scalar": 2}
 
 
-def test_standard_runtime_rejects_ggn_memory_recompute_with_reuse_settings() -> None:
+def test_standard_runtime_recomputes_ggn_memory_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     params = {"w": torch.tensor([0.5, -0.25], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.5, -2.0], dtype=torch.float64)}
     loss_hessian = torch.diag(torch.tensor([3.0, 5.0], dtype=torch.float64))
+    calls = {"function": 0, "cotangent": 0}
+    original_loss_product = runtime_module._ggn_loss_hessian_product
 
     def function(
         params: vpx.ParameterTree,
@@ -8044,6 +8109,7 @@ def test_standard_runtime_rejects_ggn_memory_recompute_with_reuse_settings() -> 
         batch: vpx.Batch,
         context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
+        calls["function"] += 1
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
         assert context.family == "ggn"
@@ -8053,33 +8119,50 @@ def test_standard_runtime_rejects_ggn_memory_recompute_with_reuse_settings() -> 
             params["w"][0] - params["w"][1] ** 2,
         ))
 
+    def recording_loss_product(
+        execution: Any,
+        output: vpx.TensorTree,
+        output_jvp: vpx.TensorTree,
+    ) -> vpx.TensorTree:
+        calls["cotangent"] += 1
+
+        return original_loss_product(execution, output, output_jvp)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_ggn_loss_hessian_product",
+        recording_loss_product,
+    )
     factory = vpx.standard_operation_factory(
         ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
+    result = factory(
+        passed_candidate(
+            "ggn",
+            "memory-recompute",
+            {
+                **ggn_reuse_settings(
+                    "recompute_jvp",
+                    "recompute_output_cotangent",
+                ),
+                "memory.jvp_outputs": "recompute",
+                "memory.output_cotangents": "recompute",
+            },
+        ),
+        {"loss_hessian": loss_hessian},
+        vector,
+    )()
+    jacobian = torch.tensor(
+        [[1.0, 1.0], [1.0, 0.5]],
+        dtype=torch.float64,
+    )
+    expected = jacobian.T @ (loss_hessian @ (jacobian @ vector["w"]))
 
-    with pytest.raises(
-        vp.MaterializationError,
-        match="package-owned output recompute lowering",
-    ):
-        factory(
-            passed_candidate(
-                "ggn",
-                "memory-recompute",
-                {
-                    **ggn_reuse_settings(
-                        "recompute_jvp",
-                        "recompute_output_cotangent",
-                    ),
-                    "memory.jvp_outputs": "recompute",
-                    "memory.output_cotangents": "recompute",
-                },
-            ),
-            {"loss_hessian": loss_hessian},
-            vector,
-        )
+    torch.testing.assert_close(tree_leaves(result)[0], expected)
+    assert calls == {"function": 3, "cotangent": 2}
 
 
 @pytest.mark.parametrize(
@@ -8099,7 +8182,7 @@ def test_standard_runtime_rejects_memory_recompute_without_lowering(
 
     with pytest.raises(
         vp.MaterializationError,
-        match="package-owned output recompute lowering",
+        match="matching package-owned recompute settings",
     ):
         factory(
             passed_candidate(
@@ -8259,6 +8342,133 @@ def test_standard_runtime_executes_fused_row_with_registered_rewriter(
     torch.testing.assert_close(
         result_map["w"], torch.tensor([4.0], dtype=torch.float64)
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "operator",
+        "family",
+        "settings",
+        "batch",
+        "vector",
+        "scalar_objectives",
+        "function_objectives",
+        "expected",
+    ),
+    [
+        (
+            ops.hvp("hvp", "loss", aggregation="sum"),
+            "hvp",
+            {**hvp_settings("reverse_over_reverse"), "fusion.loss": "fused_ce"},
+            {"scale": torch.tensor([2.0], dtype=torch.float64)},
+            {"w": torch.tensor([3.0], dtype=torch.float64)},
+            {"loss": quadratic_scalar},
+            None,
+            torch.tensor([12.0], dtype=torch.float64),
+        ),
+        (
+            ops.ggnvp("ggn", "model_output", aggregation="sum"),
+            "ggn",
+            {**ggn_dense_kernel_settings(), "fusion.loss": "fused_ce"},
+            {
+                "scale": 1.0,
+                "loss_hessian": torch.tensor([[5.0]], dtype=torch.float64),
+            },
+            {"w": torch.tensor([3.0], dtype=torch.float64)},
+            None,
+            {"model_output": square_function},
+            torch.tensor([240.0], dtype=torch.float64),
+        ),
+        (
+            score_terms_fisher("fisher", "scores"),
+            "fisher",
+            {
+                **fisher_settings("materialize_score_gradients"),
+                "fusion.loss": "fused_ce",
+            },
+            {
+                "score_gradients": torch.tensor([[2.0], [4.0]], dtype=torch.float64),
+                "normalization": 2.0,
+            },
+            {"w": torch.tensor([3.0], dtype=torch.float64)},
+            None,
+            None,
+            torch.tensor([30.0], dtype=torch.float64),
+        ),
+        (
+            score_terms_sampled_fisher("sampled", "scores"),
+            "sampled",
+            {
+                **sampled_fisher_settings("materialize_score_gradients"),
+                "fusion.loss": "fused_ce",
+            },
+            {
+                "sampled_score_gradients": torch.tensor(
+                    [[2.0], [4.0]], dtype=torch.float64
+                ),
+                "num_examples": 1,
+            },
+            {"w": torch.tensor([3.0], dtype=torch.float64)},
+            None,
+            None,
+            torch.tensor([30.0], dtype=torch.float64),
+        ),
+        (
+            empirical_fisher_sum("empirical", "scores"),
+            "empirical",
+            {**empirical_dense_settings(), "fusion.loss": "fused_ce"},
+            {
+                "per_example_gradients": torch.tensor(
+                    [[2.0], [4.0]], dtype=torch.float64
+                ),
+            },
+            {"w": torch.tensor([3.0], dtype=torch.float64)},
+            None,
+            None,
+            torch.tensor([60.0], dtype=torch.float64),
+        ),
+    ],
+)
+def test_standard_runtime_executes_fused_rows_for_higher_order_families(
+    operator: vpx.OperatorSpec,
+    family: str,
+    settings: Mapping[str, object],
+    batch: Mapping[str, object],
+    vector: vpx.TensorTree,
+    scalar_objectives: Mapping[str, Callable[..., torch.Tensor]] | None,
+    function_objectives: Mapping[str, Callable[..., vpx.TensorTree]] | None,
+    expected: torch.Tensor,
+) -> None:
+    events = []
+
+    def fusion_rewriter(
+        module: torch.nn.Module,
+        candidate: vpx.Candidate,
+    ) -> torch.nn.Module:
+        events.append((candidate.family, candidate.settings["fusion.loss"]))
+
+        return module
+
+    factory = vpx.standard_operation_factory(
+        operator,
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        scalar_objectives=scalar_objectives,
+        function_objectives=function_objectives,
+        module=OneParameterModule(),
+        fusion_rewriter=fusion_rewriter,
+    )
+    result = run_passed_candidate(
+        factory,
+        family,
+        "fused-higher-order",
+        settings,
+        batch,
+        vector,
+    )
+
+    assert events == [(family, "fused_ce")]
+    torch.testing.assert_close(tree_leaves(result)[0], expected)
 
 
 def test_standard_runtime_executes_layout_contiguity_axis() -> None:
