@@ -3307,7 +3307,20 @@ def gradient(model: Model, loss: Loss, name: str | None = None) -> Operator:
     Returns:
         Typed gradient operator.
     """
-    return _typed_gradient(model, loss, name)
+    family = _operator_family(name, "gradient")
+    spec = _operator_builders.gradient(
+        family,
+        "typed_loss",
+        aggregation="sum",
+    )
+
+    return Operator(
+        model=model,
+        spec=spec,
+        call_inputs=("batch",),
+        default_settings={"gradient.path": "torch_autograd_grad"},
+        scalar_objectives={"typed_loss": _loss_scalar_objective(model, loss)},
+    )
 
 
 def hvp(model: Model, loss: Loss, name: str | None = None) -> Operator:
@@ -3316,7 +3329,20 @@ def hvp(model: Model, loss: Loss, name: str | None = None) -> Operator:
     Returns:
         Typed HVP operator.
     """
-    return _typed_hvp(model, loss, name)
+    family = _operator_family(name, "hvp")
+    spec = _operator_builders.hvp(
+        family,
+        "typed_loss",
+        aggregation="sum",
+    )
+
+    return Operator(
+        model=model,
+        spec=spec,
+        call_inputs=("batch", "vector"),
+        default_settings={"hvp.path": "reverse_over_reverse"},
+        scalar_objectives={"typed_loss": _loss_scalar_objective(model, loss)},
+    )
 
 
 def ggnvp(model: Model, loss: Loss, name: str | None = None) -> Operator:
@@ -3325,7 +3351,33 @@ def ggnvp(model: Model, loss: Loss, name: str | None = None) -> Operator:
     Returns:
         Typed GGN operator.
     """
-    return _typed_ggnvp(model, loss, name)
+    family = _operator_family(name, "ggn")
+    spec = _operator_builders.ggnvp(
+        family,
+        loss.output,
+        aggregation="sum",
+    )
+
+    return Operator(
+        model=model,
+        spec=spec,
+        call_inputs=("batch", "vector"),
+        default_settings={
+            "ggn.jvp_path": "torch_func_jvp",
+            "ggn.loss_hessian_path": "autodiff_loss_hvp",
+            "ggn.loss_hessian_kernel": "dense_global",
+            "ggn.vjp_path": "torch_func_vjp",
+            **_torch_func_settings(requires_forward_ad=True),
+        },
+        function_objectives={loss.output: _ModelFieldObjective(model, loss.output)},
+        batch_transform=_loss_hessian_batch_transform(model, loss),
+        changed_axes=(
+            "ggn.jvp_path",
+            "ggn.loss_hessian_path",
+            "ggn.loss_hessian_kernel",
+            "ggn.vjp_path",
+        ),
+    )
 
 
 def fisher_vp(
@@ -3337,8 +3389,55 @@ def fisher_vp(
 
     Returns:
         Typed Fisher operator.
+
+    Raises:
+        MaterializationError: If the likelihood kind is not a lowered Fisher kind.
     """
-    return _typed_fisher_vp(model, likelihood, name)
+    if likelihood.kind == "categorical":
+        message = "exact categorical Fisher is represented by GGNVP"
+        raise MaterializationError(message)
+
+    if likelihood.kind != "gaussian":
+        message = f"likelihood kind is not lowered: {likelihood.kind}"
+        raise MaterializationError(message)
+
+    family = _operator_family(name, "fisher")
+    spec = _operator_builders.fisher_vp(
+        family,
+        "typed_gaussian_score",
+        aggregation="mean_per_example",
+        distribution="explicit_score_gradients",
+        label_policy="explicit_scores",
+        sample_space=_likelihood_string_field(likelihood, "sample_space"),
+        score_reduction="none",
+        denominator=_likelihood_string_field(likelihood, "denominator"),
+    )
+
+    return Operator(
+        model=model,
+        spec=spec,
+        call_inputs=("batch", "vector"),
+        default_settings={
+            "fisher.expectation_path": "explicit_full_expectation_score_rows",
+            "fisher.accumulation": "materialize_score_gradients",
+        },
+        function_objectives={
+            "typed_gaussian_score": _GaussianScoreTermsObjective(
+                model=model,
+                output=likelihood.output,
+                target=_likelihood_string_field(likelihood, "target"),
+                noise=_likelihood_float_field(likelihood, "noise"),
+            )
+        },
+        batch_transform=_likelihood_score_gradient_batch_transform(
+            model,
+            likelihood,
+        ),
+        changed_axes=(
+            "fisher.expectation_path",
+            "fisher.accumulation",
+        ),
+    )
 
 
 def sampled_fisher_vp(
@@ -3352,8 +3451,53 @@ def sampled_fisher_vp(
 
     Returns:
         Typed sampled-Fisher operator.
+
+    Raises:
+        MaterializationError: If the likelihood kind is not lowered.
     """
-    return _typed_sampled_fisher_vp(model, likelihood, samples, name)
+    if likelihood.kind not in {"categorical", "gaussian"}:
+        message = f"likelihood kind is not lowered: {likelihood.kind}"
+        raise MaterializationError(message)
+
+    family = _operator_family(name, "sampled_fisher")
+    spec = _operator_builders.sampled_fisher_vp(
+        family,
+        "typed_sampled_scores",
+        aggregation="mean_per_example",
+        distribution="explicit_score_gradients",
+        label_policy="sampled_labels",
+        sample_count=samples.count,
+        sample_source=samples.runtime_sample_source(),
+        sampling_bound={"kind": "disabled"},
+        score_reduction="none",
+        denominator=_sampled_fisher_denominator(likelihood),
+    )
+    spec = _operator_with_sample_source_identity(
+        spec,
+        likelihood,
+        samples,
+    )
+
+    return Operator(
+        model=model,
+        spec=spec,
+        call_inputs=("batch", "vector"),
+        default_settings={
+            "sampled_fisher.accumulation": "materialize_score_gradients",
+            "sampled_fisher.sample_source": samples.runtime_sample_source(),
+            "sampled_fisher.exact_fisher_check": "disabled",
+        },
+        batch_transform=_SampledFisherScoreGradientBatch(
+            model,
+            likelihood,
+            samples,
+        ),
+        changed_axes=(
+            "sampled_fisher.accumulation",
+            "sampled_fisher.sample_source",
+            "sampled_fisher.exact_fisher_check",
+        ),
+    )
 
 
 def jvp(model: Model, output: Output, name: str | None = None) -> Operator:
@@ -3362,7 +3506,21 @@ def jvp(model: Model, output: Output, name: str | None = None) -> Operator:
     Returns:
         Typed JVP operator.
     """
-    return _typed_jvp(model, output, name)
+    family = _operator_family(name, "jvp")
+    spec = _operator_builders.jvp(
+        family,
+        output.field,
+        aggregation="sum",
+    )
+
+    return _typed_model_field_operator(
+        model=model,
+        spec=spec,
+        typed_output=output,
+        path_key="jvp.path",
+        path_value="torch_func_jvp",
+        requires_forward_ad=True,
+    )
 
 
 def vjp(model: Model, output: Output, name: str | None = None) -> Operator:
@@ -3371,7 +3529,21 @@ def vjp(model: Model, output: Output, name: str | None = None) -> Operator:
     Returns:
         Typed VJP operator.
     """
-    return _typed_vjp(model, output, name)
+    family = _operator_family(name, "vjp")
+    spec = _operator_builders.vjp(
+        family,
+        output.field,
+        aggregation="sum",
+    )
+
+    return _typed_model_field_operator(
+        model=model,
+        spec=spec,
+        typed_output=output,
+        path_key="vjp.path",
+        path_value="torch_func_vjp",
+        requires_forward_ad=False,
+    )
 
 
 def per_example_gradient(
@@ -3384,7 +3556,30 @@ def per_example_gradient(
     Returns:
         Typed per-example-gradient operator.
     """
-    return _typed_per_example_gradient(model, loss, name)
+    family = _operator_family(name, "per_example_gradient")
+    spec = _operator_builders.per_example_gradient(
+        family,
+        "typed_per_example_loss",
+        aggregation="sum",
+        example_loss_reduction="per_example",
+    )
+
+    return Operator(
+        model=model,
+        spec=spec,
+        call_inputs=("batch",),
+        default_settings={
+            "per_example_gradient.grad_path": "torch_autograd_grad_loop",
+            "per_example_gradient.accumulation": "stacked_leading_axis",
+        },
+        function_objectives={
+            "typed_per_example_loss": _loss_per_example_objective(model, loss)
+        },
+        changed_axes=(
+            "per_example_gradient.grad_path",
+            "per_example_gradient.accumulation",
+        ),
+    )
 
 
 def empirical_fisher_vp(
@@ -3397,7 +3592,31 @@ def empirical_fisher_vp(
     Returns:
         Typed empirical-Fisher operator.
     """
-    return _typed_empirical_fisher_vp(model, loss, name)
+    family = _operator_family(name, "empirical_fisher")
+    spec = _operator_builders.empirical_fisher_vp(
+        family,
+        "typed_per_example_loss",
+        aggregation="mean_per_example",
+        example_loss_reduction="per_example",
+        denominator="num_examples",
+    )
+
+    return Operator(
+        model=model,
+        spec=spec,
+        call_inputs=("batch", "vector"),
+        default_settings={
+            "empirical_fisher.grad_path": "torch_autograd_grad_loop",
+            "schedule.per_example": "loop",
+        },
+        function_objectives={
+            "typed_per_example_loss": _loss_per_example_objective(model, loss)
+        },
+        changed_axes=(
+            "empirical_fisher.grad_path",
+            "schedule.per_example",
+        ),
+    )
 
 
 def composition(
@@ -3487,238 +3706,6 @@ def _composition_call_inputs(combine: Combine | str) -> tuple[str, ...]:
         return ("batch",)
 
     return ("batch", "vector")
-
-
-def _typed_gradient(model: Model, typed_loss: Loss, name: str | None) -> Operator:
-    family = _operator_family(name, "gradient")
-    spec = _operator_builders.gradient(
-        family,
-        "typed_loss",
-        aggregation="sum",
-    )
-
-    return Operator(
-        model=model,
-        spec=spec,
-        call_inputs=("batch",),
-        default_settings={"gradient.path": "torch_autograd_grad"},
-        scalar_objectives={"typed_loss": _loss_scalar_objective(model, typed_loss)},
-    )
-
-
-def _typed_hvp(model: Model, typed_loss: Loss, name: str | None) -> Operator:
-    family = _operator_family(name, "hvp")
-    spec = _operator_builders.hvp(
-        family,
-        "typed_loss",
-        aggregation="sum",
-    )
-
-    return Operator(
-        model=model,
-        spec=spec,
-        call_inputs=("batch", "vector"),
-        default_settings={"hvp.path": "reverse_over_reverse"},
-        scalar_objectives={"typed_loss": _loss_scalar_objective(model, typed_loss)},
-    )
-
-
-def _typed_ggnvp(model: Model, typed_loss: Loss, name: str | None) -> Operator:
-    family = _operator_family(name, "ggn")
-    spec = _operator_builders.ggnvp(
-        family,
-        typed_loss.output,
-        aggregation="sum",
-    )
-
-    return Operator(
-        model=model,
-        spec=spec,
-        call_inputs=("batch", "vector"),
-        default_settings={
-            "ggn.jvp_path": "torch_func_jvp",
-            "ggn.loss_hessian_path": "autodiff_loss_hvp",
-            "ggn.loss_hessian_kernel": "dense_global",
-            "ggn.vjp_path": "torch_func_vjp",
-            **_torch_func_settings(requires_forward_ad=True),
-        },
-        function_objectives={
-            typed_loss.output: _ModelFieldObjective(model, typed_loss.output)
-        },
-        batch_transform=_loss_hessian_batch_transform(model, typed_loss),
-        changed_axes=(
-            "ggn.jvp_path",
-            "ggn.loss_hessian_path",
-            "ggn.loss_hessian_kernel",
-            "ggn.vjp_path",
-        ),
-    )
-
-
-def _typed_fisher_vp(
-    model: Model,
-    typed_likelihood: Likelihood,
-    name: str | None,
-) -> Operator:
-    if typed_likelihood.kind == "categorical":
-        message = "exact categorical Fisher is represented by GGNVP"
-        raise MaterializationError(message)
-
-    if typed_likelihood.kind != "gaussian":
-        message = f"likelihood kind is not lowered: {typed_likelihood.kind}"
-        raise MaterializationError(message)
-
-    family = _operator_family(name, "fisher")
-    spec = _operator_builders.fisher_vp(
-        family,
-        "typed_gaussian_score",
-        aggregation="mean_per_example",
-        distribution="explicit_score_gradients",
-        label_policy="explicit_scores",
-        sample_space=_likelihood_string_field(typed_likelihood, "sample_space"),
-        score_reduction="none",
-        denominator=_likelihood_string_field(typed_likelihood, "denominator"),
-    )
-
-    return Operator(
-        model=model,
-        spec=spec,
-        call_inputs=("batch", "vector"),
-        default_settings={
-            "fisher.expectation_path": "explicit_full_expectation_score_rows",
-            "fisher.accumulation": "materialize_score_gradients",
-        },
-        function_objectives={
-            "typed_gaussian_score": _GaussianScoreTermsObjective(
-                model=model,
-                output=typed_likelihood.output,
-                target=_likelihood_string_field(typed_likelihood, "target"),
-                noise=_likelihood_float_field(typed_likelihood, "noise"),
-            )
-        },
-        batch_transform=_likelihood_score_gradient_batch_transform(
-            model,
-            typed_likelihood,
-        ),
-        changed_axes=(
-            "fisher.expectation_path",
-            "fisher.accumulation",
-        ),
-    )
-
-
-def _typed_sampled_fisher_vp(
-    model: Model,
-    typed_likelihood: Likelihood,
-    sample_source: SampleSource,
-    name: str | None,
-) -> Operator:
-    if typed_likelihood.kind not in {"categorical", "gaussian"}:
-        message = f"likelihood kind is not lowered: {typed_likelihood.kind}"
-        raise MaterializationError(message)
-
-    family = _operator_family(name, "sampled_fisher")
-    spec = _operator_builders.sampled_fisher_vp(
-        family,
-        "typed_sampled_scores",
-        aggregation="mean_per_example",
-        distribution="explicit_score_gradients",
-        label_policy="sampled_labels",
-        sample_count=sample_source.count,
-        sample_source=sample_source.runtime_sample_source(),
-        sampling_bound={"kind": "disabled"},
-        score_reduction="none",
-        denominator=_sampled_fisher_denominator(typed_likelihood),
-    )
-    spec = _operator_with_sample_source_identity(
-        spec,
-        typed_likelihood,
-        sample_source,
-    )
-
-    return Operator(
-        model=model,
-        spec=spec,
-        call_inputs=("batch", "vector"),
-        default_settings={
-            "sampled_fisher.accumulation": "materialize_score_gradients",
-            "sampled_fisher.sample_source": sample_source.runtime_sample_source(),
-            "sampled_fisher.exact_fisher_check": "disabled",
-        },
-        batch_transform=_SampledFisherScoreGradientBatch(
-            model,
-            typed_likelihood,
-            sample_source,
-        ),
-        changed_axes=(
-            "sampled_fisher.accumulation",
-            "sampled_fisher.sample_source",
-            "sampled_fisher.exact_fisher_check",
-        ),
-    )
-
-
-def _typed_per_example_gradient(
-    model: Model,
-    typed_loss: Loss,
-    name: str | None,
-) -> Operator:
-    family = _operator_family(name, "per_example_gradient")
-    spec = _operator_builders.per_example_gradient(
-        family,
-        "typed_per_example_loss",
-        aggregation="sum",
-        example_loss_reduction="per_example",
-    )
-
-    return Operator(
-        model=model,
-        spec=spec,
-        call_inputs=("batch",),
-        default_settings={
-            "per_example_gradient.grad_path": "torch_autograd_grad_loop",
-            "per_example_gradient.accumulation": "stacked_leading_axis",
-        },
-        function_objectives={
-            "typed_per_example_loss": _loss_per_example_objective(model, typed_loss)
-        },
-        changed_axes=(
-            "per_example_gradient.grad_path",
-            "per_example_gradient.accumulation",
-        ),
-    )
-
-
-def _typed_empirical_fisher_vp(
-    model: Model,
-    typed_loss: Loss,
-    name: str | None,
-) -> Operator:
-    family = _operator_family(name, "empirical_fisher")
-    spec = _operator_builders.empirical_fisher_vp(
-        family,
-        "typed_per_example_loss",
-        aggregation="mean_per_example",
-        example_loss_reduction="per_example",
-        denominator="num_examples",
-    )
-
-    return Operator(
-        model=model,
-        spec=spec,
-        call_inputs=("batch", "vector"),
-        default_settings={
-            "empirical_fisher.grad_path": "torch_autograd_grad_loop",
-            "schedule.per_example": "loop",
-        },
-        function_objectives={
-            "typed_per_example_loss": _loss_per_example_objective(model, typed_loss)
-        },
-        changed_axes=(
-            "empirical_fisher.grad_path",
-            "schedule.per_example",
-        ),
-    )
 
 
 def _loss_scalar_objective(model: Model, typed_loss: Loss) -> ScalarObjective:
@@ -4553,42 +4540,6 @@ def _loss_mask(
 
     message = f"loss mask field must be bool or floating point: {key}"
     raise MaterializationError(message)
-
-
-def _typed_jvp(model: Model, typed_output: Output, name: str | None) -> Operator:
-    family = _operator_family(name, "jvp")
-    spec = _operator_builders.jvp(
-        family,
-        typed_output.field,
-        aggregation="sum",
-    )
-
-    return _typed_model_field_operator(
-        model=model,
-        spec=spec,
-        typed_output=typed_output,
-        path_key="jvp.path",
-        path_value="torch_func_jvp",
-        requires_forward_ad=True,
-    )
-
-
-def _typed_vjp(model: Model, typed_output: Output, name: str | None) -> Operator:
-    family = _operator_family(name, "vjp")
-    spec = _operator_builders.vjp(
-        family,
-        typed_output.field,
-        aggregation="sum",
-    )
-
-    return _typed_model_field_operator(
-        model=model,
-        spec=spec,
-        typed_output=typed_output,
-        path_key="vjp.path",
-        path_value="torch_func_vjp",
-        requires_forward_ad=False,
-    )
 
 
 def _typed_model_field_operator(

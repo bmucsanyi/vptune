@@ -2806,10 +2806,32 @@ def test_ggn_vectorization_rejects_inner_compile_boundary() -> None:
         ),
     ],
 )
-def test_fisher_family_single_loop_vectorization_runs_batched_vectors(
+@pytest.mark.parametrize(
+    ("candidate_id", "mode_settings"),
+    [
+        (
+            "single-loop-vectors",
+            {
+                "vectorization.mode": "single_loop",
+                "vectorization.in_dims": {"w": 0},
+            },
+        ),
+        (
+            "manual-batch-vectors",
+            {
+                "vectorization.mode": "manual_batch",
+                "vectorization.batch_size": 2,
+                "vectorization.in_dims": {"w": 0},
+            },
+        ),
+    ],
+)
+def test_fisher_family_vectorization_runs_batched_vectors(
     operator: vpx.OperatorSpec,
     settings: Mapping[str, object],
     batch: vpx.Batch,
+    candidate_id: str,
+    mode_settings: Mapping[str, object],
 ) -> None:
     vector = {
         "w": torch.tensor(
@@ -2825,11 +2847,10 @@ def test_fisher_family_single_loop_vectorization_runs_batched_vectors(
     result = factory(
         vpx.Candidate(
             operator.family,
-            "single-loop-vectors",
+            candidate_id,
             {
                 **settings,
-                "vectorization.mode": "single_loop",
-                "vectorization.in_dims": {"w": 0},
+                **mode_settings,
             },
             admission_status="passed",
         ),
@@ -2883,68 +2904,6 @@ def test_parameter_order_vector_is_prepared_before_operation(
     torch.testing.assert_close(tree_leaves(first)[0], expected)
     torch.testing.assert_close(tree_leaves(second)[0], expected)
     assert calls == ["cached-vector"]
-
-
-@pytest.mark.parametrize(
-    ("operator", "settings", "batch"),
-    [
-        (
-            score_terms_fisher_sum("fisher", "scores"),
-            fisher_settings("materialize_score_gradients"),
-            {"score_gradients": torch.eye(2, dtype=torch.float64)},
-        ),
-        (
-            score_terms_sampled_fisher_sum(
-                "sampled",
-                "scores",
-                sample_source="fixed_sample_table",
-            ),
-            sampled_fisher_settings(
-                "materialize_score_gradients",
-                sample_source="fixed_sample_table",
-            ),
-            {"sampled_score_gradients": torch.eye(2, dtype=torch.float64)},
-        ),
-        (
-            empirical_fisher_sum("empirical", "scores"),
-            empirical_dense_settings(),
-            {"per_example_gradients": torch.eye(2, dtype=torch.float64)},
-        ),
-    ],
-)
-def test_fisher_family_manual_batch_vectorization_runs_batched_vectors(
-    operator: vpx.OperatorSpec,
-    settings: Mapping[str, object],
-    batch: vpx.Batch,
-) -> None:
-    vector = {
-        "w": torch.tensor(
-            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
-            dtype=torch.float64,
-        )
-    }
-    factory = vpx.standard_operation_factory(
-        operator,
-        params={"w": torch.zeros(2, dtype=torch.float64)},
-        buffers={},
-    )
-    result = factory(
-        vpx.Candidate(
-            operator.family,
-            "manual-batch-vectors",
-            {
-                **settings,
-                "vectorization.mode": "manual_batch",
-                "vectorization.batch_size": 2,
-                "vectorization.in_dims": {"w": 0},
-            },
-            admission_status="passed",
-        ),
-        batch,
-        vector,
-    )()
-
-    torch.testing.assert_close(tree_leaves(result)[0], vector["w"])
 
 
 def test_ggn_vjp_path_axis_requires_valid_jvp_hessian_vjp_row() -> None:

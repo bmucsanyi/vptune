@@ -474,23 +474,9 @@ def _runtime_binding_admission_error(
 
     settings = candidate.settings
 
-    return _first_runtime_binding_error((
-        _fusion_binding_error(settings, runtime_signature),
-        _batch_layout_binding_error(settings, runtime_signature),
-        _parameter_surface_binding_error(settings, runtime_signature),
-        _lm_head_binding_error(settings, runtime_signature),
-        _mmap_binding_error(settings, runtime_signature),
-        _intermediate_residency_binding_error(settings, runtime_signature),
-        _activation_hook_binding_error(settings, runtime_signature),
-        _checkpoint_context_binding_error(settings, runtime_signature),
-        _teacher_objective_binding_error(settings, runtime_signature),
-        _call_core_settings_binding_error(settings),
-        _module_call_binding_error(settings, runtime_signature),
-    ))
+    for rule in _RUNTIME_BINDING_RULES:
+        error = rule(settings, runtime_signature)
 
-
-def _first_runtime_binding_error(errors: tuple[str | None, ...]) -> str | None:
-    for error in errors:
         if error is not None:
             return error
 
@@ -711,7 +697,10 @@ def _runtime_callback_ids(value: Any) -> tuple[str, ...]:
     )
 
 
-def _call_core_settings_binding_error(settings: Mapping[str, Any]) -> str | None:
+def _call_core_settings_binding_error(
+    settings: Mapping[str, Any],
+    _: Mapping[str, Any],
+) -> str | None:
     try:
         admit_call_core_settings(settings)
     except AdmissionError as error:
@@ -734,6 +723,21 @@ def _module_call_binding_error(
         return "stateful_module requires a ModuleCallSpec binding"
 
     return None
+
+
+_RUNTIME_BINDING_RULES = (
+    _fusion_binding_error,
+    _batch_layout_binding_error,
+    _parameter_surface_binding_error,
+    _lm_head_binding_error,
+    _mmap_binding_error,
+    _intermediate_residency_binding_error,
+    _activation_hook_binding_error,
+    _checkpoint_context_binding_error,
+    _teacher_objective_binding_error,
+    _call_core_settings_binding_error,
+    _module_call_binding_error,
+)
 
 
 def _single_autobatch_domain(runtime: RuntimeConfig) -> AutobatchDomain | None:

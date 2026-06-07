@@ -1744,6 +1744,29 @@ def operation_factory_never_runs(
     raise AssertionError(message)
 
 
+def constant_operation_factory(
+    candidate: vpx.Candidate,
+    batch: Mapping[str, object],
+    vector: vpx.TensorTree,
+) -> vpx.CandidateOperation:
+    assert isinstance(candidate, vpx.Candidate)
+    assert isinstance(batch, Mapping)
+
+    return vpx.constant_operation(vector)
+
+
+def passing_reference_check(
+    candidate: vpx.Candidate,
+    batch: Mapping[str, object],
+    vector: vpx.TensorTree,
+) -> vpx.ReferenceResult:
+    assert isinstance(candidate, vpx.Candidate)
+    assert isinstance(batch, Mapping)
+    assert vector is not None
+
+    return reference_passed()
+
+
 def recorded_tuning_problem(
     *,
     model: torch.nn.Module,
@@ -2602,54 +2625,47 @@ def test_measurement_reuses_long_probe_as_measured_sample() -> None:
     assert math.isclose(samples[0].elapsed_seconds, 700.0)
 
 
-def test_run_candidate_records_runtime_failures() -> None:
+@pytest.mark.parametrize(
+    ("error_cls", "message", "case", "error_type", "clock_end"),
+    [
+        (RuntimeError, "failed row", "runtime", "RuntimeError", 2.0),
+        (
+            torch.cuda.OutOfMemoryError,
+            "cuda oom",
+            "oom",
+            "OutOfMemoryError",
+            3.0,
+        ),
+    ],
+)
+def test_run_candidate_records_failures(
+    error_cls: type[BaseException],
+    message: str,
+    case: str,
+    error_type: str,
+    clock_end: float,
+) -> None:
     candidate = vpx.Candidate("family", "row", {})
 
     def operation() -> torch.Tensor:
-        message = "failed row"
-        raise RuntimeError(message)
+        raise error_cls(message)
 
     record = run_candidate(
         candidate,
-        {"case": "runtime"},
+        {"case": case},
         operation,
         timing_policy=vpx.TimingPolicy(),
         memory_backend=CPUMemoryBackend(),
-        clock=SequenceClock((0.0, 2.0)),
+        clock=SequenceClock((0.0, clock_end)),
     )
 
     assert record.status == "failed"
-    assert record.error_type == "RuntimeError"
-    assert record.error == "failed row"
+    assert record.error_type == error_type
+    assert record.error == message
     assert record.reference_passed
-    assert record.input_signature == {"case": "runtime"}
-    assert record.timing_samples[0].elapsed_seconds == pytest.approx(2.0)
-    assert record.memory_samples[0].elapsed_seconds == pytest.approx(2.0)
-
-
-def test_run_candidate_records_cuda_oom_failures() -> None:
-    candidate = vpx.Candidate("family", "row", {})
-
-    def operation() -> torch.Tensor:
-        message = "cuda oom"
-        raise torch.cuda.OutOfMemoryError(message)
-
-    record = run_candidate(
-        candidate,
-        {"case": "oom"},
-        operation,
-        timing_policy=vpx.TimingPolicy(),
-        memory_backend=CPUMemoryBackend(),
-        clock=SequenceClock((0.0, 3.0)),
-    )
-
-    assert record.status == "failed"
-    assert record.error_type == "OutOfMemoryError"
-    assert record.error == "cuda oom"
-    assert record.reference_passed
-    assert record.input_signature == {"case": "oom"}
-    assert record.timing_samples[0].elapsed_seconds == pytest.approx(3.0)
-    assert record.memory_samples[0].elapsed_seconds == pytest.approx(3.0)
+    assert record.input_signature == {"case": case}
+    assert record.timing_samples[0].elapsed_seconds == pytest.approx(clock_end)
+    assert record.memory_samples[0].elapsed_seconds == pytest.approx(clock_end)
 
 
 def test_run_candidate_records_compiled_selection_metadata() -> None:
@@ -2696,27 +2712,6 @@ def test_run_candidate_records_compiled_selection_metadata() -> None:
 
 
 def test_candidate_rows_reject_missing_runtime_bindings() -> None:
-    def operation_factory(
-        candidate: vpx.Candidate,
-        batch: Mapping[str, object],
-        vector: vpx.TensorTree,
-    ) -> vpx.CandidateOperation:
-        assert isinstance(candidate, vpx.Candidate)
-        assert isinstance(batch, Mapping)
-
-        return vpx.constant_operation(vector)
-
-    def reference_check(
-        candidate: vpx.Candidate,
-        batch: Mapping[str, object],
-        vector: vpx.TensorTree,
-    ) -> vpx.ReferenceResult:
-        assert isinstance(candidate, vpx.Candidate)
-        assert isinstance(batch, Mapping)
-        assert vector is not None
-
-        return reference_passed()
-
     candidates = passed_candidates(
         "family",
         (
@@ -2747,8 +2742,8 @@ def test_candidate_rows_reject_missing_runtime_bindings() -> None:
     )
     runtime = runtime_config(
         candidates,
-        operation_factory,
-        reference_check,
+        constant_operation_factory,
+        passing_reference_check,
         materialize_candidate,
         None,
         {
@@ -2814,27 +2809,6 @@ def test_candidate_rows_reject_missing_runtime_bindings() -> None:
 
 
 def test_candidate_rows_admit_declared_parameter_groups() -> None:
-    def operation_factory(
-        candidate: vpx.Candidate,
-        batch: Mapping[str, object],
-        vector: vpx.TensorTree,
-    ) -> vpx.CandidateOperation:
-        assert isinstance(candidate, vpx.Candidate)
-        assert isinstance(batch, Mapping)
-
-        return vpx.constant_operation(vector)
-
-    def reference_check(
-        candidate: vpx.Candidate,
-        batch: Mapping[str, object],
-        vector: vpx.TensorTree,
-    ) -> vpx.ReferenceResult:
-        assert isinstance(candidate, vpx.Candidate)
-        assert isinstance(batch, Mapping)
-        assert vector is not None
-
-        return reference_passed()
-
     runtime = runtime_config(
         (
             vpx.Candidate(
@@ -2848,8 +2822,8 @@ def test_candidate_rows_admit_declared_parameter_groups() -> None:
                 admission_status="passed",
             ),
         ),
-        operation_factory,
-        reference_check,
+        constant_operation_factory,
+        passing_reference_check,
         materialize_candidate,
         None,
         {
@@ -2866,27 +2840,6 @@ def test_candidate_rows_admit_declared_parameter_groups() -> None:
 
 
 def test_candidate_rows_reject_fusion_without_module() -> None:
-    def operation_factory(
-        candidate: vpx.Candidate,
-        batch: Mapping[str, object],
-        vector: vpx.TensorTree,
-    ) -> vpx.CandidateOperation:
-        assert isinstance(candidate, vpx.Candidate)
-        assert isinstance(batch, Mapping)
-
-        return vpx.constant_operation(vector)
-
-    def reference_check(
-        candidate: vpx.Candidate,
-        batch: Mapping[str, object],
-        vector: vpx.TensorTree,
-    ) -> vpx.ReferenceResult:
-        assert isinstance(candidate, vpx.Candidate)
-        assert isinstance(batch, Mapping)
-        assert vector is not None
-
-        return reference_passed()
-
     runtime = runtime_config(
         (
             vpx.Candidate(
@@ -2896,8 +2849,8 @@ def test_candidate_rows_reject_fusion_without_module() -> None:
                 admission_status="passed",
             ),
         ),
-        operation_factory,
-        reference_check,
+        constant_operation_factory,
+        passing_reference_check,
         materialize_candidate,
         None,
         {
@@ -2913,27 +2866,6 @@ def test_candidate_rows_reject_fusion_without_module() -> None:
 
 
 def test_candidate_rows_reject_stateful_module_without_module() -> None:
-    def operation_factory(
-        candidate: vpx.Candidate,
-        batch: Mapping[str, object],
-        vector: vpx.TensorTree,
-    ) -> vpx.CandidateOperation:
-        assert isinstance(candidate, vpx.Candidate)
-        assert isinstance(batch, Mapping)
-
-        return vpx.constant_operation(vector)
-
-    def reference_check(
-        candidate: vpx.Candidate,
-        batch: Mapping[str, object],
-        vector: vpx.TensorTree,
-    ) -> vpx.ReferenceResult:
-        assert isinstance(candidate, vpx.Candidate)
-        assert isinstance(batch, Mapping)
-        assert vector is not None
-
-        return reference_passed()
-
     runtime = runtime_config(
         (
             vpx.Candidate(
@@ -2947,8 +2879,8 @@ def test_candidate_rows_reject_stateful_module_without_module() -> None:
                 admission_status="passed",
             ),
         ),
-        operation_factory,
-        reference_check,
+        constant_operation_factory,
+        passing_reference_check,
         materialize_candidate,
         None,
         {
@@ -2964,27 +2896,6 @@ def test_candidate_rows_reject_stateful_module_without_module() -> None:
 
 
 def test_candidate_rows_admit_builtin_intermediate_residency_points() -> None:
-    def operation_factory(
-        candidate: vpx.Candidate,
-        batch: Mapping[str, object],
-        vector: vpx.TensorTree,
-    ) -> vpx.CandidateOperation:
-        assert isinstance(candidate, vpx.Candidate)
-        assert isinstance(batch, Mapping)
-
-        return vpx.constant_operation(vector)
-
-    def reference_check(
-        candidate: vpx.Candidate,
-        batch: Mapping[str, object],
-        vector: vpx.TensorTree,
-    ) -> vpx.ReferenceResult:
-        assert isinstance(candidate, vpx.Candidate)
-        assert isinstance(batch, Mapping)
-        assert vector is not None
-
-        return reference_passed()
-
     runtime = runtime_config(
         (
             vpx.Candidate(
@@ -2994,8 +2905,8 @@ def test_candidate_rows_admit_builtin_intermediate_residency_points() -> None:
                 admission_status="passed",
             ),
         ),
-        operation_factory,
-        reference_check,
+        constant_operation_factory,
+        passing_reference_check,
         materialize_candidate,
         None,
         {
@@ -4379,7 +4290,14 @@ def test_checkpoint_operation_can_disable_rng_preservation() -> None:
     assert not torch.equal(values[0], values[1])
 
 
-def test_checkpoint_operation_uses_declared_context_pair() -> None:
+@pytest.mark.parametrize(
+    "recompute",
+    [
+        "checkpoint_non_reentrant_by_layer",
+        "checkpoint_selective",
+    ],
+)
+def test_checkpoint_operation_uses_declared_context_pair(recompute: str) -> None:
     events = []
     vector = torch.tensor([1.0], requires_grad=True)
 
@@ -4390,44 +4308,7 @@ def test_checkpoint_operation_uses_declared_context_pair() -> None:
         "family",
         "row",
         {
-            "activation.recompute": "checkpoint_non_reentrant_by_layer",
-            **checkpoint_fields(),
-            "checkpoint.context_fn": "declared_context_pair",
-            "checkpoint.context_fn_callable": "default",
-        },
-        admission_status="passed",
-    )
-
-    def function(value: torch.Tensor) -> torch.Tensor:
-        events.append("called")
-
-        return value.square().sum()
-
-    output = vpx.checkpoint_operation(
-        candidate,
-        function,
-        (vector,),
-        policy_key="activation.recompute",
-        checkpoint_contexts={"default": context_fn},
-    )()
-    assert isinstance(output, torch.Tensor)
-    output.backward()
-
-    assert events == ["called", "called"]
-
-
-def test_checkpoint_operation_executes_selective_checkpoint_context_pair() -> None:
-    events = []
-    vector = torch.tensor([1.0], requires_grad=True)
-
-    def context_fn() -> tuple[object, object]:
-        return contextlib.nullcontext(), contextlib.nullcontext()
-
-    candidate = vpx.Candidate(
-        "family",
-        "row",
-        {
-            "activation.recompute": "checkpoint_selective",
+            "activation.recompute": recompute,
             **checkpoint_fields(),
             "checkpoint.context_fn": "declared_context_pair",
             "checkpoint.context_fn_callable": "default",
