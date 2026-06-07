@@ -14856,13 +14856,6 @@ def _require_activation_runtime_settings(
         )
         raise MaterializationError(message)
 
-    if recompute == "checkpoint_non_reentrant_by_layer":
-        message = (
-            "checkpoint_non_reentrant_by_layer requires package-owned layer "
-            "checkpoint lowering"
-        )
-        raise MaterializationError(message)
-
     if recompute in {"checkpoint_non_reentrant_by_layer", "checkpoint_selective"}:
         _admit_checkpoint_runtime(settings)
         _require_checkpoint_context_binding(settings, checkpoint_contexts)

@@ -15166,27 +15166,78 @@ def test_standard_runtime_rejects_split_dtypes_without_model_call() -> None:
         )
 
 
-def test_standard_runtime_rejects_unlowered_non_reentrant_layer_checkpoint() -> None:
-    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
+def test_standard_runtime_executes_non_reentrant_layer_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64, requires_grad=True)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+    calls = []
+    original_checkpoint_operation = runtime_module.checkpoint_operation
+
+    def recording_checkpoint_operation(
+        candidate: vpx.Candidate,
+        function: Callable[..., vpx.TensorTree],
+        args: Sequence[object],
+        *,
+        policy_key: str,
+        activation_pack_hooks: Mapping[str, Callable[[torch.Tensor], object]]
+        | None = None,
+        activation_unpack_hooks: Mapping[str, Callable[[object], torch.Tensor]]
+        | None = None,
+        checkpoint_contexts: Mapping[str, Callable[[], object]] | None = None,
+    ) -> vpx.CandidateOperation:
+        assert activation_pack_hooks == {}
+        assert activation_unpack_hooks == {}
+        assert checkpoint_contexts == {}
+        calls.append({
+            "policy_key": policy_key,
+            "recompute": candidate.settings["activation.recompute"],
+            "context_fn": candidate.settings["checkpoint.context_fn"],
+            "arg_count": len(args),
+        })
+
+        return original_checkpoint_operation(
+            candidate,
+            function,
+            args,
+            policy_key=policy_key,
+            activation_pack_hooks=activation_pack_hooks,
+            activation_unpack_hooks=activation_unpack_hooks,
+            checkpoint_contexts=checkpoint_contexts,
+        )
+
+    monkeypatch.setattr(
+        runtime_module,
+        "checkpoint_operation",
+        recording_checkpoint_operation,
+    )
     factory = vpx.standard_operation_factory(
         ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
+    result = factory(
+        vpx.Candidate(
+            "gradient",
+            "checkpoint-row",
+            {**gradient_settings(), **standard_checkpoint_settings()},
+            admission_status="passed",
+        ),
+        {"scale": 1.0},
+        vector,
+    )()
+    result_map = tensor_mapping(result)
 
-    with pytest.raises(vp.MaterializationError, match="layer checkpoint lowering"):
-        factory(
-            vpx.Candidate(
-                "gradient",
-                "checkpoint-row",
-                {**gradient_settings(), **standard_checkpoint_settings()},
-                admission_status="passed",
-            ),
-            {"scale": 1.0},
-            vector,
-        )
+    assert calls == [
+        {
+            "policy_key": "activation.recompute",
+            "recompute": "checkpoint_non_reentrant_by_layer",
+            "context_fn": "none",
+            "arg_count": 2,
+        }
+    ]
+    assert torch.equal(result_map["w"], torch.tensor([4.0], dtype=torch.float64))
 
 
 def test_standard_runtime_rejects_selective_checkpoint_without_context_pair() -> None:
