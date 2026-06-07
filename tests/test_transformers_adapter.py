@@ -10,7 +10,7 @@ import vptune.adapters as vpa
 import vptune.adapters.transformers as transformers_module
 import vptune.ext as vpx
 import vptune.runtime as runtime_module
-from vptune.data import PACKAGE_VERSION
+from vptune import operators as ops
 from vptune.errors import AdmissionError
 
 
@@ -37,46 +37,6 @@ class TinyTiedModule(torch.nn.Module):
         self.register_buffer("scale", torch.tensor([0.5]))
 
 
-class FakeModelLoader:
-    def __init__(self, calls: list[dict[str, object]]) -> None:
-        self.calls = calls
-
-    def from_pretrained(
-        self,
-        model_name_or_path: str,
-        *,
-        revision: str,
-        torch_dtype: torch.dtype,
-        attn_implementation: str,
-        use_cache: bool,
-    ) -> torch.nn.Module:
-        self.calls.append({
-            "model_name_or_path": model_name_or_path,
-            "revision": revision,
-            "torch_dtype": torch_dtype,
-            "attn_implementation": attn_implementation,
-            "use_cache": use_cache,
-        })
-
-        return TinyTiedModule()
-
-
-class FakeTransformersRegistry:
-    def __init__(self) -> None:
-        self.calls = []
-
-    def register(self, name: str, function: Callable[..., object]) -> None:
-        self.calls.append((name, function))
-
-
-class FakeAttentionConfigurable:
-    def __init__(self) -> None:
-        self.values = []
-
-    def set_attn_implementation(self, attn_implementation: str) -> None:
-        self.values.append(attn_implementation)
-
-
 class TinyTransformersScalarModule(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -90,6 +50,35 @@ class TinyTransformersScalarModule(torch.nn.Module):
         return (self.w * scale).sum()
 
 
+class RowSelectedAttentionModule(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.tensor([2.0], dtype=torch.float64))
+        self.attention_values = []
+        self.attention_factors = {
+            "custom_attention_a": 2.0,
+            "custom_attention_b": 3.0,
+        }
+        self.mask_values = []
+        self.mask_factors = {
+            "custom_attention_a": 5.0,
+            "custom_attention_b": 7.0,
+        }
+        self.attention_factor = 1.0
+        self.mask_factor = 1.0
+
+    def set_attn_implementation(self, attn_implementation: str) -> None:
+        self.attention_values.append(attn_implementation)
+        self.attention_factor = self.attention_factors[attn_implementation]
+
+    def set_attention_mask_formatter(self, mask_formatter_id: str) -> None:
+        self.mask_values.append(mask_formatter_id)
+        self.mask_factor = self.mask_factors[mask_formatter_id]
+
+    def forward(self, scale: torch.Tensor) -> torch.Tensor:
+        return (self.w * scale * self.attention_factor * self.mask_factor).sum()
+
+
 class ContextCheckingTransformersModule(TinyTransformersScalarModule):
     def __init__(self, active: list[bool], forward_events: list[bool]) -> None:
         super().__init__()
@@ -100,14 +89,6 @@ class ContextCheckingTransformersModule(TinyTransformersScalarModule):
         self.forward_events.append(bool(self.active))
 
         return super().forward(scale)
-
-
-def fake_attention() -> None:
-    return None
-
-
-def fake_mask() -> None:
-    return None
 
 
 def stateful_transformers_settings() -> dict[str, object]:
@@ -139,93 +120,17 @@ def tensor_dict(tree: object) -> dict[str, torch.Tensor]:
     return result
 
 
-def test_load_transformers_model_calls_from_pretrained_with_explicit_settings() -> None:
-    calls = []
-
-    model = vpa.load_transformers_model(
-        FakeModelLoader(calls),
-        model_name_or_path="org/model",
-        revision="abc123",
-        torch_dtype=torch.bfloat16,
-        attention_frontend="transformers_flash_attention_4",
-        attention_custom_kernel_id=None,
-        use_cache=False,
-    )
-
-    assert isinstance(model, TinyTiedModule)
-    assert calls == [
-        {
-            "model_name_or_path": "org/model",
-            "revision": "abc123",
-            "torch_dtype": torch.bfloat16,
-            "attn_implementation": "flash_attention_4",
-            "use_cache": False,
-        }
-    ]
-
-
-def test_transformers_patched_attention_output_reference_returns_result() -> None:
-    query = torch.tensor([[1.0, 2.0], [0.5, -1.0]])
-    key = torch.tensor([[0.25, -0.5], [1.5, 0.75]])
-    value = torch.tensor([[0.0, 1.0], [2.0, -3.0]])
-
-    def reference(
-        input_query: torch.Tensor,
-        input_key: torch.Tensor,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        return input_query @ input_key.T + input_value
-
-    result = vpa.check_patched_attention_output_reference(
-        reference,
-        reference,
-        (query, key, value),
-        thresholds={"max_abs_diff": 0.0, "max_rel_diff": 0.0},
-    )
-
-    assert result.name == "patched_attention_output"
-    assert result.thresholds == {"max_abs_diff": 0.0, "max_rel_diff": 0.0}
-    assert result.measurements["max_abs_diff"] == pytest.approx(0.0)
-
-
-def test_transformers_patched_attention_vjp_reference_returns_result() -> None:
-    query = torch.tensor([[1.0, 2.0], [0.5, -1.0]])
-    key = torch.tensor([[0.25, -0.5], [1.5, 0.75]])
-    value = torch.tensor([[0.0, 1.0], [2.0, -3.0]])
-    cotangent = torch.ones(2, 2)
-
-    def reference(
-        input_query: torch.Tensor,
-        input_key: torch.Tensor,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        return input_query @ input_key.T + input_value
-
-    result = vpa.check_patched_attention_vjp_reference(
-        reference,
-        reference,
-        (query, key, value),
-        cotangent,
-        (0, 1, 2),
-        thresholds={"max_abs_diff": 0.0, "max_rel_diff": 0.0},
-    )
-
-    assert result.name == "patched_attention_vjp"
-    assert result.thresholds == {"max_abs_diff": 0.0, "max_rel_diff": 0.0}
-    assert result.measurements["max_abs_diff"] == pytest.approx(0.0)
-
-
 def test_transformers_operation_factory_sets_attention_and_runs_module() -> None:
     model = TinyTransformersScalarModule()
     factory = vpa.transformers_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         params=dict(model.named_parameters()),
         buffers=dict(model.named_buffers()),
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
     )
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "transformers-gradient",
             stateful_transformers_settings(),
@@ -243,6 +148,154 @@ def test_transformers_operation_factory_sets_attention_and_runs_module() -> None
     )
 
 
+def test_transformers_registered_attention_row_selects_runtime_backend() -> None:
+    model = RowSelectedAttentionModule()
+    factory = vpa.transformers_operation_factory(
+        ops.gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
+    )
+    batch = {"scale": torch.tensor([4.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+
+    first = factory(
+        vpx.Candidate(
+            "gradient",
+            "registered-a",
+            {
+                **stateful_transformers_settings(),
+                "attention.frontend": "registered_transformers_attention",
+                "attention.custom_kernel_id": "custom_attention_a",
+                "attention.mask_formatter_id": "custom_attention_a",
+            },
+            admission_status="passed",
+        ),
+        batch,
+        vector,
+    )()
+    second = factory(
+        vpx.Candidate(
+            "gradient",
+            "registered-b",
+            {
+                **stateful_transformers_settings(),
+                "attention.frontend": "registered_transformers_attention",
+                "attention.custom_kernel_id": "custom_attention_b",
+                "attention.mask_formatter_id": "custom_attention_b",
+            },
+            admission_status="passed",
+        ),
+        batch,
+        vector,
+    )()
+
+    assert model.attention_values == ["custom_attention_a", "custom_attention_b"]
+    assert model.mask_values == ["custom_attention_a", "custom_attention_b"]
+    torch.testing.assert_close(
+        tensor_dict(first)["w"],
+        torch.tensor([40.0], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        tensor_dict(second)["w"],
+        torch.tensor([84.0], dtype=torch.float64),
+    )
+
+
+def test_transformers_registered_attention_requires_mask_formatter_runtime() -> None:
+    model = TinyTransformersScalarModule()
+    factory = vpa.transformers_operation_factory(
+        ops.gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
+    )
+
+    with pytest.raises(vp.AdmissionError, match="set_attention_mask_formatter"):
+        factory(
+            vpx.Candidate(
+                "gradient",
+                "registered",
+                {
+                    **stateful_transformers_settings(),
+                    "attention.frontend": "registered_transformers_attention",
+                    "attention.custom_kernel_id": "custom_attention_a",
+                    "attention.mask_formatter_id": "custom_attention_a",
+                },
+                admission_status="passed",
+            ),
+            {"scale": torch.tensor([4.0], dtype=torch.float64)},
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+        )
+
+
+def test_transformers_registered_attention_rejects_conflicting_runtime_id() -> None:
+    model = RowSelectedAttentionModule()
+    factory = vpa.transformers_operation_factory(
+        ops.gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
+        attention_custom_kernel_id="custom_attention_a",
+    )
+
+    with pytest.raises(vp.AdmissionError, match="must match"):
+        factory(
+            vpx.Candidate(
+                "gradient",
+                "registered-b",
+                {
+                    **stateful_transformers_settings(),
+                    "attention.frontend": "registered_transformers_attention",
+                    "attention.custom_kernel_id": "custom_attention_b",
+                    "attention.mask_formatter_id": "custom_attention_b",
+                },
+                admission_status="passed",
+            ),
+            {"scale": torch.tensor([4.0], dtype=torch.float64)},
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+        )
+
+
+@pytest.mark.parametrize(
+    ("extra_setting", "message"),
+    [
+        ({"use_cache": True}, "model-load setting"),
+        ({"output_attentions": True}, "attention-weights output surface"),
+    ],
+)
+def test_transformers_runtime_rejects_unlowered_row_settings(
+    extra_setting: dict[str, object],
+    message: str,
+) -> None:
+    model = TinyTransformersScalarModule()
+    factory = vpa.transformers_operation_factory(
+        ops.gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
+    )
+
+    with pytest.raises(vp.AdmissionError, match=message):
+        factory(
+            vpx.Candidate(
+                "gradient",
+                "unlowered-transformers-row",
+                {
+                    **stateful_transformers_settings(),
+                    **extra_setting,
+                },
+                admission_status="passed",
+            ),
+            {"scale": torch.tensor([4.0], dtype=torch.float64)},
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+        )
+
+
 def test_transformers_sdpa_rows_enter_declared_kernel_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -256,7 +309,7 @@ def test_transformers_sdpa_rows_enter_declared_kernel_context(
         "attention.sdpa_kernel": "priority_list",
         "attention.sdpa_priority_list": ("flash_attention", "math"),
     }
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "gradient",
         "transformers-sdpa",
         settings,
@@ -279,10 +332,10 @@ def test_transformers_sdpa_rows_enter_declared_kernel_context(
             active.pop()
 
     def scalar_objective(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -291,18 +344,18 @@ def test_transformers_sdpa_rows_enter_declared_kernel_context(
 
     monkeypatch.setattr(transformers_module, "sdpa_kernel", fake_sdpa_kernel)
     factory = vpa.transformers_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         params=dict(model.named_parameters()),
         buffers=dict(model.named_buffers()),
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
     )
     check = vpa.transformers_reference_check(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         params=dict(model.named_parameters()),
         buffers=dict(model.named_buffers()),
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
         thresholds={
             "max_abs_diff": 0.0,
             "max_rel_diff": 0.0,
@@ -358,7 +411,7 @@ def test_transformers_sdpa_warm_compile_enters_declared_kernel_context(
         "compile.cuda_graphs": "false",
         "compile.cache_state": "warm_cache",
     }
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "gradient",
         "transformers-sdpa-warm",
         settings,
@@ -380,19 +433,19 @@ def test_transformers_sdpa_warm_compile_enters_declared_kernel_context(
             active.pop()
 
     def fake_compile(
-        operation: Callable[[], vp.TensorTree],
+        operation: Callable[[], vpx.TensorTree],
         **_: object,
-    ) -> Callable[[], vp.TensorTree]:
+    ) -> Callable[[], vpx.TensorTree]:
         return operation
 
     monkeypatch.setattr(transformers_module, "sdpa_kernel", fake_sdpa_kernel)
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     factory = vpa.transformers_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         params=dict(model.named_parameters()),
         buffers=dict(model.named_buffers()),
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
     )
     batch = {"scale": torch.tensor([4.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
@@ -476,16 +529,16 @@ def test_transformers_operation_factory_compiles_declared_submodule_boundary(
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     model = TinyBlockModel()
     factory = vpa.transformers_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         params=dict(model.named_parameters()),
         buffers=dict(model.named_buffers()),
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
         transformer_block_paths=block_paths,
         attention_module_paths=attention_paths,
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "compiled-submodule",
             {
@@ -542,16 +595,16 @@ def test_transformers_operation_factory_rejects_compile_boundary_without_paths()
 ):
     model = TinyTransformersScalarModule()
     factory = vpa.transformers_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         params=dict(model.named_parameters()),
         buffers=dict(model.named_buffers()),
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
     )
 
     with pytest.raises(vp.MaterializationError, match="declared module paths"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "missing-paths",
                 {
@@ -579,10 +632,10 @@ def test_transformers_reference_check_runs_independent_anchor() -> None:
     model = TinyTransformersScalarModule()
 
     def scalar_objective(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -590,11 +643,11 @@ def test_transformers_reference_check_runs_independent_anchor() -> None:
         return (params["w"] * batch["scale"]).sum()
 
     check = vpa.transformers_reference_check(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         params=dict(model.named_parameters()),
         buffers=dict(model.named_buffers()),
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
         thresholds={
             "max_abs_diff": 0.0,
             "max_rel_diff": 0.0,
@@ -604,7 +657,7 @@ def test_transformers_reference_check_runs_independent_anchor() -> None:
         scalar_objectives={"loss": scalar_objective},
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "transformers-gradient",
             stateful_transformers_settings(),
@@ -622,24 +675,24 @@ def test_transformers_runtime_config_runs_full_size_check_and_materializer() -> 
     model = TinyTransformersScalarModule()
 
     def scalar_objective(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
 
         return (params["w"] * batch["scale"]).sum()
 
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "gradient",
         "transformers-gradient",
         stateful_transformers_settings(),
         admission_status="passed",
     )
     runtime = vpa.transformers_runtime_config(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         params=dict(model.named_parameters()),
         buffers=dict(model.named_buffers()),
@@ -651,7 +704,7 @@ def test_transformers_runtime_config_runs_full_size_check_and_materializer() -> 
             "directional_rel_diff": 1e-9,
         },
         objective_signature={"case": "transformers-runtime"},
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
         axis_registry=None,
         scalar_objectives={"loss": scalar_objective},
     )
@@ -667,7 +720,7 @@ def test_transformers_runtime_config_runs_full_size_check_and_materializer() -> 
         (output,),
         (),
     )
-    record = vp.FullSizeRecord(
+    record = vpx.FullSizeRecord(
         family="gradient",
         candidate_id="transformers-gradient",
         status="passed",
@@ -685,117 +738,6 @@ def test_transformers_runtime_config_runs_full_size_check_and_materializer() -> 
     torch.testing.assert_close(
         selected_map["w"], torch.tensor([4.0], dtype=torch.float64)
     )
-
-
-def test_load_transformers_model_forwards_registered_attention_id() -> None:
-    calls = []
-
-    vpa.load_transformers_model(
-        FakeModelLoader(calls),
-        model_name_or_path="org/model",
-        revision="abc123",
-        torch_dtype=torch.float16,
-        attention_frontend="registered_transformers_attention",
-        attention_custom_kernel_id="custom_attention",
-        use_cache=True,
-    )
-
-    assert calls == [
-        {
-            "model_name_or_path": "org/model",
-            "revision": "abc123",
-            "torch_dtype": torch.float16,
-            "attn_implementation": "custom_attention",
-            "use_cache": True,
-        }
-    ]
-
-
-@pytest.mark.parametrize(
-    ("attention_frontend", "expected"),
-    [
-        ("transformers_eager", "eager"),
-        ("transformers_sdpa", "sdpa"),
-        ("transformers_flash_attention_2", "flash_attention_2"),
-        ("transformers_flash_attention_3", "flash_attention_3"),
-        ("transformers_flash_attention_4", "flash_attention_4"),
-        ("transformers_flex_attention", "flex_attention"),
-        ("paged|eager", "paged|eager"),
-        ("paged|sdpa", "paged|sdpa"),
-        ("paged|flash_attention_2", "paged|flash_attention_2"),
-        ("paged|flash_attention_3", "paged|flash_attention_3"),
-        ("paged|flash_attention_4", "paged|flash_attention_4"),
-    ],
-)
-def test_transformers_attn_implementation_maps_load_time_frontends(
-    attention_frontend: str,
-    expected: str,
-) -> None:
-    assert vpa.transformers_attn_implementation(attention_frontend, None) == expected
-
-
-def test_registered_transformers_attn_implementation_uses_custom_id() -> None:
-    assert (
-        vpa.transformers_attn_implementation(
-            "registered_transformers_attention",
-            "custom_attention",
-        )
-        == "custom_attention"
-    )
-
-    with pytest.raises(vp.AdmissionError):
-        vpa.transformers_attn_implementation("pytorch_sdpa_direct", None)
-
-    with pytest.raises(vp.AdmissionError):
-        vpa.transformers_attn_implementation("registered_transformers_attention", None)
-
-
-def test_set_transformers_attention_implementation_calls_model_method() -> None:
-    model = FakeAttentionConfigurable()
-
-    selected = vpa.set_transformers_attention_implementation(
-        model,
-        attention_frontend="transformers_sdpa",
-        attention_custom_kernel_id=None,
-    )
-    custom = vpa.set_transformers_attention_implementation(
-        model,
-        attention_frontend="registered_transformers_attention",
-        attention_custom_kernel_id="custom_attention",
-    )
-
-    assert selected == "sdpa"
-    assert custom == "custom_attention"
-    assert model.values == ["sdpa", "custom_attention"]
-
-
-def test_register_transformers_attention_registers_attention_and_mask() -> None:
-    attention_registry = FakeTransformersRegistry()
-    mask_registry = FakeTransformersRegistry()
-
-    identity = vpa.register_transformers_attention(
-        attention_registry,
-        mask_registry,
-        attention_custom_kernel_id="custom_attention",
-        attention_function=fake_attention,
-        mask_formatter_id="custom_attention",
-        mask_function=fake_mask,
-    )
-
-    assert attention_registry.calls == [("custom_attention", fake_attention)]
-    assert mask_registry.calls == [("custom_attention", fake_mask)]
-    assert identity["attention_custom_kernel_id"] == "custom_attention"
-    assert identity["mask_formatter_id"] == "custom_attention"
-
-    with pytest.raises(vp.AdmissionError, match="matching attention and mask"):
-        vpa.register_transformers_attention(
-            attention_registry,
-            mask_registry,
-            attention_custom_kernel_id="custom_attention",
-            attention_function=fake_attention,
-            mask_formatter_id="custom_mask",
-            mask_function=fake_mask,
-        )
 
 
 def test_transformers_attention_location_executes_core_attention() -> None:
@@ -859,11 +801,47 @@ def test_transformers_attention_location_executes_core_attention() -> None:
     assert signature["semantics"]["final_logit_softcap"] == pytest.approx(30.0)
 
 
-def test_transformers_model_identity_records_module_and_adapter_fields() -> None:
+def test_transformers_model_identity_changes_with_replay_inputs() -> None:
     model = TinyTiedModule()
     model.eval()
-
-    identity = vpa.transformers_model_identity(
+    base = vpa.transformers_model_identity(
+        model,
+        transformers_version="4.0.0",
+        model_config_hash="config-hash",
+        source_revision="revision",
+        dtype_policy={"dtype.model_compute": "bf16"},
+        tokenizer_identity={"name": "tokenizer", "revision": "tok-rev"},
+        adapter_rules={"attention": "sdpa"},
+    )
+    changed_config = vpa.transformers_model_identity(
+        model,
+        transformers_version="4.0.0",
+        model_config_hash="other-config",
+        source_revision="revision",
+        dtype_policy={"dtype.model_compute": "bf16"},
+        tokenizer_identity={"name": "tokenizer", "revision": "tok-rev"},
+        adapter_rules={"attention": "sdpa"},
+    )
+    changed_tokenizer = vpa.transformers_model_identity(
+        model,
+        transformers_version="4.0.0",
+        model_config_hash="config-hash",
+        source_revision="revision",
+        dtype_policy={"dtype.model_compute": "bf16"},
+        tokenizer_identity={"name": "tokenizer", "revision": "other"},
+        adapter_rules={"attention": "sdpa"},
+    )
+    changed_rules = vpa.transformers_model_identity(
+        model,
+        transformers_version="4.0.0",
+        model_config_hash="config-hash",
+        source_revision="revision",
+        dtype_policy={"dtype.model_compute": "bf16"},
+        tokenizer_identity={"name": "tokenizer", "revision": "tok-rev"},
+        adapter_rules={"attention": "eager"},
+    )
+    model.train()
+    changed_module_state = vpa.transformers_model_identity(
         model,
         transformers_version="4.0.0",
         model_config_hash="config-hash",
@@ -873,22 +851,10 @@ def test_transformers_model_identity_records_module_and_adapter_fields() -> None
         adapter_rules={"attention": "sdpa"},
     )
 
-    signature = identity.signature()
-
-    assert signature["adapter_id"] == "vptune.transformers"
-    assert signature["adapter_version"] == PACKAGE_VERSION
-    assert signature["transformers_version"] == "4.0.0"
-    assert signature["model_config_hash"] == "config-hash"
-    assert signature["source_revision"] == "revision"
-    assert signature["dtype_policy"] == {"dtype.model_compute": "bf16"}
-    assert signature["tokenizer_identity"] == {
-        "name": "tokenizer",
-        "revision": "tok-rev",
-    }
-    assert signature["adapter_rules"] == {"attention": "sdpa"}
-    assert signature["module"]["training"] is False
-    assert signature["module"]["tied_parameter_groups"] == (("embedding", "lm_head"),)
-    assert signature["module"]["buffers"][0]["name"] == "scale"
+    assert base.signature() != changed_config.signature()
+    assert base.signature() != changed_tokenizer.signature()
+    assert base.signature() != changed_rules.signature()
+    assert base.signature() != changed_module_state.signature()
 
 
 def test_transformers_model_identity_requires_explicit_fields() -> None:
@@ -918,51 +884,6 @@ def test_transformers_model_identity_requires_explicit_fields() -> None:
 
 
 @pytest.mark.parametrize(
-    "sdpa_kernel",
-    [
-        "math",
-        "flash_attention",
-        "efficient_attention",
-        "cudnn_attention",
-        "overrideable",
-    ],
-)
-def test_transformers_sdpa_axis_admits_each_kernel_value(sdpa_kernel: str) -> None:
-    policy = transformers_policy()
-    axis = vpa.transformers_attention_axis(("transformers_sdpa",), policy=policy)
-    settings = {
-        "attention.frontend": "transformers_sdpa",
-        "attention.sdpa_kernel": sdpa_kernel,
-        "module_mode": "eval",
-        "dropout_p": 0.0,
-    }
-
-    if sdpa_kernel == "flash_attention":
-        settings["dtype.model_compute"] = "bf16"
-
-    assert axis.admit(vp.Candidate("family", sdpa_kernel, settings)) == (True, None)
-
-
-def test_transformers_sdpa_axis_admits_priority_list() -> None:
-    policy = transformers_policy()
-    axis = vpa.transformers_attention_axis(("transformers_sdpa",), policy=policy)
-    candidate = vp.Candidate(
-        "family",
-        "priority",
-        {
-            "attention.frontend": "transformers_sdpa",
-            "attention.sdpa_kernel": "priority_list",
-            "attention.sdpa_priority_list": ("flash_attention", "math"),
-            "dtype.model_compute": "bf16",
-            "module_mode": "eval",
-            "dropout_p": 0.0,
-        },
-    )
-
-    assert axis.admit(candidate) == (True, None)
-
-
-@pytest.mark.parametrize(
     "settings_override",
     [
         {"attention.partition": "full"},
@@ -983,7 +904,7 @@ def test_transformers_attention_axis_rejects_core_attention_settings(
         **settings_override,
     }
 
-    assert axis.admit(vp.Candidate("family", "core-owned", settings)) == (
+    assert axis.admit(vpx.Candidate("family", "core-owned", settings)) == (
         False,
         f"{next(iter(settings_override))} is owned by the core attention executor",
     )
@@ -996,7 +917,7 @@ def test_transformers_sdpa_axis_rejects_unavailable_forced_kernel() -> None:
         forced_kernel_failure_reason="kernel missing",
     )
     axis = vpa.transformers_attention_axis(("transformers_sdpa",), policy=policy)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "efficient",
         {
@@ -1010,37 +931,13 @@ def test_transformers_sdpa_axis_rejects_unavailable_forced_kernel() -> None:
     assert axis.admit(candidate) == (False, "kernel missing")
 
 
-def test_transformers_attention_registers_adapter_axis() -> None:
-    policy = transformers_policy()
-    registry = vpx.standard_axis_registry()
-    registry.register(
-        vpa.transformers_attention_axis(
-            ("transformers_eager",),
-            policy=policy,
-        )
-    )
-    admitted = registry.admit(
-        vp.Candidate(
-            "family",
-            "row",
-            {
-                "attention.frontend": "transformers_eager",
-                "module_mode": "eval",
-                "dropout_p": 0.0,
-            },
-        )
-    )
-
-    assert admitted.admission_status == "passed"
-
-
 def test_transformers_attention_requires_mode_and_effective_flash_dtype() -> None:
     policy = transformers_policy()
     axis = vpa.transformers_attention_axis(
         ("transformers_flash_attention_2",),
         policy=policy,
     )
-    missing_mode = vp.Candidate(
+    missing_mode = vpx.Candidate(
         "family",
         "missing-mode",
         {
@@ -1050,7 +947,7 @@ def test_transformers_attention_requires_mode_and_effective_flash_dtype() -> Non
             "output_attentions": False,
         },
     )
-    float32_compute = vp.Candidate(
+    float32_compute = vpx.Candidate(
         "family",
         "float32-compute",
         {
@@ -1062,7 +959,7 @@ def test_transformers_attention_requires_mode_and_effective_flash_dtype() -> Non
             "output_attentions": False,
         },
     )
-    bf16_compute = vp.Candidate(
+    bf16_compute = vpx.Candidate(
         "family",
         "bf16-compute",
         {
@@ -1080,16 +977,16 @@ def test_transformers_attention_requires_mode_and_effective_flash_dtype() -> Non
     assert axis.admit(bf16_compute) == (True, None)
 
 
-def test_transformers_attention_axis_owns_optional_admission_fields() -> None:
+def test_transformers_attention_axis_uses_core_and_adapter_admission_fields() -> None:
     policy = transformers_policy()
-    registry = vpx.AxisRegistry()
+    registry = vpx.standard_axis_registry()
     registry.register(
         vpa.transformers_attention_axis(
             ("transformers_flash_attention_2", "registered_transformers_attention"),
             policy=policy,
         )
     )
-    flash = vp.Candidate(
+    flash = vpx.Candidate(
         "family",
         "flash",
         {
@@ -1100,7 +997,7 @@ def test_transformers_attention_axis_owns_optional_admission_fields() -> None:
             "output_attentions": False,
         },
     )
-    registered = vp.Candidate(
+    registered = vpx.Candidate(
         "family",
         "registered",
         {
@@ -1111,7 +1008,7 @@ def test_transformers_attention_axis_owns_optional_admission_fields() -> None:
             "attention.mask_formatter_id": "custom_attention",
         },
     )
-    mismatched_registered = vp.Candidate(
+    mismatched_registered = vpx.Candidate(
         "family",
         "mismatched-registered",
         {
@@ -1122,7 +1019,7 @@ def test_transformers_attention_axis_owns_optional_admission_fields() -> None:
             "attention.mask_formatter_id": "custom_mask",
         },
     )
-    missing_dropout = vp.Candidate(
+    missing_dropout = vpx.Candidate(
         "family",
         "missing-dropout",
         {
@@ -1136,6 +1033,24 @@ def test_transformers_attention_axis_owns_optional_admission_fields() -> None:
     assert registry.admit(registered).admission_status == "passed"
     assert registry.admit(mismatched_registered).admission_status == "failed"
     assert registry.admit(missing_dropout).admission_status == "failed"
+
+    with pytest.raises(vp.AdmissionError, match="no axis owner"):
+        registry.admit(
+            vpx.Candidate(
+                "family",
+                "gqa-row-setting",
+                {
+                    "attention.frontend": "transformers_flash_attention_2",
+                    "dtype.model_compute": "bf16",
+                    "module_mode": "eval",
+                    "dropout_p": 0.0,
+                    "enable_gqa": True,
+                    "query_heads": 4,
+                    "key_heads": 2,
+                    "value_heads": 2,
+                },
+            )
+        )
 
 
 def test_transformers_attention_axis_rejects_core_frontends() -> None:

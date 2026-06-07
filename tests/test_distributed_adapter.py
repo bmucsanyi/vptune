@@ -8,21 +8,8 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-import vptune.ext as vpx
-from vptune import (
-    AdmissionError,
-    Batch,
-    BufferTree,
-    Candidate,
-    FullSizeRecord,
-    MaterializationError,
-    Measurement,
-    ModuleCallSpec,
-    ObjectiveContext,
-    ParameterTree,
-    TensorTree,
-    gradient,
-)
+from vptune import AdmissionError, MaterializationError
+from vptune import operators as ops
 from vptune.adapters import distributed as distributed_module
 from vptune.adapters.distributed import (
     DistributedAdmissionPolicy,
@@ -40,24 +27,9 @@ from vptune.adapters.distributed import (
     RankSelectedSettings,
     RankStatus,
     admit_distributed_candidate,
-    apply_context_parallel,
-    apply_fsdp2,
-    apply_fsdp2_group,
-    apply_tensor_parallel,
-    build_colwise_parallel,
-    build_device_mesh,
     build_dtensor_placement,
-    build_fsdp_dp_mesh_dims,
-    build_fsdp_mixed_precision_policy,
-    build_fsdp_offload_policy,
-    build_prepare_module_input,
-    build_prepare_module_output,
-    build_rowwise_parallel,
-    build_sequence_parallel,
     collective_all_gather_into_tensor,
-    collective_all_to_all_single,
-    collective_reduce_scatter_tensor,
-    distributed_axis_manifest,
+    distributed_axis_registry,
     distributed_identity,
     distributed_operation_factory,
     distributed_record,
@@ -67,12 +39,23 @@ from vptune.adapters.distributed import (
     distributed_strategy_axis,
     initialize_process_group,
     named_modules_for_distributed_wrap,
-    redistribute_dtensor,
     reduce_rank_statuses,
     require_rank_selected_settings_agree,
     resolve_process_group_backend,
     run_with_loss_parallel,
     wait_collective,
+)
+from vptune.candidates import INTEGER_DOMAIN
+from vptune.ext import (
+    Batch,
+    BufferTree,
+    Candidate,
+    FullSizeRecord,
+    Measurement,
+    ModuleCallSpec,
+    ObjectiveContext,
+    ParameterTree,
+    TensorTree,
 )
 
 
@@ -123,6 +106,11 @@ def distributed_policy(
     *,
     hook_entry_policy: str = "root-forward",
     fsdp_wrap_granularity: tuple[str, ...] = ("root", "transformer_block"),
+    fsdp_reshard_after_forward: tuple[Any, ...] = (
+        "true",
+        "false",
+        INTEGER_DOMAIN,
+    ),
     output_layout: str = "rowwise",
     offload: str = "none",
     context_rotate_method: tuple[str, ...] = ("all_gather",),
@@ -141,7 +129,7 @@ def distributed_policy(
             "allowed_fsdp.wrap_granularity": fsdp_wrap_granularity,
             "allowed_fsdp.forward_prefetch": ("disabled", "next-forward"),
             "allowed_fsdp.backward_prefetch": ("disabled", "backward-pre"),
-            "allowed_fsdp.reshard_after_forward": ("true", "false"),
+            "allowed_fsdp.reshard_after_forward": fsdp_reshard_after_forward,
             "allowed_fsdp.shard_placement_fn": ("none", "declared_fn"),
             "allowed_fsdp.mp_policy.param_dtype": ("fp32", "bf16", "fp16"),
             "allowed_fsdp.mp_policy.reduce_dtype": ("fp32", "bf16", "fp16"),
@@ -449,6 +437,26 @@ def distributed_fsdp_bindings(
 
         return sharded
 
+    def configure_forward_prefetch(
+        module: torch.nn.Module,
+        policy: str,
+    ) -> None:
+        events.append({
+            "kind": "forward_prefetch",
+            "module": module,
+            "policy": policy,
+        })
+
+    def configure_backward_prefetch(
+        module: torch.nn.Module,
+        policy: str,
+    ) -> None:
+        events.append({
+            "kind": "backward_prefetch",
+            "module": module,
+            "policy": policy,
+        })
+
     def mixed_precision_policy(**kwargs: object) -> dict[str, object]:
         events.append({"kind": "mixed_precision", **kwargs})
 
@@ -488,13 +496,14 @@ def distributed_fsdp_bindings(
 
     return DistributedFSDPBindings(
         fully_shard=fully_shard,
+        configure_forward_prefetch=configure_forward_prefetch,
+        configure_backward_prefetch=configure_backward_prefetch,
         mixed_precision_policy=mixed_precision_policy,
         offload_policy=offload_policy,
         cpu_offload_policy=cpu_offload_policy,
         data_parallel_mesh_dims=data_parallel_mesh_dims,
         shard_placement_fns={"declared_fn": shard_placement_fn},
         ignored_params={},
-        reshard_group_size=3,
         cpu_offload_pin_memory=True,
         hsdp_replicate_mesh_dims="replicate",
     )
@@ -799,163 +808,6 @@ def test_resolve_process_group_backend_uses_declared_backend() -> None:
         )
 
 
-def test_initialize_process_group_forwards_declared_arguments() -> None:
-    calls = []
-    result = object()
-    timeout = object()
-    store = object()
-    pg_options = object()
-    device_id = object()
-
-    def init_process_group(
-        *,
-        backend: str,
-        init_method: str | None,
-        timeout: object,
-        world_size: int,
-        rank: int,
-        store: object,
-        pg_options: object,
-        device_id: object,
-    ) -> object:
-        calls.append({
-            "backend": backend,
-            "init_method": init_method,
-            "timeout": timeout,
-            "world_size": world_size,
-            "rank": rank,
-            "store": store,
-            "pg_options": pg_options,
-            "device_id": device_id,
-        })
-
-        return result
-
-    initialized = initialize_process_group(
-        init_process_group,
-        backend="nccl",
-        init_method="env://",
-        timeout=timeout,
-        world_size=8,
-        rank=3,
-        store=store,
-        pg_options=pg_options,
-        device_id=device_id,
-    )
-
-    assert initialized is result
-    assert calls == [
-        {
-            "backend": "nccl",
-            "init_method": "env://",
-            "timeout": timeout,
-            "world_size": 8,
-            "rank": 3,
-            "store": store,
-            "pg_options": pg_options,
-            "device_id": device_id,
-        }
-    ]
-
-
-def test_build_device_mesh_forwards_declared_mesh_arguments() -> None:
-    calls = []
-    mesh = object()
-
-    def init_device_mesh(
-        device_type: str,
-        mesh_shape: tuple[int, ...],
-        *,
-        mesh_dim_names: tuple[str, ...],
-    ) -> object:
-        calls.append({
-            "device_type": device_type,
-            "mesh_shape": mesh_shape,
-            "mesh_dim_names": mesh_dim_names,
-        })
-
-        return mesh
-
-    result = build_device_mesh(
-        init_device_mesh,
-        device_type="cuda",
-        mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "tp"),
-    )
-
-    assert result is mesh
-    assert calls == [
-        {
-            "device_type": "cuda",
-            "mesh_shape": (2, 4),
-            "mesh_dim_names": ("dp", "tp"),
-        }
-    ]
-
-
-def test_apply_fsdp2_forwards_declared_fully_shard_arguments() -> None:
-    calls = []
-    module = torch.nn.Linear(2, 2)
-    sharded = torch.nn.Sequential(module)
-    mesh = object()
-    mp_policy = object()
-    offload_policy = object()
-    ignored = tuple(module.parameters())
-
-    def shard_placement_fn(_: torch.nn.Module) -> object:
-        return object()
-
-    def fully_shard(
-        module: torch.nn.Module,
-        *,
-        mesh: object,
-        reshard_after_forward: bool | int | None,
-        shard_placement_fn: object,
-        mp_policy: object,
-        offload_policy: object,
-        ignored_params: tuple[torch.nn.Parameter, ...],
-        dp_mesh_dims: tuple[int, ...],
-    ) -> torch.nn.Module:
-        calls.append({
-            "module": module,
-            "mesh": mesh,
-            "reshard_after_forward": reshard_after_forward,
-            "shard_placement_fn": shard_placement_fn,
-            "mp_policy": mp_policy,
-            "offload_policy": offload_policy,
-            "ignored_params": ignored_params,
-            "dp_mesh_dims": dp_mesh_dims,
-        })
-
-        return sharded
-
-    result = apply_fsdp2(
-        fully_shard,
-        module,
-        mesh=mesh,
-        reshard_after_forward=2,
-        shard_placement_fn=shard_placement_fn,
-        mp_policy=mp_policy,
-        offload_policy=offload_policy,
-        ignored_params=ignored,
-        dp_mesh_dims=(0,),
-    )
-
-    assert result is sharded
-    assert calls == [
-        {
-            "module": module,
-            "mesh": mesh,
-            "reshard_after_forward": 2,
-            "shard_placement_fn": shard_placement_fn,
-            "mp_policy": mp_policy,
-            "offload_policy": offload_policy,
-            "ignored_params": ignored,
-            "dp_mesh_dims": (0,),
-        }
-    ]
-
-
 def test_named_modules_for_distributed_wrap_returns_declared_order() -> None:
     first = torch.nn.Linear(2, 2)
     nested = torch.nn.Sequential(torch.nn.Linear(2, 2))
@@ -967,408 +819,6 @@ def test_named_modules_for_distributed_wrap_returns_declared_order() -> None:
 
     with pytest.raises(AdmissionError, match="missing"):
         named_modules_for_distributed_wrap(model, ("2",))
-
-
-def test_apply_fsdp2_group_forwards_declared_module_group() -> None:
-    calls = []
-    first = torch.nn.Linear(2, 2)
-    second = torch.nn.Linear(2, 2)
-    sharded = torch.nn.Sequential(first, second)
-    modules = list(named_modules_for_distributed_wrap(sharded, ("0", "1")))
-    mesh = object()
-    mp_policy = object()
-    offload_policy = object()
-    ignored = tuple(first.parameters())
-
-    def shard_placement_fn(_: torch.nn.Module) -> object:
-        return object()
-
-    def fully_shard(
-        modules: list[torch.nn.Module],
-        *,
-        mesh: object,
-        reshard_after_forward: bool | int | None,
-        shard_placement_fn: object,
-        mp_policy: object,
-        offload_policy: object,
-        ignored_params: tuple[torch.nn.Parameter, ...],
-        dp_mesh_dims: tuple[int, ...],
-    ) -> torch.nn.Module:
-        calls.append({
-            "modules": modules,
-            "mesh": mesh,
-            "reshard_after_forward": reshard_after_forward,
-            "shard_placement_fn": shard_placement_fn,
-            "mp_policy": mp_policy,
-            "offload_policy": offload_policy,
-            "ignored_params": ignored_params,
-            "dp_mesh_dims": dp_mesh_dims,
-        })
-
-        return sharded
-
-    result = apply_fsdp2_group(
-        fully_shard,
-        modules,
-        mesh=mesh,
-        reshard_after_forward=True,
-        shard_placement_fn=shard_placement_fn,
-        mp_policy=mp_policy,
-        offload_policy=offload_policy,
-        ignored_params=ignored,
-        dp_mesh_dims=("dp",),
-    )
-
-    assert result is sharded
-    assert calls == [
-        {
-            "modules": modules,
-            "mesh": mesh,
-            "reshard_after_forward": True,
-            "shard_placement_fn": shard_placement_fn,
-            "mp_policy": mp_policy,
-            "offload_policy": offload_policy,
-            "ignored_params": ignored,
-            "dp_mesh_dims": ("dp",),
-        }
-    ]
-
-
-def test_build_fsdp_mixed_precision_policy_forwards_declared_fields() -> None:
-    calls = []
-    policy = object()
-
-    def mixed_precision_policy(
-        *,
-        param_dtype: torch.dtype | None,
-        reduce_dtype: torch.dtype | None,
-        output_dtype: torch.dtype | None,
-        cast_forward_inputs: bool,
-    ) -> object:
-        calls.append({
-            "param_dtype": param_dtype,
-            "reduce_dtype": reduce_dtype,
-            "output_dtype": output_dtype,
-            "cast_forward_inputs": cast_forward_inputs,
-        })
-
-        return policy
-
-    result = build_fsdp_mixed_precision_policy(
-        mixed_precision_policy,
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
-        output_dtype=torch.float16,
-        cast_forward_inputs=False,
-    )
-
-    assert result is policy
-    assert calls == [
-        {
-            "param_dtype": torch.bfloat16,
-            "reduce_dtype": torch.float32,
-            "output_dtype": torch.float16,
-            "cast_forward_inputs": False,
-        }
-    ]
-
-
-def test_build_fsdp_offload_policy_forwards_declared_mode() -> None:
-    calls = []
-    no_offload = object()
-    cpu_offload = object()
-
-    def offload_policy() -> object:
-        calls.append({"kind": "none"})
-
-        return no_offload
-
-    def cpu_offload_policy(*, pin_memory: bool) -> object:
-        calls.append({"kind": "cpu", "pin_memory": pin_memory})
-
-        return cpu_offload
-
-    assert (
-        build_fsdp_offload_policy(
-            offload_policy,
-            cpu_offload_policy,
-            offload="none",
-            pin_memory=False,
-        )
-        is no_offload
-    )
-    assert (
-        build_fsdp_offload_policy(
-            offload_policy,
-            cpu_offload_policy,
-            offload="cpu",
-            pin_memory=True,
-        )
-        is cpu_offload
-    )
-    assert calls == [
-        {"kind": "none"},
-        {"kind": "cpu", "pin_memory": True},
-    ]
-
-    with pytest.raises(AdmissionError, match="unsupported"):
-        build_fsdp_offload_policy(
-            offload_policy,
-            cpu_offload_policy,
-            offload="disk",
-            pin_memory=True,
-        )
-
-
-def test_build_fsdp_dp_mesh_dims_forwards_declared_dimensions() -> None:
-    calls = []
-    dims = object()
-
-    def data_parallel_mesh_dims(
-        *,
-        shard: str | tuple[str, ...] | None,
-        replicate: str | tuple[str, ...] | None,
-    ) -> object:
-        calls.append({"shard": shard, "replicate": replicate})
-
-        return dims
-
-    result = build_fsdp_dp_mesh_dims(
-        data_parallel_mesh_dims,
-        shard=("dp_shard", "expert"),
-        replicate="dp_replicate",
-    )
-
-    assert result is dims
-    assert calls == [
-        {
-            "shard": ("dp_shard", "expert"),
-            "replicate": "dp_replicate",
-        }
-    ]
-
-
-def test_apply_tensor_parallel_forwards_declared_parallelize_arguments() -> None:
-    calls = []
-    module = torch.nn.Linear(2, 2)
-    parallelized = torch.nn.Sequential(module)
-    mesh = object()
-    plan = {"layers.0": object()}
-
-    def parallelize_module(
-        module: torch.nn.Module,
-        device_mesh: object,
-        parallelize_plan: dict[str, object],
-        *,
-        src_data_rank: int,
-    ) -> torch.nn.Module:
-        calls.append({
-            "module": module,
-            "device_mesh": device_mesh,
-            "parallelize_plan": parallelize_plan,
-            "src_data_rank": src_data_rank,
-        })
-
-        return parallelized
-
-    result = apply_tensor_parallel(
-        parallelize_module,
-        module,
-        device_mesh=mesh,
-        parallelize_plan=plan,
-        src_data_rank=3,
-    )
-
-    assert result is parallelized
-    assert calls == [
-        {
-            "module": module,
-            "device_mesh": mesh,
-            "parallelize_plan": plan,
-            "src_data_rank": 3,
-        }
-    ]
-
-
-def test_build_tensor_parallel_styles_forward_declared_arguments() -> None:
-    calls = []
-    input_layout = object()
-    output_layout = object()
-    colwise_result = object()
-    rowwise_result = object()
-    sequence_result = object()
-
-    def colwise_parallel(
-        *,
-        input_layouts: object,
-        output_layouts: object,
-        use_local_output: bool,
-    ) -> object:
-        calls.append({
-            "kind": "colwise",
-            "input_layouts": input_layouts,
-            "output_layouts": output_layouts,
-            "use_local_output": use_local_output,
-        })
-
-        return colwise_result
-
-    def rowwise_parallel(
-        *,
-        input_layouts: object,
-        output_layouts: object,
-        use_local_output: bool,
-    ) -> object:
-        calls.append({
-            "kind": "rowwise",
-            "input_layouts": input_layouts,
-            "output_layouts": output_layouts,
-            "use_local_output": use_local_output,
-        })
-
-        return rowwise_result
-
-    def sequence_parallel(
-        *,
-        sequence_dim: int,
-        use_local_output: bool,
-    ) -> object:
-        calls.append({
-            "kind": "sequence",
-            "sequence_dim": sequence_dim,
-            "use_local_output": use_local_output,
-        })
-
-        return sequence_result
-
-    assert (
-        build_colwise_parallel(
-            colwise_parallel,
-            input_layouts=input_layout,
-            output_layouts=output_layout,
-            use_local_output=False,
-        )
-        is colwise_result
-    )
-    assert (
-        build_rowwise_parallel(
-            rowwise_parallel,
-            input_layouts=input_layout,
-            output_layouts=output_layout,
-            use_local_output=True,
-        )
-        is rowwise_result
-    )
-    assert (
-        build_sequence_parallel(
-            sequence_parallel,
-            sequence_dim=2,
-            use_local_output=False,
-        )
-        is sequence_result
-    )
-    assert calls == [
-        {
-            "kind": "colwise",
-            "input_layouts": input_layout,
-            "output_layouts": output_layout,
-            "use_local_output": False,
-        },
-        {
-            "kind": "rowwise",
-            "input_layouts": input_layout,
-            "output_layouts": output_layout,
-            "use_local_output": True,
-        },
-        {
-            "kind": "sequence",
-            "sequence_dim": 2,
-            "use_local_output": False,
-        },
-    ]
-
-
-def test_build_prepare_module_styles_forward_declared_arguments() -> None:
-    calls = []
-    input_layouts = (object(), None)
-    desired_input_layouts = (object(), None)
-    input_kwarg_layouts = {"attention_mask": object()}
-    desired_input_kwarg_layouts = {"attention_mask": object()}
-    output_layouts = object()
-    desired_output_layouts = object()
-    input_result = object()
-    output_result = object()
-
-    def prepare_module_input(
-        *,
-        input_layouts: tuple[object | None, ...],
-        desired_input_layouts: tuple[object | None, ...],
-        input_kwarg_layouts: dict[str, object],
-        desired_input_kwarg_layouts: dict[str, object],
-        use_local_output: bool,
-    ) -> object:
-        calls.append({
-            "kind": "input",
-            "input_layouts": input_layouts,
-            "desired_input_layouts": desired_input_layouts,
-            "input_kwarg_layouts": input_kwarg_layouts,
-            "desired_input_kwarg_layouts": desired_input_kwarg_layouts,
-            "use_local_output": use_local_output,
-        })
-
-        return input_result
-
-    def prepare_module_output(
-        *,
-        output_layouts: object,
-        desired_output_layouts: object,
-        use_local_output: bool,
-    ) -> object:
-        calls.append({
-            "kind": "output",
-            "output_layouts": output_layouts,
-            "desired_output_layouts": desired_output_layouts,
-            "use_local_output": use_local_output,
-        })
-
-        return output_result
-
-    assert (
-        build_prepare_module_input(
-            prepare_module_input,
-            input_layouts=input_layouts,
-            desired_input_layouts=desired_input_layouts,
-            input_kwarg_layouts=input_kwarg_layouts,
-            desired_input_kwarg_layouts=desired_input_kwarg_layouts,
-            use_local_output=False,
-        )
-        is input_result
-    )
-    assert (
-        build_prepare_module_output(
-            prepare_module_output,
-            output_layouts=output_layouts,
-            desired_output_layouts=desired_output_layouts,
-            use_local_output=True,
-        )
-        is output_result
-    )
-    assert calls == [
-        {
-            "kind": "input",
-            "input_layouts": input_layouts,
-            "desired_input_layouts": desired_input_layouts,
-            "input_kwarg_layouts": input_kwarg_layouts,
-            "desired_input_kwarg_layouts": desired_input_kwarg_layouts,
-            "use_local_output": False,
-        },
-        {
-            "kind": "output",
-            "output_layouts": output_layouts,
-            "desired_output_layouts": desired_output_layouts,
-            "use_local_output": True,
-        },
-    ]
 
 
 def test_run_with_loss_parallel_executes_inside_context() -> None:
@@ -1491,32 +941,6 @@ def test_build_dtensor_placement_rejects_contradictory_fields(
         )
 
 
-def test_redistribute_dtensor_forwards_declared_arguments() -> None:
-    dtensor = RecordingDTensor()
-    mesh = object()
-    placements = (object(), object())
-
-    result = redistribute_dtensor(
-        dtensor,
-        device_mesh=mesh,
-        placements=placements,
-        async_op=True,
-        forward_dtype=torch.bfloat16,
-        backward_dtype=torch.float32,
-    )
-
-    assert result is dtensor.result
-    assert dtensor.calls == [
-        {
-            "device_mesh": mesh,
-            "placements": placements,
-            "async_op": True,
-            "forward_dtype": torch.bfloat16,
-            "backward_dtype": torch.float32,
-        }
-    ]
-
-
 def test_distributed_redistribution_runs_before_output_schedule() -> None:
     events = []
     bindings = distributed_bindings(events)
@@ -1603,94 +1027,6 @@ def test_distributed_redistribution_requires_bindings_for_active_schedule() -> N
 
     with pytest.raises(MaterializationError, match="requires strategy bindings"):
         distributed_module._distributed_redistribution(settings, None)
-
-
-def test_apply_context_parallel_forwards_declared_arguments() -> None:
-    calls = []
-    mesh = object()
-    result = object()
-    first = torch.tensor([1.0])
-    second = torch.tensor([2.0])
-
-    def context_parallel(
-        mesh: object,
-        *,
-        rotate_method: str,
-        buffers: tuple[torch.Tensor, ...],
-        buffer_seq_dims: tuple[int, ...],
-        no_restore_buffers: tuple[torch.Tensor, ...],
-    ) -> object:
-        calls.append({
-            "mesh": mesh,
-            "rotate_method": rotate_method,
-            "buffers": buffers,
-            "buffer_seq_dims": buffer_seq_dims,
-            "no_restore_buffers": no_restore_buffers,
-        })
-
-        return result
-
-    applied = apply_context_parallel(
-        context_parallel,
-        mesh,
-        rotate_method="all_gather",
-        buffers=(first, second),
-        buffer_seq_dims=(1, 1),
-        no_restore_buffers=(second,),
-    )
-
-    assert applied is result
-    assert calls == [
-        {
-            "mesh": mesh,
-            "rotate_method": "all_gather",
-            "buffers": (first, second),
-            "buffer_seq_dims": (1, 1),
-            "no_restore_buffers": (second,),
-        }
-    ]
-
-
-def test_collective_all_gather_into_tensor_forwards_declared_arguments() -> None:
-    calls = []
-    output = torch.empty(4)
-    input_tensor = torch.ones(2)
-    group = object()
-    work = object()
-
-    def all_gather_into_tensor(
-        output_tensor: torch.Tensor,
-        input_tensor: torch.Tensor,
-        *,
-        group: object,
-        async_op: bool,
-    ) -> object:
-        calls.append({
-            "output_tensor": output_tensor,
-            "input_tensor": input_tensor,
-            "group": group,
-            "async_op": async_op,
-        })
-
-        return work
-
-    result = collective_all_gather_into_tensor(
-        all_gather_into_tensor,
-        output,
-        input_tensor,
-        group=group,
-        async_op=True,
-    )
-
-    assert result is work
-    assert calls == [
-        {
-            "output_tensor": output,
-            "input_tensor": input_tensor,
-            "group": group,
-            "async_op": True,
-        }
-    ]
 
 
 def test_gloo_process_group_all_gather_matches_logical_rank_output(
@@ -1839,105 +1175,6 @@ def test_nccl_process_group_all_gather_matches_logical_rank_output(
     )
 
 
-def test_collective_reduce_scatter_tensor_forwards_declared_arguments() -> None:
-    calls = []
-    output = torch.empty(2)
-    input_tensor = torch.ones(4)
-    group = object()
-    op = object()
-    work = object()
-
-    def reduce_scatter_tensor(
-        output_tensor: torch.Tensor,
-        input_tensor: torch.Tensor,
-        *,
-        op: object,
-        group: object,
-        async_op: bool,
-    ) -> object:
-        calls.append({
-            "output_tensor": output_tensor,
-            "input_tensor": input_tensor,
-            "op": op,
-            "group": group,
-            "async_op": async_op,
-        })
-
-        return work
-
-    result = collective_reduce_scatter_tensor(
-        reduce_scatter_tensor,
-        output,
-        input_tensor,
-        op=op,
-        group=group,
-        async_op=False,
-    )
-
-    assert result is work
-    assert calls == [
-        {
-            "output_tensor": output,
-            "input_tensor": input_tensor,
-            "op": op,
-            "group": group,
-            "async_op": False,
-        }
-    ]
-
-
-def test_collective_all_to_all_single_forwards_declared_arguments() -> None:
-    calls = []
-    output = torch.empty(4)
-    input_tensor = torch.ones(4)
-    group = object()
-    output_split_sizes = [1, 3]
-    input_split_sizes = [2, 2]
-    work = object()
-
-    def all_to_all_single(
-        output_tensor: torch.Tensor,
-        input_tensor: torch.Tensor,
-        *,
-        output_split_sizes: list[int],
-        input_split_sizes: list[int],
-        group: object,
-        async_op: bool,
-    ) -> object:
-        calls.append({
-            "output_tensor": output_tensor,
-            "input_tensor": input_tensor,
-            "output_split_sizes": output_split_sizes,
-            "input_split_sizes": input_split_sizes,
-            "group": group,
-            "async_op": async_op,
-        })
-
-        return work
-
-    result = collective_all_to_all_single(
-        all_to_all_single,
-        output,
-        input_tensor,
-        output_split_sizes=output_split_sizes,
-        input_split_sizes=input_split_sizes,
-        group=group,
-        async_op=True,
-    )
-
-    assert result is work
-    assert calls == [
-        {
-            "output_tensor": output,
-            "input_tensor": input_tensor,
-            "output_split_sizes": output_split_sizes,
-            "input_split_sizes": input_split_sizes,
-            "group": group,
-            "async_op": True,
-        }
-    ]
-
-
 def test_wait_collective_waits_on_work_handle() -> None:
     work = RecordingWork("done")
 
@@ -1992,51 +1229,72 @@ def recording_tensor_tree(tensor: torch.Tensor) -> TensorTree:
     return {"w": tensor}
 
 
-def test_distributed_strategy_axis_validates_modes() -> None:
+def test_distributed_strategy_axis_rejects_unsupported_modes() -> None:
     policy = distributed_policy()
-    axis = distributed_strategy_axis(("fsdp2", "tensor_parallel"), policy=policy)
-
-    assert axis.adapter_id == "vptune.distributed"
-    assert axis.allowed_values == ("fsdp2", "tensor_parallel")
-    assert axis.signature()["has_admission_rule"] is True
 
     with pytest.raises(AdmissionError):
         distributed_strategy_axis(("single_device",), policy=policy)
 
 
-def test_distributed_strategy_axis_records_admission_identity() -> None:
-    first = distributed_strategy_axis(("fsdp2",), policy=distributed_policy())
-    second = distributed_strategy_axis(
-        ("fsdp2",),
-        policy=distributed_policy(hook_entry_policy="layer-forward"),
-    )
-
-    assert first.signature()["identity"]["adapter_id"] == "vptune.distributed"
-    assert first.signature()["identity"] != second.signature()["identity"]
-
-
-def test_distributed_axis_manifest_returns_strategy_axis() -> None:
-    policy = distributed_policy()
-    axis = distributed_axis_manifest(("fsdp2", "tensor_parallel"), policy=policy)
-
-    assert axis.name == "distributed.strategy"
-    assert axis.allowed_values == ("fsdp2", "tensor_parallel")
-    assert axis.identity == policy.signature()
-
-
-def test_distributed_strategy_axis_owns_optional_admission_fields() -> None:
-    registry = vpx.AxisRegistry()
-    registry.register(
-        distributed_strategy_axis(
-            ("fsdp2", "tensor_parallel"),
-            policy=distributed_policy(),
-        )
+def test_distributed_adapter_registry_admits_owned_axes_and_strategy_fields() -> None:
+    registry = distributed_axis_registry(
+        ("fsdp2", "tensor_parallel"),
+        policy=distributed_policy(),
     )
     fsdp = Candidate("family", "fsdp", valid_fsdp_settings())
     tensor_parallel = Candidate("family", "tensor-parallel", valid_layout_settings())
+    orphan_fsdp = Candidate(
+        "family",
+        "orphan-fsdp",
+        {"fsdp.wrap_granularity": "root"},
+    )
 
     assert registry.admit(fsdp).admission_status == "passed"
     assert registry.admit(tensor_parallel).admission_status == "passed"
+    assert registry.admit(orphan_fsdp).admission_status == "failed"
+
+
+def test_distributed_adapter_registry_admits_direct_fsdp_reshard_group_sizes() -> None:
+    registry = distributed_axis_registry(
+        ("fsdp2",),
+        policy=distributed_policy(),
+    )
+    direct_group_size = Candidate(
+        "family",
+        "direct-group-size",
+        {**valid_fsdp_settings(), "fsdp.reshard_after_forward": 3},
+    )
+    old_marker = Candidate(
+        "family",
+        "old-marker",
+        {
+            **valid_fsdp_settings(),
+            "fsdp.reshard_after_forward": "positive_integer_group_size",
+        },
+    )
+    zero_group_size = Candidate(
+        "family",
+        "zero-group-size",
+        {**valid_fsdp_settings(), "fsdp.reshard_after_forward": 0},
+    )
+    bool_group_size = Candidate(
+        "family",
+        "bool-group-size",
+        {**valid_fsdp_settings(), "fsdp.reshard_after_forward": True},
+    )
+    policy_without_integer_domain = distributed_axis_registry(
+        ("fsdp2",),
+        policy=distributed_policy(fsdp_reshard_after_forward=("true", "false")),
+    )
+
+    assert registry.admit(direct_group_size).admission_status == "passed"
+    assert registry.admit(old_marker).admission_status == "failed"
+    assert registry.admit(zero_group_size).admission_status == "failed"
+    assert registry.admit(bool_group_size).admission_status == "failed"
+    assert (
+        policy_without_integer_domain.admit(direct_group_size).admission_status
+        == "failed"
+    )
 
 
 def test_fsdp2_admission_requires_hook_entry_and_rejects_bypass() -> None:
@@ -2332,7 +1590,7 @@ def test_distributed_strategy_applier_lowers_fsdp2_row_settings() -> None:
         **distributed_base_settings(),
         "fsdp.hook_entry_points": ("0.forward",),
         "fsdp.wrap_granularity": "transformer_block",
-        "fsdp.reshard_after_forward": "positive_integer_group_size",
+        "fsdp.reshard_after_forward": 3,
         "fsdp.shard_placement_fn": "declared_fn",
         "fsdp.mp_policy.param_dtype": "bf16",
         "fsdp.mp_policy.reduce_dtype": "fp16",
@@ -2392,6 +1650,40 @@ def test_distributed_strategy_applier_lowers_fsdp2_row_settings() -> None:
     assert fully_shard_call["target"] == [model[0]]
     assert fully_shard_call["reshard_after_forward"] == 3
     assert fully_shard_call["shard_placement_fn"]
+
+
+def test_distributed_strategy_applier_lowers_fsdp2_prefetch_settings() -> None:
+    events = []
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    settings = {
+        **valid_fsdp_settings(),
+        **distributed_base_settings(),
+        "fsdp.forward_prefetch": "next-forward",
+        "fsdp.backward_prefetch": "backward-pre",
+    }
+    candidate = Candidate("gradient", "fsdp-prefetch", settings)
+    applier = distributed_strategy_applier(distributed_bindings(events))
+
+    assert admit_distributed_candidate(candidate, policy=distributed_policy()) == (
+        True,
+        None,
+    )
+    result = applier(model, candidate)
+
+    assert isinstance(result, torch.nn.Module)
+    sharded = next(
+        event["module"] for event in events if event["kind"] == "forward_prefetch"
+    )
+    assert {
+        "kind": "forward_prefetch",
+        "module": sharded,
+        "policy": "next-forward",
+    } in events
+    assert {
+        "kind": "backward_prefetch",
+        "module": sharded,
+        "policy": "backward-pre",
+    } in events
 
 
 def test_distributed_strategy_applier_lowers_fsdp2_block_group_wrap() -> None:
@@ -2590,7 +1882,7 @@ def test_distributed_operation_factory_wraps_loss_parallel_from_bindings() -> No
     events = []
     model = TinyDistributedScalarModule()
     factory = distributed_operation_factory(
-        gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         params=dict(model.named_parameters()),
         buffers=dict(model.named_buffers()),
@@ -2657,7 +1949,7 @@ def test_distributed_operation_factory_applies_strategy_and_runs_module() -> Non
     model = TinyDistributedScalarModule()
     applier = RecordingStrategyApplier()
     factory = distributed_operation_factory(
-        gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         strategy_applier=applier,
         params=dict(model.named_parameters()),
@@ -2687,7 +1979,7 @@ def test_distributed_operation_factory_delegates_dtensor_layout_to_strategy() ->
     model = TinyDistributedScalarModule()
     applier = RecordingStrategyApplier()
     factory = distributed_operation_factory(
-        gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         strategy_applier=applier,
         params=dict(model.named_parameters()),
@@ -2743,7 +2035,7 @@ def test_distributed_reference_check_uses_single_device_anchor() -> None:
         return (params["w"] * batch["scale"]).sum()
 
     check = distributed_reference_check(
-        gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         reference_model=reference_model,
         params=dict(reference_model.named_parameters()),
         buffers=dict(reference_model.named_buffers()),
@@ -2794,7 +2086,7 @@ def test_distributed_runtime_config_records_rank_selection_metadata() -> None:
         admission_status="passed",
     )
     runtime = distributed_runtime_config(
-        gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         model=model,
         reference_model=reference_model,
         strategy_applier=applier,

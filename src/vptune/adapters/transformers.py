@@ -26,6 +26,8 @@ from vptune.data import (
     Batch,
     BufferTree,
     CallableMaterializer,
+    CallableOperationFactory,
+    CallableReferenceCheck,
     Candidate,
     CandidateAdmitter,
     CandidateOperation,
@@ -85,6 +87,14 @@ TRANSFORMERS_ATTENTION_FRONTENDS = (
     *FLASH_ATTENTION_FRONTENDS,
     *CUSTOM_ATTENTION_FRONTENDS,
 )
+PUBLIC_ATTENTION_FRONTEND_ALIASES = {
+    "eager": "transformers_eager",
+    "sdpa": "transformers_sdpa",
+    "flash_attention_2": "transformers_flash_attention_2",
+    "flash_attention_3": "transformers_flash_attention_3",
+    "flash_attention_4": "transformers_flash_attention_4",
+    "flex_attention": "transformers_flex_attention",
+}
 SDPA_KERNELS = (
     "math",
     "flash_attention",
@@ -121,14 +131,9 @@ TRANSFORMERS_RUNTIME_SETTINGS = (
     "attention.sdpa_priority_list",
     "attention.custom_kernel_id",
     "attention.mask_formatter_id",
-    "use_cache",
     "output_attentions",
     "module_mode",
     "dropout_p",
-    "enable_gqa",
-    "query_heads",
-    "key_heads",
-    "value_heads",
 )
 COMPILE_RUNTIME_SETTINGS = (
     "compile.enabled",
@@ -185,6 +190,128 @@ class TransformersAttentionPolicy:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class TransformersAttentionSpace:
+    """Public search-space component for Transformers attention frontends."""
+
+    frontends: tuple[str, ...]
+    policy: TransformersAttentionPolicy
+    sdpa_kernel: str
+    module_mode: str
+    dropout_p: float
+    sdpa_priority_list: tuple[str, ...] = ()
+    attention_custom_kernel_id: str | None = None
+    mask_formatter_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate frontend and admission fields.
+
+        Raises:
+            AdmissionError: If an attention field is invalid.
+        """
+        normalized = _normalize_public_attention_frontends(self.frontends)
+
+        if self.sdpa_kernel not in SDPA_KERNELS:
+            message = f"unsupported SDPA kernel: {self.sdpa_kernel}"
+            raise AdmissionError(message)
+
+        if self.module_mode not in {"train", "eval"}:
+            message = f"unsupported module_mode: {self.module_mode}"
+            raise AdmissionError(message)
+
+        if not isinstance(self.dropout_p, float | int) or self.dropout_p < 0.0:
+            message = "dropout_p must be a nonnegative number"
+            raise AdmissionError(message)
+
+        if self.module_mode == "eval" and not math.isclose(
+            float(self.dropout_p),
+            0.0,
+        ):
+            message = "eval attention rows require dropout_p=0.0"
+            raise AdmissionError(message)
+
+        if self.sdpa_kernel == "priority_list":
+            _require_sdpa_priority_list(self.sdpa_priority_list)
+        elif self.sdpa_priority_list:
+            message = "attention.sdpa_priority_list requires priority_list"
+            raise AdmissionError(message)
+
+        if "registered_transformers_attention" in normalized:
+            if self.attention_custom_kernel_id is None:
+                message = "registered attention requires attention_custom_kernel_id"
+                raise AdmissionError(message)
+
+            if self.mask_formatter_id is None:
+                message = "registered attention requires mask_formatter_id"
+                raise AdmissionError(message)
+
+        object.__setattr__(self, "frontends", normalized)
+        object.__setattr__(self, "dropout_p", float(self.dropout_p))
+        object.__setattr__(
+            self,
+            "sdpa_priority_list",
+            tuple(self.sdpa_priority_list),
+        )
+
+    def axes_for(self, operator: object) -> Mapping[str, Sequence[Any]]:
+        """Return adapter attention axes for a public operator."""
+        _ = operator
+
+        return {"transformers_attention_frontend": _attention_axis_values(self)}
+
+    def axis_descriptors(self) -> tuple[AxisDescriptor, ...]:
+        """Return adapter descriptors registered by this component."""
+        return (_attention_space_axis(self),)
+
+    def settings_for(self, operator: object) -> Mapping[str, Any]:
+        """Return fixed admission settings for generated attention rows."""
+        _ = operator
+        settings = dict[str, Any]()
+        settings["module_mode"] = self.module_mode
+        settings["dropout_p"] = self.dropout_p
+
+        if self.sdpa_kernel == "priority_list":
+            settings["attention.sdpa_priority_list"] = self.sdpa_priority_list
+
+        if self.attention_custom_kernel_id is not None:
+            settings["attention.custom_kernel_id"] = self.attention_custom_kernel_id
+
+        if self.mask_formatter_id is not None:
+            settings["attention.mask_formatter_id"] = self.mask_formatter_id
+
+        return settings
+
+
+def attention_space(
+    *,
+    frontends: Sequence[str],
+    sdpa_kernel: str = "math",
+    module_mode: str = "eval",
+    dropout_p: float = 0.0,
+    sdpa_priority_list: Sequence[str] = (),
+    attention_custom_kernel_id: str | None = None,
+    mask_formatter_id: str | None = None,
+    policy: TransformersAttentionPolicy | None = None,
+) -> TransformersAttentionSpace:
+    """Build a public search-space component for Transformers attention.
+
+    Returns:
+        Transformers attention search-space component.
+    """
+    attention_policy = _public_attention_policy() if policy is None else policy
+
+    return TransformersAttentionSpace(
+        frontends=tuple(frontends),
+        policy=attention_policy,
+        sdpa_kernel=sdpa_kernel,
+        module_mode=module_mode,
+        dropout_p=dropout_p,
+        sdpa_priority_list=tuple(sdpa_priority_list),
+        attention_custom_kernel_id=attention_custom_kernel_id,
+        mask_formatter_id=mask_formatter_id,
+    )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class TransformersModelIdentity:
     """Serializable identity for a Transformers model adapter."""
 
@@ -231,6 +358,13 @@ class TransformersAttentionConfigurable(Protocol):
 
     def set_attn_implementation(self, attn_implementation: str) -> None:
         """Set the active Transformers attention implementation."""
+
+
+class TransformersMaskConfigurable(Protocol):
+    """Object with a Transformers attention-mask formatter switch method."""
+
+    def set_attention_mask_formatter(self, mask_formatter_id: str) -> None:
+        """Set the active Transformers attention-mask formatter."""
 
 
 class TransformersRegistry(Protocol):
@@ -317,6 +451,21 @@ def set_transformers_attention_implementation(
     model.set_attn_implementation(attn_implementation)
 
     return attn_implementation
+
+
+def set_transformers_attention_mask_formatter(
+    model: TransformersMaskConfigurable,
+    *,
+    mask_formatter_id: str,
+) -> str:
+    """Set the active Transformers attention-mask formatter.
+
+    Returns:
+        Mask formatter id sent to the model.
+    """
+    model.set_attention_mask_formatter(mask_formatter_id)
+
+    return mask_formatter_id
 
 
 def register_transformers_attention(
@@ -665,6 +814,38 @@ def transformers_runtime_config(
         transformer_block_paths=transformer_block_paths,
         attention_module_paths=attention_module_paths,
     )
+    runtime_signature = {
+        "runtime": "transformers",
+        "operator": operator.signature(),
+        "model": module_identity(model),
+        "params": tree_signature(params),
+        "buffers": tree_signature(buffers),
+        "parameter_surface": (
+            None if parameter_surface is None else parameter_surface.signature()
+        ),
+        "thresholds": dict(thresholds),
+        "numeric_bound_fields": {}
+        if numeric_bound_fields is None
+        else dict(numeric_bound_fields),
+        "objective": dict(objective_signature),
+        "module_call": module_call.signature(),
+        "transformer_block_paths": tuple(transformer_block_paths),
+        "attention_module_paths": tuple(attention_module_paths),
+    }
+    operation_factory = CallableOperationFactory(
+        "vptune.transformers_operation_factory",
+        PACKAGE_VERSION,
+        runtime_signature,
+        {"callback": "vptune.adapters.transformers.transformers_operation_factory"},
+        operation_factory,
+    )
+    reference_check = CallableReferenceCheck(
+        "vptune.transformers_reference_check",
+        PACKAGE_VERSION,
+        runtime_signature,
+        {"callback": "vptune.adapters.transformers.transformers_reference_check"},
+        reference_check,
+    )
     full_size_check = transformers_full_size_check(
         operation_factory=operation_factory,
         reference_check=reference_check,
@@ -673,7 +854,8 @@ def transformers_runtime_config(
     materializer = CallableMaterializer(
         "vptune.transformers_runtime",
         PACKAGE_VERSION,
-        {"operation_factory": "transformers_operation_factory"},
+        {"operation_factory": dict(operation_factory.identity())},
+        {"callback": "_materialize_transformers_selected"},
         lambda candidate, record: _materialize_transformers_selected(
             operation_factory,
             candidate,
@@ -688,24 +870,7 @@ def transformers_runtime_config(
         materializer=materializer,
         axis_registry=axis_registry,
         reference_check_name="standard_anchor",
-        signature={
-            "runtime": "transformers",
-            "operator": operator.signature(),
-            "model": module_identity(model),
-            "params": tree_signature(params),
-            "buffers": tree_signature(buffers),
-            "parameter_surface": (
-                None if parameter_surface is None else parameter_surface.signature()
-            ),
-            "thresholds": dict(thresholds),
-            "numeric_bound_fields": {}
-            if numeric_bound_fields is None
-            else dict(numeric_bound_fields),
-            "objective": dict(objective_signature),
-            "module_call": module_call.signature(),
-            "transformer_block_paths": tuple(transformer_block_paths),
-            "attention_module_paths": tuple(attention_module_paths),
-        },
+        signature=runtime_signature,
         full_size_check=full_size_check,
     )
 
@@ -749,14 +914,22 @@ def _configure_transformers_runtime(
     *,
     attention_custom_kernel_id: str | None,
 ) -> None:
+    _require_transformers_runtime_row_settings(candidate.settings)
     attention_frontend = candidate.settings.get("attention.frontend")
 
     if isinstance(attention_frontend, str):
         set_transformers_attention_implementation(
             model,
             attention_frontend=attention_frontend,
-            attention_custom_kernel_id=attention_custom_kernel_id,
+            attention_custom_kernel_id=_runtime_attention_custom_kernel_id(
+                candidate.settings,
+                attention_custom_kernel_id,
+            ),
         )
+        mask_formatter_id = _runtime_attention_mask_formatter_id(candidate.settings)
+
+        if mask_formatter_id is not None:
+            _set_transformers_attention_mask_formatter(model, mask_formatter_id)
 
     module_mode = candidate.settings.get("module_mode")
 
@@ -775,6 +948,82 @@ def _configure_transformers_runtime(
 
     message = f"module_mode is unsupported: {module_mode}"
     raise AdmissionError(message)
+
+
+def _require_transformers_runtime_row_settings(settings: Mapping[str, Any]) -> None:
+    if "use_cache" in settings:
+        message = "use_cache is a Transformers model-load setting"
+        raise AdmissionError(message)
+
+    if settings.get("output_attentions") is True:
+        message = "output_attentions=True requires an attention-weights output surface"
+        raise AdmissionError(message)
+
+
+def _runtime_attention_custom_kernel_id(
+    settings: Mapping[str, Any],
+    configured_id: str | None,
+) -> str | None:
+    row_id = settings.get("attention.custom_kernel_id")
+    mask_id = settings.get("attention.mask_formatter_id")
+
+    if settings.get("attention.frontend") != "registered_transformers_attention":
+        if row_id is not None or mask_id is not None:
+            message = (
+                "registered attention ids apply only to "
+                "registered_transformers_attention"
+            )
+            raise AdmissionError(message)
+
+        return configured_id
+
+    error = _registered_attention_ids_error(settings)
+
+    if error is not None:
+        raise AdmissionError(error)
+
+    if configured_id is not None and configured_id != row_id:
+        message = (
+            "runtime attention_custom_kernel_id must match attention.custom_kernel_id"
+        )
+        raise AdmissionError(message)
+
+    return row_id
+
+
+def _runtime_attention_mask_formatter_id(
+    settings: Mapping[str, Any],
+) -> str | None:
+    if settings.get("attention.frontend") != "registered_transformers_attention":
+        return None
+
+    error = _registered_attention_ids_error(settings)
+
+    if error is not None:
+        raise AdmissionError(error)
+
+    value = settings["attention.mask_formatter_id"]
+
+    if not isinstance(value, str):
+        message = "attention.mask_formatter_id must be a string"
+        raise AdmissionError(message)
+
+    return value
+
+
+def _set_transformers_attention_mask_formatter(
+    model: Any,
+    mask_formatter_id: str,
+) -> None:
+    setter = getattr(model, "set_attention_mask_formatter", None)
+
+    if not callable(setter):
+        message = (
+            "registered_transformers_attention requires set_attention_mask_formatter"
+        )
+        raise AdmissionError(message)
+
+    setter(mask_formatter_id)
 
 
 @contextlib.contextmanager
@@ -1133,19 +1382,12 @@ def transformers_attention_axis(
         settings_keys=("attention.frontend",),
         allowed_values=tuple(frontends),
         optional_settings_keys=(
-            "attention.sdpa_kernel",
             "attention.sdpa_priority_list",
             "attention.custom_kernel_id",
             "attention.mask_formatter_id",
-            "dtype.parameter_storage",
-            "dtype.model_compute",
             "output_attentions",
             "module_mode",
             "dropout_p",
-            "enable_gqa",
-            "query_heads",
-            "key_heads",
-            "value_heads",
         ),
         adapter_id="vptune.transformers",
         adapter_version=PACKAGE_VERSION,
@@ -1154,6 +1396,133 @@ def transformers_attention_axis(
             policy=policy,
         ),
         identity=policy.signature(),
+    )
+
+
+def transformers_manifest_attention_axis() -> AxisDescriptor:
+    """Return the Transformers attention descriptor for the package manifest."""
+    return transformers_attention_axis(
+        TRANSFORMERS_ATTENTION_FRONTENDS,
+        policy=_transformers_manifest_attention_policy(),
+    )
+
+
+def _attention_space_axis(space: TransformersAttentionSpace) -> AxisDescriptor:
+    optional_keys = (
+        "module_mode",
+        "dropout_p",
+        "attention.sdpa_priority_list",
+        "attention.custom_kernel_id",
+        "attention.mask_formatter_id",
+        "output_attentions",
+    )
+
+    return AxisDescriptor(
+        name="transformers_attention_frontend",
+        settings_keys=("attention.frontend", "attention.sdpa_kernel"),
+        allowed_values=_attention_axis_values(space),
+        optional_settings_keys=optional_keys,
+        adapter_id="vptune.transformers",
+        adapter_version=PACKAGE_VERSION,
+        admission_rule=lambda candidate: admit_transformers_attention(
+            candidate,
+            policy=space.policy,
+        ),
+        identity={
+            "policy": space.policy.signature(),
+            "frontends": space.frontends,
+            "sdpa_kernel": space.sdpa_kernel,
+        },
+    )
+
+
+def _attention_axis_values(
+    space: TransformersAttentionSpace,
+) -> tuple[Mapping[str, Any], ...]:
+    return tuple(
+        {
+            "attention.frontend": frontend,
+            "attention.sdpa_kernel": (
+                space.sdpa_kernel if frontend in SDPA_ATTENTION_FRONTENDS else None
+            ),
+        }
+        for frontend in space.frontends
+    )
+
+
+def _normalize_public_attention_frontends(
+    frontends: Sequence[str],
+) -> tuple[str, ...]:
+    if not frontends:
+        message = "attention frontends must be nonempty"
+        raise AdmissionError(message)
+
+    normalized = []
+
+    for frontend in frontends:
+        if not isinstance(frontend, str) or not frontend:
+            message = "attention frontend must be a nonempty string"
+            raise AdmissionError(message)
+
+        value = PUBLIC_ATTENTION_FRONTEND_ALIASES.get(frontend, frontend)
+
+        if value not in TRANSFORMERS_ATTENTION_FRONTENDS:
+            message = f"unsupported Transformers attention frontend: {frontend}"
+            raise AdmissionError(message)
+
+        if value in normalized:
+            message = f"duplicate Transformers attention frontend: {frontend}"
+            raise AdmissionError(message)
+
+        normalized.append(value)
+
+    return tuple(normalized)
+
+
+def _require_sdpa_priority_list(priority_list: Sequence[str]) -> None:
+    if (
+        not isinstance(priority_list, Sequence)
+        or isinstance(priority_list, str)
+        or not priority_list
+    ):
+        message = "attention.sdpa_priority_list must be a nonempty sequence"
+        raise AdmissionError(message)
+
+    for kernel in priority_list:
+        if not isinstance(kernel, str):
+            message = "attention.sdpa_priority_list entries must be strings"
+            raise AdmissionError(message)
+
+        if kernel not in SDPA_KERNELS or kernel == "priority_list":
+            message = f"invalid SDPA priority-list entry: {kernel}"
+            raise AdmissionError(message)
+
+
+def _public_attention_policy() -> TransformersAttentionPolicy:
+    return TransformersAttentionPolicy(
+        model_config_hash="public_attention_space",
+        use_cache=False,
+        softcap={},
+        mask_semantics="boolean_keep_mask",
+        causal_policy="causal",
+        backend_numeric_policy={"backend": "sdpa"},
+        determinism={"deterministic": True},
+        padding_limit=1,
+        forced_kernel_available=True,
+    )
+
+
+def _transformers_manifest_attention_policy() -> TransformersAttentionPolicy:
+    return TransformersAttentionPolicy(
+        model_config_hash="manifest",
+        use_cache=False,
+        softcap={"logit_softcap": 30.0},
+        mask_semantics="boolean_keep_mask",
+        causal_policy="causal",
+        backend_numeric_policy={"backend": "sdpa"},
+        determinism={"deterministic": True},
+        padding_limit=1,
+        forced_kernel_available=True,
     )
 
 
@@ -1204,9 +1573,6 @@ def _attention_error(
 
     if error is None:
         error = _eval_dropout_error(candidate.settings)
-
-    if error is None:
-        error = _gqa_error(candidate.settings)
 
     if error is None:
         error = _registered_attention_error(candidate.settings, attention_frontend)
@@ -1399,33 +1765,6 @@ def _eval_dropout_error(settings: Mapping[str, Any]) -> str | None:
         return None
 
     return "eval attention references require dropout_p=0.0"
-
-
-def _gqa_error(settings: Mapping[str, Any]) -> str | None:
-    if settings.get("enable_gqa") is not True:
-        return None
-
-    query_heads = settings.get("query_heads")
-    key_heads = settings.get("key_heads")
-    value_heads = settings.get("value_heads")
-
-    if (
-        not isinstance(query_heads, int)
-        or not isinstance(key_heads, int)
-        or not isinstance(value_heads, int)
-    ):
-        return "GQA admission requires integer head counts"
-
-    if key_heads <= 0 or value_heads <= 0:
-        return "GQA key and value head counts must be positive"
-
-    if key_heads != value_heads:
-        return "GQA requires key_heads equal to value_heads"
-
-    if query_heads % key_heads != 0:
-        return "GQA requires query_heads divisible by key_heads"
-
-    return None
 
 
 def _registered_attention_error(

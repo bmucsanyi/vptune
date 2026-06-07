@@ -394,9 +394,17 @@ Owned axes:
 - `per_example_gradient.grad_path`: `torch_autograd_grad_loop`, `torch_func_grad`, `vmap_grad`, `backward_materialized_grad`
 - `per_example_gradient.accumulation`: `stacked_leading_axis`, `blockwise_stacked`
 
-Shared axes that apply: vectorization (the per-example axis), model call, batching and
-chunking, memory schedule, dtype and numeric backend, torch compile, parameter and
-vector layout, distributed execution.
+The returned tree is the same fixed object for both `accumulation` values; only the
+computation differs. `stacked_leading_axis` materializes all $n$ per-example gradients and
+stacks them into the leading-axis tree. `blockwise_stacked` computes them in example-blocks
+of `batch.per_example_block_size` and writes each block into the preallocated output,
+bounding peak memory; it requires `batch.per_example_block_size`, which `stacked_leading_axis`
+does not read. The per-example mapping is owned by `grad_path`; this family has no vector
+dimension, so the `vectorization.*` axis does not apply.
+
+Shared axes that apply: model call, batching and chunking (the example-block size is
+`batch.per_example_block_size`), memory schedule, dtype and numeric backend, torch compile,
+parameter and vector layout, distributed execution.
 
 Mandatory checks:
 
@@ -768,6 +776,7 @@ families named in the key.
 - `batch.ggn_batch_size`
 - `batch.fisher_sample_batch_size`
 - `batch.empirical_example_batch_size`
+- `batch.per_example_block_size`
 - `chunk.token_block_size`
 - `chunk.sequence_position_block_size`
 - `chunk.class_block_size_with_exact_global_normalization`

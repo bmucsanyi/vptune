@@ -14,34 +14,28 @@ from vptune.cohorts import candidate_matches_assignment, cohort_assignments
 from vptune.data import (
     AutobatchDomain,
     Batch,
-    BufferTree,
     Candidate,
     CandidateOperation,
     CheckRecord,
     CohortAssignment,
     CohortConstraint,
-    DataProvider,
     Family,
     FullSizeRecord,
-    FunctionObjective,
     Materializer,
     Measurement,
     OperatorSpec,
-    ParameterSurface,
-    ParameterTree,
     Plan,
     PlanValidationContext,
     PlanValidator,
     Problem,
+    ReferenceCheck,
     ReferenceResult,
     ReplayContext,
     RuntimeConfig,
-    ScalarObjective,
     SelectionPolicy,
     Target,
     TimingPolicy,
     TuningRun,
-    VectorProvider,
 )
 from vptune.errors import (
     AdmissionError,
@@ -59,7 +53,12 @@ from vptune.measure import (
     measure_once,
     run_candidate,
 )
-from vptune.runtime import deferred_runtime_finite_checks, standard_problem
+from vptune.runtime import (
+    CompositionChild,
+    composition_runtime_config,
+    deferred_runtime_finite_checks,
+    standard_runtime_with_matrix_free_bindings,
+)
 from vptune.schemas import (
     candidate_from_signature,
     candidate_record_from_json,
@@ -99,6 +98,7 @@ class _RunCohortState:
     cohort: Mapping[str, tuple[Candidate, FullSizeRecord]]
     input_signature: Mapping[str, Any]
     materializers: Mapping[str, Any]
+    runtime_identities: Mapping[str, Mapping[str, Any]]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -498,7 +498,7 @@ def _fusion_binding_error(
         if settings.get(key) not in values:
             continue
 
-        if runtime_signature.get("fusion_rewriter") is not True:
+        if not _runtime_callback_present(runtime_signature, "fusion_rewriter"):
             return f"{key} requires a registered fused implementation"
 
         if runtime_signature.get("module") is not True:
@@ -518,7 +518,10 @@ def _batch_layout_binding_error(
         or settings.get("schedule.per_token") == "packed"
     )
 
-    if uses_batch_layout and runtime_signature.get("batch_layout") is not True:
+    if uses_batch_layout and not _runtime_callback_present(
+        runtime_signature,
+        "batch_layout",
+    ):
         return "declared input layout requires a batch_layout binding"
 
     return None
@@ -576,9 +579,8 @@ def _lm_head_binding_error(
     settings: Mapping[str, Any],
     runtime_signature: Mapping[str, Any],
 ) -> str | None:
-    if (
-        "chunk.lm_head_weight_chunk_bytes" in settings
-        and runtime_signature.get("lm_head_chunker") is not True
+    if "chunk.lm_head_weight_chunk_bytes" in settings and not _runtime_callback_present(
+        runtime_signature, "lm_head_chunker"
     ):
         return "chunk.lm_head_weight_chunk_bytes requires an LM-head chunker binding"
 
@@ -589,7 +591,7 @@ def _mmap_binding_error(
     settings: Mapping[str, Any],
     runtime_signature: Mapping[str, Any],
 ) -> str | None:
-    if runtime_signature.get("mmap_residency") is True:
+    if _runtime_callback_present(runtime_signature, "mmap_residency"):
         return None
 
     for key in ("memory.vector_residency", "memory.factor_residency"):
@@ -612,9 +614,6 @@ def _intermediate_residency_binding_error(
     if operator_kind in {"composition", "ggnvp"}:
         return None
 
-    if runtime_signature.get("intermediate_residency") is True:
-        return None
-
     return "memory.intermediate_residency requires named intermediate boundaries"
 
 
@@ -634,10 +633,10 @@ def _activation_hook_binding_error(
     pack_hooks = runtime_signature.get("activation_pack_hooks")
     unpack_hooks = runtime_signature.get("activation_unpack_hooks")
 
-    if not isinstance(pack_hooks, tuple) or pack_hook_id not in pack_hooks:
+    if pack_hook_id not in _runtime_callback_ids(pack_hooks):
         return f"activation pack hook is not registered: {pack_hook_id}"
 
-    if not isinstance(unpack_hooks, tuple) or unpack_hook_id not in unpack_hooks:
+    if unpack_hook_id not in _runtime_callback_ids(unpack_hooks):
         return f"activation unpack hook is not registered: {unpack_hook_id}"
 
     return None
@@ -657,10 +656,7 @@ def _checkpoint_context_binding_error(
 
     checkpoint_contexts = runtime_signature.get("checkpoint_contexts")
 
-    if (
-        not isinstance(checkpoint_contexts, tuple)
-        or context_id not in checkpoint_contexts
-    ):
+    if context_id not in _runtime_callback_ids(checkpoint_contexts):
         return f"checkpoint context is not registered: {context_id}"
 
     return None
@@ -670,13 +666,34 @@ def _teacher_objective_binding_error(
     settings: Mapping[str, Any],
     runtime_signature: Mapping[str, Any],
 ) -> str | None:
-    if (
-        settings.get("teacher_outputs") == "recomputed_with_equality_check"
-        and runtime_signature.get("teacher_objective") is not True
+    if settings.get(
+        "teacher_outputs"
+    ) == "recomputed_with_equality_check" and not _runtime_callback_present(
+        runtime_signature, "teacher_objective"
     ):
         return "recomputed teacher outputs require a teacher objective"
 
     return None
+
+
+def _runtime_callback_present(
+    runtime_signature: Mapping[str, Any],
+    key: str,
+) -> bool:
+    value = runtime_signature.get(key)
+
+    return value is not None and value is not False
+
+
+def _runtime_callback_ids(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        return ()
+
+    return tuple(
+        item["id"]
+        for item in value
+        if isinstance(item, Mapping) and isinstance(item.get("id"), str)
+    )
 
 
 def _call_core_settings_binding_error(settings: Mapping[str, Any]) -> str | None:
@@ -1292,6 +1309,306 @@ def _with_dependency_identities(
     )
 
 
+def _with_selected_composition_children(
+    problem: Problem,
+    dependencies: tuple[str, ...],
+    selected: dict[str, Candidate],
+    records: dict[str, FullSizeRecord],
+    materializers: dict[str, Any],
+    problems_by_family: Mapping[str, Problem],
+) -> Problem:
+    if problem.operator.kind != "composition":
+        return problem
+
+    child_order = _composition_child_order(problem.operator)
+
+    if set(dependencies) != set(child_order):
+        return problem
+
+    runtime = _runtime(problem)
+    children = tuple(
+        _selected_composition_child(
+            child,
+            selected,
+            records,
+            materializers,
+            problems_by_family,
+        )
+        for child in child_order
+    )
+    components = {child.name: child.component for child in children}
+    anchor_components = {child.name: child.anchor_component for child in children}
+    component_signature = {
+        child: _dependency_identity(
+            child,
+            selected[child],
+            records[child],
+            materializers[child].identity(),
+        )
+        for child in child_order
+    }
+    bound_runtime = composition_runtime_config(
+        problem.operator,
+        components=components,
+        anchor_components=anchor_components,
+        children=children,
+        candidates=runtime.candidates,
+        thresholds=_composition_thresholds(runtime),
+        component_signature=component_signature,
+        anchor_component_signature=component_signature,
+        axis_registry=runtime.axis_registry,
+        numeric_bound_fields=_composition_numeric_bound_fields(runtime),
+    )
+
+    return dataclasses.replace(problem, runtime=bound_runtime)
+
+
+def _with_run_dependencies(
+    problem: Problem,
+    dependencies: tuple[str, ...],
+    selected: dict[str, Candidate],
+    records: dict[str, FullSizeRecord],
+    materializers: dict[str, Any],
+    problems_by_family: Mapping[str, Problem],
+) -> Problem:
+    problem_with_dependencies = _with_dependency_identities(
+        problem,
+        dependencies,
+        selected,
+        records,
+        materializers,
+    )
+    problem_with_dependencies = _with_selected_matrix_free_metric(
+        problem_with_dependencies,
+        dependencies,
+        selected,
+        records,
+        materializers,
+        problems_by_family,
+    )
+
+    return _with_selected_composition_children(
+        problem_with_dependencies,
+        dependencies,
+        selected,
+        records,
+        materializers,
+        problems_by_family,
+    )
+
+
+def _with_selected_matrix_free_metric(
+    problem: Problem,
+    dependencies: tuple[str, ...],
+    selected: dict[str, Candidate],
+    records: dict[str, FullSizeRecord],
+    materializers: dict[str, Any],
+    problems_by_family: Mapping[str, Problem],
+) -> Problem:
+    product = _matrix_free_metric_dependency(problem.operator)
+
+    if product is None:
+        return problem
+
+    if dependencies != (product,):
+        return problem
+
+    selected_component = materializers[product](selected[product], records[product])
+
+    if not callable(selected_component):
+        message = (
+            f"matrix_free dependency materializer returned non-callable: {product}"
+        )
+        raise MaterializationError(message)
+
+    component = _selected_matrix_free_component(
+        product,
+        problems_by_family[product],
+        selected_component,
+    )
+    binding_signature = {
+        product: _dependency_identity(
+            product,
+            selected[product],
+            records[product],
+            materializers[product].identity(),
+        )
+    }
+    runtime = standard_runtime_with_matrix_free_bindings(
+        _runtime(problem),
+        bindings={product: component},
+        binding_signature=binding_signature,
+    )
+
+    return dataclasses.replace(problem, runtime=runtime)
+
+
+def _selected_matrix_free_component(
+    product: str,
+    child_problem: Problem,
+    selected_component: Callable[[Batch, TensorTree], TensorTree],
+) -> Callable[[Batch, TensorTree], TensorTree]:
+    def component(batch: Batch, vector: TensorTree) -> TensorTree:
+        return selected_component(
+            _matrix_free_dependency_batch(product, child_problem, batch),
+            vector,
+        )
+
+    return component
+
+
+def _matrix_free_dependency_batch(
+    product: str,
+    child_problem: Problem,
+    batch: Batch,
+) -> Batch:
+    child_static_batch = child_problem.data.reference_batch(
+        product,
+        "matrix_free_dependency",
+    )
+
+    return {**dict(child_static_batch), **dict(batch)}
+
+
+def _matrix_free_metric_dependency(operator: OperatorSpec) -> str | None:
+    if operator.kind not in {
+        "metric",
+        "sqrt_metric",
+        "inverse_sqrt_metric",
+        "metric_inner",
+        "inverse_metric",
+        "inverse_metric_inner",
+    }:
+        return None
+
+    representation = operator.semantics.get("representation")
+
+    if not isinstance(representation, Mapping):
+        return None
+
+    if representation.get("kind") != "matrix_free":
+        return None
+
+    product = representation.get("operator")
+
+    if not isinstance(product, str) or not product:
+        message = "matrix_free metric requires a named sibling product"
+        raise MaterializationError(message)
+
+    return product
+
+
+def _selected_composition_child(
+    child: str,
+    selected: dict[str, Candidate],
+    records: dict[str, FullSizeRecord],
+    materializers: dict[str, Any],
+    problems_by_family: Mapping[str, Problem],
+) -> CompositionChild:
+    child_problem = problems_by_family[child]
+    selected_component = materializers[child](selected[child], records[child])
+
+    if not callable(selected_component):
+        message = f"composition child materializer returned non-callable: {child}"
+        raise MaterializationError(message)
+
+    component = _composition_child_component(child, child_problem, selected_component)
+    reference_check = _composition_child_reference_check(child, child_problem)
+
+    return CompositionChild(
+        name=child,
+        candidate=selected[child],
+        component=component,
+        anchor_component=component,
+        reference_check=reference_check,
+        input_signature=records[child].input_signature,
+    )
+
+
+def _composition_child_component(
+    child: str,
+    child_problem: Problem,
+    selected_component: Callable[[Batch, TensorTree], TensorTree],
+) -> Callable[[Batch, TensorTree], TensorTree]:
+    def component(batch: Batch, vector: TensorTree) -> TensorTree:
+        return selected_component(
+            _composition_child_batch(child, child_problem, batch),
+            vector,
+        )
+
+    return component
+
+
+def _composition_child_reference_check(
+    child: str,
+    child_problem: Problem,
+) -> ReferenceCheck:
+    child_runtime = _runtime(child_problem)
+
+    def reference_check(
+        candidate: Candidate,
+        batch: Batch,
+        vector: TensorTree,
+    ) -> ReferenceResult:
+        return child_runtime.reference_check(
+            candidate,
+            _composition_child_batch(child, child_problem, batch),
+            vector,
+        )
+
+    return reference_check
+
+
+def _composition_child_batch(
+    child: str,
+    child_problem: Problem,
+    batch: Batch,
+) -> Batch:
+    child_static_batch = child_problem.data.reference_batch(
+        child,
+        "composition_child",
+    )
+
+    return {**dict(child_static_batch), **dict(batch)}
+
+
+def _composition_child_order(operator: OperatorSpec) -> tuple[str, ...]:
+    children = operator.semantics.get("children")
+
+    if not isinstance(children, tuple):
+        message = "composition operator must declare tuple children"
+        raise MaterializationError(message)
+
+    return children
+
+
+def _composition_thresholds(runtime: RuntimeConfig) -> Mapping[str, float]:
+    thresholds = runtime.signature.get("thresholds")
+
+    if not isinstance(thresholds, Mapping):
+        message = "composition runtime thresholds are missing"
+        raise MaterializationError(message)
+
+    return {
+        key: value
+        for key, value in thresholds.items()
+        if isinstance(key, str) and isinstance(value, int | float)
+    }
+
+
+def _composition_numeric_bound_fields(runtime: RuntimeConfig) -> Mapping[str, Any]:
+    fields = runtime.signature.get("numeric_bound_fields")
+
+    if fields is None:
+        return {}
+
+    if not isinstance(fields, Mapping):
+        message = "composition numeric bound fields are invalid"
+        raise MaterializationError(message)
+
+    return fields
+
+
 def tune(
     problem: Problem,
     *,
@@ -1357,54 +1674,6 @@ def tune(
         _write_summary(run_dir, plan)
 
     return plan
-
-
-def autotune(
-    *,
-    model: Any,
-    parameter_surface: ParameterSurface,
-    parameter_values: ParameterTree,
-    buffers: BufferTree,
-    data: DataProvider,
-    operator: OperatorSpec,
-    vectors: VectorProvider,
-    target: Target,
-    candidates: Mapping[str, Mapping[str, Any]],
-    thresholds: Mapping[str, float],
-    objective_signature: Mapping[str, Any],
-    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
-    function_objectives: Mapping[str, FunctionObjective] | None = None,
-    run_dir: Path | None = None,
-    memory_backend: MemoryBackend | None = None,
-    clock: Callable[[], float] = time.perf_counter,
-) -> Plan:
-    """Build and tune a standard PyTorch problem.
-
-    Returns:
-        Selected plan.
-    """
-    tuning_problem = standard_problem(
-        model=model,
-        parameter_surface=parameter_surface,
-        parameter_values=parameter_values,
-        buffers=buffers,
-        data=data,
-        operator=operator,
-        vectors=vectors,
-        target=target,
-        candidates=candidates,
-        thresholds=thresholds,
-        objective_signature=objective_signature,
-        scalar_objectives=scalar_objectives,
-        function_objectives=function_objectives,
-    )
-
-    return tune(
-        tuning_problem,
-        run_dir=run_dir,
-        memory_backend=memory_backend,
-        clock=clock,
-    )
 
 
 def _select_probe_result(
@@ -3161,6 +3430,7 @@ def _tune_cohort_assignment(
         run_id=run.run_id,
         cohort_assignment=assignment.signature(),
     )
+    runtime_identities = {}
 
     for family in ordered_families:
         if any(dependency not in selected for dependency in family.dependencies):
@@ -3179,25 +3449,23 @@ def _tune_cohort_assignment(
             full_size_records = (*full_size_records, *prerequisite.full_size_records)
             continue
 
-        problem = problems_by_family[family.name]
-
-        if problem.operator != family.operator:
+        if problems_by_family[family.name].operator != family.operator:
             message = f"family operator differs from problem operator: {family.name}"
             raise MaterializationError(message)
 
         problem_for_assignment = _problem_for_assignment(
-            _with_dependency_identities(
-                problem,
+            _with_run_dependencies(
+                problems_by_family[family.name],
                 family.dependencies,
                 selected,
                 records,
                 materializers,
+                problems_by_family,
             ),
             assignment,
             run.cohort_constraints,
             family_names,
         )
-
         if not _runtime(problem_for_assignment).candidates:
             continue
 
@@ -3232,6 +3500,7 @@ def _tune_cohort_assignment(
         selected[family.name] = selected_candidate
         records[family.name] = selected_record
         materializers[family.name] = probe.materializer
+        runtime_identities[family.name] = probe.runtime_identity
 
     if set(selected) != set(family_names):
         return _AssignmentResult(
@@ -3253,6 +3522,7 @@ def _tune_cohort_assignment(
             },
             input_signature=input_signature,
             materializers=materializers,
+            runtime_identities=runtime_identities,
         ),
         candidate_rows=candidate_rows,
         full_size_records=full_size_records,
@@ -3364,7 +3634,7 @@ def tune_run(
         cohort_constraints=run.cohort_constraints,
         target_identity=run.target.signature(),
         runtime_identities={
-            family: index.problems_by_family[family].runtime.identity()
+            family: dict(selected_state.runtime_identities[family])
             for family in index.family_names
         },
         adapter_identities={
@@ -3493,9 +3763,14 @@ def _validate_run_validators(run: TuningRun, family_names: tuple[str, ...]) -> N
         raise MaterializationError(message)
 
 
-def materialize(plan: Plan, *, family: str | None = None) -> Any:
+def materialize(
+    plan: Plan,
+    *,
+    name: str | None = None,
+    family: str | None = None,
+) -> Any:
     """Return selected materialization data for a plan."""
-    return plan.materialize(family)
+    return plan.materialize(family, name=name)
 
 
 def load_tuned_plan(
@@ -3605,6 +3880,7 @@ def _replay_context_for_run(
     selected_so_far = {}
     records_so_far = {}
     family_input_signatures = {}
+    runtime_identities = {}
     assignment = _cohort_assignment_from_record(summary["cohort_assignment"])
 
     for family in ordered_families:
@@ -3621,6 +3897,14 @@ def _replay_context_for_run(
             records_so_far,
             dict(materializers),
         )
+        problem_with_dependencies = _with_selected_composition_children(
+            problem_with_dependencies,
+            family.dependencies,
+            selected_so_far,
+            records_so_far,
+            dict(materializers),
+            problems_by_family,
+        )
         problem_for_assignment = _problem_for_assignment(
             problem_with_dependencies,
             assignment,
@@ -3632,6 +3916,7 @@ def _replay_context_for_run(
             problem_for_assignment,
             backend,
         )
+        runtime_identities[family.name] = _runtime(problem_for_assignment).identity()
         selected_so_far[family.name] = selected[family.name]
         records_so_far[family.name] = selected_records[family.name]
 
@@ -3647,10 +3932,7 @@ def _replay_context_for_run(
         },
         selection_policy=run.target.selection_policy,
         target_identity=run.target.signature(),
-        runtime_identities={
-            family: _runtime(problems_by_family[family]).identity()
-            for family in family_names
-        },
+        runtime_identities=runtime_identities,
         adapter_identities={
             family: dict(problems_by_family[family].adapter_identity)
             for family in family_names

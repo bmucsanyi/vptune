@@ -1,7 +1,5 @@
 import contextlib
 import dataclasses
-import importlib.resources
-import inspect
 import math
 import types
 from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -19,10 +17,14 @@ from vptune_test_helpers import (
 
 import vptune as vp
 import vptune.adapters as vpa
+import vptune.attention as attention_module
+import vptune.candidates as candidates_module
 import vptune.ext as vpx
 import vptune.measure as measure_module
 import vptune.run as run_module
+import vptune.runtime as runtime_module
 from vptune import autobatch_bridge
+from vptune import operators as ops
 from vptune.checks import (
     numeric_error_bound_measurements,
     uses_reduction_degrading_setting,
@@ -45,6 +47,7 @@ from vptune.measure import (
     measure_operation,
     run_candidate,
 )
+from vptune.run import tune as tune_problem
 from vptune.schemas import record_current
 from vptune.select import memory_stable, select_cohort, select_family
 from vptune.tensor_tree import (
@@ -53,14 +56,10 @@ from vptune.tensor_tree import (
     tree_elementwise_div_foreach,
     tree_elementwise_mul_foreach,
     tree_from_leaves,
-    tree_l2_norm_foreach,
     tree_leaves,
     tree_map,
-    tree_max_abs_foreach,
     tree_mul_foreach,
     tree_signature,
-    tree_sub_foreach,
-    tree_zeros_like_foreach,
 )
 
 
@@ -149,18 +148,18 @@ class SequenceClock:
         return value
 
 
-def reference_passed() -> vp.ReferenceResult:
-    return vp.ReferenceResult(
+def reference_passed() -> vpx.ReferenceResult:
+    return vpx.ReferenceResult(
         "tree_close",
         {"max_abs_diff": 1e-6},
         {"max_abs_diff": 0.0},
     )
 
 
-def cpu_target(timing_policy: vp.TimingPolicy | None = None) -> vp.Target:
-    policy = vp.TimingPolicy() if timing_policy is None else timing_policy
+def cpu_target(timing_policy: vpx.TimingPolicy | None = None) -> vpx.Target:
+    policy = vpx.TimingPolicy() if timing_policy is None else timing_policy
 
-    return vp.Target(
+    return vpx.Target(
         devices=("cpu",),
         accelerator="cpu",
         allowed_dtypes=("float64", "fp32", "bf16", "fp16"),
@@ -168,15 +167,15 @@ def cpu_target(timing_policy: vp.TimingPolicy | None = None) -> vp.Target:
         allowed_sdpa_kernels=(),
         allowed_sharding_modes=("single_device",),
         timing_policy=policy,
-        selection_policy=vp.SelectionPolicy(),
-        search_policy=vp.SearchPolicy(strategy="exhaustive"),
+        selection_policy=vpx.SelectionPolicy(),
+        search_policy=vpx.SearchPolicy(strategy="exhaustive"),
         determinism_policy={},
         environment_capture={"runtime": "test"},
     )
 
 
 def _input_signature(case: str = "test", family: str = "family") -> dict[str, object]:
-    operator = vp.gradient(family, f"{case}-objective", aggregation="sum").signature()
+    operator = ops.gradient(family, f"{case}-objective", aggregation="sum").signature()
 
     return {
         "case": case,
@@ -261,20 +260,20 @@ def test_target_signature_includes_declared_device_identity() -> None:
 
 def test_search_policy_rejects_unknown_strategy() -> None:
     with pytest.raises(RuntimeError, match="unsupported search strategy"):
-        vp.SearchPolicy(strategy="random")
+        vpx.SearchPolicy(strategy="random")
 
 
 def test_search_policy_requires_balanced_top_count() -> None:
     with pytest.raises(RuntimeError, match="retained_top_count"):
-        vp.SearchPolicy(strategy="balanced")
+        vpx.SearchPolicy(strategy="balanced")
 
 
 def test_search_policy_requires_thorough_fields() -> None:
     with pytest.raises(RuntimeError, match="compile_call_horizons"):
-        vp.SearchPolicy(strategy="thorough", retained_top_count=1)
+        vpx.SearchPolicy(strategy="thorough", retained_top_count=1)
 
     with pytest.raises(RuntimeError, match="variance_repeat_count"):
-        vp.SearchPolicy(
+        vpx.SearchPolicy(
             strategy="thorough",
             retained_top_count=1,
             compile_call_horizons=(1,),
@@ -284,13 +283,13 @@ def test_search_policy_requires_thorough_fields() -> None:
 def test_tune_rejects_thorough_horizon_mismatch_before_probe() -> None:
     calls = []
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate("family", "row", {}, admission_status="passed")
+    candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
     target = dataclasses.replace(
         dataclasses.replace(
             cpu_target(),
-            selection_policy=vp.SelectionPolicy(compile_call_horizon=3),
+            selection_policy=vpx.SelectionPolicy(compile_call_horizon=3),
         ),
-        search_policy=vp.SearchPolicy(
+        search_policy=vpx.SearchPolicy(
             strategy="thorough",
             retained_top_count=1,
             compile_call_horizons=(2,),
@@ -299,31 +298,31 @@ def test_tune_rejects_thorough_horizon_mismatch_before_probe() -> None:
     )
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         calls.append(("operation", candidate, batch, vector))
 
         return vpx.constant_operation(torch.tensor([1.0]))
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         calls.append(("reference", candidate, batch, vector))
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -334,7 +333,7 @@ def test_tune_rejects_thorough_horizon_mismatch_before_probe() -> None:
     )
 
     with pytest.raises(vp.MaterializationError, match="selection horizon"):
-        vp.tune(problem)
+        tune_problem(problem)
 
     assert calls == []
 
@@ -345,29 +344,29 @@ def test_tune_smoke_strategy_measures_baseline_and_class_c_rows(
     calls = []
     model = torch.nn.Linear(1, 1)
     candidates = (
-        vp.Candidate("family", "base", {}, admission_status="passed"),
-        vp.Candidate(
+        vpx.Candidate("family", "base", {}, admission_status="passed"),
+        vpx.Candidate(
             "family",
             "hvp-path",
             {"hvp.path": "reverse_over_reverse"},
             changed_axes=("hvp.path",),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "gradient-graph",
             {"gradient.graph_schedule": "build_once"},
             changed_axes=("gradient.graph_schedule",),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "dtype",
             {"dtype.model_compute": "fp32"},
             changed_axes=("dtype.model_compute",),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "attention",
             {"attention.frontend": "transformers_sdpa"},
@@ -377,41 +376,41 @@ def test_tune_smoke_strategy_measures_baseline_and_class_c_rows(
     )
     target = dataclasses.replace(
         cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_measured_calls=1,
             )
         ),
-        search_policy=vp.SearchPolicy(strategy="smoke"),
+        search_policy=vpx.SearchPolicy(strategy="smoke"),
     )
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         calls.append(("operation", candidate.candidate_id, batch, vector))
 
         return vpx.constant_operation(torch.tensor([1.0]))
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         calls.append(("reference", candidate.candidate_id, batch, vector))
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=TwoProbeData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=TwoVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             candidates,
             operation_factory,
             reference_check,
@@ -420,7 +419,7 @@ def test_tune_smoke_strategy_measures_baseline_and_class_c_rows(
             {"runtime": "test.search-smoke"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -457,13 +456,13 @@ def test_tune_smoke_strategy_requires_one_admitted_baseline() -> None:
     model = torch.nn.Linear(1, 1)
     target = dataclasses.replace(
         cpu_target(),
-        search_policy=vp.SearchPolicy(strategy="smoke"),
+        search_policy=vpx.SearchPolicy(strategy="smoke"),
     )
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "hvp-path"
         assert batch["source"] == "probe"
@@ -472,26 +471,26 @@ def test_tune_smoke_strategy_requires_one_admitted_baseline() -> None:
         return vpx.constant_operation(torch.tensor([1.0]))
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "hvp-path"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (
-                vp.Candidate(
+                vpx.Candidate(
                     "family",
                     "hvp-path",
                     {"hvp.path": "reverse_over_reverse"},
@@ -508,7 +507,7 @@ def test_tune_smoke_strategy_requires_one_admitted_baseline() -> None:
     )
 
     with pytest.raises(vp.MaterializationError, match="baseline"):
-        vp.tune(problem)
+        tune_problem(problem)
 
 
 def test_tune_fast_strategy_compiles_near_fastest_eager_rows(
@@ -530,36 +529,36 @@ def test_tune_fast_strategy_compiles_near_fastest_eager_rows(
         "compile.cache_state": "warm_cache",
     }
     candidates = (
-        vp.Candidate("family", "base", {}, admission_status="passed"),
-        vp.Candidate(
+        vpx.Candidate("family", "base", {}, admission_status="passed"),
+        vpx.Candidate(
             "family",
             "hvp",
             {"hvp.path": "reverse_over_reverse"},
             changed_axes=("hvp.path",),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "input",
             {"input.residency": "gpu"},
             changed_axes=("input.residency",),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "dtype",
             {"dtype.model_compute": "fp32"},
             changed_axes=("dtype.model_compute",),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "compiled-hvp",
             {"hvp.path": "reverse_over_reverse", **compile_settings},
             changed_axes=("hvp.path", "compile.enabled"),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "compiled-dtype",
             {"dtype.model_compute": "fp32", **compile_settings},
@@ -569,13 +568,13 @@ def test_tune_fast_strategy_compiles_near_fastest_eager_rows(
     )
     target = dataclasses.replace(
         cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_measured_calls=1,
             )
         ),
-        search_policy=vp.SearchPolicy(strategy="fast"),
+        search_policy=vpx.SearchPolicy(strategy="fast"),
     )
 
     class CompileMetadataCheck:
@@ -585,10 +584,10 @@ def test_tune_fast_strategy_compiles_near_fastest_eager_rows(
 
         @staticmethod
         def __call__(
-            candidate: vp.Candidate,
-            inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
-            output: vp.TensorTree,
-            samples: tuple[vp.Measurement, ...],
+            candidate: vpx.Candidate,
+            inputs: tuple[tuple[vpx.Batch, vpx.TensorTree], ...],
+            output: vpx.TensorTree,
+            samples: tuple[vpx.Measurement, ...],
         ) -> Mapping[str, object]:
             assert inputs
             assert output is not None
@@ -604,31 +603,31 @@ def test_tune_fast_strategy_compiles_near_fastest_eager_rows(
             }
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         calls.append(("operation", candidate.candidate_id, batch, vector))
 
         return vpx.constant_operation(torch.tensor([1.0]))
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         calls.append(("reference", candidate.candidate_id, batch, vector))
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             candidates,
             operation_factory,
             reference_check,
@@ -638,7 +637,7 @@ def test_tune_fast_strategy_compiles_near_fastest_eager_rows(
             full_size_check=CompileMetadataCheck(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -693,29 +692,29 @@ def test_tune_balanced_strategy_crosses_retained_group_winners(
         "compile.cache_state": "warm_cache",
     }
     candidates = (
-        vp.Candidate("family", "base", {}, admission_status="passed"),
-        vp.Candidate(
+        vpx.Candidate("family", "base", {}, admission_status="passed"),
+        vpx.Candidate(
             "family",
             "hvp-slow",
             {"hvp.path": "reverse_over_reverse"},
             changed_axes=("hvp.path",),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "hvp-fast",
             {"hvp.path": "jvp_grad"},
             changed_axes=("hvp.path",),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "dtype",
             {"dtype.model_compute": "fp32"},
             changed_axes=("dtype.model_compute",),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "compiled-cross",
             {"hvp.path": "jvp_grad", "dtype.model_compute": "fp32", **compile_settings},
@@ -729,13 +728,13 @@ def test_tune_balanced_strategy_crosses_retained_group_winners(
     )
     target = dataclasses.replace(
         cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_measured_calls=1,
             )
         ),
-        search_policy=vp.SearchPolicy(strategy="balanced", retained_top_count=1),
+        search_policy=vpx.SearchPolicy(strategy="balanced", retained_top_count=1),
     )
 
     class CompileMetadataCheck:
@@ -745,10 +744,10 @@ def test_tune_balanced_strategy_crosses_retained_group_winners(
 
         @staticmethod
         def __call__(
-            candidate: vp.Candidate,
-            inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
-            output: vp.TensorTree,
-            samples: tuple[vp.Measurement, ...],
+            candidate: vpx.Candidate,
+            inputs: tuple[tuple[vpx.Batch, vpx.TensorTree], ...],
+            output: vpx.TensorTree,
+            samples: tuple[vpx.Measurement, ...],
         ) -> Mapping[str, object]:
             assert inputs
             assert output is not None
@@ -764,31 +763,31 @@ def test_tune_balanced_strategy_crosses_retained_group_winners(
             }
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         calls.append(("operation", candidate.candidate_id, batch, vector))
 
         return vpx.constant_operation(torch.tensor([1.0]))
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         calls.append(("reference", candidate.candidate_id, batch, vector))
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             candidates,
             operation_factory,
             reference_check,
@@ -798,7 +797,7 @@ def test_tune_balanced_strategy_crosses_retained_group_winners(
             full_size_check=CompileMetadataCheck(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -850,7 +849,7 @@ def test_tune_balanced_strategy_crosses_retained_group_winners(
     saved_paths = tuple(
         sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*.json"))
     )
-    second_plan = vp.tune(
+    second_plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -889,22 +888,22 @@ def test_tune_balanced_strategy_halves_group_rows_by_probe_stage(
     calls = []
     model = torch.nn.Linear(1, 1)
     candidates = (
-        vp.Candidate("family", "base", {}, admission_status="passed"),
-        vp.Candidate(
+        vpx.Candidate("family", "base", {}, admission_status="passed"),
+        vpx.Candidate(
             "family",
             "hvp-slow",
             {"hvp.path": "reverse_over_reverse"},
             changed_axes=("hvp.path",),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "hvp-middle",
             {"hvp.path": "jvp_grad"},
             changed_axes=("hvp.path",),
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "hvp-fast",
             {"hvp.path": "autograd_functional_hvp"},
@@ -914,19 +913,19 @@ def test_tune_balanced_strategy_halves_group_rows_by_probe_stage(
     )
     target = dataclasses.replace(
         cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_measured_calls=1,
             )
         ),
-        search_policy=vp.SearchPolicy(strategy="balanced", retained_top_count=1),
+        search_policy=vpx.SearchPolicy(strategy="balanced", retained_top_count=1),
     )
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert isinstance(vector, torch.Tensor)
         calls.append(("operation", candidate.candidate_id, batch["index"]))
@@ -934,24 +933,24 @@ def test_tune_balanced_strategy_halves_group_rows_by_probe_stage(
         return vpx.constant_operation(torch.tensor([1.0]))
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
         calls.append(("reference", candidate.candidate_id, None))
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=TwoProbeData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=TwoVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             candidates,
             operation_factory,
             reference_check,
@@ -960,7 +959,7 @@ def test_tune_balanced_strategy_halves_group_rows_by_probe_stage(
             {"runtime": "test.search-balanced-halving"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -1005,22 +1004,22 @@ def test_tune_balanced_strategy_with_only_baseline_measures_it_once(
 ) -> None:
     calls = []
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate("family", "base", {}, admission_status="passed")
+    candidate = vpx.Candidate("family", "base", {}, admission_status="passed")
     target = dataclasses.replace(
         cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_measured_calls=1,
             )
         ),
-        search_policy=vp.SearchPolicy(strategy="balanced", retained_top_count=1),
+        search_policy=vpx.SearchPolicy(strategy="balanced", retained_top_count=1),
     )
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert batch["source"] == "probe"
         assert isinstance(vector, torch.Tensor)
@@ -1029,24 +1028,24 @@ def test_tune_balanced_strategy_with_only_baseline_measures_it_once(
         return vpx.constant_operation(torch.tensor([1.0]))
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
         calls.append(("reference", candidate.candidate_id))
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -1055,7 +1054,7 @@ def test_tune_balanced_strategy_with_only_baseline_measures_it_once(
             {"runtime": "test.search-balanced-baseline"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -1072,19 +1071,19 @@ def test_tune_thorough_strategy_uses_declared_repeat_count(
 ) -> None:
     calls = []
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate("family", "base", {}, admission_status="passed")
+    candidate = vpx.Candidate("family", "base", {}, admission_status="passed")
     target = dataclasses.replace(
         dataclasses.replace(
             cpu_target(
-                vp.TimingPolicy(
+                vpx.TimingPolicy(
                     short_seconds=0.0,
                     medium_seconds=0.0,
                     long_measured_calls=1,
                 )
             ),
-            selection_policy=vp.SelectionPolicy(compile_call_horizon=3),
+            selection_policy=vpx.SelectionPolicy(compile_call_horizon=3),
         ),
-        search_policy=vp.SearchPolicy(
+        search_policy=vpx.SearchPolicy(
             strategy="thorough",
             retained_top_count=1,
             compile_call_horizons=(3,),
@@ -1093,31 +1092,31 @@ def test_tune_thorough_strategy_uses_declared_repeat_count(
     )
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         calls.append(("operation", candidate.candidate_id, batch, vector))
 
         return vpx.constant_operation(torch.tensor([1.0]))
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         calls.append(("reference", candidate.candidate_id, batch, vector))
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -1127,7 +1126,7 @@ def test_tune_thorough_strategy_uses_declared_repeat_count(
         ),
     )
     clock = SequenceClock((0.0, 1.0, 1.0, 2.0, 2.0, 3.0))
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -1157,8 +1156,8 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
         "compile.cuda_graphs": "false",
         "compile.cache_state": "warm_cache",
     }
-    base = vp.Candidate("family", "base", {}, admission_status="passed")
-    compiled = vp.Candidate(
+    base = vpx.Candidate("family", "base", {}, admission_status="passed")
+    compiled = vpx.Candidate(
         "family",
         "compiled",
         compile_settings,
@@ -1168,15 +1167,15 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
     target = dataclasses.replace(
         dataclasses.replace(
             cpu_target(
-                vp.TimingPolicy(
+                vpx.TimingPolicy(
                     short_seconds=0.0,
                     medium_seconds=0.0,
                     long_measured_calls=1,
                 )
             ),
-            selection_policy=vp.SelectionPolicy(compile_call_horizon=3),
+            selection_policy=vpx.SelectionPolicy(compile_call_horizon=3),
         ),
-        search_policy=vp.SearchPolicy(
+        search_policy=vpx.SearchPolicy(
             strategy="thorough",
             retained_top_count=1,
             compile_call_horizons=(3, 6),
@@ -1191,10 +1190,10 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
 
         @staticmethod
         def __call__(
-            candidate: vp.Candidate,
-            inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
-            output: vp.TensorTree,
-            samples: tuple[vp.Measurement, ...],
+            candidate: vpx.Candidate,
+            inputs: tuple[tuple[vpx.Batch, vpx.TensorTree], ...],
+            output: vpx.TensorTree,
+            samples: tuple[vpx.Measurement, ...],
         ) -> Mapping[str, object]:
             assert inputs
             assert output is not None
@@ -1212,9 +1211,9 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
             }
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id in {"base", "compiled"}
         assert batch["source"] == "probe"
@@ -1223,24 +1222,24 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
         return vpx.constant_operation(torch.tensor([1.0]))
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id in {"base", "compiled"}
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (base, compiled),
             operation_factory,
             reference_check,
@@ -1250,7 +1249,7 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
             full_size_check=CompileMetadataCheck(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -1291,7 +1290,7 @@ def test_tune_thorough_strategy_records_compile_horizon_scores(
 def test_tune_admission_strategy_returns_candidate_table_only(tmp_path: Path) -> None:
     calls = []
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"dtype.model_compute": "fp32"},
@@ -1299,35 +1298,35 @@ def test_tune_admission_strategy_returns_candidate_table_only(tmp_path: Path) ->
     )
     target = dataclasses.replace(
         cpu_target(),
-        search_policy=vp.SearchPolicy(strategy="admission"),
+        search_policy=vpx.SearchPolicy(strategy="admission"),
     )
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         calls.append(("operation", candidate, batch, vector))
 
         return vpx.constant_operation(torch.tensor([1.0]))
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         calls.append(("reference", candidate, batch, vector))
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -1336,7 +1335,7 @@ def test_tune_admission_strategy_returns_candidate_table_only(tmp_path: Path) ->
             {"runtime": "test.admission-search"},
         ),
     )
-    plan = vp.tune(problem, run_dir=tmp_path)
+    plan = tune_problem(problem, run_dir=tmp_path)
 
     assert plan.selected == {}
     assert plan.records == {}
@@ -1363,224 +1362,6 @@ def test_tune_admission_strategy_returns_candidate_table_only(tmp_path: Path) ->
     )
 
 
-def test_root_api_all_matches_public_surface() -> None:
-    assert tuple(vp.__all__) == (
-        "AdmissionError",
-        "Batch",
-        "BufferTree",
-        "Candidate",
-        "CheckRecord",
-        "CohortAssignment",
-        "CohortConstraint",
-        "DataProvider",
-        "Family",
-        "FullSizeRecord",
-        "FunctionObjective",
-        "MaterializationError",
-        "Materializer",
-        "Measurement",
-        "MeasurementError",
-        "ModuleCallSpec",
-        "NoPassedCandidateError",
-        "ObjectiveContext",
-        "OperatorSpec",
-        "ParameterSurface",
-        "ParameterTree",
-        "Plan",
-        "PlanValidationContext",
-        "PlanValidator",
-        "Problem",
-        "RecordFormatError",
-        "ReferenceFailedError",
-        "ReferenceResult",
-        "ReplayContext",
-        "ScalarObjective",
-        "SearchPolicy",
-        "SelectionPolicy",
-        "StaleRecordError",
-        "Target",
-        "TensorTree",
-        "TimingPolicy",
-        "TuningRun",
-        "VPTuneError",
-        "VectorProvider",
-        "autotune",
-        "composition",
-        "empirical_fisher_vp",
-        "fisher_vp",
-        "ggnvp",
-        "gradient",
-        "hvp",
-        "inverse_metric",
-        "jvp",
-        "load_plan",
-        "load_tuned_plan",
-        "load_tuned_run",
-        "materialize",
-        "metric",
-        "parameter_surface",
-        "sampled_fisher_vp",
-        "standard_problem",
-        "tune",
-        "tune_run",
-        "validate_plan",
-        "vjp",
-    )
-    assert issubclass(vp.MeasurementError, vp.VPTuneError)
-    assert issubclass(vp.RecordFormatError, vp.VPTuneError)
-
-
-def test_standard_front_door_signatures_match_spec() -> None:
-    assert tuple(inspect.signature(vp.autotune).parameters) == (
-        "model",
-        "parameter_surface",
-        "parameter_values",
-        "buffers",
-        "data",
-        "operator",
-        "vectors",
-        "target",
-        "candidates",
-        "thresholds",
-        "objective_signature",
-        "scalar_objectives",
-        "function_objectives",
-        "run_dir",
-        "memory_backend",
-        "clock",
-    )
-    assert tuple(inspect.signature(vp.standard_problem).parameters) == (
-        "model",
-        "parameter_surface",
-        "parameter_values",
-        "buffers",
-        "data",
-        "operator",
-        "vectors",
-        "target",
-        "candidates",
-        "thresholds",
-        "objective_signature",
-        "scalar_objectives",
-        "function_objectives",
-    )
-
-
-def test_extension_api_all_matches_extension_surface() -> None:
-    assert tuple(vpx.__all__) == (
-        "STANDARD_THRESHOLDS",
-        "AnchorRegistry",
-        "AttentionInputs",
-        "AttentionLocation",
-        "AttentionSemantics",
-        "AttentionSettings",
-        "AutobatchDomain",
-        "AutobatchFind",
-        "AxisDescriptor",
-        "AxisManifest",
-        "AxisRegistry",
-        "AxisTable",
-        "CPUMemoryBackend",
-        "CUDAMemoryBackend",
-        "CallableMaterializer",
-        "Candidate",
-        "CandidateAdmitter",
-        "CandidateOperation",
-        "CheckRecord",
-        "CohortAssignment",
-        "CohortConstraint",
-        "CompositionChild",
-        "FullSizeCheck",
-        "FullSizeRecord",
-        "KFACMetricBlock",
-        "KFACMetricOperator",
-        "MappingAttentionLocation",
-        "MaterializerCallback",
-        "Measurement",
-        "MemoryBackend",
-        "ModuleCallSpec",
-        "OperationFactory",
-        "ReferenceCheck",
-        "RuntimeConfig",
-        "StandardMetricOperator",
-        "admit_checkpoint",
-        "admit_core_attention",
-        "admit_forward_ad",
-        "admit_functional_call",
-        "admit_torch_func",
-        "apply_final_logit_softcap",
-        "apply_softcap",
-        "attention_operation_factory",
-        "attention_reference_check",
-        "attention_settings_from_candidate",
-        "axis_manifest",
-        "axis_table",
-        "candidate_record_from_json",
-        "candidate_record_to_json",
-        "check_record_current",
-        "check_record_from_json",
-        "check_record_to_json",
-        "checkpoint_operation",
-        "clear_parameter_gradients",
-        "composition_operation_factory",
-        "composition_reference_check",
-        "composition_runtime_config",
-        "constant_operation",
-        "core_attention_axis",
-        "default_memory_backend",
-        "dense_jacobian_anchor",
-        "dense_metric_inner",
-        "dense_metric_inverse_multiply",
-        "dense_metric_inverse_residual",
-        "dense_metric_multiply",
-        "device_signature",
-        "empirical_fisher_vp_dense_anchor",
-        "environment_signature",
-        "exact_attention",
-        "execute_attention",
-        "finite_difference_hvp",
-        "finite_difference_jvp",
-        "fisher_vp_dense_anchor",
-        "forward_ad_jvp_anchor",
-        "full_size_record_current",
-        "full_size_record_from_json",
-        "full_size_record_to_json",
-        "ggnvp_dense_anchor",
-        "gradient_anchor",
-        "hvp_anchor",
-        "hvp_jvp_grad_anchor",
-        "hvp_reverse_over_reverse_anchor",
-        "jvp_anchor",
-        "module_functional_call",
-        "plan_from_json",
-        "plan_record_current",
-        "plan_to_json",
-        "run_attention",
-        "sampled_fisher_vp_dense_anchor",
-        "select_fastest_candidate_with_autobatch",
-        "selected_plan_validation_summary_current",
-        "selected_plan_validation_summary_record",
-        "settings_product",
-        "standard_axis_descriptors",
-        "standard_axis_registry",
-        "standard_operation_factory",
-        "standard_reference_check",
-        "standard_runtime_config",
-        "tensor_signature",
-        "tree_add",
-        "tree_l2_norm",
-        "tree_reference_check",
-        "tree_zeros_like",
-        "vhp_anchor",
-        "vjp_anchor",
-        "vjp_dot_identity_error",
-    )
-    assert isinstance(vpx.CPUMemoryBackend(), vpx.CPUMemoryBackend)
-    assert vpx.STANDARD_THRESHOLDS["max_abs_diff"] == pytest.approx(1e-4)
-    assert vpx.AxisManifest is vpx.AxisTable
-    assert vpx.axis_manifest().signature() == vpx.axis_table().signature()
-
-
 def test_extension_tensor_and_measurement_helpers() -> None:
     parameter = torch.nn.Parameter(torch.tensor([1.0]))
     parameter.sum().backward()
@@ -1597,7 +1378,7 @@ def test_extension_tensor_and_measurement_helpers() -> None:
     assert float(vpx.tree_l2_norm(tree)) == pytest.approx(5.0)
 
 
-def test_tensor_tree_foreach_inventory_matches_python_ops() -> None:
+def test_tensor_tree_foreach_helpers_match_python_ops() -> None:
     left = {
         "a": torch.tensor([1.0, -2.0], dtype=torch.float64),
         "b": torch.tensor([3.0], dtype=torch.float64),
@@ -1609,26 +1390,10 @@ def test_tensor_tree_foreach_inventory_matches_python_ops() -> None:
     thresholds = {"max_abs_diff": 1e-12, "max_rel_diff": 1e-12}
 
     assert_tree_close(
-        tree_zeros_like_foreach(left),
-        {
-            "a": torch.zeros(2, dtype=torch.float64),
-            "b": torch.zeros(1, dtype=torch.float64),
-        },
-        thresholds=thresholds,
-    )
-    assert_tree_close(
         tree_add_foreach(left, right),
         {
             "a": torch.tensor([5.0, 3.0], dtype=torch.float64),
             "b": torch.tensor([-3.0], dtype=torch.float64),
-        },
-        thresholds=thresholds,
-    )
-    assert_tree_close(
-        tree_sub_foreach(left, right),
-        {
-            "a": torch.tensor([-3.0, -7.0], dtype=torch.float64),
-            "b": torch.tensor([9.0], dtype=torch.float64),
         },
         thresholds=thresholds,
     )
@@ -1658,363 +1423,236 @@ def test_tensor_tree_foreach_inventory_matches_python_ops() -> None:
     )
 
     assert float(tree_dot_foreach(left, right)) == pytest.approx(-24.0)
-    assert float(tree_max_abs_foreach(right)) == pytest.approx(6.0)
-    assert float(tree_l2_norm_foreach(left)) == pytest.approx(math.sqrt(14.0))
 
     with pytest.raises(RuntimeError, match="same dtype"):
         tree_add_foreach(left, {"a": right["a"].float(), "b": right["b"]})
 
 
-def test_axis_table_matches_spec_feature_space() -> None:
-    axis_table = vpx.axis_table()
-    by_key = axis_table.by_key()
-    expected_keys = {
-        "activation.offload",
-        "activation.recompute",
-        "attention.custom_kernel_id",
-        "attention.frontend",
-        "attention.mask_formatter_id",
-        "attention.padding",
-        "attention.partition",
-        "attention.sdpa_kernel",
-        "autocast",
-        "batch.data_microbatch_size",
-        "batch.empirical_example_batch_size",
-        "batch.fisher_sample_batch_size",
-        "batch.ggn_batch_size",
-        "batch.hvp_row_batch_size",
-        "call.buffer_mutation",
-        "call.buffers",
-        "call.grad_mode",
-        "call.params",
-        "call.parametrizations",
-        "call.path",
-        "call.return_type",
-        "call.tied_weights",
-        "checkpoint.context_fn",
-        "checkpoint.determinism_check",
-        "checkpoint.early_stop",
-        "checkpoint.preserve_rng_state",
-        "checkpoint.use_reentrant",
-        "chunk.class_block_size_with_exact_global_normalization",
-        "chunk.layer_block_size",
-        "chunk.lm_head_weight_chunk_bytes",
-        "chunk.output_cotangent_block_size",
-        "chunk.parameter_block_size",
-        "chunk.sequence_position_block_size",
-        "chunk.token_block_size",
-        "comm.collective_bucket_size",
-        "comm.overlap",
-        "comm.prefetch",
-        "compile.backend",
-        "compile.boundary",
-        "compile.cache_state",
-        "compile.compiled_autograd",
-        "compile.cuda_graphs",
-        "compile.dynamic",
-        "compile.enabled",
-        "compile.fullgraph",
-        "compile.mode",
-        "compile.options.epilogue_fusion",
-        "compile.options.shape_padding",
-        "composition.child_evaluation",
-        "composition.execution",
-        "composition.validation",
-        "context_parallel.enabled",
-        "context_parallel.rotate_method",
-        "context_parallel.sequence_dim",
-        "distributed.launch",
-        "distributed.local_rank_binding",
-        "distributed.mesh_dim_names",
-        "distributed.mesh_shape",
-        "distributed.process_group_backend",
-        "distributed.strategy",
-        "dtensor.cotangent_placement",
-        "dtensor.logits_placement",
-        "dtensor.output_placement",
-        "dtensor.params_placement",
-        "dtensor.redistribute_schedule",
-        "dtensor.tangent_placement",
-        "dtensor.vector_placement",
-        "dtype.accumulation",
-        "dtype.autodiff_compute",
-        "dtype.intermediate",
-        "dtype.metric_factor",
-        "dtype.model_compute",
-        "dtype.output",
-        "dtype.parameter_storage",
-        "dtype.vector",
-        "empirical_fisher.accumulation",
-        "empirical_fisher.grad_path",
-        "fisher.accumulation",
-        "fisher.expectation_path",
-        "fisher.score_grad_path",
-        "fsdp.dp_mesh_dims",
-        "fsdp.ignored_params",
-        "fsdp.mp_policy.cast_forward_inputs",
-        "fsdp.mp_policy.output_dtype",
-        "fsdp.mp_policy.param_dtype",
-        "fsdp.mp_policy.reduce_dtype",
-        "fsdp.offload_policy",
-        "fsdp.reshard_after_forward",
-        "fsdp.shard_placement_fn",
-        "fsdp.wrap_granularity",
-        "fusion.logits",
-        "fusion.loss",
-        "fusion.mlp",
-        "fusion.norm",
-        "fusion.rope",
-        "ggn.cotangent_reuse",
-        "ggn.jvp_path",
-        "ggn.jvp_reuse",
-        "ggn.loss_hessian_kernel",
-        "ggn.loss_hessian_path",
-        "ggn.vjp_path",
-        "gradient.graph_schedule",
-        "gradient.path",
-        "gradient.value_reuse",
-        "hvp.gradient_reuse",
-        "hvp.graph_schedule",
-        "hvp.path",
-        "hvp.primal_reuse",
-        "input.batch_layout",
-        "input.host_to_device",
-        "input.length_grouping",
-        "input.residency",
-        "inverse_metric.factor_reuse",
-        "inverse_metric.block_schedule",
-        "inverse_metric.iteration_budget",
-        "inverse_metric.preconditioner",
-        "inverse_metric.solve_path",
-        "jvp.linearize_reuse",
-        "jvp.path",
-        "layout.aliasing",
-        "layout.contiguity",
-        "layout.flatten_order",
-        "layout.output",
-        "layout.params",
-        "layout.parametrizations",
-        "layout.vector",
-        "layout.vector_ops",
-        "memory.factor_residency",
-        "memory.intermediate_residency",
-        "memory.jvp_outputs",
-        "memory.output_buffers",
-        "memory.output_cotangents",
-        "memory.primal_outputs",
-        "memory.vector_residency",
-        "metric.accumulation",
-        "metric.block_schedule",
-        "metric.multiply_path",
-        "numeric.bf16_reduced_precision_reduction",
-        "numeric.deterministic_algorithms",
-        "numeric.float32_matmul_precision",
-        "numeric.fp16_reduced_precision_reduction",
-        "numeric.loss_scaling",
-        "sampled_fisher.accumulation",
-        "sampled_fisher.exact_fisher_check",
-        "sampled_fisher.sample_source",
-        "sampled_fisher.score_grad_path",
-        "schedule.gradient_accumulation",
-        "schedule.per_example",
-        "schedule.per_token",
-        "sequence_parallel.enabled",
-        "sequence_parallel.norm_modules",
-        "sequence_parallel.output_placement_policy",
-        "teacher_outputs",
-        "tp.embedding",
-        "tp.lm_head",
-        "tp.loss_parallel",
-        "tp.mlp_down",
-        "tp.mlp_up_gate",
-        "tp.output_projection",
-        "tp.plan",
-        "tp.prepare_module_input",
-        "tp.prepare_module_output",
-        "tp.qkv_projection",
-        "vectorization.batch_size",
-        "vectorization.in_dims",
-        "vectorization.mode",
-        "vectorization.randomness",
-        "vectorization.vmap_chunk_size",
-        "vjp.closure_reuse",
-        "vjp.path",
-    }
-    expected_groups = {
-        "activation_memory",
-        "ad_lowering",
-        "attention_dispatch",
-        "compile",
-        "distributed_layout",
-        "fusion",
-        "input_schedule",
-        "inverse_solve",
-        "metric_storage",
-        "numeric_backend",
-    }
-    grouped_keys = tuple(
-        key for keys in axis_table.class_c_groups.values() for key in keys
+def test_axis_manifest_adapter_axes_use_adapter_admission_rules() -> None:
+    axes = vpx.axis_manifest().by_key()
+
+    attention_passed, attention_message = axes["attention.partition"].admit(
+        vpx.Candidate(
+            "attention",
+            "missing-frontend",
+            {"attention.partition": "full"},
+        )
+    )
+    distributed_passed, distributed_message = axes["distributed.launch"].admit(
+        vpx.Candidate(
+            "distributed",
+            "missing-strategy",
+            {"distributed.launch": "torchrun"},
+        )
+    )
+    registered_passed, registered_message = axes["attention.custom_kernel_id"].admit(
+        vpx.Candidate(
+            "attention",
+            "empty-registered-id",
+            {"attention.custom_kernel_id": ""},
+        )
     )
 
-    assert set(by_key) == expected_keys
-    assert set(axis_table.class_c_groups) == expected_groups
-    assert set(grouped_keys) == expected_keys
-    assert len(grouped_keys) == len(expected_keys)
-    assert axis_table.merge_rules == (
-        (
-            "attention.partition=packed_tokens merges "
-            "attention_dispatch with input_schedule"
-        ),
-        "compile.boundary=attention_module merges compile with attention_dispatch",
-        "compile.boundary operator part merges compile with ad_lowering",
-        "fusion non-default merges fusion with ad_lowering",
-        "dtensor placement merges distributed_layout with ad_lowering",
-        "fsdp reduce dtype not fp32 merges distributed_layout with numeric_backend",
-        "factorized inverse rows merge inverse_solve with metric_storage",
+    assert not attention_passed
+    assert attention_message == "attention.partition requires attention.frontend"
+    assert not distributed_passed
+    assert distributed_message == "distributed.launch requires distributed.strategy"
+    assert not registered_passed
+    assert registered_message == (
+        "candidate axis requires a registered id: attention.custom_kernel_id"
     )
-
-    for axis in by_key.values():
-        assert axis.owner_id
-        assert axis.value_domain
-        assert axis.operators
-        assert axis.adapter_id or axis.owner_id
-        assert axis.axis_key in axis_table.class_c_groups[axis.class_c_group]
-
-    assert by_key["compile.mode"].value_domain == (None, "default", "max-autotune")
-    assert by_key["attention.frontend"].value_domain == (
-        "transformers_eager",
-        "transformers_sdpa",
-        "transformers_flash_attention_2",
-        "transformers_flash_attention_3",
-        "transformers_flash_attention_4",
-        "transformers_flex_attention",
-        "paged|eager",
-        "paged|sdpa",
-        "paged|flash_attention_2",
-        "paged|flash_attention_3",
-        "paged|flash_attention_4",
-        "registered_transformers_attention",
-        "pytorch_sdpa_direct",
-        "patched_eager",
-        "packed_exact",
-        "blockwise_exact",
-    )
-    assert by_key["metric.multiply_path"].value_domain == (
-        "dense_matmul",
-        "factorized_multiply",
-        "blockwise_multiply",
-        "streaming_multiply",
-    )
-    assert by_key["inverse_metric.solve_path"].value_domain == (
-        "dense_solve",
-        "cholesky_solve",
-        "eigh_solve",
-        "svd_solve",
-        "conjugate_gradient",
-        "factorized_solve",
-        "blockwise_solve",
-        "woodbury_low_rank_solve",
-    )
-    assert by_key["layout.vector_ops"].class_a == ("mostly_independent_after_admission")
-    assert by_key["teacher_outputs"].class_b == "conditionally_independent"
-    assert by_key["dtensor.params_placement"].adapter_id == (
-        "vptune.adapters.distributed"
-    )
-    assert axis_table.signature()["axis_table_version"] == "1"
 
 
 @pytest.mark.parametrize(
-    ("settings", "changed_axes", "groups"),
+    "setting_key",
     [
-        (
-            {"attention.partition": "packed_tokens"},
-            ("attention.partition",),
-            ("attention_dispatch", "input_schedule"),
-        ),
-        (
-            {"compile.boundary": "attention_module"},
-            ("compile.boundary",),
-            ("attention_dispatch", "compile"),
-        ),
-        (
-            {"compile.boundary": "gradient_closure"},
-            ("compile.boundary",),
-            ("ad_lowering", "compile"),
-        ),
-        (
-            {"fusion.mlp": "torch_inductor"},
-            ("fusion.mlp",),
-            ("ad_lowering", "fusion"),
-        ),
-        (
-            {"dtensor.params_placement": ("shard",)},
-            ("dtensor.params_placement",),
-            ("ad_lowering", "distributed_layout"),
-        ),
-        (
-            {"fsdp.mp_policy.reduce_dtype": "bf16"},
-            ("fsdp.mp_policy.reduce_dtype",),
-            ("distributed_layout", "numeric_backend"),
-        ),
-        (
-            {"inverse_metric.solve_path": "factorized_solve"},
-            ("inverse_metric.solve_path",),
-            ("inverse_solve", "metric_storage"),
-        ),
+        "memory.primal_outputs",
+        "memory.jvp_outputs",
+        "memory.output_cotangents",
     ],
 )
-def test_search_grouping_applies_coupled_axis_rules(
-    settings: Mapping[str, object],
-    changed_axes: tuple[str, ...],
-    groups: tuple[str, ...],
-) -> None:
-    candidate = vp.Candidate(
-        "family",
-        "row",
-        settings,
-        changed_axes=changed_axes,
-        admission_status="passed",
+def test_memory_output_recompute_rejected_until_lowered(setting_key: str) -> None:
+    registry = vpx.standard_axis_registry()
+    candidate = vpx.Candidate(
+        "hvp",
+        "memory-output-recompute",
+        {setting_key: "recompute"},
+    )
+    admitted = registry.admit(candidate)
+
+    assert admitted.admission_status == "failed"
+    assert admitted.admission_error == (
+        f"{setting_key}=recompute requires package-owned output recompute lowering"
     )
 
-    assert (
-        run_module._candidate_class_c_groups(
-            candidate,
-            vpx.axis_table(),
+
+def test_memory_intermediate_residency_admits_only_owned_boundaries() -> None:
+    registry = vpx.standard_axis_registry()
+    torch_func_fields = {
+        "contains_autograd_call": False,
+        "contains_backward_call": False,
+        "uses_out_variant": False,
+        "uses_data_dependent_control_flow": False,
+        "uses_item": False,
+        "has_dynamic_shape_output": False,
+        "vectorization.randomness": "error",
+        "requires_forward_ad": True,
+        "forward_ad_supported": True,
+    }
+    ggn_candidate = vpx.Candidate(
+        "ggn",
+        "ggn-intermediate-residency",
+        {
+            "ggn.jvp_path": "torch_func_jvp",
+            "memory.intermediate_residency": "cpu_staged",
+            **torch_func_fields,
+        },
+    )
+    composition_candidate = vpx.Candidate(
+        "composition",
+        "composition-intermediate-residency",
+        {
+            "composition.execution": "stream_child_outputs",
+            "memory.intermediate_residency": "cpu_staged",
+        },
+    )
+    hvp_candidate = vpx.Candidate(
+        "hvp",
+        "hvp-intermediate-residency",
+        {
+            "hvp.path": "reverse_over_reverse",
+            "memory.intermediate_residency": "cpu_staged",
+        },
+    )
+    fused_composition_candidate = vpx.Candidate(
+        "composition",
+        "fused-composition-intermediate-residency",
+        {
+            "composition.execution": "fuse_adjacent_children",
+            "memory.intermediate_residency": "cpu_staged",
+        },
+    )
+
+    assert registry.admit(ggn_candidate).admission_status == "passed"
+    assert registry.admit(composition_candidate).admission_status == "passed"
+    assert registry.admit(hvp_candidate).admission_error == (
+        "memory.intermediate_residency requires named intermediate boundaries"
+    )
+    assert registry.admit(fused_composition_candidate).admission_error == (
+        "memory.intermediate_residency requires visible composition child boundaries"
+    )
+
+
+def test_matrix_free_lanczos_requires_declared_iterations() -> None:
+    registry = vpx.standard_axis_registry()
+    matrix_free_candidate = vpx.Candidate(
+        "sqrt_metric",
+        "matrix-free-lanczos",
+        {
+            "sqrt_metric.factor_path": "matrix_free_lanczos",
+            "sqrt_metric.lanczos_iterations": 8,
+        },
+    )
+    stray_iterations = vpx.Candidate(
+        "sqrt_metric",
+        "stray-lanczos-iterations",
+        {"sqrt_metric.lanczos_iterations": 8},
+    )
+
+    assert registry.admit(matrix_free_candidate).admission_status == "passed"
+    assert registry.admit(stray_iterations).admission_error == (
+        "sqrt_metric.lanczos_iterations requires matrix_free_lanczos"
+    )
+
+
+def test_matrix_free_preconditioner_rejected_until_sibling_product_lowered() -> None:
+    registry = vpx.standard_axis_registry()
+    candidate = vpx.Candidate(
+        "inverse_metric",
+        "matrix-free-preconditioner",
+        {"inverse_metric.preconditioner": "matrix_free"},
+    )
+
+    assert registry.admit(candidate).admission_error == (
+        "inverse_metric.preconditioner=matrix_free requires named sibling product "
+        "lowering"
+    )
+
+
+@pytest.mark.parametrize(
+    ("setting_key", "value"),
+    [
+        ("layout.params", "per_shard"),
+        ("layout.params", "dtensor"),
+        ("layout.vector", "per_shard"),
+        ("layout.vector", "dtensor"),
+        ("layout.output", "per_shard"),
+        ("layout.output", "dtensor"),
+    ],
+)
+def test_distributed_layout_values_require_distributed_adapter(
+    setting_key: str,
+    value: str,
+) -> None:
+    registry = vpx.standard_axis_registry()
+    core_candidate = vpx.Candidate(
+        "gradient",
+        "core-distributed-layout",
+        {setting_key: value},
+    )
+    combined_registry = vpx.standard_axis_registry()
+    combined_registry.register(
+        vpx.AxisDescriptor(
+            "distributed.strategy",
+            ("distributed.strategy",),
+            ("tensor_parallel",),
         )
-        == groups
+    )
+    distributed_candidate = vpx.Candidate(
+        "gradient",
+        "adapter-distributed-layout",
+        {setting_key: value, "distributed.strategy": "tensor_parallel"},
+    )
+
+    assert registry.admit(core_candidate).admission_error == (
+        f"{setting_key}={value} requires distributed adapter ownership"
+    )
+    assert combined_registry.admit(distributed_candidate).admission_status == "passed"
+
+
+def test_standard_compile_boundary_rejects_transformer_block_without_adapter() -> None:
+    registry = vpx.standard_axis_registry()
+    candidate = vpx.Candidate(
+        "gradient",
+        "plain-transformer-block",
+        {
+            "gradient.path": "torch_autograd_grad",
+            "compile.enabled": "true",
+            "compile.boundary": "transformer_block",
+            "compile.backend": "inductor",
+            "compile.mode": "default",
+            "compile.fullgraph": "false",
+            "compile.dynamic": None,
+            "compile.compiled_autograd": "false",
+            "compile.options.epilogue_fusion": "false",
+            "compile.options.shape_padding": "false",
+            "compile.cuda_graphs": "false",
+            "compile.cache_state": "cold_compile",
+        },
+    )
+
+    assert registry.admit(candidate).admission_error == (
+        "compile.boundary=transformer_block is not lowered for gradient"
     )
 
 
-def axis_table_candidate(
-    settings: Mapping[str, object],
-    fixed_fields: Mapping[str, object],
-) -> vp.Candidate:
-    return vpx.axis_table().admit(
-        vp.Candidate("family", "row", settings),
-        fixed_fields=fixed_fields,
-    )
-
-
-def assert_axis_table_admitted(
-    settings: Mapping[str, object],
-    fixed_fields: Mapping[str, object],
-) -> None:
-    admitted = axis_table_candidate(settings, fixed_fields)
-
-    assert admitted.admission_status == "passed"
-    assert admitted.admission_error is None
-
-
-def assert_axis_table_rejected(
-    settings: Mapping[str, object],
-    fixed_fields: Mapping[str, object],
-    match: str,
-) -> None:
-    rejected = axis_table_candidate(settings, fixed_fields)
-
-    assert rejected.admission_status == "failed"
-    assert rejected.admission_error is not None
-    assert match in rejected.admission_error
+def valid_sampling_bound() -> dict[str, object]:
+    return {
+        "kind": "abs_or_rel",
+        "max_abs_diff": 1e-12,
+        "max_rel_diff": 1e-12,
+        "norm_floor": 1e-12,
+    }
 
 
 def reduction_bound_fields() -> dict[str, object]:
@@ -2027,469 +1665,9 @@ def reduction_bound_fields() -> dict[str, object]:
     }
 
 
-def test_axis_table_admission_requires_exact_loss_scaling_fields() -> None:
-    assert_axis_table_admitted(
-        {
-            "numeric.loss_scaling": "static_scale_with_exact_unscale",
-            "numeric.loss_scale": 8.0,
-            "numeric.loss_unscale_degree": 1,
-        },
-        {},
-    )
-    assert_axis_table_rejected(
-        {"numeric.loss_scale": 8.0},
-        {},
-        "numeric.loss_scaling is required",
-    )
-    assert_axis_table_rejected(
-        {"numeric.loss_scaling": "none", "numeric.loss_scale": 8.0},
-        {},
-        "forbids",
-    )
-    assert_axis_table_rejected(
-        {"numeric.loss_scaling": "static_scale_with_exact_unscale"},
-        {},
-        "numeric.loss_scale is required",
-    )
-    assert_axis_table_rejected(
-        {
-            "numeric.loss_scaling": "static_scale_with_exact_unscale",
-            "numeric.loss_scale": 8.0,
-        },
-        {},
-        "numeric.loss_unscale_degree is required",
-    )
-    assert_axis_table_rejected(
-        {
-            "numeric.loss_scaling": "static_scale_with_exact_unscale",
-            "numeric.loss_scale": 0.0,
-            "numeric.loss_unscale_degree": 1,
-        },
-        {},
-        "positive float",
-    )
-
-
-def test_axis_table_admission_rejects_metric_representation_mismatches() -> None:
-    assert_axis_table_admitted(
-        {"metric.multiply_path": "dense_matmul"},
-        {"metric.representation": "dense_matrix"},
-    )
-    assert_axis_table_admitted(
-        {
-            "metric.multiply_path": "factorized_multiply",
-            "metric.accumulation": "materialized_blocks",
-        },
-        {"metric.representation": "kfac_factors"},
-    )
-    assert_axis_table_admitted(
-        {"inverse_metric.solve_path": "woodbury_low_rank_solve"},
-        {"metric.representation": "low_rank_factors"},
-    )
-    assert_axis_table_admitted(
-        {"inverse_metric.solve_path": "cholesky_solve"},
-        {"metric.representation": "dense_matrix", "metric.psd": True},
-    )
-    assert_axis_table_admitted(
-        {"inverse_metric.solve_path": "eigh_solve"},
-        {"metric.representation": "dense_matrix", "metric.symmetric": True},
-    )
-    assert_axis_table_admitted(
-        {
-            "inverse_metric.solve_path": "conjugate_gradient",
-            "inverse_metric.iteration_budget": 4,
-            "inverse_metric.preconditioner": "none",
-            "metric.multiply_path": "dense_matmul",
-        },
-        {"metric.representation": "dense_matrix"},
-    )
-    assert_axis_table_admitted(
-        {
-            "metric.multiply_path": "blockwise_multiply",
-            "metric.block_schedule": "custom_blocks",
-            "metric.accumulation": "materialized_blocks",
-        },
-        {
-            "metric.representation": {
-                "kind": "block_diagonal",
-                "block_schedule": "custom_blocks",
-            }
-        },
-    )
-    assert_axis_table_admitted(
-        {
-            "inverse_metric.solve_path": "blockwise_solve",
-            "inverse_metric.block_schedule": "layer_blocks",
-        },
-        {
-            "metric.representation": {
-                "kind": "block_diagonal",
-                "block_schedule": "layer_blocks",
-            }
-        },
-    )
-
-    assert_axis_table_rejected(
-        {"metric.multiply_path": "dense_matmul"},
-        {"metric.representation": "kfac_factors"},
-        "dense matrix",
-    )
-    assert_axis_table_rejected(
-        {"metric.multiply_path": "factorized_multiply"},
-        {"metric.representation": "dense_matrix"},
-        "requires factors",
-    )
-    assert_axis_table_rejected(
-        {"metric.multiply_path": "blockwise_multiply"},
-        {"metric.representation": "kfac_factors"},
-        "requires blocks",
-    )
-    assert_axis_table_rejected(
-        {"inverse_metric.solve_path": "dense_solve"},
-        {"metric.representation": "kfac_factors"},
-        "requires dense matrix",
-    )
-    assert_axis_table_rejected(
-        {"inverse_metric.solve_path": "cholesky_solve"},
-        {"metric.representation": "dense_matrix"},
-        "requires a PSD metric",
-    )
-    assert_axis_table_rejected(
-        {"inverse_metric.solve_path": "eigh_solve"},
-        {"metric.representation": "dense_matrix"},
-        "requires a symmetric metric",
-    )
-    assert_axis_table_rejected(
-        {"inverse_metric.solve_path": "woodbury_low_rank_solve"},
-        {"metric.representation": "kfac_factors"},
-        "requires low-rank factors",
-    )
-    assert_axis_table_rejected(
-        {
-            "inverse_metric.solve_path": "conjugate_gradient",
-            "inverse_metric.iteration_budget": 4,
-            "inverse_metric.preconditioner": "none",
-        },
-        {"metric.representation": "dense_matrix"},
-        "metric.multiply_path",
-    )
-    assert_axis_table_rejected(
-        {
-            "inverse_metric.solve_path": "conjugate_gradient",
-            "metric.multiply_path": "dense_matmul",
-        },
-        {"metric.representation": "dense_matrix"},
-        "iteration_budget",
-    )
-    assert_axis_table_rejected(
-        {
-            "inverse_metric.solve_path": "conjugate_gradient",
-            "metric.multiply_path": "dense_matmul",
-            "inverse_metric.iteration_budget": 4,
-        },
-        {"metric.representation": "dense_matrix"},
-        "preconditioner",
-    )
-    assert_axis_table_rejected(
-        {
-            "inverse_metric.solve_path": "dense_solve",
-            "inverse_metric.preconditioner": "none",
-        },
-        {"metric.representation": "dense_matrix"},
-        "iterative",
-    )
-    assert_axis_table_rejected(
-        {"metric.block_schedule": "layer_blocks"},
-        {"metric.representation": "low_rank_factors"},
-        "requires blocks or KFAC factors",
-    )
-    assert_axis_table_rejected(
-        {"metric.block_schedule": "layer_blocks"},
-        {"metric.representation": "block_diagonal"},
-        "representation.block_schedule",
-    )
-    assert_axis_table_rejected(
-        {"metric.block_schedule": "layer_blocks"},
-        {
-            "metric.representation": {
-                "kind": "block_diagonal",
-                "block_schedule": "custom_blocks",
-            }
-        },
-        "must match representation.block_schedule",
-    )
-    assert_axis_table_rejected(
-        {"inverse_metric.block_schedule": "module_blocks"},
-        {
-            "metric.representation": {
-                "kind": "kfac_factors",
-                "block_schedule": "layer_blocks",
-            }
-        },
-        "must match representation.block_schedule",
-    )
-    assert_axis_table_rejected(
-        {"metric.accumulation": "streaming", "metric.multiply_path": "dense_matmul"},
-        {"metric.representation": "dense_matrix"},
-        "non-dense metric paths",
-    )
-    assert_axis_table_rejected(
-        {"metric.accumulation": "streaming"},
-        {"metric.representation": "kfac_factors"},
-        "requires metric.multiply_path",
-    )
-    assert_axis_table_rejected(
-        {"metric.multiply_path": "factorized_multiply"},
-        {"metric.representation": "kfac_factors"},
-        "metric.accumulation is required",
-    )
-    assert_axis_table_rejected(
-        {
-            "metric.multiply_path": "streaming_multiply",
-            "metric.accumulation": "materialized_blocks",
-        },
-        {"metric.representation": "kfac_factors"},
-        "must be streaming",
-    )
-    assert_axis_table_rejected(
-        {
-            "metric.multiply_path": "factorized_multiply",
-            "metric.accumulation": "streaming",
-        },
-        {"metric.representation": "kfac_factors"},
-        "must be materialized_blocks",
-    )
-    assert_axis_table_rejected(
-        {"dtype.metric_factor": "bf16"},
-        {"metric.representation": "dense_matrix"},
-        "requires a factorized metric path",
-    )
-
-
-def test_axis_table_admission_rejects_cross_axis_contradictions() -> None:
-    assert_axis_table_admitted(
-        {
-            "attention.sdpa_kernel": "math",
-            "attention.partition": "packed_tokens",
-            "input.batch_layout": "packed_with_inverse_permutation",
-        },
-        {"attention.calls_sdpa": True},
-    )
-    assert_axis_table_admitted(
-        {
-            "compile.enabled": "true",
-            "compile.mode": None,
-            "compile.options.epilogue_fusion": "true",
-            "compile.options.shape_padding": "false",
-        },
-        {},
-    )
-    assert_axis_table_admitted(
-        {"attention.partition": "segmented_forward_ad", "jvp.path": "forward_ad_dual"},
-        {},
-    )
-    assert_axis_table_admitted(
-        {"dtype.accumulation": "bf16"},
-        reduction_bound_fields(),
-    )
-    assert_axis_table_admitted(
-        {"sampled_fisher.sample_source": "fixed_seed_and_count"},
-        {
-            "sampled_fisher.sample_count": 4,
-            "sampled_fisher.sample_seed": 123,
-        },
-    )
-    assert_axis_table_admitted(
-        {
-            "sampled_fisher.sample_source": "fixed_seed_and_count",
-            "sampled_fisher.exact_fisher_check": "enabled_with_sampling_bound",
-        },
-        {
-            "sampled_fisher.sample_count": 4,
-            "sampled_fisher.sample_seed": 123,
-            "sampled_fisher.sampling_bound": {"kind": "absolute_error"},
-        },
-    )
-    assert_axis_table_admitted(
-        {"tp.loss_parallel": "true"},
-        {
-            "tp.exact_cross_shard_normalization": True,
-            "tp.multi_rank_agreement_check": True,
-        },
-    )
-
-    assert_axis_table_rejected(
-        {"unknown.axis": "x"},
-        {},
-        "no axis table owner",
-    )
-    assert_axis_table_rejected(
-        {"vectorization.batch_size": 0},
-        {},
-        "positive integer",
-    )
-    assert_axis_table_rejected(
-        {"attention.sdpa_kernel": "math"},
-        {},
-        "calls PyTorch SDPA",
-    )
-    assert_axis_table_rejected(
-        {"attention.sdpa_kernel": "flash_attention"},
-        {"attention.calls_sdpa": True, "attention.effective_runtime_dtype": "fp32"},
-        "requires float16 or bfloat16",
-    )
-    assert_axis_table_rejected(
-        {"attention.sdpa_kernel": "priority_list"},
-        {"attention.calls_sdpa": True},
-        "requires backend order",
-    )
-    assert_axis_table_rejected(
-        {"schedule.per_token": "packed", "input.batch_layout": "dense_padded"},
-        {},
-        "requires packed or variable-length layout",
-    )
-    assert_axis_table_rejected(
-        {
-            "activation.recompute": "none",
-            "checkpoint.early_stop": "true",
-        },
-        {},
-        "checkpoint.early_stop=false",
-    )
-    assert_axis_table_rejected(
-        {"activation.offload": "saved_tensor_hooks_cpu"},
-        {},
-        "saved-tensor-hooks path",
-    )
-    assert_axis_table_rejected(
-        {
-            "compile.enabled": "false",
-            "compile.mode": "max-autotune",
-        },
-        {},
-        "compile.enabled=false forbids",
-    )
-    assert_axis_table_rejected(
-        {
-            "compile.mode": "default",
-            "compile.options.epilogue_fusion": "true",
-        },
-        {},
-        "backend options require compile.mode=None",
-    )
-    assert_axis_table_rejected(
-        {
-            "compile.mode": "default",
-            "compile.cuda_graphs": "true",
-        },
-        {},
-        "backend options require compile.mode=None",
-    )
-    assert_axis_table_rejected(
-        {
-            "compile.mode": None,
-            "compile.options.epilogue_fusion": "false",
-            "compile.options.shape_padding": "false",
-            "compile.cuda_graphs": "false",
-        },
-        {},
-        "forbid compile.mode=None",
-    )
-    assert_axis_table_rejected(
-        {"numeric.float32_matmul_precision": "medium"},
-        {},
-        "missing bound fields",
-    )
-    assert_axis_table_rejected(
-        {"sampled_fisher.sample_source": "fixed_sample_table"},
-        {"sampled_fisher.sample_count": 4},
-        "sample table identity",
-    )
-    assert_axis_table_rejected(
-        {
-            "sampled_fisher.sample_source": "fixed_seed_and_count",
-            "sampled_fisher.exact_fisher_check": "enabled_with_sampling_bound",
-        },
-        {
-            "sampled_fisher.sample_count": 4,
-            "sampled_fisher.sample_seed": 123,
-        },
-        "sampling-bound formula",
-    )
-    assert_axis_table_rejected(
-        {
-            "gradient.value_reuse": "gradient_and_primal_value",
-            "gradient.path": "torch_func_grad",
-        },
-        {},
-        "value-and-gradient path",
-    )
-    assert_axis_table_rejected(
-        {
-            "jvp.linearize_reuse": "reuse_at_same_primal",
-            "jvp.path": "torch_func_jvp",
-        },
-        {},
-        "requires torch_func_linearize",
-    )
-    assert_axis_table_rejected(
-        {
-            "vjp.closure_reuse": "reuse_vjp_closure_at_same_primal",
-            "vjp.path": "autograd_grad_outputs",
-        },
-        {},
-        "requires torch_func_vjp",
-    )
-    assert_axis_table_rejected(
-        {"ggn.jvp_path": "torch_func_jvp"},
-        {},
-        "ggn.vjp_path is required",
-    )
-    assert_axis_table_rejected(
-        {"fisher.accumulation": "streaming_dot_accumulate"},
-        {},
-        "fisher.expectation_path is required",
-    )
-    assert_axis_table_rejected(
-        {
-            "fisher.expectation_path": "explicit_full_expectation_score_rows",
-            "fisher.accumulation": "streaming_dot_accumulate",
-        },
-        {},
-        "fisher.score_grad_path is required",
-    )
-    assert_axis_table_rejected(
-        {
-            "fisher.expectation_path": "explicit_full_expectation_score_rows",
-            "fisher.accumulation": "materialize_score_gradients",
-            "fisher.score_grad_path": "torch_autograd_grad_loop",
-        },
-        {},
-        "not used",
-    )
-    assert_axis_table_rejected(
-        {
-            "inverse_metric.solve_path": "dense_solve",
-            "inverse_metric.iteration_budget": 4,
-        },
-        {"metric.representation": "dense_matrix"},
-        "applies only to iterative solves",
-    )
-    assert_axis_table_rejected(
-        {"attention.partition": "segmented_forward_ad"},
-        {},
-        "requires forward AD path",
-    )
-    assert_axis_table_rejected(
-        {"tp.loss_parallel": "true"},
-        {"tp.exact_cross_shard_normalization": True},
-        "multi-rank agreement check",
-    )
-
-
 def test_cohort_constraint_rejects_unsupported_modes() -> None:
     with pytest.raises(RuntimeError, match="dependency inheritance"):
-        vp.CohortConstraint(
+        vpx.CohortConstraint(
             name="bad",
             settings_keys=("dtype.model_compute",),
             assignments=({"dtype.model_compute": "fp32"},),
@@ -2497,7 +1675,7 @@ def test_cohort_constraint_rejects_unsupported_modes() -> None:
         )
 
     with pytest.raises(RuntimeError, match="selection aggregation"):
-        vp.CohortConstraint(
+        vpx.CohortConstraint(
             name="bad",
             settings_keys=("dtype.model_compute",),
             assignments=({"dtype.model_compute": "fp32"},),
@@ -2506,8 +1684,8 @@ def test_cohort_constraint_rejects_unsupported_modes() -> None:
 
 
 def materialize_candidate_impl(
-    candidate: vp.Candidate,
-    record: vp.FullSizeRecord,
+    candidate: vpx.Candidate,
+    record: vpx.FullSizeRecord,
 ) -> vpx.CandidateOperation:
     def operation() -> torch.Tensor:
         return torch.tensor([float(candidate.settings.get("scale", 1.0))])
@@ -2521,15 +1699,120 @@ materialize_candidate = vpx.CallableMaterializer(
     "tests.materialize_candidate",
     "1",
     {},
+    {"callback": "tests.materialize_candidate_impl"},
     materialize_candidate_impl,
 )
 
 
+def runtime_config(
+    candidates: Sequence[vpx.Candidate],
+    operation_factory: vpx.OperationFactoryCallback,
+    reference_check: vpx.ReferenceCheckCallback,
+    materializer: vpx.Materializer,
+    axis_registry: vpx.CandidateAdmitter | None,
+    signature: Mapping[str, Any],
+    autobatch_domains: tuple[vpx.AutobatchDomain, ...] = (),
+    *,
+    full_size_check: vpx.FullSizeCheck | None = None,
+    reference_check_name: str = "tree_close",
+) -> vpx.RuntimeConfig:
+    settings = {"runtime": dict(signature)}
+    operation_factory = vpx.CallableOperationFactory(
+        "tests.operation_factory",
+        "1",
+        settings,
+        {"callback": "tests.operation_factory"},
+        operation_factory,
+    )
+    reference_check = vpx.CallableReferenceCheck(
+        "tests.reference_check",
+        "1",
+        settings,
+        {"callback": "tests.reference_check"},
+        reference_check,
+    )
+
+    return vpx.RuntimeConfig(
+        tuple(candidates),
+        operation_factory,
+        reference_check,
+        materializer,
+        axis_registry,
+        signature,
+        autobatch_domains=autobatch_domains,
+        full_size_check=full_size_check,
+        reference_check_name=reference_check_name,
+    )
+
+
+def test_runtime_config_requires_identity_bearing_callbacks() -> None:
+    candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
+
+    def operation_factory(
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert candidate.candidate_id == "row"
+        assert batch == {}
+
+        return vpx.constant_operation(vector)
+
+    def reference_check(
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
+        assert candidate.candidate_id == "row"
+        assert batch == {}
+        assert vector is not None
+
+        return reference_passed()
+
+    wrapped_operation_factory = vpx.CallableOperationFactory(
+        "tests.operation_factory",
+        "1",
+        {},
+        {"callback": "tests.operation_factory"},
+        operation_factory,
+    )
+    wrapped_reference_check = vpx.CallableReferenceCheck(
+        "tests.reference_check",
+        "1",
+        {},
+        {"callback": "tests.reference_check"},
+        reference_check,
+    )
+
+    def untyped(value: Any) -> Any:
+        return value
+
+    with pytest.raises(vp.MaterializationError, match="operation_factory"):
+        vpx.RuntimeConfig(
+            (candidate,),
+            untyped(operation_factory),
+            wrapped_reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.raw-callback"},
+        )
+
+    with pytest.raises(vp.MaterializationError, match="reference_check"):
+        vpx.RuntimeConfig(
+            (candidate,),
+            wrapped_operation_factory,
+            untyped(reference_check),
+            materialize_candidate,
+            None,
+            {"runtime": "test.raw-callback"},
+        )
+
+
 def replay_context_for_plan(
-    plan: vp.Plan,
+    plan: vpx.Plan,
     *,
     validation_required: bool = False,
-) -> vp.ReplayContext:
+) -> vpx.ReplayContext:
     family_input_signatures = {
         family: record.input_signature for family, record in plan.records.items()
     }
@@ -2537,7 +1820,7 @@ def replay_context_for_plan(
     for record in plan.check_records:
         family_input_signatures.setdefault(record.family, record.input_signature)
 
-    return vp.ReplayContext(
+    return vpx.ReplayContext(
         input_signature=plan.input_signature,
         family_input_signatures=family_input_signatures,
         materializer_identities=plan.materializer_identities(),
@@ -2553,8 +1836,8 @@ def replay_context_for_plan(
 
 def saved_plan_rows(
     run_dir: Path,
-    plan: vp.Plan,
-) -> tuple[tuple[vp.FullSizeRecord, ...], tuple[vp.CheckRecord, ...]]:
+    plan: vpx.Plan,
+) -> tuple[tuple[vpx.FullSizeRecord, ...], tuple[vpx.CheckRecord, ...]]:
     saved_full_size_rows = tuple(
         vpx.full_size_record_from_json(read_record(path))
         for path in sorted((run_dir / "full_size").rglob("*.json"))
@@ -2582,15 +1865,15 @@ def saved_plan_rows(
 
 def saved_candidate_rows(
     run_dir: Path,
-    _: vp.Plan,
+    _: vpx.Plan,
 ) -> tuple[Mapping[str, object], ...]:
     return tuple(
         read_record(path) for path in sorted((run_dir / "candidates").rglob("*.json"))
     )
 
 
-def candidate_records_for_plan(plan: vp.Plan) -> tuple[Mapping[str, object], ...]:
-    def candidate_for_record(record: vp.FullSizeRecord) -> vp.Candidate:
+def candidate_records_for_plan(plan: vpx.Plan) -> tuple[Mapping[str, object], ...]:
+    def candidate_for_record(record: vpx.FullSizeRecord) -> vpx.Candidate:
         selected_candidate = plan.selected.get(record.family)
 
         if (
@@ -2601,7 +1884,7 @@ def candidate_records_for_plan(plan: vp.Plan) -> tuple[Mapping[str, object], ...
         ):
             return selected_candidate
 
-        return vp.Candidate(
+        return vpx.Candidate(
             family=record.family,
             candidate_id=record.candidate_id,
             settings=dict(record.candidate_settings),
@@ -2624,7 +1907,7 @@ def candidate_records_for_plan(plan: vp.Plan) -> tuple[Mapping[str, object], ...
 
 
 def test_candidate_record_round_trips_migration_source_id() -> None:
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"scale": 1.0},
@@ -2643,7 +1926,7 @@ def test_candidate_record_round_trips_migration_source_id() -> None:
 
 
 def test_candidate_record_writes_declared_hook_ids(tmp_path: Path) -> None:
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "hooks",
         {
@@ -2665,8 +1948,8 @@ def test_candidate_record_writes_declared_hook_ids(tmp_path: Path) -> None:
 
 def test_write_record_exclusive_preserves_existing_record(tmp_path: Path) -> None:
     path = tmp_path / "candidate.json"
-    first = vp.Candidate("family", "first", {}, admission_status="passed")
-    second = vp.Candidate("family", "second", {}, admission_status="passed")
+    first = vpx.Candidate("family", "first", {}, admission_status="passed")
+    second = vpx.Candidate("family", "second", {}, admission_status="passed")
 
     write_record(path, vpx.candidate_record_to_json(first, _input_signature("first")))
 
@@ -2681,8 +1964,8 @@ def test_write_record_exclusive_preserves_existing_record(tmp_path: Path) -> Non
 
 def test_write_unique_record_moves_to_numbered_sibling(tmp_path: Path) -> None:
     path = tmp_path / "candidate.json"
-    first = vp.Candidate("family", "first", {}, admission_status="passed")
-    second = vp.Candidate("family", "second", {}, admission_status="passed")
+    first = vpx.Candidate("family", "first", {}, admission_status="passed")
+    second = vpx.Candidate("family", "second", {}, admission_status="passed")
 
     run_module._write_unique_record(
         path,
@@ -2698,7 +1981,7 @@ def test_write_unique_record_moves_to_numbered_sibling(tmp_path: Path) -> None:
 
 
 def test_write_record_rejects_type_specific_missing_fields(tmp_path: Path) -> None:
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"scale": 1.0},
@@ -2736,7 +2019,7 @@ def test_write_record_rejects_type_specific_missing_fields(tmp_path: Path) -> No
         "materializer_identities": {},
         "runtime_identities": {},
         "adapter_identities": {},
-        "policy": dataclasses.asdict(vp.SelectionPolicy()),
+        "policy": dataclasses.asdict(vpx.SelectionPolicy()),
     }
 
     with pytest.raises(vp.RecordFormatError, match="target_identity"):
@@ -2761,61 +2044,6 @@ def test_stable_hash_changes_on_identity_inputs() -> None:
     assert stable_hash(first) != stable_hash(second)
 
 
-def test_adapter_namespace_exports_adapter_helpers() -> None:
-    assert vpa.apply_context_parallel
-    assert vpa.apply_fsdp2
-    assert vpa.apply_fsdp2_group
-    assert vpa.apply_tensor_parallel
-    assert vpa.DistributedCommunicationBindings
-    assert vpa.DistributedContextParallelBindings
-    assert vpa.DistributedFSDPBindings
-    assert vpa.DistributedMeshBindings
-    assert vpa.DistributedPlacementBindings
-    assert vpa.DistributedProcessGroupBindings
-    assert vpa.DistributedSequenceParallelBindings
-    assert vpa.DistributedStrategyBindings
-    assert vpa.DistributedTensorParallelBindings
-    assert vpa.build_colwise_parallel
-    assert vpa.build_device_mesh
-    assert vpa.build_dtensor_placement
-    assert vpa.build_fsdp_dp_mesh_dims
-    assert vpa.build_fsdp_mixed_precision_policy
-    assert vpa.build_fsdp_offload_policy
-    assert vpa.build_prepare_module_input
-    assert vpa.build_prepare_module_output
-    assert vpa.build_rowwise_parallel
-    assert vpa.build_sequence_parallel
-    assert vpa.collective_all_gather_into_tensor
-    assert vpa.collective_all_to_all_single
-    assert vpa.collective_reduce_scatter_tensor
-    assert vpa.initialize_process_group
-    assert vpa.named_modules_for_distributed_wrap
-    assert vpa.redistribute_dtensor
-    assert vpa.resolve_process_group_backend
-    assert vpa.run_with_loss_parallel
-    assert vpa.wait_collective
-    assert vpa.distributed_axis_manifest
-    assert vpa.distributed_strategy_axis
-    assert vpa.distributed_strategy_applier
-    assert vpa.RankCompileTiming
-    assert vpa.RankStatus
-    assert vpa.PilotReadiness
-    assert vpa.check_patched_attention_output_reference
-    assert vpa.check_patched_attention_vjp_reference
-    assert vpa.load_transformers_model
-    assert vpa.register_transformers_attention
-    assert vpa.set_transformers_attention_implementation
-    assert vpa.transformers_attention_location
-    assert vpa.transformers_attention_axis
-    assert vpa.transformers_attn_implementation
-
-
-def test_package_exposes_type_marker() -> None:
-    marker = importlib.resources.files("vptune").joinpath("py.typed")
-
-    assert marker.is_file()
-
-
 def test_module_identity_records_tied_parameters_and_devices() -> None:
     class TiedModule(torch.nn.Module):
         def __init__(self) -> None:
@@ -2831,16 +2059,16 @@ def test_module_identity_records_tied_parameters_and_devices() -> None:
     assert identity["parameters"][0]["device"] == "cpu"
     assert identity["buffers"][0]["device"] == "cpu"
 
-    preserved = vp.parameter_surface(TiedModule(), tied_weights="preserve")
-    deduplicated = vp.parameter_surface(TiedModule(), tied_weights="deduplicate")
+    preserved = vpx.parameter_surface(TiedModule(), tied_weights="preserve")
+    deduplicated = vpx.parameter_surface(TiedModule(), tied_weights="deduplicate")
 
     assert preserved.names == ("first", "second")
     assert deduplicated.names == ("first",)
 
     with pytest.raises(RuntimeError):
-        vp.parameter_surface(TiedModule(), tied_weights="unknown")
+        vpx.parameter_surface(TiedModule(), tied_weights="unknown")
 
-    grouped = vp.parameter_surface(
+    grouped = vpx.parameter_surface(
         TiedModule(),
         layer_groups=(("first", "second"),),
         block_groups=(("first", "second"),),
@@ -2851,10 +2079,10 @@ def test_module_identity_records_tied_parameters_and_devices() -> None:
     assert grouped.signature()["layer_groups"] == (("first", "second"),)
 
     with pytest.raises(RuntimeError, match="layer_groups"):
-        vp.parameter_surface(TiedModule(), layer_groups=(("first",),))
+        vpx.parameter_surface(TiedModule(), layer_groups=(("first",),))
 
     with pytest.raises(RuntimeError, match="parametrization_policy"):
-        vp.ParameterSurface(
+        vpx.ParameterSurface(
             names=("first",),
             shapes=((2,),),
             trainable=(True,),
@@ -3202,7 +2430,7 @@ def test_measurement_timing_policy() -> None:
 
     samples, output, probe = measure_operation(
         operation,
-        timing_policy=vp.TimingPolicy(),
+        timing_policy=vpx.TimingPolicy(),
         memory_backend=CPUMemoryBackend(),
         clock=FakeClock(),
     )
@@ -3224,7 +2452,7 @@ def test_measurement_reuses_long_probe_as_measured_sample() -> None:
 
     samples, output, probe = measure_operation(
         operation,
-        timing_policy=vp.TimingPolicy(),
+        timing_policy=vpx.TimingPolicy(),
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 700.0)),
     )
@@ -3237,7 +2465,7 @@ def test_measurement_reuses_long_probe_as_measured_sample() -> None:
 
 
 def test_run_candidate_records_runtime_failures() -> None:
-    candidate = vp.Candidate("family", "row", {})
+    candidate = vpx.Candidate("family", "row", {})
 
     def operation() -> torch.Tensor:
         message = "failed row"
@@ -3247,7 +2475,7 @@ def test_run_candidate_records_runtime_failures() -> None:
         candidate,
         {"case": "runtime"},
         operation,
-        timing_policy=vp.TimingPolicy(),
+        timing_policy=vpx.TimingPolicy(),
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 2.0)),
     )
@@ -3262,7 +2490,7 @@ def test_run_candidate_records_runtime_failures() -> None:
 
 
 def test_run_candidate_records_cuda_oom_failures() -> None:
-    candidate = vp.Candidate("family", "row", {})
+    candidate = vpx.Candidate("family", "row", {})
 
     def operation() -> torch.Tensor:
         message = "cuda oom"
@@ -3272,7 +2500,7 @@ def test_run_candidate_records_cuda_oom_failures() -> None:
         candidate,
         {"case": "oom"},
         operation,
-        timing_policy=vp.TimingPolicy(),
+        timing_policy=vpx.TimingPolicy(),
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 3.0)),
     )
@@ -3287,7 +2515,7 @@ def test_run_candidate_records_cuda_oom_failures() -> None:
 
 
 def test_run_candidate_records_compiled_selection_metadata() -> None:
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "compiled",
         {
@@ -3308,7 +2536,7 @@ def test_run_candidate_records_compiled_selection_metadata() -> None:
         candidate,
         {"case": "compiled-metadata"},
         operation,
-        timing_policy=vp.TimingPolicy(
+        timing_policy=vpx.TimingPolicy(
             short_seconds=10.0,
             short_warmups=0,
             short_measured_calls=2,
@@ -3331,95 +2559,95 @@ def test_run_candidate_records_compiled_selection_metadata() -> None:
 
 def test_candidate_rows_reject_missing_runtime_bindings() -> None:
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
-        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(candidate, vpx.Candidate)
         assert isinstance(batch, Mapping)
 
         return vpx.constant_operation(vector)
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
-        assert isinstance(candidate, vp.Candidate)
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
+        assert isinstance(candidate, vpx.Candidate)
         assert isinstance(batch, Mapping)
         assert vector is not None
 
         return reference_passed()
 
     candidates = (
-        vp.Candidate("family", "baseline", {}, admission_status="passed"),
-        vp.Candidate(
+        vpx.Candidate("family", "baseline", {}, admission_status="passed"),
+        vpx.Candidate(
             "family",
             "fused",
             {"fusion.loss": "fused_ce"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "packed",
             {"input.batch_layout": "packed_with_inverse_permutation"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "lm-head",
             {"chunk.lm_head_weight_chunk_bytes": 1024},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "layer-output",
             {"layout.output": "per_layer_flat"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "block-vector",
             {"layout.vector": "per_block_flat"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "layer-chunk",
             {"chunk.layer_block_size": 2},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "mmap",
             {"memory.vector_residency": "mmap_cpu"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "intermediate",
             {"memory.intermediate_residency": "cpu_staged"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "manual",
             {"activation.recompute": "manual_recompute"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "teacher",
             {"teacher_outputs": "recomputed_with_equality_check"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "stateful-incomplete",
             {"call.path": "stateful_module"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "stateful-unbound",
             {
@@ -3430,7 +2658,7 @@ def test_candidate_rows_reject_missing_runtime_bindings() -> None:
             admission_status="passed",
         ),
     )
-    runtime = vpx.RuntimeConfig(
+    runtime = runtime_config(
         candidates,
         operation_factory,
         reference_check,
@@ -3442,7 +2670,6 @@ def test_candidate_rows_reject_missing_runtime_bindings() -> None:
             "batch_layout": False,
             "lm_head_chunker": False,
             "mmap_residency": False,
-            "intermediate_residency": False,
             "manual_recompute": False,
             "teacher_objective": False,
             "module": True,
@@ -3501,29 +2728,29 @@ def test_candidate_rows_reject_missing_runtime_bindings() -> None:
 
 def test_candidate_rows_admit_declared_parameter_groups() -> None:
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
-        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(candidate, vpx.Candidate)
         assert isinstance(batch, Mapping)
 
         return vpx.constant_operation(vector)
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
-        assert isinstance(candidate, vp.Candidate)
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
+        assert isinstance(candidate, vpx.Candidate)
         assert isinstance(batch, Mapping)
         assert vector is not None
 
         return reference_passed()
 
-    runtime = vpx.RuntimeConfig(
+    runtime = runtime_config(
         (
-            vp.Candidate(
+            vpx.Candidate(
                 "family",
                 "grouped",
                 {
@@ -3553,29 +2780,29 @@ def test_candidate_rows_admit_declared_parameter_groups() -> None:
 
 def test_candidate_rows_reject_fusion_without_module() -> None:
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
-        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(candidate, vpx.Candidate)
         assert isinstance(batch, Mapping)
 
         return vpx.constant_operation(vector)
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
-        assert isinstance(candidate, vp.Candidate)
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
+        assert isinstance(candidate, vpx.Candidate)
         assert isinstance(batch, Mapping)
         assert vector is not None
 
         return reference_passed()
 
-    runtime = vpx.RuntimeConfig(
+    runtime = runtime_config(
         (
-            vp.Candidate(
+            vpx.Candidate(
                 "family",
                 "fused",
                 {"fusion.loss": "fused_ce"},
@@ -3600,29 +2827,29 @@ def test_candidate_rows_reject_fusion_without_module() -> None:
 
 def test_candidate_rows_reject_stateful_module_without_module() -> None:
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
-        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(candidate, vpx.Candidate)
         assert isinstance(batch, Mapping)
 
         return vpx.constant_operation(vector)
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
-        assert isinstance(candidate, vp.Candidate)
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
+        assert isinstance(candidate, vpx.Candidate)
         assert isinstance(batch, Mapping)
         assert vector is not None
 
         return reference_passed()
 
-    runtime = vpx.RuntimeConfig(
+    runtime = runtime_config(
         (
-            vp.Candidate(
+            vpx.Candidate(
                 "family",
                 "stateful",
                 {
@@ -3651,29 +2878,29 @@ def test_candidate_rows_reject_stateful_module_without_module() -> None:
 
 def test_candidate_rows_admit_builtin_intermediate_residency_points() -> None:
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
-        assert isinstance(candidate, vp.Candidate)
+        assert isinstance(candidate, vpx.Candidate)
         assert isinstance(batch, Mapping)
 
         return vpx.constant_operation(vector)
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
-        assert isinstance(candidate, vp.Candidate)
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
+        assert isinstance(candidate, vpx.Candidate)
         assert isinstance(batch, Mapping)
         assert vector is not None
 
         return reference_passed()
 
-    runtime = vpx.RuntimeConfig(
+    runtime = runtime_config(
         (
-            vp.Candidate(
+            vpx.Candidate(
                 "family",
                 "ggn-intermediate",
                 {"memory.intermediate_residency": "cpu_staged"},
@@ -3687,7 +2914,6 @@ def test_candidate_rows_admit_builtin_intermediate_residency_points() -> None:
         {
             "runtime": "standard",
             "operator": {"kind": "ggnvp"},
-            "intermediate_residency": False,
         },
     )
     rows = tuple(run_module._candidate_rows(runtime))
@@ -3696,7 +2922,7 @@ def test_candidate_rows_admit_builtin_intermediate_residency_points() -> None:
 
 
 def test_run_candidate_records_full_size_check_metadata() -> None:
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "flash",
         {
@@ -3709,8 +2935,8 @@ def test_run_candidate_records_full_size_check_metadata() -> None:
         return torch.tensor([1.0])
 
     def full_size_check(
-        output: vp.TensorTree,
-        samples: tuple[vp.Measurement, ...],
+        output: vpx.TensorTree,
+        samples: tuple[vpx.Measurement, ...],
     ) -> Mapping[str, object]:
         assert isinstance(output, torch.Tensor)
         assert len(samples) == 1
@@ -3725,7 +2951,7 @@ def test_run_candidate_records_full_size_check_metadata() -> None:
         candidate,
         {"case": "full-size-check"},
         operation,
-        timing_policy=vp.TimingPolicy(
+        timing_policy=vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
@@ -3746,7 +2972,7 @@ def test_run_candidate_records_full_size_check_metadata() -> None:
 def test_run_candidate_records_measured_recompile_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "compiled",
         {
@@ -3779,7 +3005,7 @@ def test_run_candidate_records_measured_recompile_count(
         candidate,
         {"case": "compiled-recompile-count"},
         operation,
-        timing_policy=vp.TimingPolicy(
+        timing_policy=vpx.TimingPolicy(
             short_seconds=10.0,
             short_warmups=0,
             short_measured_calls=2,
@@ -3839,7 +3065,7 @@ def test_measurement_cleans_memory_backend_after_runtime_failure() -> None:
 
 
 def _record(
-    candidate: vp.Candidate,
+    candidate: vpx.Candidate,
     *,
     elapsed: tuple[float, ...],
     reserved: tuple[float, ...],
@@ -3900,11 +3126,11 @@ def _with_rank_memory_samples(
 
 
 def _check_record(
-    candidate: vp.Candidate,
+    candidate: vpx.Candidate,
     *,
     input_signature: Mapping[str, object],
-) -> vp.CheckRecord:
-    record = vp.CheckRecord(
+) -> vpx.CheckRecord:
+    record = vpx.CheckRecord(
         family=candidate.family,
         candidate_id=candidate.candidate_id,
         name="tree_close",
@@ -3938,8 +3164,8 @@ def _identity_kwargs(
 
 def test_plan_materialize_validates_selected_dependency_identities() -> None:
     input_signature = {"case": "plan-materialize-dependencies"}
-    dependency = vp.Candidate("dependency", "selected", {}, admission_status="passed")
-    dependent = vp.Candidate(
+    dependency = vpx.Candidate("dependency", "selected", {}, admission_status="passed")
+    dependent = vpx.Candidate(
         "dependent",
         "selected",
         {},
@@ -3958,7 +3184,7 @@ def test_plan_materialize_validates_selected_dependency_identities() -> None:
         reserved=(1.0,),
         input_signature=input_signature,
     )
-    plan = vp.Plan(
+    plan = vpx.Plan(
         selected={
             "dependency": dependency,
             "dependent": dependent,
@@ -3968,7 +3194,7 @@ def test_plan_materialize_validates_selected_dependency_identities() -> None:
             "dependent": dependent_record,
         },
         input_signature=input_signature,
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         materializers={
             "dependency": materialize_candidate,
             "dependent": materialize_candidate,
@@ -3983,13 +3209,46 @@ def test_plan_materialize_validates_selected_dependency_identities() -> None:
         plan.materialize("dependent")
 
 
+def test_plan_materialize_accepts_public_name_selector() -> None:
+    input_signature = {"case": "plan-materialize-name"}
+    candidate = vpx.Candidate(
+        "family",
+        "selected",
+        {"scale": 3.0},
+        admission_status="passed",
+    )
+    record = _record(
+        candidate,
+        elapsed=(1.0,),
+        reserved=(1.0,),
+        input_signature=input_signature,
+    )
+    plan = vpx.Plan(
+        selected={"family": candidate},
+        records={"family": record},
+        input_signature=input_signature,
+        policy=vpx.SelectionPolicy(),
+        materializers={"family": materialize_candidate},
+        dependencies_by_family={"family": ()},
+    )
+
+    selected_from_plan = plan.materialize(name="family")
+    selected_from_public_helper = vp.materialize(plan, name="family")
+
+    assert torch.equal(selected_from_plan(), torch.tensor([3.0]))
+    assert torch.equal(selected_from_public_helper(), torch.tensor([3.0]))
+
+    with pytest.raises(vp.MaterializationError, match="selectors differ"):
+        plan.materialize("family", name="other")
+
+
 def test_validate_plan_materializes_in_validation_order() -> None:
     input_signature = {"case": "validation-materialization-order"}
     calls = []
 
     def first_materializer_callback(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
     ) -> str:
         assert candidate.family == record.family
         calls.append("materialize:first")
@@ -3997,8 +3256,8 @@ def test_validate_plan_materializes_in_validation_order() -> None:
         return "first"
 
     def second_materializer_callback(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
     ) -> str:
         assert candidate.family == record.family
         calls.append("materialize:second")
@@ -4009,15 +3268,17 @@ def test_validate_plan_materializes_in_validation_order() -> None:
         "tests.first_materializer",
         "1",
         {},
+        {"callback": "tests.first_materializer_callback"},
         first_materializer_callback,
     )
     second_materializer = vpx.CallableMaterializer(
         "tests.second_materializer",
         "1",
         {},
+        {"callback": "tests.second_materializer_callback"},
         second_materializer_callback,
     )
-    first = vp.Candidate("first", "row", {}, admission_status="passed")
+    first = vpx.Candidate("first", "row", {}, admission_status="passed")
     first_record = _record(
         first,
         elapsed=(1.0,),
@@ -4031,7 +3292,7 @@ def test_validate_plan_materializes_in_validation_order() -> None:
         "full_size_row": first_record.row_key(),
         "materializer_identity": dict(first_materializer.identity()),
     }
-    second = vp.Candidate(
+    second = vpx.Candidate(
         "second",
         "row",
         {},
@@ -4044,11 +3305,11 @@ def test_validate_plan_materializes_in_validation_order() -> None:
         reserved=(1.0,),
         input_signature=input_signature,
     )
-    plan = vp.Plan(
+    plan = vpx.Plan(
         selected={"first": first, "second": second},
         records={"first": first_record, "second": second_record},
         input_signature=input_signature,
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         materializers={
             "first": first_materializer,
             "second": second_materializer,
@@ -4058,10 +3319,10 @@ def test_validate_plan_materializes_in_validation_order() -> None:
     )
 
     def first_validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         assert candidate.family == record.family
         assert context.selected == "first"
         calls.append("validate:first")
@@ -4069,10 +3330,10 @@ def test_validate_plan_materializes_in_validation_order() -> None:
         raise RuntimeError(message)
 
     def second_validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         assert candidate.family == record.family
         assert context.selected == "second"
         calls.append("validate:second")
@@ -4094,10 +3355,10 @@ def _current_record(record: FullSizeRecord) -> FullSizeRecord:
 
 def test_within_family_selection() -> None:
     signature = {"case": "current"}
-    policy = vp.SelectionPolicy()
-    fast = vp.Candidate("family", "fast", {})
-    near = vp.Candidate("family", "near", {})
-    slow = vp.Candidate("family", "slow", {})
+    policy = vpx.SelectionPolicy()
+    fast = vpx.Candidate("family", "fast", {})
+    near = vpx.Candidate("family", "near", {})
+    slow = vpx.Candidate("family", "slow", {})
 
     selected, _ = select_family(
         (
@@ -4167,13 +3428,13 @@ def test_within_family_selection() -> None:
 )
 def test_selection_requires_full_size_agreement(settings: Mapping[str, object]) -> None:
     signature = {"case": "full-size-gate", "settings": dict(settings)}
-    policy = vp.SelectionPolicy()
-    gated = vp.Candidate(
+    policy = vpx.SelectionPolicy()
+    gated = vpx.Candidate(
         "family",
         "gated",
         settings,
     )
-    fallback = vp.Candidate("family", "fallback", {})
+    fallback = vpx.Candidate("family", "fallback", {})
 
     selected, _ = select_family(
         (
@@ -4250,9 +3511,9 @@ def test_selection_allows_baseline_rows_without_full_size_agreement(
     settings: Mapping[str, object],
 ) -> None:
     signature = {"case": "ungated-selection", "settings": dict(settings)}
-    policy = vp.SelectionPolicy()
-    fast = vp.Candidate("family", "fast", settings)
-    slow = vp.Candidate("family", "slow", {})
+    policy = vpx.SelectionPolicy()
+    fast = vpx.Candidate("family", "fast", settings)
+    slow = vpx.Candidate("family", "slow", {})
 
     selected, _ = select_family(
         (
@@ -4284,8 +3545,8 @@ def test_selection_allows_baseline_rows_without_full_size_agreement(
 
 def test_selection_scores_compiled_rows_by_call_horizon() -> None:
     signature = {"case": "compiled-selection"}
-    eager = vp.Candidate("family", "eager", {})
-    compiled = vp.Candidate(
+    eager = vpx.Candidate("family", "eager", {})
+    compiled = vpx.Candidate(
         "family",
         "compiled",
         {"compile.enabled": "true"},
@@ -4307,8 +3568,8 @@ def test_selection_scores_compiled_rows_by_call_horizon() -> None:
             "recompile_count": 0,
         },
     )
-    short_horizon = vp.SelectionPolicy(compile_call_horizon=10)
-    long_horizon = vp.SelectionPolicy(compile_call_horizon=30)
+    short_horizon = vpx.SelectionPolicy(compile_call_horizon=10)
+    long_horizon = vpx.SelectionPolicy(compile_call_horizon=30)
 
     short_selected, _ = select_family(
         ((eager, eager_record), (compiled, compiled_record)),
@@ -4327,8 +3588,8 @@ def test_selection_scores_compiled_rows_by_call_horizon() -> None:
 
 def test_selection_scores_distributed_rows_by_global_elapsed_seconds() -> None:
     signature = {"case": "distributed-selection"}
-    local = vp.Candidate("family", "local", {})
-    distributed = vp.Candidate(
+    local = vpx.Candidate("family", "local", {})
+    distributed = vpx.Candidate(
         "family",
         "distributed",
         {"distributed.strategy": "fsdp2"},
@@ -4356,7 +3617,7 @@ def test_selection_scores_distributed_rows_by_global_elapsed_seconds() -> None:
             ),
         ),
         input_signature=signature,
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
     )
 
     assert selected == local
@@ -4375,14 +3636,14 @@ def test_selection_scores_distributed_rows_by_global_elapsed_seconds() -> None:
                 ),
             ),
             input_signature=signature,
-            policy=vp.SelectionPolicy(),
+            policy=vpx.SelectionPolicy(),
         )
 
 
 def test_selection_scores_compiled_distributed_rows_by_global_compile_fields() -> None:
     signature = {"case": "compiled-distributed-selection"}
-    eager = vp.Candidate("family", "eager", {})
-    compiled = vp.Candidate(
+    eager = vpx.Candidate("family", "eager", {})
+    compiled = vpx.Candidate(
         "family",
         "compiled",
         {"compile.enabled": "true", "distributed.strategy": "fsdp2"},
@@ -4404,8 +3665,8 @@ def test_selection_scores_compiled_distributed_rows_by_global_compile_fields() -
             "recompile_count": 0,
         },
     )
-    short_horizon = vp.SelectionPolicy(compile_call_horizon=10)
-    long_horizon = vp.SelectionPolicy(compile_call_horizon=90)
+    short_horizon = vpx.SelectionPolicy(compile_call_horizon=10)
+    long_horizon = vpx.SelectionPolicy(compile_call_horizon=90)
 
     short_selected, _ = select_family(
         ((eager, eager_record), (compiled, compiled_record)),
@@ -4424,8 +3685,8 @@ def test_selection_scores_compiled_distributed_rows_by_global_compile_fields() -
 
 def test_selection_tie_breaks_with_declared_rank_memory_reduction() -> None:
     signature = {"case": "distributed-memory-selection"}
-    first = vp.Candidate("family", "first", {"distributed.strategy": "fsdp2"})
-    second = vp.Candidate("family", "second", {"distributed.strategy": "fsdp2"})
+    first = vpx.Candidate("family", "first", {"distributed.strategy": "fsdp2"})
+    second = vpx.Candidate("family", "second", {"distributed.strategy": "fsdp2"})
     first_record = _with_rank_memory_samples(
         _record(
             first,
@@ -4449,12 +3710,12 @@ def test_selection_tie_breaks_with_declared_rank_memory_reduction() -> None:
     max_selected, _ = select_family(
         ((first, first_record), (second, second_record)),
         input_signature=signature,
-        policy=vp.SelectionPolicy(rank_memory_reduction="max_peak_reserved"),
+        policy=vpx.SelectionPolicy(rank_memory_reduction="max_peak_reserved"),
     )
     sum_selected, _ = select_family(
         ((first, first_record), (second, second_record)),
         input_signature=signature,
-        policy=vp.SelectionPolicy(rank_memory_reduction="sum_peak_reserved"),
+        policy=vpx.SelectionPolicy(rank_memory_reduction="sum_peak_reserved"),
     )
 
     assert max_selected == second
@@ -4463,11 +3724,11 @@ def test_selection_tie_breaks_with_declared_rank_memory_reduction() -> None:
 
 def test_cohort_selection_sums_compiled_row_scores() -> None:
     signature = {"case": "compiled-cohort"}
-    eager_a = vp.Candidate("a", "eager-a", {})
-    eager_b = vp.Candidate("b", "eager-b", {})
-    compiled_a = vp.Candidate("a", "compiled-a", {"compile.enabled": "true"})
-    compiled_b = vp.Candidate("b", "compiled-b", {"compile.enabled": "true"})
-    policy = vp.SelectionPolicy(compile_call_horizon=30)
+    eager_a = vpx.Candidate("a", "eager-a", {})
+    eager_b = vpx.Candidate("b", "eager-b", {})
+    compiled_a = vpx.Candidate("a", "compiled-a", {"compile.enabled": "true"})
+    compiled_b = vpx.Candidate("b", "compiled-b", {"compile.enabled": "true"})
+    policy = vpx.SelectionPolicy(compile_call_horizon=30)
     cohort = select_cohort(
         (
             {
@@ -4530,14 +3791,14 @@ def test_cohort_selection_sums_compiled_row_scores() -> None:
 
 
 def test_selection_rejects_unsupported_policy_fields() -> None:
-    candidate = vp.Candidate("family", "row", {})
+    candidate = vpx.Candidate("family", "row", {})
     policies = (
-        vp.SelectionPolicy(speed_statistic="mean_elapsed_seconds"),
-        vp.SelectionPolicy(compiled_speed_statistic="steady_elapsed_seconds"),
-        vp.SelectionPolicy(distributed_speed_statistic="rank_zero_elapsed_seconds"),
-        vp.SelectionPolicy(rank_memory_reduction="rank_zero_peak_reserved"),
-        vp.SelectionPolicy(cohort_speed_statistic="sum_selection_score_seconds"),
-        vp.SelectionPolicy(accepted_status="passed_only"),
+        vpx.SelectionPolicy(speed_statistic="mean_elapsed_seconds"),
+        vpx.SelectionPolicy(compiled_speed_statistic="steady_elapsed_seconds"),
+        vpx.SelectionPolicy(distributed_speed_statistic="rank_zero_elapsed_seconds"),
+        vpx.SelectionPolicy(rank_memory_reduction="rank_zero_peak_reserved"),
+        vpx.SelectionPolicy(cohort_speed_statistic="sum_selection_score_seconds"),
+        vpx.SelectionPolicy(accepted_status="passed_only"),
     )
 
     for policy in policies:
@@ -4560,7 +3821,7 @@ def test_selection_rejects_unsupported_policy_fields() -> None:
 
 
 def test_cohort_constraint_uses_spec_selection_aggregation_token() -> None:
-    constraint = vp.CohortConstraint(
+    constraint = vpx.CohortConstraint(
         name="dtype",
         settings_keys=("dtype.model_compute",),
         assignments=({"dtype.model_compute": "fp32"},),
@@ -4569,7 +3830,7 @@ def test_cohort_constraint_uses_spec_selection_aggregation_token() -> None:
     assert constraint.selection_aggregation == "sum_median_elapsed_seconds"
 
     with pytest.raises(RuntimeError):
-        vp.CohortConstraint(
+        vpx.CohortConstraint(
             name="old-token",
             settings_keys=("dtype.model_compute",),
             assignments=({"dtype.model_compute": "fp32"},),
@@ -4579,8 +3840,8 @@ def test_cohort_constraint_uses_spec_selection_aggregation_token() -> None:
 
 def test_selection_rejects_invalid_rows() -> None:
     signature = {"case": "current"}
-    stale = vp.Candidate("family", "stale", {})
-    failed = vp.Candidate("family", "failed", {})
+    stale = vpx.Candidate("family", "stale", {})
+    failed = vpx.Candidate("family", "failed", {})
 
     with pytest.raises(vp.NoPassedCandidateError):
         select_family(
@@ -4606,13 +3867,13 @@ def test_selection_rejects_invalid_rows() -> None:
                 ),
             ),
             input_signature=signature,
-            policy=vp.SelectionPolicy(),
+            policy=vpx.SelectionPolicy(),
         )
 
 
 def test_selection_rejects_record_from_different_candidate_settings() -> None:
     signature = {"case": "current"}
-    candidate = vp.Candidate("family", "row", {})
+    candidate = vpx.Candidate("family", "row", {})
     mismatched = dataclasses.replace(
         _record(
             candidate,
@@ -4627,12 +3888,12 @@ def test_selection_rejects_record_from_different_candidate_settings() -> None:
         select_family(
             ((candidate, mismatched),),
             input_signature=signature,
-            policy=vp.SelectionPolicy(),
+            policy=vpx.SelectionPolicy(),
         )
 
 
 def test_selection_uses_json_normalized_signatures() -> None:
-    candidate = vp.Candidate("family", "row", {})
+    candidate = vpx.Candidate("family", "row", {})
     tuple_signature = {"shape": (1, 2)}
     list_signature = {"shape": [1, 2]}
     record = _current_record(
@@ -4646,14 +3907,14 @@ def test_selection_uses_json_normalized_signatures() -> None:
     selected, _ = select_family(
         ((candidate, record),),
         input_signature=list_signature,
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
     )
 
     assert selected == candidate
 
 
 def test_memory_stability() -> None:
-    candidate = vp.Candidate("family", "row", {})
+    candidate = vpx.Candidate("family", "row", {})
     stable = _record(
         candidate,
         elapsed=(1.0, 1.0),
@@ -4692,11 +3953,11 @@ def test_memory_stability() -> None:
 
 def test_cohort_selection_prefers_lower_memory_near_fastest() -> None:
     signature = {}
-    policy = vp.SelectionPolicy()
-    first_a = vp.Candidate("a", "first-a", {"backend": "first"})
-    first_b = vp.Candidate("b", "first-b", {"backend": "first"})
-    second_a = vp.Candidate("a", "second-a", {"backend": "second"})
-    second_b = vp.Candidate("b", "second-b", {"backend": "second"})
+    policy = vpx.SelectionPolicy()
+    first_a = vpx.Candidate("a", "first-a", {"backend": "first"})
+    first_b = vpx.Candidate("b", "first-b", {"backend": "first"})
+    second_a = vpx.Candidate("a", "second-a", {"backend": "second"})
+    second_b = vpx.Candidate("b", "second-b", {"backend": "second"})
     cohort = select_cohort(
         (
             {
@@ -4749,9 +4010,9 @@ def test_cohort_selection_prefers_lower_memory_near_fastest() -> None:
 
 def test_cohort_selection_rejects_incomplete_cohort() -> None:
     signature = {}
-    first_a = vp.Candidate("a", "first-a", {"backend": "first"})
-    second_a = vp.Candidate("a", "second-a", {"backend": "second"})
-    second_b = vp.Candidate("b", "second-b", {"backend": "second"})
+    first_a = vpx.Candidate("a", "first-a", {"backend": "first"})
+    second_a = vpx.Candidate("a", "second-a", {"backend": "second"})
+    second_b = vpx.Candidate("b", "second-b", {"backend": "second"})
 
     with pytest.raises(vp.NoPassedCandidateError):
         select_cohort(
@@ -4789,7 +4050,7 @@ def test_cohort_selection_rejects_incomplete_cohort() -> None:
                 },
             ),
             families=("a", "b", "c"),
-            policy=vp.SelectionPolicy(),
+            policy=vpx.SelectionPolicy(),
         )
 
 
@@ -4819,7 +4080,7 @@ def test_record_current_rejects_stale_generator_version() -> None:
 
 def test_record_current_rejects_stale_candidate_and_full_size_status() -> None:
     input_signature = _input_signature("status-current")
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"dtype": "fp32"},
@@ -4888,8 +4149,8 @@ def test_record_current_rejects_stale_candidate_and_full_size_status() -> None:
 
 
 def test_reference_row_key_includes_row_and_check_identity() -> None:
-    candidate_a = vp.Candidate("family", "row-a", {"axis": "same"})
-    candidate_b = vp.Candidate("family", "row-b", {"axis": "same"})
+    candidate_a = vpx.Candidate("family", "row-a", {"axis": "same"})
+    candidate_b = vpx.Candidate("family", "row-b", {"axis": "same"})
     first = _check_record(candidate_a, input_signature={})
     second = _check_record(candidate_b, input_signature={})
     third = dataclasses.replace(first, name="second")
@@ -4903,7 +4164,7 @@ def test_reference_row_key_includes_row_and_check_identity() -> None:
 
 
 def test_check_record_current_rejects_stale_status_and_thresholds() -> None:
-    record = _check_record(vp.Candidate("family", "row", {}), input_signature={})
+    record = _check_record(vpx.Candidate("family", "row", {}), input_signature={})
 
     assert not vpx.check_record_current(dataclasses.replace(record, status="failed"))
     assert not vpx.check_record_current(
@@ -4965,7 +4226,7 @@ def checkpoint_fields() -> dict[str, object]:
 def test_checkpoint_operation_preserves_rng_state() -> None:
     values = []
     vector = torch.tensor([1.0, 2.0], requires_grad=True)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {
@@ -4999,7 +4260,7 @@ def test_checkpoint_operation_preserves_rng_state() -> None:
 def test_checkpoint_operation_can_disable_rng_preservation() -> None:
     values = []
     vector = torch.tensor([1.0, 2.0], requires_grad=True)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {
@@ -5038,7 +4299,7 @@ def test_checkpoint_operation_uses_declared_context_pair() -> None:
     def context_fn() -> tuple[object, object]:
         return contextlib.nullcontext(), contextlib.nullcontext()
 
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {
@@ -5075,7 +4336,7 @@ def test_checkpoint_operation_executes_selective_checkpoint_context_pair() -> No
     def context_fn() -> tuple[object, object]:
         return contextlib.nullcontext(), contextlib.nullcontext()
 
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {
@@ -5107,7 +4368,7 @@ def test_checkpoint_operation_executes_selective_checkpoint_context_pair() -> No
 
 def test_checkpoint_operation_rejects_declared_context_without_context_id() -> None:
     vector = torch.tensor([1.0], requires_grad=True)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {
@@ -5132,7 +4393,7 @@ def test_checkpoint_operation_rejects_declared_context_without_context_id() -> N
 def test_checkpoint_operation_rejects_unadmitted_fields_before_execution() -> None:
     calls = []
     vector = torch.tensor([1.0], requires_grad=True)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {
@@ -5160,7 +4421,7 @@ def test_checkpoint_operation_rejects_unadmitted_fields_before_execution() -> No
 
 def test_checkpoint_operation_runs_cpu_saved_tensor_hooks() -> None:
     vector = torch.tensor([2.0], requires_grad=True)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {
@@ -5200,7 +4461,7 @@ def test_checkpoint_operation_runs_custom_saved_tensor_hooks() -> None:
 
         return tensor
 
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {
@@ -5232,7 +4493,7 @@ def test_checkpoint_operation_runs_custom_saved_tensor_hooks() -> None:
 
 
 def test_checkpoint_operation_rejects_missing_activation_offload() -> None:
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"activation.recompute": "none"},
@@ -5252,7 +4513,7 @@ def test_checkpoint_operation_rejects_missing_activation_offload() -> None:
 
 
 def test_checkpoint_operation_rejects_custom_offload_without_hooks() -> None:
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {
@@ -5283,7 +4544,7 @@ def test_adapter_runtime_executes_checkpoint_without_standard_runtime_support(
         "activation.recompute": "checkpoint_non_reentrant_by_layer",
         **checkpoint_fields(),
     }
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "checkpoint-row",
         settings,
@@ -5291,9 +4552,9 @@ def test_adapter_runtime_executes_checkpoint_without_standard_runtime_support(
     )
 
     def adapter_operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert batch["family"] == "family"
         assert isinstance(vector, torch.Tensor)
@@ -5309,10 +4570,10 @@ def test_adapter_runtime_executes_checkpoint_without_standard_runtime_support(
         )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         output = adapter_operation_factory(candidate, batch, vector)()
         assert isinstance(vector, torch.Tensor)
         assert isinstance(output, torch.Tensor)
@@ -5320,7 +4581,7 @@ def test_adapter_runtime_executes_checkpoint_without_standard_runtime_support(
 
         return reference_passed()
 
-    runtime = vpx.RuntimeConfig(
+    runtime = runtime_config(
         candidates=(candidate,),
         operation_factory=adapter_operation_factory,
         reference_check=reference_check,
@@ -5328,14 +4589,14 @@ def test_adapter_runtime_executes_checkpoint_without_standard_runtime_support(
         axis_registry=None,
         signature={"runtime": "checkpoint-adapter"},
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "objective", aggregation="sum"),
+        operator=ops.gradient("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_warmups=0,
@@ -5344,7 +4605,7 @@ def test_adapter_runtime_executes_checkpoint_without_standard_runtime_support(
         ),
         runtime=runtime,
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -5354,10 +4615,10 @@ def test_adapter_runtime_executes_checkpoint_without_standard_runtime_support(
     assert plan.selected["family"].candidate_id == "checkpoint-row"
 
     def scalar_objective(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert not buffers
         assert batch
@@ -5366,7 +4627,7 @@ def test_adapter_runtime_executes_checkpoint_without_standard_runtime_support(
         return params["weight"].sum()
 
     standard_factory = vpx.standard_operation_factory(
-        vp.gradient("family", "objective", aggregation="sum"),
+        ops.gradient("family", "objective", aggregation="sum"),
         params=dict(model.named_parameters()),
         buffers={},
         scalar_objectives={"objective": scalar_objective},
@@ -5401,7 +4662,7 @@ def test_transformers_attention_admission_axis() -> None:
         ),
         policy=policy,
     )
-    flash = vp.Candidate(
+    flash = vpx.Candidate(
         "family",
         "flash",
         {
@@ -5411,7 +4672,7 @@ def test_transformers_attention_admission_axis() -> None:
             "dropout_p": 0.0,
         },
     )
-    float_flash = vp.Candidate(
+    float_flash = vpx.Candidate(
         "family",
         "float-flash",
         {
@@ -5421,7 +4682,7 @@ def test_transformers_attention_admission_axis() -> None:
             "dropout_p": 0.0,
         },
     )
-    flash3 = vp.Candidate(
+    flash3 = vpx.Candidate(
         "family",
         "flash3",
         {
@@ -5431,7 +4692,7 @@ def test_transformers_attention_admission_axis() -> None:
             "dropout_p": 0.0,
         },
     )
-    flash4 = vp.Candidate(
+    flash4 = vpx.Candidate(
         "family",
         "flash4",
         {
@@ -5441,7 +4702,7 @@ def test_transformers_attention_admission_axis() -> None:
             "dropout_p": 0.0,
         },
     )
-    paged_flash = vp.Candidate(
+    paged_flash = vpx.Candidate(
         "family",
         "paged-flash",
         {
@@ -5451,7 +4712,7 @@ def test_transformers_attention_admission_axis() -> None:
             "dropout_p": 0.0,
         },
     )
-    attentions = vp.Candidate(
+    attentions = vpx.Candidate(
         "family",
         "attentions",
         {
@@ -5462,7 +4723,7 @@ def test_transformers_attention_admission_axis() -> None:
             "output_attentions": True,
         },
     )
-    math_attention = vp.Candidate(
+    math_attention = vpx.Candidate(
         "family",
         "math",
         {
@@ -5472,7 +4733,7 @@ def test_transformers_attention_admission_axis() -> None:
             "dropout_p": 0.0,
         },
     )
-    math_attentions = vp.Candidate(
+    math_attentions = vpx.Candidate(
         "family",
         "math-attentions",
         {
@@ -5483,7 +4744,7 @@ def test_transformers_attention_admission_axis() -> None:
             "output_attentions": True,
         },
     )
-    direct_flash_kernel = vp.Candidate(
+    direct_flash_kernel = vpx.Candidate(
         "family",
         "sdpa-flash",
         {
@@ -5494,7 +4755,7 @@ def test_transformers_attention_admission_axis() -> None:
             "dropout_p": 0.0,
         },
     )
-    float_direct_flash_kernel = vp.Candidate(
+    float_direct_flash_kernel = vpx.Candidate(
         "family",
         "float-sdpa-flash",
         {
@@ -5505,7 +4766,7 @@ def test_transformers_attention_admission_axis() -> None:
             "dropout_p": 0.0,
         },
     )
-    priority_sdpa = vp.Candidate(
+    priority_sdpa = vpx.Candidate(
         "family",
         "priority-sdpa",
         {
@@ -5517,7 +4778,7 @@ def test_transformers_attention_admission_axis() -> None:
             "dropout_p": 0.0,
         },
     )
-    bad_priority_sdpa = vp.Candidate(
+    bad_priority_sdpa = vpx.Candidate(
         "family",
         "bad-priority-sdpa",
         {
@@ -5529,51 +4790,13 @@ def test_transformers_attention_admission_axis() -> None:
             "dropout_p": 0.0,
         },
     )
-    eval_dropout = vp.Candidate(
+    eval_dropout = vpx.Candidate(
         "family",
         "dropout",
         {
             "attention.frontend": "transformers_eager",
             "module_mode": "eval",
             "dropout_p": 0.1,
-        },
-    )
-    bad_gqa = vp.Candidate(
-        "family",
-        "gqa",
-        {
-            "attention.frontend": "transformers_eager",
-            "module_mode": "eval",
-            "dropout_p": 0.0,
-            "enable_gqa": True,
-            "query_heads": 5,
-            "key_value_heads": 2,
-        },
-    )
-    valid_gqa = vp.Candidate(
-        "family",
-        "valid-gqa",
-        {
-            "attention.frontend": "transformers_eager",
-            "module_mode": "eval",
-            "dropout_p": 0.0,
-            "enable_gqa": True,
-            "query_heads": 8,
-            "key_heads": 2,
-            "value_heads": 2,
-        },
-    )
-    mismatched_gqa = vp.Candidate(
-        "family",
-        "mismatched-gqa",
-        {
-            "attention.frontend": "transformers_eager",
-            "module_mode": "eval",
-            "dropout_p": 0.0,
-            "enable_gqa": True,
-            "query_heads": 8,
-            "key_heads": 2,
-            "value_heads": 4,
         },
     )
     assert axis.admit(flash) == (True, None)
@@ -5589,9 +4812,6 @@ def test_transformers_attention_admission_axis() -> None:
     assert axis.admit(priority_sdpa) == (True, None)
     assert axis.admit(bad_priority_sdpa)[0] is False
     assert axis.admit(eval_dropout)[0] is False
-    assert axis.admit(bad_gqa)[0] is False
-    assert axis.admit(valid_gqa) == (True, None)
-    assert axis.admit(mismatched_gqa)[0] is False
     assert axis.signature()["identity"]["softcap"] == {"logit_softcap": 30.0}
 
     no_padding_policy = dataclasses.replace(policy, padding_limit=None)
@@ -5613,7 +4833,7 @@ def test_transformers_attention_admission_axis() -> None:
     assert unavailable_axis.admit(flash) == (False, "kernel unavailable")
     assert (
         vpa.admit_transformers_attention(
-            vp.Candidate(
+            vpx.Candidate(
                 "family",
                 "unknown",
                 {"attention.frontend": "unknown"},
@@ -5631,7 +4851,7 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
     model = torch.nn.Linear(1, 1)
     registry = vpx.AxisRegistry()
 
-    def admit_dtype(candidate: vp.Candidate) -> tuple[bool, str | None]:
+    def admit_dtype(candidate: vpx.Candidate) -> tuple[bool, str | None]:
         if candidate.settings["dtype"] == "fp16":
             return False, "float16 disabled"
 
@@ -5657,10 +4877,10 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
     )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.settings["dtype"] == "fp32"
         assert batch["family"] == "family"
         assert batch["source"] == "reference"
@@ -5670,9 +4890,9 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.settings["dtype"] == "fp32"
         assert batch["family"] == "family"
@@ -5681,21 +4901,21 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
 
         return vpx.constant_operation(vector)
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.hvp("family", "objective", aggregation="sum"),
+        operator=ops.hvp("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_warmups=0,
                 long_measured_calls=1,
             )
         ),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             candidates,
             operation_factory,
             reference_check,
@@ -5704,7 +4924,7 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
             {"generator": "grid"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
@@ -5718,7 +4938,7 @@ def test_axis_registry_admits_grid_and_records_failed_admission() -> None:
     assert plan.full_size_records[1].status == "failed"
     assert plan.full_size_records[1].error_type == "AdmissionError"
 
-    invalid = vp.Candidate(
+    invalid = vpx.Candidate(
         "family",
         "invalid",
         {"dtype": "float64"},
@@ -5739,10 +4959,10 @@ def test_tune_records_runtime_full_size_check_metadata() -> None:
 
         def __call__(
             self,
-            candidate: vp.Candidate,
-            inputs: tuple[tuple[vp.Batch, vp.TensorTree], ...],
-            output: vp.TensorTree,
-            samples: tuple[vp.Measurement, ...],
+            candidate: vpx.Candidate,
+            inputs: tuple[tuple[vpx.Batch, vpx.TensorTree], ...],
+            output: vpx.TensorTree,
+            samples: tuple[vpx.Measurement, ...],
         ) -> Mapping[str, object]:
             assert candidate.candidate_id == "flash"
             assert len(inputs) == 1
@@ -5753,7 +4973,7 @@ def test_tune_records_runtime_full_size_check_metadata() -> None:
             return {"full_size_agreement_passed": True}
 
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "flash",
         {
@@ -5765,10 +4985,10 @@ def test_tune_records_runtime_full_size_check_metadata() -> None:
     full_size_check = PassingFullSizeCheck()
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "flash"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -5776,9 +4996,9 @@ def test_tune_records_runtime_full_size_check_metadata() -> None:
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "flash"
         assert batch["source"] == "probe"
@@ -5786,15 +5006,15 @@ def test_tune_records_runtime_full_size_check_metadata() -> None:
 
         return vpx.constant_operation(vector)
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.hvp("family", "objective", aggregation="sum"),
+        operator=ops.hvp("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=dataclasses.replace(
             cpu_target(
-                vp.TimingPolicy(
+                vpx.TimingPolicy(
                     short_seconds=0.0,
                     medium_seconds=0.0,
                     long_warmups=0,
@@ -5804,7 +5024,7 @@ def test_tune_records_runtime_full_size_check_metadata() -> None:
             allowed_attention_frontends=("pytorch_sdpa_direct",),
             allowed_sdpa_kernels=("flash_attention",),
         ),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -5814,7 +5034,7 @@ def test_tune_records_runtime_full_size_check_metadata() -> None:
             full_size_check=full_size_check,
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
@@ -5870,7 +5090,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
         "requires_forward_ad": True,
         "forward_ad_supported": True,
     }
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {
@@ -5879,38 +5099,38 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "numeric.float32_matmul_precision": "high",
         },
     )
-    bad_flag = vp.Candidate(
+    bad_flag = vpx.Candidate(
         "family",
         "bad-flag",
         {"numeric.bf16_reduced_precision_reduction": True},
     )
-    bad_dtype = vp.Candidate("family", "bad-dtype", {"dtype.model_compute": "float64"})
-    fp8_storage = vp.Candidate(
+    bad_dtype = vpx.Candidate("family", "bad-dtype", {"dtype.model_compute": "float64"})
+    fp8_storage = vpx.Candidate(
         "family",
         "fp8-storage",
         {"dtype.parameter_storage": "fp8_when_supported"},
     )
-    fp8_compute = vp.Candidate(
+    fp8_compute = vpx.Candidate(
         "family",
         "fp8-compute",
         {"dtype.model_compute": "fp8_when_supported"},
     )
-    bad_path = vp.Candidate(
+    bad_path = vpx.Candidate(
         "family",
         "bad-path",
         {"hvp.path": "reverse_over_forward"},
     )
-    missing_torch_func_fields = vp.Candidate(
+    missing_torch_func_fields = vpx.Candidate(
         "family",
         "missing-torch-func-fields",
         {"jvp.path": "torch_func_jvp"},
     )
-    valid_torch_func = vp.Candidate(
+    valid_torch_func = vpx.Candidate(
         "family",
         "valid-torch-func",
         {"jvp.path": "torch_func_jvp", **torch_func_fields},
     )
-    valid_ggn_linearize = vp.Candidate(
+    valid_ggn_linearize = vpx.Candidate(
         "family",
         "valid-ggn-linearize",
         {
@@ -5919,7 +5139,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             **torch_func_fields,
         },
     )
-    missing_ggn_linearize_fields = vp.Candidate(
+    missing_ggn_linearize_fields = vpx.Candidate(
         "family",
         "missing-ggn-linearize-fields",
         {
@@ -5927,7 +5147,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "ggn.vjp_path": "torch_func_vjp",
         },
     )
-    valid_forward_ad = vp.Candidate(
+    valid_forward_ad = vpx.Candidate(
         "family",
         "valid-forward-ad",
         {
@@ -5936,7 +5156,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "forward_ad_supported": True,
         },
     )
-    unsupported_forward_ad = vp.Candidate(
+    unsupported_forward_ad = vpx.Candidate(
         "family",
         "unsupported-forward-ad",
         {
@@ -5945,7 +5165,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "forward_ad_supported": False,
         },
     )
-    valid_vmap = vp.Candidate(
+    valid_vmap = vpx.Candidate(
         "family",
         "valid-vmap",
         {
@@ -5956,7 +5176,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "batch.empirical_example_batch_size": 2,
         },
     )
-    valid_sampled_vmap = vp.Candidate(
+    valid_sampled_vmap = vpx.Candidate(
         "family",
         "valid-sampled-vmap",
         {
@@ -5967,7 +5187,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "batch.fisher_sample_batch_size": 2,
         },
     )
-    valid_hvp_vmap = vp.Candidate(
+    valid_hvp_vmap = vpx.Candidate(
         "family",
         "valid-hvp-vmap",
         {
@@ -5980,7 +5200,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"w": 0},
         },
     )
-    valid_jvp_vmap = vp.Candidate(
+    valid_jvp_vmap = vpx.Candidate(
         "family",
         "valid-jvp-vmap",
         {
@@ -5993,7 +5213,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"w": 0},
         },
     )
-    valid_vjp_vmap = vp.Candidate(
+    valid_vjp_vmap = vpx.Candidate(
         "family",
         "valid-vjp-vmap",
         {
@@ -6005,7 +5225,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"y": 0},
         },
     )
-    valid_ggn_vmap = vp.Candidate(
+    valid_ggn_vmap = vpx.Candidate(
         "family",
         "valid-ggn-vmap",
         {
@@ -6019,7 +5239,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"w": 0},
         },
     )
-    valid_fisher_vector_vmap = vp.Candidate(
+    valid_fisher_vector_vmap = vpx.Candidate(
         "family",
         "valid-fisher-vector-vmap",
         {
@@ -6034,7 +5254,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.randomness": "error",
         },
     )
-    valid_composition_vmap = vp.Candidate(
+    valid_composition_vmap = vpx.Candidate(
         "family",
         "valid-composition-vmap",
         {
@@ -6048,7 +5268,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.randomness": "error",
         },
     )
-    missing_vmap_randomness = vp.Candidate(
+    missing_vmap_randomness = vpx.Candidate(
         "family",
         "missing-vmap-randomness",
         {
@@ -6059,7 +5279,12 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"w": 0},
         },
     )
-    valid_manual_batch = vp.Candidate(
+    stray_vmap_randomness = vpx.Candidate(
+        "family",
+        "stray-vmap-randomness",
+        {"vectorization.randomness": "same"},
+    )
+    valid_manual_batch = vpx.Candidate(
         "family",
         "valid-manual-batch",
         {
@@ -6069,7 +5294,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"w": 0},
         },
     )
-    rejected_ggn_vmap_autograd_vjp = vp.Candidate(
+    rejected_ggn_vmap_autograd_vjp = vpx.Candidate(
         "family",
         "rejected-ggn-vmap-autograd-vjp",
         {
@@ -6083,7 +5308,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"w": 0},
         },
     )
-    rejected_forward_ad_jvp_vmap = vp.Candidate(
+    rejected_forward_ad_jvp_vmap = vpx.Candidate(
         "family",
         "rejected-forward-ad-jvp-vmap",
         {
@@ -6095,7 +5320,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"w": 0},
         },
     )
-    valid_hvp_single_loop = vp.Candidate(
+    valid_hvp_single_loop = vpx.Candidate(
         "family",
         "valid-hvp-single-loop",
         {
@@ -6104,7 +5329,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"w": 0},
         },
     )
-    missing_sampled_vmap_schedule = vp.Candidate(
+    missing_sampled_vmap_schedule = vpx.Candidate(
         "family",
         "missing-sampled-vmap-schedule",
         {
@@ -6114,7 +5339,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "batch.fisher_sample_batch_size": 2,
         },
     )
-    stray_vmap_in_dims = vp.Candidate(
+    stray_vmap_in_dims = vpx.Candidate(
         "family",
         "stray-vmap-in-dims",
         {
@@ -6126,7 +5351,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"x": 0},
         },
     )
-    invalid_vmap_in_dims = vp.Candidate(
+    invalid_vmap_in_dims = vpx.Candidate(
         "family",
         "invalid-vmap-in-dims",
         {
@@ -6139,7 +5364,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"x": "0"},
         },
     )
-    forward_ad_vmap = vp.Candidate(
+    forward_ad_vmap = vpx.Candidate(
         "family",
         "forward-ad-vmap",
         {
@@ -6149,7 +5374,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "batch.empirical_example_batch_size": 2,
         },
     )
-    missing_vmap_schedule = vp.Candidate(
+    missing_vmap_schedule = vpx.Candidate(
         "family",
         "missing-vmap-schedule",
         {
@@ -6159,7 +5384,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "batch.empirical_example_batch_size": 2,
         },
     )
-    valid_manual_per_example = vp.Candidate(
+    valid_manual_per_example = vpx.Candidate(
         "family",
         "valid-manual-per-example",
         {
@@ -6168,7 +5393,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "batch.fisher_sample_batch_size": 2,
         },
     )
-    missing_manual_per_example_size = vp.Candidate(
+    missing_manual_per_example_size = vpx.Candidate(
         "family",
         "missing-manual-per-example-size",
         {
@@ -6176,7 +5401,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "schedule.per_example": "manual_batch",
         },
     )
-    single_loop_vmap = vp.Candidate(
+    single_loop_vmap = vpx.Candidate(
         "family",
         "single-loop-vmap",
         {
@@ -6188,7 +5413,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.in_dims": {"x": 0, "normalization": None},
         },
     )
-    vmap_without_vmap_path = vp.Candidate(
+    vmap_without_vmap_path = vpx.Candidate(
         "family",
         "vmap-without-vmap-path",
         {
@@ -6196,12 +5421,12 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "vectorization.mode": "vmap",
         },
     )
-    manual_batch = vp.Candidate(
+    manual_batch = vpx.Candidate(
         "family",
         "manual-batch",
         {"vectorization.mode": "manual_batch"},
     )
-    valid_microbatch_accumulation = vp.Candidate(
+    valid_microbatch_accumulation = vpx.Candidate(
         "family",
         "valid-microbatch-accumulation",
         {
@@ -6210,7 +5435,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "batch.data_microbatch_size": 2,
         },
     )
-    missing_microbatch_size = vp.Candidate(
+    missing_microbatch_size = vpx.Candidate(
         "family",
         "missing-microbatch-size",
         {
@@ -6218,12 +5443,12 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "schedule.gradient_accumulation": "microbatch_accumulate",
         },
     )
-    stray_microbatch_size = vp.Candidate(
+    stray_microbatch_size = vpx.Candidate(
         "family",
         "stray-microbatch-size",
         {"batch.data_microbatch_size": 2},
     )
-    jvp_microbatch = vp.Candidate(
+    jvp_microbatch = vpx.Candidate(
         "family",
         "jvp-microbatch",
         {
@@ -6235,7 +5460,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "batch.data_microbatch_size": 2,
         },
     )
-    hvp_microbatch = vp.Candidate(
+    hvp_microbatch = vpx.Candidate(
         "family",
         "hvp-microbatch",
         {
@@ -6244,7 +5469,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "batch.data_microbatch_size": 2,
         },
     )
-    valid_input_memory_axes = vp.Candidate(
+    valid_input_memory_axes = vpx.Candidate(
         "family",
         "valid-input-memory-axes",
         {
@@ -6255,12 +5480,11 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "input.residency": "cpu_staged",
             "teacher_outputs": "precomputed_cpu",
             "memory.vector_residency": "cpu_staged",
-            "memory.intermediate_residency": "cpu_staged",
             "memory.factor_residency": "cpu_staged",
             "memory.output_buffers": "fresh_allocation",
         },
     )
-    valid_package_runtime_axes = vp.Candidate(
+    valid_package_runtime_axes = vpx.Candidate(
         "family",
         "valid-package-runtime-axes",
         {
@@ -6291,12 +5515,12 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "fusion.loss": "model_default",
         },
     )
-    invalid_package_runtime_axis = vp.Candidate(
+    invalid_package_runtime_axis = vpx.Candidate(
         "family",
         "invalid-package-runtime-axis",
         {"checkpoint.use_reentrant": "true"},
     )
-    callable_activation_hook_axis = vp.Candidate(
+    callable_activation_hook_axis = vpx.Candidate(
         "family",
         "callable-activation-hook-axis",
         {
@@ -6305,7 +5529,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "activation.unpack_hook": len,
         },
     )
-    callable_checkpoint_context_axis = vp.Candidate(
+    callable_checkpoint_context_axis = vpx.Candidate(
         "family",
         "callable-checkpoint-context-axis",
         {
@@ -6313,17 +5537,61 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "checkpoint.context_fn_callable": contextlib.nullcontext,
         },
     )
-    valid_compile_boundary = vp.Candidate(
+    valid_compile_boundary = vpx.Candidate(
         "family",
         "valid-compile-boundary",
-        {"compile.boundary": "metric_multiply"},
+        {
+            "metric.multiply_path": "dense_matmul",
+            "compile.enabled": "true",
+            "compile.boundary": "metric_multiply",
+            "compile.backend": "inductor",
+            "compile.mode": "default",
+            "compile.fullgraph": "false",
+            "compile.dynamic": None,
+            "compile.compiled_autograd": "false",
+            "compile.options.epilogue_fusion": "false",
+            "compile.options.shape_padding": "false",
+            "compile.cuda_graphs": "false",
+            "compile.cache_state": "cold_compile",
+        },
     )
-    invalid_compile_boundary = vp.Candidate(
+    invalid_compile_boundary = vpx.Candidate(
         "family",
         "invalid-compile-boundary",
-        {"compile.boundary": "unknown_boundary"},
+        {
+            "metric.multiply_path": "dense_matmul",
+            "compile.enabled": "true",
+            "compile.boundary": "unknown_boundary",
+            "compile.backend": "inductor",
+            "compile.mode": "default",
+            "compile.fullgraph": "false",
+            "compile.dynamic": None,
+            "compile.compiled_autograd": "false",
+            "compile.options.epilogue_fusion": "false",
+            "compile.options.shape_padding": "false",
+            "compile.cuda_graphs": "false",
+            "compile.cache_state": "cold_compile",
+        },
     )
-    valid_chunk_axes = vp.Candidate(
+    unlowered_bound_operator_boundary = vpx.Candidate(
+        "family",
+        "unlowered-bound-operator-boundary",
+        {
+            "metric.multiply_path": "dense_matmul",
+            "compile.enabled": "true",
+            "compile.boundary": "bound_operator_vector_step",
+            "compile.backend": "inductor",
+            "compile.mode": "default",
+            "compile.fullgraph": "false",
+            "compile.dynamic": None,
+            "compile.compiled_autograd": "false",
+            "compile.options.epilogue_fusion": "false",
+            "compile.options.shape_padding": "false",
+            "compile.cuda_graphs": "false",
+            "compile.cache_state": "cold_compile",
+        },
+    )
+    valid_chunk_axes = vpx.Candidate(
         "family",
         "valid-chunk-axes",
         {
@@ -6337,7 +5605,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
             "chunk.lm_head_weight_chunk_bytes": 9,
         },
     )
-    invalid_chunk_axis = vp.Candidate(
+    invalid_chunk_axis = vpx.Candidate(
         "family",
         "invalid-chunk-axis",
         {"chunk.token_block_size": 0},
@@ -6362,6 +5630,7 @@ def test_standard_axis_registry_validates_core_axes() -> None:
     assert registry.admit(valid_fisher_vector_vmap).admission_status == "passed"
     assert registry.admit(valid_composition_vmap).admission_status == "passed"
     assert registry.admit(missing_vmap_randomness).admission_status == "failed"
+    assert registry.admit(stray_vmap_randomness).admission_status == "failed"
     assert registry.admit(valid_manual_batch).admission_status == "passed"
     assert registry.admit(rejected_ggn_vmap_autograd_vjp).admission_status == "failed"
     assert registry.admit(rejected_forward_ad_jvp_vmap).admission_status == "failed"
@@ -6388,6 +5657,10 @@ def test_standard_axis_registry_validates_core_axes() -> None:
     assert registry.admit(callable_checkpoint_context_axis).admission_status == "failed"
     assert registry.admit(valid_compile_boundary).admission_status == "passed"
     assert registry.admit(invalid_compile_boundary).admission_status == "failed"
+    bound_operator_rejection = registry.admit(unlowered_bound_operator_boundary)
+    assert bound_operator_rejection.admission_status == "failed"
+    assert bound_operator_rejection.admission_error is not None
+    assert "bound_operator_vector_step" in bound_operator_rejection.admission_error
     assert registry.admit(valid_chunk_axes).admission_status == "passed"
     assert registry.admit(invalid_chunk_axis).admission_status == "failed"
     assert registry.axes["dtype.model_compute"].admit(bad_dtype)[0] is False
@@ -6403,17 +5676,17 @@ def test_standard_axis_registry_accepts_concrete_registered_compile_backend(
 ) -> None:
     monkeypatch.setattr(torch.compiler, "list_backends", lambda: ["custom_backend"])
     registry = vpx.standard_axis_registry()
-    concrete = vp.Candidate(
+    concrete = vpx.Candidate(
         "family",
         "concrete-backend",
         {"compile.backend": "custom_backend"},
     )
-    placeholder = vp.Candidate(
+    placeholder = vpx.Candidate(
         "family",
         "placeholder-backend",
         {"compile.backend": "registered_backend"},
     )
-    missing = vp.Candidate(
+    missing = vpx.Candidate(
         "family",
         "missing-backend",
         {"compile.backend": "missing_backend"},
@@ -6448,10 +5721,10 @@ def test_problem_signature_includes_axis_registry_identity() -> None:
     )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate
         assert batch
         assert vector
@@ -6459,23 +5732,23 @@ def test_problem_signature_includes_axis_registry_identity() -> None:
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate
         assert batch
 
         return vpx.constant_operation(vector)
 
-    first = vp.Problem(
+    first = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.hvp("family", "objective", aggregation="sum"),
+        operator=ops.hvp("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (),
             operation_factory,
             reference_check,
@@ -6493,10 +5766,66 @@ def test_problem_signature_includes_axis_registry_identity() -> None:
     assert first.input_signature() != second.input_signature()
 
 
+def test_package_owned_identities_use_package_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(candidates_module, "PACKAGE_VERSION", "9.9.9")
+    monkeypatch.setattr(attention_module, "PACKAGE_VERSION", "9.9.9")
+    monkeypatch.setattr(measure_module, "PACKAGE_VERSION", "9.9.9")
+    monkeypatch.setattr(runtime_module, "PACKAGE_VERSION", "9.9.9")
+
+    def scalar_objective(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert batch == {}
+        assert context.family == "gradient"
+
+        return params["w"].pow(2).sum()
+
+    runtime = vpx.standard_runtime_config(
+        ops.gradient("gradient", "loss", aggregation="sum"),
+        params={"w": torch.tensor([1.0], dtype=torch.float64)},
+        buffers={},
+        candidates=(
+            vpx.Candidate(
+                "gradient",
+                "row",
+                {"operator_path": "autograd_grad"},
+                admission_status="passed",
+            ),
+        ),
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "directional_abs_diff": 1e-12,
+            "directional_rel_diff": 1e-12,
+        },
+        objective_signature={"loss": "versioned"},
+        axis_registry=None,
+        scalar_objectives={"loss": scalar_objective},
+    )
+    grid = candidates_module.settings_product("family", {"axis": ("value",)})
+
+    assert candidates_module.axis_table().package_version == "9.9.9"
+    assert vpx.AxisDescriptor("axis", ("axis",), ("value",)).adapter_version == "9.9.9"
+    assert grid[0].generator_version == "9.9.9"
+    assert attention_module.core_attention_axis().adapter_version == "9.9.9"
+    assert CPUMemoryBackend.identity()["backend_version"] == "9.9.9"
+    assert (
+        measure_module.CUDAMemoryBackend(("cuda:0",)).identity()["backend_version"]
+        == "9.9.9"
+    )
+    assert runtime.materializer.identity()["materializer_version"] == "9.9.9"
+
+
 def test_target_admission_rejects_disallowed_settings() -> None:
     model = torch.nn.Linear(1, 1)
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "allowed",
             {
@@ -6506,13 +5835,13 @@ def test_target_admission_rejects_disallowed_settings() -> None:
             },
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "blocked",
             {"dtype.model_compute": "bf16"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "blocked-frontend",
             {
@@ -6521,7 +5850,7 @@ def test_target_admission_rejects_disallowed_settings() -> None:
             },
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "blocked-kernel",
             {
@@ -6534,10 +5863,10 @@ def test_target_admission_rejects_disallowed_settings() -> None:
     )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "allowed"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -6545,9 +5874,9 @@ def test_target_admission_rejects_disallowed_settings() -> None:
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "allowed"
         assert batch["source"] == "probe"
@@ -6555,32 +5884,32 @@ def test_target_admission_rejects_disallowed_settings() -> None:
 
         return vpx.constant_operation(vector)
 
-    target = vp.Target(
+    target = vpx.Target(
         devices=("cpu",),
         accelerator="cpu",
         allowed_dtypes=("fp32",),
         allowed_attention_frontends=("pytorch_sdpa_direct",),
         allowed_sdpa_kernels=("math",),
         allowed_sharding_modes=("single_device",),
-        timing_policy=vp.TimingPolicy(
+        timing_policy=vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
             long_measured_calls=1,
         ),
-        selection_policy=vp.SelectionPolicy(),
-        search_policy=vp.SearchPolicy(strategy="exhaustive"),
+        selection_policy=vpx.SelectionPolicy(),
+        search_policy=vpx.SearchPolicy(strategy="exhaustive"),
         determinism_policy={},
         environment_capture={"runtime": "test"},
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.hvp("family", "objective", aggregation="sum"),
+        operator=ops.hvp("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             candidates,
             operation_factory,
             reference_check,
@@ -6589,7 +5918,7 @@ def test_target_admission_rejects_disallowed_settings() -> None:
             {"generator": "target-admission"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
@@ -6604,8 +5933,8 @@ def test_target_admission_rejects_disallowed_settings() -> None:
 def test_autobatch_bridge_selects_candidate_by_positive_index_domain() -> None:
     calls = []
     candidates = (
-        vp.Candidate("family", "first", {}, admission_status="passed"),
-        vp.Candidate("family", "second", {}, admission_status="passed"),
+        vpx.Candidate("family", "first", {}, admission_status="passed"),
+        vpx.Candidate("family", "second", {}, admission_status="passed"),
     )
 
     def fake_find(
@@ -6688,43 +6017,6 @@ def make_autobatch_domain(
     )
 
 
-def test_autobatch_domain_signature_records_finite_search_shape() -> None:
-    domain = make_autobatch_domain()
-    signature = domain.signature()
-
-    assert signature["min_value"] == 1
-    assert signature["max_value"] == 4
-    assert signature["initial_value"] == 1
-    assert signature["growth"] == "doubling"
-    assert signature["objective"] == "fastest_passing"
-    assert signature["failure_signals"] == AUTOBATCH_FAILURE_SIGNALS
-    assert signature["termination"] == "exhausted_declared_values"
-    assert signature["values"] == (1, 2, 4)
-    assert signature["settings_by_value"] == {
-        "1": {"batch_size": 1},
-        "2": {"batch_size": 2},
-        "4": {"batch_size": 4},
-    }
-
-
-def test_autobatch_domain_accepts_all_growth_rules() -> None:
-    doubling = make_autobatch_domain(growth="doubling", values=(1, 2, 4))
-    linear = make_autobatch_domain(
-        growth="linear_step",
-        values=(1, 3, 5),
-        max_value=5,
-    )
-    declared = make_autobatch_domain(
-        growth="declared_sequence",
-        values=(1, 3, 8),
-        max_value=8,
-    )
-
-    assert doubling.signature()["growth"] == "doubling"
-    assert linear.signature()["growth"] == "linear_step"
-    assert declared.signature()["growth"] == "declared_sequence"
-
-
 def test_autobatch_domain_rejects_invalid_finite_search_shape() -> None:
     with pytest.raises(RuntimeError, match="strictly increasing"):
         make_autobatch_domain(values=(1, 1, 2))
@@ -6756,10 +6048,10 @@ def test_tune_fast_strategy_delegates_autobatch_domain_to_autobatch_find(
     model = torch.nn.Linear(1, 1)
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.settings["batch_size"] in {1, 2}
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -6767,9 +6059,9 @@ def test_tune_fast_strategy_delegates_autobatch_domain_to_autobatch_find(
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert batch["source"] == "probe"
         assert isinstance(vector, torch.Tensor)
@@ -6807,25 +6099,25 @@ def test_tune_fast_strategy_delegates_autobatch_domain_to_autobatch_find(
 
     target = dataclasses.replace(
         cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_warmups=0,
                 long_measured_calls=1,
             )
         ),
-        search_policy=vp.SearchPolicy(strategy="fast"),
+        search_policy=vpx.SearchPolicy(strategy="fast"),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "objective", aggregation="sum"),
+        operator=ops.gradient("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (
-                vp.Candidate(
+                vpx.Candidate(
                     "family",
                     "base",
                     {},
@@ -6867,7 +6159,7 @@ def test_tune_fast_strategy_delegates_autobatch_domain_to_autobatch_find(
             ),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 2.0, 2.0, 3.0)),
@@ -6893,10 +6185,10 @@ def test_tune_reuses_current_autobatch_rows_on_next_tune(
     model = torch.nn.Linear(1, 1)
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.settings["batch_size"] in {1, 2}
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -6905,9 +6197,9 @@ def test_tune_reuses_current_autobatch_rows_on_next_tune(
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert batch["source"] == "probe"
         assert isinstance(vector, torch.Tensor)
@@ -6962,25 +6254,25 @@ def test_tune_reuses_current_autobatch_rows_on_next_tune(
 
     target = dataclasses.replace(
         cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_warmups=0,
                 long_measured_calls=1,
             )
         ),
-        search_policy=vp.SearchPolicy(strategy="fast"),
+        search_policy=vpx.SearchPolicy(strategy="fast"),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "objective", aggregation="sum"),
+        operator=ops.gradient("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (
-                vp.Candidate(
+                vpx.Candidate(
                     "family",
                     "base",
                     {},
@@ -7024,14 +6316,14 @@ def test_tune_reuses_current_autobatch_rows_on_next_tune(
     )
 
     monkeypatch.setattr(autobatch_bridge.autobatch, "find", first_find)
-    first_plan = vp.tune(
+    first_plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 2.0, 2.0, 3.0)),
     )
     monkeypatch.setattr(autobatch_bridge.autobatch, "find", second_find)
-    second_plan = vp.tune(
+    second_plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -7056,10 +6348,10 @@ def test_autobatch_domain_filters_reference_failures_before_probe(
     model = torch.nn.Linear(1, 1)
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
 
@@ -7070,9 +6362,9 @@ def test_autobatch_domain_filters_reference_failures_before_probe(
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert batch["source"] == "probe"
         assert isinstance(vector, torch.Tensor)
@@ -7106,22 +6398,22 @@ def test_autobatch_domain_filters_reference_failures_before_probe(
 
     monkeypatch.setattr(autobatch_bridge.autobatch, "find", fake_find)
     target = cpu_target(
-        vp.TimingPolicy(
+        vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
             long_measured_calls=1,
         )
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "objective", aggregation="sum"),
+        operator=ops.gradient("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
-            (vp.Candidate("family", "base", {}, admission_status="passed"),),
+        runtime=runtime_config(
+            (vpx.Candidate("family", "base", {}, admission_status="passed"),),
             operation_factory,
             reference_check,
             materialize_candidate,
@@ -7152,7 +6444,7 @@ def test_autobatch_domain_filters_reference_failures_before_probe(
             ),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 2.0)),
@@ -7177,10 +6469,10 @@ def test_plan_replay_preserves_autobatch_selected_value(
     model = torch.nn.Linear(1, 1)
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.settings["batch_size"] in {1, 2}
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -7188,9 +6480,9 @@ def test_plan_replay_preserves_autobatch_selected_value(
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert batch["source"] == "probe"
         assert isinstance(vector, torch.Tensor)
@@ -7223,22 +6515,22 @@ def test_plan_replay_preserves_autobatch_selected_value(
 
     monkeypatch.setattr(autobatch_bridge.autobatch, "find", fake_find)
     target = cpu_target(
-        vp.TimingPolicy(
+        vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
             long_measured_calls=1,
         )
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "objective", aggregation="sum"),
+        operator=ops.gradient("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
-            (vp.Candidate("family", "base", {}, admission_status="passed"),),
+        runtime=runtime_config(
+            (vpx.Candidate("family", "base", {}, admission_status="passed"),),
             operation_factory,
             reference_check,
             materialize_candidate,
@@ -7274,7 +6566,7 @@ def test_plan_replay_preserves_autobatch_selected_value(
             ),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -7298,12 +6590,12 @@ def test_plan_replay_preserves_autobatch_selected_value(
 
 def test_plan_replay_rejects_unsupported_selection_policy(tmp_path: Path) -> None:
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate("family", "row", {}, admission_status="passed")
+    candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "probe"
@@ -7315,30 +6607,30 @@ def test_plan_replay_rejects_unsupported_selection_policy(tmp_path: Path) -> Non
         return operation
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_measured_calls=1,
             )
         ),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -7347,7 +6639,7 @@ def test_plan_replay_rejects_unsupported_selection_policy(tmp_path: Path) -> Non
             {"runtime": "test.replay-policy"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -7356,7 +6648,7 @@ def test_plan_replay_rejects_unsupported_selection_policy(tmp_path: Path) -> Non
     saved_full_size, saved_checks = saved_plan_rows(tmp_path, plan)
     context = dataclasses.replace(
         replay_context_for_plan(plan),
-        selection_policy=vp.SelectionPolicy(speed_statistic="mean_elapsed_seconds"),
+        selection_policy=vpx.SelectionPolicy(speed_statistic="mean_elapsed_seconds"),
     )
 
     with pytest.raises(vp.VPTuneError, match="unsupported speed statistic"):
@@ -7372,12 +6664,12 @@ def test_plan_replay_rejects_unsupported_selection_policy(tmp_path: Path) -> Non
 
 def test_plan_replay_rejects_changed_memory_backend_identity(tmp_path: Path) -> None:
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate("family", "row", {}, admission_status="passed")
+    candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "probe"
@@ -7389,30 +6681,30 @@ def test_plan_replay_rejects_changed_memory_backend_identity(tmp_path: Path) -> 
         return operation
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_measured_calls=1,
             )
         ),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -7421,7 +6713,7 @@ def test_plan_replay_rejects_changed_memory_backend_identity(tmp_path: Path) -> 
             {"runtime": "test.memory-backend"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -7459,9 +6751,9 @@ def test_tune_rejects_adapter_identity_that_contradicts_runtime() -> None:
     model = torch.nn.Linear(1, 1)
 
     def operation_factory(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "row"
         assert batch
@@ -7473,25 +6765,25 @@ def test_tune_rejects_adapter_identity_that_contradicts_runtime() -> None:
         return operation
 
     def reference_check(
-        candidate: vp.Candidate,
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert batch
         assert isinstance(vector, torch.Tensor)
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(),
-        runtime=vpx.RuntimeConfig(
-            (vp.Candidate("family", "row", {}, admission_status="passed"),),
+        runtime=runtime_config(
+            (vpx.Candidate("family", "row", {}, admission_status="passed"),),
             operation_factory,
             reference_check,
             materialize_candidate,
@@ -7505,26 +6797,26 @@ def test_tune_rejects_adapter_identity_that_contradicts_runtime() -> None:
     )
 
     with pytest.raises(vp.MaterializationError, match="adapter identity"):
-        vp.tune(problem, memory_backend=CPUMemoryBackend())
+        tune_problem(problem, memory_backend=CPUMemoryBackend())
 
 
 def test_tune_uses_explicit_candidates_and_reference_checks(tmp_path: Path) -> None:
     calls = {"slow": 0, "bad": 0, "fast": 0}
     model = torch.nn.Linear(1, 1)
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "slow",
             {"scale": 1.0},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "bad",
             {"scale": 0.0},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "fast",
             {"scale": 2.0},
@@ -7533,10 +6825,10 @@ def test_tune_uses_explicit_candidates_and_reference_checks(tmp_path: Path) -> N
     )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert batch["family"] == "family"
         assert batch["source"] == "reference"
         assert batch["check"] == "tree_close"
@@ -7550,9 +6842,9 @@ def test_tune_uses_explicit_candidates_and_reference_checks(tmp_path: Path) -> N
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert batch["family"] == "family"
         assert batch["source"] == "probe"
@@ -7569,21 +6861,21 @@ def test_tune_uses_explicit_candidates_and_reference_checks(tmp_path: Path) -> N
         return operation
 
     target = cpu_target(
-        vp.TimingPolicy(
+        vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
             long_measured_calls=1,
         )
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.hvp("family", "objective", aggregation="sum"),
+        operator=ops.hvp("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             candidates,
             operation_factory,
             reference_check,
@@ -7592,7 +6884,7 @@ def test_tune_uses_explicit_candidates_and_reference_checks(tmp_path: Path) -> N
             {"generator": "unit_test"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -7624,16 +6916,16 @@ def test_tune_uses_explicit_candidates_and_reference_checks(tmp_path: Path) -> N
     assert vpx.plan_record_current(vpx.plan_to_json(replayed), plan)
 
     def validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "fast"
         assert record.candidate_id == "fast"
         assert context.family == "family"
         assert torch.equal(context.selected(), torch.tensor([2.0]))
 
-        return vp.ReferenceResult(
+        return vpx.ReferenceResult(
             "selected_plan_validation",
             {"max_abs_diff": 1e-6},
             {"max_abs_diff": 0.0},
@@ -7647,7 +6939,7 @@ def test_tune_uses_explicit_candidates_and_reference_checks(tmp_path: Path) -> N
 
 def test_tune_builds_measured_operation_before_clock(tmp_path: Path) -> None:
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"scale": 1.0},
@@ -7662,9 +6954,9 @@ def test_tune_builds_measured_operation_before_clock(tmp_path: Path) -> None:
         return next(clock_values)
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "probe"
@@ -7679,31 +6971,31 @@ def test_tune_builds_measured_operation_before_clock(tmp_path: Path) -> None:
         return operation
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
 
         return reference_passed()
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "objective", aggregation="sum"),
+        operator=ops.gradient("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_warmups=0,
                 long_measured_calls=1,
             )
         ),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -7713,7 +7005,7 @@ def test_tune_builds_measured_operation_before_clock(tmp_path: Path) -> None:
         ),
     )
 
-    vp.tune(
+    tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -7725,7 +7017,7 @@ def test_tune_builds_measured_operation_before_clock(tmp_path: Path) -> None:
 
 def test_tune_writes_admission_failure_rows_without_measurement(tmp_path: Path) -> None:
     model = torch.nn.Linear(1, 1)
-    failed_candidate = vp.Candidate(
+    failed_candidate = vpx.Candidate(
         "family",
         "blocked",
         {},
@@ -7734,10 +7026,10 @@ def test_tune_writes_admission_failure_rows_without_measurement(tmp_path: Path) 
     )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate
         assert batch
         assert vector
@@ -7745,9 +7037,9 @@ def test_tune_writes_admission_failure_rows_without_measurement(tmp_path: Path) 
         raise AssertionError(message)
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate
         assert batch
@@ -7755,14 +7047,14 @@ def test_tune_writes_admission_failure_rows_without_measurement(tmp_path: Path) 
         message = "operation should not run"
         raise AssertionError(message)
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (failed_candidate,),
             operation_factory,
             reference_check,
@@ -7773,7 +7065,7 @@ def test_tune_writes_admission_failure_rows_without_measurement(tmp_path: Path) 
     )
 
     with pytest.raises(vp.NoPassedCandidateError):
-        vp.tune(
+        tune_problem(
             problem,
             run_dir=tmp_path,
             memory_backend=CPUMemoryBackend(),
@@ -7799,14 +7091,14 @@ def test_tune_writes_admission_failure_rows_without_measurement(tmp_path: Path) 
 
 def test_reference_failed_rows_are_rechecked_on_next_tune(tmp_path: Path) -> None:
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate("family", "row", {}, admission_status="passed")
+    candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
     calls = {"reference": 0, "operation": 0}
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -7819,9 +7111,9 @@ def test_reference_failed_rows_are_rechecked_on_next_tune(tmp_path: Path) -> Non
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "probe"
@@ -7834,21 +7126,21 @@ def test_reference_failed_rows_are_rechecked_on_next_tune(tmp_path: Path) -> Non
 
         return operation
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_warmups=0,
                 long_measured_calls=1,
             )
         ),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -7859,14 +7151,14 @@ def test_reference_failed_rows_are_rechecked_on_next_tune(tmp_path: Path) -> Non
     )
 
     with pytest.raises(vp.NoPassedCandidateError):
-        vp.tune(
+        tune_problem(
             problem,
             run_dir=tmp_path,
             memory_backend=CPUMemoryBackend(),
             clock=SequenceClock(()),
         )
 
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -7897,14 +7189,14 @@ def test_reference_failed_rows_are_rechecked_on_next_tune(tmp_path: Path) -> Non
 
 def test_tune_reuses_current_run_dir_rows_on_next_tune(tmp_path: Path) -> None:
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate("family", "row", {}, admission_status="passed")
+    candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
     calls = {"reference": 0, "operation": 0}
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -7913,9 +7205,9 @@ def test_tune_reuses_current_run_dir_rows_on_next_tune(tmp_path: Path) -> None:
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "probe"
@@ -7928,21 +7220,21 @@ def test_tune_reuses_current_run_dir_rows_on_next_tune(tmp_path: Path) -> None:
 
         return operation
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.gradient("family", "loss", aggregation="sum"),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_warmups=0,
                 long_measured_calls=1,
             )
         ),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -7952,13 +7244,13 @@ def test_tune_reuses_current_run_dir_rows_on_next_tune(tmp_path: Path) -> None:
         ),
     )
 
-    first_plan = vp.tune(
+    first_plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
     )
-    second_plan = vp.tune(
+    second_plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -7981,10 +7273,10 @@ def test_tune_reruns_when_saved_candidate_settings_differ(tmp_path: Path) -> Non
     calls = {"reference": 0, "operation": 0}
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -7993,9 +7285,9 @@ def test_tune_reruns_when_saved_candidate_settings_differ(tmp_path: Path) -> Non
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "probe"
@@ -8008,29 +7300,29 @@ def test_tune_reruns_when_saved_candidate_settings_differ(tmp_path: Path) -> Non
 
         return operation
 
-    def problem_for(scale: float) -> vp.Problem:
-        candidate = vp.Candidate(
+    def problem_for(scale: float) -> vpx.Problem:
+        candidate = vpx.Candidate(
             "family",
             "row",
             {"scale": scale},
             admission_status="passed",
         )
 
-        return vp.Problem(
+        return vpx.Problem(
             model=model,
-            params=vp.parameter_surface(model),
+            params=vpx.parameter_surface(model),
             data=OneBatchData(),
-            operator=vp.gradient("family", "loss", aggregation="sum"),
+            operator=ops.gradient("family", "loss", aggregation="sum"),
             vectors=OneVectorProvider(),
             target=cpu_target(
-                vp.TimingPolicy(
+                vpx.TimingPolicy(
                     short_seconds=0.0,
                     medium_seconds=0.0,
                     long_warmups=0,
                     long_measured_calls=1,
                 )
             ),
-            runtime=vpx.RuntimeConfig(
+            runtime=runtime_config(
                 (candidate,),
                 operation_factory,
                 reference_check,
@@ -8040,13 +7332,13 @@ def test_tune_reruns_when_saved_candidate_settings_differ(tmp_path: Path) -> Non
             ),
         )
 
-    first_plan = vp.tune(
+    first_plan = tune_problem(
         problem_for(1.0),
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
     )
-    second_plan = vp.tune(
+    second_plan = tune_problem(
         problem_for(2.0),
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -8065,15 +7357,15 @@ def test_tune_reruns_when_saved_candidate_settings_differ(tmp_path: Path) -> Non
 def test_tune_records_reference_runtime_failures() -> None:
     model = torch.nn.Linear(1, 1)
     candidates = (
-        vp.Candidate("family", "bad", {}, admission_status="passed"),
-        vp.Candidate("family", "good", {}, admission_status="passed"),
+        vpx.Candidate("family", "bad", {}, admission_status="passed"),
+        vpx.Candidate("family", "good", {}, admission_status="passed"),
     )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
 
@@ -8084,9 +7376,9 @@ def test_tune_records_reference_runtime_failures() -> None:
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "good"
         assert batch["source"] == "probe"
@@ -8094,21 +7386,21 @@ def test_tune_records_reference_runtime_failures() -> None:
 
         return vpx.constant_operation(vector)
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.hvp("family", "objective", aggregation="sum"),
+        operator=ops.hvp("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_warmups=0,
                 long_measured_calls=1,
             )
         ),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             candidates,
             operation_factory,
             reference_check,
@@ -8117,7 +7409,7 @@ def test_tune_records_reference_runtime_failures() -> None:
             {"generator": "reference-runtime"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
@@ -8132,7 +7424,7 @@ def test_tune_records_reference_runtime_failures() -> None:
 
 def test_tune_writes_records_and_produced_rows_are_current(tmp_path: Path) -> None:
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"scale": 1.0},
@@ -8140,10 +7432,10 @@ def test_tune_writes_records_and_produced_rows_are_current(tmp_path: Path) -> No
     )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -8151,30 +7443,30 @@ def test_tune_writes_records_and_produced_rows_are_current(tmp_path: Path) -> No
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "probe"
 
         return vpx.constant_operation(vector)
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.hvp("family", "objective", aggregation="sum"),
+        operator=ops.hvp("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_warmups=0,
                 long_measured_calls=1,
             )
         ),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -8183,7 +7475,7 @@ def test_tune_writes_records_and_produced_rows_are_current(tmp_path: Path) -> No
             {"generator": "write-test"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -8302,13 +7594,13 @@ def test_tune_writes_records_and_produced_rows_are_current(tmp_path: Path) -> No
 def test_tune_measures_every_probe_input() -> None:
     calls = []
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate("family", "row", {}, admission_status="passed")
+    candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -8316,9 +7608,9 @@ def test_tune_measures_every_probe_input() -> None:
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "row"
         assert isinstance(vector, torch.Tensor)
@@ -8330,21 +7622,21 @@ def test_tune_measures_every_probe_input() -> None:
 
         return operation
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=TwoProbeData(),
-        operator=vp.hvp("family", "objective", aggregation="sum"),
+        operator=ops.hvp("family", "objective", aggregation="sum"),
         vectors=TwoVectorProvider(),
         target=cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_warmups=0,
                 long_measured_calls=1,
             )
         ),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -8353,7 +7645,7 @@ def test_tune_measures_every_probe_input() -> None:
             {"generator": "two-probe"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
@@ -8364,13 +7656,13 @@ def test_tune_measures_every_probe_input() -> None:
 
 
 def test_tree_reference_check_compares_candidate_to_anchor() -> None:
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"mode": "same"},
         admission_status="passed",
     )
-    bad_candidate = vp.Candidate(
+    bad_candidate = vpx.Candidate(
         "family",
         "bad",
         {"mode": "bad"},
@@ -8378,9 +7670,9 @@ def test_tree_reference_check_compares_candidate_to_anchor() -> None:
     )
 
     def anchor_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "anchor"
         assert batch["family"] == "family"
@@ -8389,9 +7681,9 @@ def test_tree_reference_check_compares_candidate_to_anchor() -> None:
         return vpx.constant_operation(vector)
 
     def candidate_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert batch["family"] == "family"
         assert isinstance(vector, torch.Tensor)
@@ -8415,9 +7707,38 @@ def test_tree_reference_check_compares_candidate_to_anchor() -> None:
         check(bad_candidate, {"family": "family"}, torch.tensor([1.0]))
 
 
+def test_tree_reference_check_rejects_self_anchor_candidate_id() -> None:
+    candidate = vpx.Candidate(
+        "family",
+        "row",
+        {"mode": "same"},
+        admission_status="passed",
+    )
+
+    def operation_factory(
+        candidate: vpx.Candidate,
+        batch: Mapping[str, object],
+        vector: vpx.TensorTree,
+    ) -> vpx.CandidateOperation:
+        assert candidate.family == "family"
+        assert batch["family"] == "family"
+
+        return vpx.constant_operation(vector)
+
+    check = vpx.tree_reference_check(
+        anchor_factory=operation_factory,
+        candidate_factory=operation_factory,
+        thresholds={"max_abs_diff": 1e-6, "max_rel_diff": 1e-6},
+        anchor_candidate_id="row",
+    )
+
+    with pytest.raises(vp.MaterializationError, match="anchor candidate_id"):
+        check(candidate, {"family": "family"}, torch.tensor([1.0]))
+
+
 def test_records_round_trip_through_json(tmp_path: Path) -> None:
     input_signature = _input_signature("json")
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"dtype": "fp32"},
@@ -8429,11 +7750,11 @@ def test_records_round_trip_through_json(tmp_path: Path) -> None:
         reserved=(2.0,),
         input_signature=input_signature,
     )
-    plan = vp.Plan(
+    plan = vpx.Plan(
         selected={"family": candidate},
         records={"family": record},
         input_signature=input_signature,
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(record,),
         materializers={"family": materialize_candidate},
         **_identity_kwargs(),
@@ -8474,7 +7795,7 @@ def test_records_round_trip_through_json(tmp_path: Path) -> None:
 
 def test_plan_replay_requires_all_saved_rows(tmp_path: Path) -> None:
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"scale": 1.0},
@@ -8482,10 +7803,10 @@ def test_plan_replay_requires_all_saved_rows(tmp_path: Path) -> None:
     )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -8493,9 +7814,9 @@ def test_plan_replay_requires_all_saved_rows(tmp_path: Path) -> None:
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.candidate_id == "row"
         assert batch["source"] == "probe"
@@ -8503,21 +7824,21 @@ def test_plan_replay_requires_all_saved_rows(tmp_path: Path) -> None:
 
         return vpx.constant_operation(vector)
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
-        operator=vp.hvp("family", "objective", aggregation="sum"),
+        operator=ops.hvp("family", "objective", aggregation="sum"),
         vectors=OneVectorProvider(),
         target=cpu_target(
-            vp.TimingPolicy(
+            vpx.TimingPolicy(
                 short_seconds=0.0,
                 medium_seconds=0.0,
                 long_warmups=0,
                 long_measured_calls=1,
             )
         ),
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -8526,7 +7847,7 @@ def test_plan_replay_requires_all_saved_rows(tmp_path: Path) -> None:
             {"generator": "replay-test"},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -8574,7 +7895,7 @@ def test_plan_replay_requires_all_saved_rows(tmp_path: Path) -> None:
 def test_plan_replay_rejects_stale_context_and_materializer() -> None:
     input_signature = _input_signature("replay-context")
     other_signature = _input_signature("other")
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"scale": 1.0},
@@ -8589,11 +7910,11 @@ def test_plan_replay_rejects_stale_context_and_materializer() -> None:
         )
     )
     check = _check_record(candidate, input_signature=input_signature)
-    plan = vp.Plan(
+    plan = vpx.Plan(
         selected={"family": candidate},
         records={"family": record},
         input_signature=input_signature,
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(record,),
         check_records=(check,),
         materializers={"family": materialize_candidate},
@@ -8602,9 +7923,10 @@ def test_plan_replay_rejects_stale_context_and_materializer() -> None:
     summary = vpx.plan_to_json(plan)
     context = replay_context_for_plan(plan)
     other_materializer = vpx.CallableMaterializer(
-        "tests.other_materializer",
+        "tests.materialize_candidate",
         "1",
         {},
+        {"callback": "tests.materialize_candidate_impl.other"},
         materialize_candidate_impl,
     )
 
@@ -8646,7 +7968,7 @@ def test_plan_replay_rejects_stale_context_and_materializer() -> None:
             summary,
             replay_context=dataclasses.replace(
                 context,
-                selection_policy=vp.SelectionPolicy(near_fastest_multiplier=1.01),
+                selection_policy=vpx.SelectionPolicy(near_fastest_multiplier=1.01),
             ),
             full_size_records=(record,),
             check_records=(check,),
@@ -8745,13 +8067,13 @@ def test_plan_replay_rejects_stale_context_and_materializer() -> None:
 def test_plan_replay_recomputes_family_selection() -> None:
     input_signature = _input_signature("recompute")
     memory_signature = _input_signature("recompute-memory")
-    fast = vp.Candidate(
+    fast = vpx.Candidate(
         "family",
         "fast",
         {"scale": 1.0},
         admission_status="passed",
     )
-    slow = vp.Candidate(
+    slow = vpx.Candidate(
         "family",
         "slow",
         {"scale": 2.0},
@@ -8775,11 +8097,11 @@ def test_plan_replay_recomputes_family_selection() -> None:
     )
     fast_check = _check_record(fast, input_signature=input_signature)
     slow_check = _check_record(slow, input_signature=input_signature)
-    plan = vp.Plan(
+    plan = vpx.Plan(
         selected={"family": slow},
         records={"family": slow_record},
         input_signature=input_signature,
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(fast_record, slow_record),
         check_records=(fast_check, slow_check),
         materializers={"family": materialize_candidate},
@@ -8796,13 +8118,13 @@ def test_plan_replay_recomputes_family_selection() -> None:
             materializers={"family": materialize_candidate},
         )
 
-    low_memory = vp.Candidate(
+    low_memory = vpx.Candidate(
         "family",
         "low-memory",
         {"scale": 1.0},
         admission_status="passed",
     )
-    high_memory = vp.Candidate(
+    high_memory = vpx.Candidate(
         "family",
         "high-memory",
         {"scale": 2.0},
@@ -8832,11 +8154,11 @@ def test_plan_replay_recomputes_family_selection() -> None:
         high_memory,
         input_signature=memory_signature,
     )
-    memory_plan = vp.Plan(
+    memory_plan = vpx.Plan(
         selected={"family": high_memory},
         records={"family": high_memory_record},
         input_signature=memory_signature,
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(low_memory_record, high_memory_record),
         check_records=(low_memory_check, high_memory_check),
         materializers={"family": materialize_candidate},
@@ -8856,7 +8178,7 @@ def test_plan_replay_recomputes_family_selection() -> None:
 
 def test_plan_replay_rejects_missing_full_size_agreement() -> None:
     input_signature = _input_signature("full-size-gate-replay")
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "flash",
         {
@@ -8874,11 +8196,11 @@ def test_plan_replay_rejects_missing_full_size_agreement() -> None:
         )
     )
     check = _check_record(candidate, input_signature=input_signature)
-    plan = vp.Plan(
+    plan = vpx.Plan(
         selected={"family": candidate},
         records={"family": record},
         input_signature=input_signature,
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(record,),
         check_records=(check,),
         materializers={"family": materialize_candidate},
@@ -8898,7 +8220,7 @@ def test_plan_replay_rejects_missing_full_size_agreement() -> None:
 
 def test_selected_plan_validation_writes_failed_record(tmp_path: Path) -> None:
     input_signature = _input_signature("validation")
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"scale": 1.0},
@@ -8911,11 +8233,11 @@ def test_selected_plan_validation_writes_failed_record(tmp_path: Path) -> None:
         input_signature=input_signature,
     )
     check = _check_record(candidate, input_signature=input_signature)
-    plan = vp.Plan(
+    plan = vpx.Plan(
         selected={"family": candidate},
         records={"family": record},
         input_signature=input_signature,
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(record,),
         check_records=(check,),
         materializers={"family": materialize_candidate},
@@ -8924,10 +8246,10 @@ def test_selected_plan_validation_writes_failed_record(tmp_path: Path) -> None:
     )
 
     def validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert record.candidate_id == "row"
         assert torch.equal(context.selected(), torch.tensor([1.0]))
@@ -9017,7 +8339,7 @@ def test_selected_plan_validation_writes_runtime_failure_record(
     tmp_path: Path,
 ) -> None:
     input_signature = _input_signature("validation-runtime")
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"scale": 1.0},
@@ -9029,20 +8351,20 @@ def test_selected_plan_validation_writes_runtime_failure_record(
         reserved=(1.0,),
         input_signature=input_signature,
     )
-    plan = vp.Plan(
+    plan = vpx.Plan(
         selected={"family": candidate},
         records={"family": record},
         input_signature=input_signature,
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(record,),
         materializers={"family": materialize_candidate},
     )
 
     def validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == "row"
         assert record.candidate_id == "row"
         assert torch.equal(context.selected(), torch.tensor([1.0]))
@@ -9062,200 +8384,12 @@ def test_selected_plan_validation_writes_runtime_failure_record(
     assert summary["status"] == "failed"
 
 
-def test_operator_constructors_declare_kind_and_aggregation() -> None:
-    operator = vp.hvp(
-        "curvature",
-        "capability",
-        aggregation="sum",
-        thresholds={"max_rel_diff": 1e-3},
-    )
-
-    assert operator.family == "curvature"
-    assert operator.kind == "hvp"
-    assert operator.objective_id == "capability"
-    assert operator.aggregation == "sum"
-    assert operator.thresholds == {"max_rel_diff": 1e-3}
-    assert operator.batch_inputs == {
-        "reference": ("symmetry_vector",),
-        "operation": (),
-    }
-    fisher = vp.fisher_vp(
-        "metric",
-        "retain",
-        aggregation="mean",
-        distribution="explicit_score_gradients",
-        label_policy="explicit_scores",
-        sample_space="terms",
-        score_reduction="none",
-        denominator="batch_normalization",
-    )
-
-    assert fisher.kind == "fisher_vp"
-    assert fisher.semantics["distribution"] == "explicit_score_gradients"
-    assert fisher.semantics["score_reduction"] == "none"
-    assert fisher.batch_inputs == {"reference": (), "operation": ()}
-    with pytest.raises(vp.MaterializationError, match="GGNVP"):
-        vp.fisher_vp(
-            "metric",
-            "retain",
-            aggregation="mean",
-            distribution="categorical",
-            label_policy="model_distribution",
-            sample_space="classes",
-            score_reduction="none",
-            denominator="num_examples",
-        )
-
-    sampled = vp.sampled_fisher_vp(
-        "metric",
-        "retain",
-        aggregation="mean",
-        distribution="explicit_score_gradients",
-        label_policy="sampled_labels",
-        sample_count=8,
-        sample_source="fixed_seed_and_count",
-        sampling_bound={"gamma": 0.25},
-        score_reduction="none",
-        denominator="num_examples",
-    )
-
-    assert sampled.kind == "sampled_fisher_vp"
-    assert sampled.semantics == {
-        "distribution": "explicit_score_gradients",
-        "label_policy": "sampled_labels",
-        "sample_count": 8,
-        "sample_source": "fixed_seed_and_count",
-        "sampling_bound": {"gamma": 0.25},
-        "score_reduction": "none",
-        "denominator": "num_examples",
-    }
-    assert sampled.batch_inputs == {"reference": (), "operation": ()}
-    with pytest.raises(vp.MaterializationError, match="sample_count"):
-        vp.sampled_fisher_vp(
-            "metric",
-            "retain",
-            aggregation="mean",
-            distribution="explicit_score_gradients",
-            label_policy="sampled_labels",
-            sample_count=0,
-            sample_source="fixed_seed_and_count",
-            sampling_bound={"gamma": 0.25},
-            score_reduction="none",
-            denominator="num_examples",
-        )
-    with pytest.raises(vp.MaterializationError, match="sample_source"):
-        vp.sampled_fisher_vp(
-            "metric",
-            "retain",
-            aggregation="mean",
-            distribution="explicit_score_gradients",
-            label_policy="sampled_labels",
-            sample_count=1,
-            sample_source="live_random_samples",
-            sampling_bound={"gamma": 0.25},
-            score_reduction="none",
-            denominator="num_examples",
-        )
-
-    empirical = vp.empirical_fisher_vp(
-        "metric",
-        "retain",
-        aggregation="mean",
-        example_loss_reduction="per_example",
-        denominator="num_examples",
-    )
-
-    assert empirical.kind == "empirical_fisher_vp"
-    assert empirical.semantics == {
-        "example_loss_reduction": "per_example",
-        "denominator": "num_examples",
-    }
-    assert empirical.batch_inputs == {"reference": (), "operation": ()}
-    ggn = vp.ggnvp(
-        "metric",
-        "retain",
-        aggregation="mean",
-    )
-
-    assert ggn.kind == "ggnvp"
-    assert ggn.semantics == {"loss_geometry": "psd_metric"}
-    assert ggn.batch_inputs == {
-        "reference": ("loss_hessian", "symmetry_vector"),
-        "operation": ("loss_hessian",),
-    }
-    assert vp.gradient("grad", "loss", aggregation="sum").kind == "gradient"
-    jvp = vp.jvp("jvp", "function", aggregation="none")
-    vjp = vp.vjp("vjp", "function", aggregation="none")
-    dense_representation = {"kind": "dense_matrix"}
-    metric = vp.metric(
-        "metric",
-        "retain",
-        aggregation="mean",
-        representation=dense_representation,
-    )
-    inverse_metric = vp.inverse_metric(
-        "inverse_metric",
-        "retain",
-        aggregation="mean",
-        representation=dense_representation,
-        damping=0.0,
-    )
-
-    assert jvp.kind == "jvp"
-    assert jvp.batch_inputs == {"reference": (), "operation": ()}
-    assert vjp.kind == "vjp"
-    assert vjp.batch_inputs == {"reference": ("tangent_vector",), "operation": ()}
-    assert metric.kind == "metric"
-    assert metric.semantics == {"representation": dense_representation}
-    assert metric.batch_inputs == {
-        "reference": ("metric_matrix",),
-        "operation": ("metric_matrix",),
-    }
-    assert inverse_metric.kind == "inverse_metric"
-    assert inverse_metric.semantics == {
-        "damping": 0.0,
-        "representation": dense_representation,
-    }
-    assert inverse_metric.batch_inputs == {
-        "reference": ("metric_matrix",),
-        "operation": ("metric_matrix",),
-    }
-    with pytest.raises(vp.MaterializationError, match="damping"):
-        vp.inverse_metric(
-            "inverse_metric",
-            "retain",
-            aggregation="mean",
-            representation=dense_representation,
-            damping=-1.0,
-        )
-    composition = vp.composition(
-        "compose",
-        "hvp_after_metric",
-        aggregation="none",
-        children=("metric", "hvp"),
-    )
-    assert composition.kind == "composition"
-    assert composition.semantics == {"children": ("metric", "hvp")}
-    assert vp.Family("compose", composition).dependencies == ("metric", "hvp")
-
-    with pytest.raises(vp.MaterializationError, match="derived from children"):
-        vp.Family("compose", composition, dependencies=("metric",))
-
-
 def test_operator_constructors_reject_unknown_semantic_values() -> None:
     with pytest.raises(vp.MaterializationError, match="aggregation"):
-        vp.gradient("grad", "loss", aggregation="summ")
-
-    with pytest.raises(TypeError, match="loss_geometry"):
-        vp.ggnvp(
-            "ggn",
-            "model_output",
-            aggregation="sum",
-            loss_geometry="psd_mteric",
-        )
+        ops.gradient("grad", "loss", aggregation="summ")
 
     with pytest.raises(vp.MaterializationError, match="distribution"):
-        vp.fisher_vp(
+        ops.fisher_vp(
             "fisher",
             "scores",
             aggregation="mean",
@@ -9267,7 +8401,7 @@ def test_operator_constructors_reject_unknown_semantic_values() -> None:
         )
 
     with pytest.raises(vp.MaterializationError, match="label_policy"):
-        vp.fisher_vp(
+        ops.fisher_vp(
             "fisher",
             "scores",
             aggregation="mean",
@@ -9279,7 +8413,7 @@ def test_operator_constructors_reject_unknown_semantic_values() -> None:
         )
 
     with pytest.raises(vp.MaterializationError, match="sample_space"):
-        vp.fisher_vp(
+        ops.fisher_vp(
             "fisher",
             "scores",
             aggregation="mean",
@@ -9291,7 +8425,7 @@ def test_operator_constructors_reject_unknown_semantic_values() -> None:
         )
 
     with pytest.raises(vp.MaterializationError, match="score_reduction"):
-        vp.sampled_fisher_vp(
+        ops.sampled_fisher_vp(
             "sampled",
             "scores",
             aggregation="mean",
@@ -9299,13 +8433,13 @@ def test_operator_constructors_reject_unknown_semantic_values() -> None:
             label_policy="sampled_labels",
             sample_count=1,
             sample_source="fixed_seed_and_count",
-            sampling_bound={"gamma": 0.25},
+            sampling_bound=valid_sampling_bound(),
             score_reduction="mean",
             denominator="num_examples",
         )
 
     with pytest.raises(vp.MaterializationError, match="denominator"):
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "loss",
             aggregation="mean",
@@ -9314,7 +8448,7 @@ def test_operator_constructors_reject_unknown_semantic_values() -> None:
         )
 
     with pytest.raises(vp.MaterializationError, match="example_loss_reduction"):
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "loss",
             aggregation="mean",
@@ -9326,17 +8460,17 @@ def test_operator_constructors_reject_unknown_semantic_values() -> None:
 def test_tune_run_preflight_errors_do_not_write_summary(tmp_path: Path) -> None:
     target = cpu_target()
     model = torch.nn.Linear(1, 1)
-    operator_a = vp.gradient("a", "loss_a", aggregation="sum")
-    operator_b = vp.gradient("b", "loss_b", aggregation="sum")
+    operator_a = ops.gradient("a", "loss_a", aggregation="sum")
+    operator_b = ops.gradient("b", "loss_b", aggregation="sum")
 
-    def make_problem(operator: vp.OperatorSpec) -> vp.Problem:
-        candidate = vp.Candidate(operator.family, "row", {}, admission_status="passed")
+    def make_problem(operator: vpx.OperatorSpec) -> vpx.Problem:
+        candidate = vpx.Candidate(operator.family, "row", {}, admission_status="passed")
 
         def reference_check(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
-        ) -> vp.ReferenceResult:
+            vector: vpx.TensorTree,
+        ) -> vpx.ReferenceResult:
             assert candidate
             assert batch
             assert vector
@@ -9344,9 +8478,9 @@ def test_tune_run_preflight_errors_do_not_write_summary(tmp_path: Path) -> None:
             raise AssertionError(message)
 
         def operation_factory(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
+            vector: vpx.TensorTree,
         ) -> vpx.CandidateOperation:
             assert candidate
             assert batch
@@ -9354,14 +8488,14 @@ def test_tune_run_preflight_errors_do_not_write_summary(tmp_path: Path) -> None:
             message = "operation should not run"
             raise AssertionError(message)
 
-        return vp.Problem(
+        return vpx.Problem(
             model=model,
-            params=vp.parameter_surface(model),
+            params=vpx.parameter_surface(model),
             data=OneBatchData(),
             operator=operator,
             vectors=OneVectorProvider(),
             target=target,
-            runtime=vpx.RuntimeConfig(
+            runtime=runtime_config(
                 (candidate,),
                 operation_factory,
                 reference_check,
@@ -9374,18 +8508,18 @@ def test_tune_run_preflight_errors_do_not_write_summary(tmp_path: Path) -> None:
     cases = (
         (
             tmp_path / "missing-problems",
-            vp.TuningRun(
+            vpx.TuningRun(
                 target=target,
-                families=(vp.Family("a", operator_a),),
+                families=(vpx.Family("a", operator_a),),
                 run_id="missing-problems",
             ),
             "run adapter is required",
         ),
         (
             tmp_path / "duplicate-problems",
-            vp.TuningRun(
+            vpx.TuningRun(
                 target=target,
-                families=(vp.Family("a", operator_a),),
+                families=(vpx.Family("a", operator_a),),
                 problems=(make_problem(operator_a), make_problem(operator_a)),
                 run_id="duplicate-problems",
             ),
@@ -9393,9 +8527,9 @@ def test_tune_run_preflight_errors_do_not_write_summary(tmp_path: Path) -> None:
         ),
         (
             tmp_path / "family-mismatch",
-            vp.TuningRun(
+            vpx.TuningRun(
                 target=target,
-                families=(vp.Family("b", operator_b),),
+                families=(vpx.Family("b", operator_b),),
                 problems=(make_problem(operator_a),),
                 run_id="family-mismatch",
             ),
@@ -9419,18 +8553,18 @@ def test_tune_run_uses_family_dag_order(tmp_path: Path) -> None:
     calls = []
     model = torch.nn.Linear(1, 1)
     target = cpu_target(
-        vp.TimingPolicy(
+        vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
             long_measured_calls=1,
         )
     )
-    operator_a = vp.gradient("a", "loss_a", aggregation="sum")
-    operator_b = vp.hvp("b", "loss_b", aggregation="sum")
+    operator_a = ops.gradient("a", "loss_a", aggregation="sum")
+    operator_b = ops.hvp("b", "loss_b", aggregation="sum")
 
-    def make_problem(name: str, operator: vp.OperatorSpec) -> vp.Problem:
-        candidate = vp.Candidate(
+    def make_problem(name: str, operator: vpx.OperatorSpec) -> vpx.Problem:
+        candidate = vpx.Candidate(
             name,
             f"{name}:row",
             {"axis": name},
@@ -9438,10 +8572,10 @@ def test_tune_run_uses_family_dag_order(tmp_path: Path) -> None:
         )
 
         def reference_check(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
-        ) -> vp.ReferenceResult:
+            vector: vpx.TensorTree,
+        ) -> vpx.ReferenceResult:
             assert batch["family"] == name
             assert batch["source"] == "reference"
             assert candidate.family == name
@@ -9451,9 +8585,9 @@ def test_tune_run_uses_family_dag_order(tmp_path: Path) -> None:
             return reference_passed()
 
         def operation_factory(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
+            vector: vpx.TensorTree,
         ) -> vpx.CandidateOperation:
             assert batch["family"] == name
             assert batch["source"] == "probe"
@@ -9467,14 +8601,14 @@ def test_tune_run_uses_family_dag_order(tmp_path: Path) -> None:
 
             return operation
 
-        return vp.Problem(
+        return vpx.Problem(
             model=model,
-            params=vp.parameter_surface(model),
+            params=vpx.parameter_surface(model),
             data=OneBatchData(),
             operator=operator,
             vectors=OneVectorProvider(),
             target=target,
-            runtime=vpx.RuntimeConfig(
+            runtime=runtime_config(
                 (candidate,),
                 operation_factory,
                 reference_check,
@@ -9484,11 +8618,11 @@ def test_tune_run_uses_family_dag_order(tmp_path: Path) -> None:
             ),
         )
 
-    run = vp.TuningRun(
+    run = vpx.TuningRun(
         target=target,
         families=(
-            vp.Family("b", operator_b, dependencies=("a",)),
-            vp.Family("a", operator_a),
+            vpx.Family("b", operator_b, dependencies=("a",)),
+            vpx.Family("a", operator_a),
         ),
         problems=(make_problem("b", operator_b), make_problem("a", operator_a)),
         run_id="dag",
@@ -9583,10 +8717,10 @@ def test_tune_run_uses_family_dag_order(tmp_path: Path) -> None:
     validation_calls = []
 
     def validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         validation_calls.append(candidate.family)
         assert record.family == candidate.family
         assert torch.equal(context.selected(), torch.tensor([1.0]))
@@ -9722,15 +8856,15 @@ def test_tune_run_executes_declared_selected_plan_validators(
     validation_calls = []
     model = torch.nn.Linear(1, 1)
     target = cpu_target(
-        vp.TimingPolicy(
+        vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
             long_measured_calls=1,
         )
     )
-    operator = vp.gradient("family", "loss", aggregation="sum")
-    candidate = vp.Candidate(
+    operator = ops.gradient("family", "loss", aggregation="sum")
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"axis": "value"},
@@ -9738,10 +8872,10 @@ def test_tune_run_executes_declared_selected_plan_validators(
     )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.family == "family"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -9749,9 +8883,9 @@ def test_tune_run_executes_declared_selected_plan_validators(
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.family == "family"
         assert batch["source"] == "probe"
@@ -9765,28 +8899,28 @@ def test_tune_run_executes_declared_selected_plan_validators(
         return operation
 
     def validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         validation_calls.append(candidate.candidate_id)
         assert record.candidate_id == candidate.candidate_id
         assert torch.equal(context.selected(), torch.tensor([1.0]))
 
-        return vp.ReferenceResult(
+        return vpx.ReferenceResult(
             "selected_plan_validation",
             {"max_abs_diff": 1e-6},
             {"max_abs_diff": 0.0},
         )
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
         operator=operator,
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -9795,9 +8929,9 @@ def test_tune_run_executes_declared_selected_plan_validators(
             {"generator": "validation-run"},
         ),
     )
-    run = vp.TuningRun(
+    run = vpx.TuningRun(
         target=target,
-        families=(vp.Family("family", operator),),
+        families=(vpx.Family("family", operator),),
         problems=(problem,),
         validators={"family": validator},
         validator_identities={"family": {"validator_id": "tests.validator.v1"}},
@@ -9915,21 +9049,21 @@ def test_tune_run_writes_selected_summary_before_validator_failure(
 ) -> None:
     model = torch.nn.Linear(1, 1)
     target = cpu_target(
-        vp.TimingPolicy(
+        vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
             long_measured_calls=1,
         )
     )
-    operator = vp.gradient("family", "loss", aggregation="sum")
-    candidate = vp.Candidate("family", "row", {}, admission_status="passed")
+    operator = ops.gradient("family", "loss", aggregation="sum")
+    candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.family == "family"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -9937,9 +9071,9 @@ def test_tune_run_writes_selected_summary_before_validator_failure(
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.family == "family"
         assert batch["source"] == "probe"
@@ -9951,24 +9085,24 @@ def test_tune_run_writes_selected_summary_before_validator_failure(
         return operation
 
     def validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         assert candidate.candidate_id == record.candidate_id
         assert context.family == "family"
 
         message = "validation failed"
         raise RuntimeError(message)
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
         operator=operator,
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             (candidate,),
             operation_factory,
             reference_check,
@@ -9977,9 +9111,9 @@ def test_tune_run_writes_selected_summary_before_validator_failure(
             {"generator": "validation-failure-run"},
         ),
     )
-    run = vp.TuningRun(
+    run = vpx.TuningRun(
         target=target,
-        families=(vp.Family("family", operator),),
+        families=(vpx.Family("family", operator),),
         problems=(problem,),
         validators={"family": validator},
         validator_identities={"family": {"validator_id": "tests.validator.fail"}},
@@ -10006,7 +9140,7 @@ def test_tune_run_writes_selected_summary_before_validator_failure(
 
 def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
     target = cpu_target(
-        vp.TimingPolicy(
+        vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
@@ -10014,20 +9148,20 @@ def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
         )
     )
     model = torch.nn.Linear(1, 1)
-    operator_a = vp.gradient("a", "loss", aggregation="sum")
-    operator_b = vp.gradient("b", "loss", aggregation="sum")
+    operator_a = ops.gradient("a", "loss", aggregation="sum")
+    operator_b = ops.gradient("b", "loss", aggregation="sum")
     calls = []
 
     def make_problem(
         name: str,
-        operator: vp.OperatorSpec,
-        candidates: tuple[vp.Candidate, ...],
-    ) -> vp.Problem:
+        operator: vpx.OperatorSpec,
+        candidates: tuple[vpx.Candidate, ...],
+    ) -> vpx.Problem:
         def reference_check(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
-        ) -> vp.ReferenceResult:
+            vector: vpx.TensorTree,
+        ) -> vpx.ReferenceResult:
             assert candidate.family == name
             assert batch["source"] == "reference"
             assert isinstance(vector, torch.Tensor)
@@ -10035,9 +9169,9 @@ def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
             return reference_passed()
 
         def operation_factory(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
+            vector: vpx.TensorTree,
         ) -> vpx.CandidateOperation:
             assert batch["source"] == "probe"
             assert isinstance(vector, torch.Tensor)
@@ -10049,14 +9183,14 @@ def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
 
             return operation
 
-        return vp.Problem(
+        return vpx.Problem(
             model=model,
-            params=vp.parameter_surface(model),
+            params=vpx.parameter_surface(model),
             data=OneBatchData(),
             operator=operator,
             vectors=OneVectorProvider(),
             target=target,
-            runtime=vpx.RuntimeConfig(
+            runtime=runtime_config(
                 candidates,
                 operation_factory,
                 reference_check,
@@ -10066,21 +9200,21 @@ def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
             ),
         )
 
-    run = vp.TuningRun(
+    run = vpx.TuningRun(
         target=target,
-        families=(vp.Family("a", operator_a), vp.Family("b", operator_b)),
+        families=(vpx.Family("a", operator_a), vpx.Family("b", operator_b)),
         problems=(
             make_problem(
                 "a",
                 operator_a,
                 (
-                    vp.Candidate(
+                    vpx.Candidate(
                         "a",
                         "a-float16",
                         {"dtype.model_compute": "fp16"},
                         admission_status="passed",
                     ),
-                    vp.Candidate(
+                    vpx.Candidate(
                         "a",
                         "a-float32",
                         {"dtype.model_compute": "fp32"},
@@ -10092,13 +9226,13 @@ def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
                 "b",
                 operator_b,
                 (
-                    vp.Candidate(
+                    vpx.Candidate(
                         "b",
                         "b-float16",
                         {"dtype.model_compute": "fp16"},
                         admission_status="passed",
                     ),
-                    vp.Candidate(
+                    vpx.Candidate(
                         "b",
                         "b-float32",
                         {"dtype.model_compute": "fp32"},
@@ -10108,7 +9242,7 @@ def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
             ),
         ),
         cohort_constraints=(
-            vp.CohortConstraint(
+            vpx.CohortConstraint(
                 name="dtype",
                 settings_keys=("dtype.model_compute",),
                 assignments=(
@@ -10135,7 +9269,7 @@ def test_tune_run_selects_complete_dtype_cohort(tmp_path: Path) -> None:
 
 def test_tune_run_uses_generic_multi_key_cohort_constraint(tmp_path: Path) -> None:
     target = cpu_target(
-        vp.TimingPolicy(
+        vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
@@ -10143,21 +9277,21 @@ def test_tune_run_uses_generic_multi_key_cohort_constraint(tmp_path: Path) -> No
         )
     )
     model = torch.nn.Linear(1, 1)
-    operator_a = vp.gradient("a", "loss", aggregation="sum")
-    operator_b = vp.gradient("b", "loss", aggregation="sum")
-    operator_c = vp.gradient("c", "loss", aggregation="sum")
+    operator_a = ops.gradient("a", "loss", aggregation="sum")
+    operator_b = ops.gradient("b", "loss", aggregation="sum")
+    operator_c = ops.gradient("c", "loss", aggregation="sum")
     calls = []
 
     def make_problem(
         name: str,
-        operator: vp.OperatorSpec,
-        candidates: tuple[vp.Candidate, ...],
-    ) -> vp.Problem:
+        operator: vpx.OperatorSpec,
+        candidates: tuple[vpx.Candidate, ...],
+    ) -> vpx.Problem:
         def reference_check(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
-        ) -> vp.ReferenceResult:
+            vector: vpx.TensorTree,
+        ) -> vpx.ReferenceResult:
             assert candidate.family == name
             assert batch["source"] == "reference"
             assert isinstance(vector, torch.Tensor)
@@ -10165,9 +9299,9 @@ def test_tune_run_uses_generic_multi_key_cohort_constraint(tmp_path: Path) -> No
             return reference_passed()
 
         def operation_factory(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
+            vector: vpx.TensorTree,
         ) -> vpx.CandidateOperation:
             assert batch["source"] == "probe"
             assert isinstance(vector, torch.Tensor)
@@ -10179,14 +9313,14 @@ def test_tune_run_uses_generic_multi_key_cohort_constraint(tmp_path: Path) -> No
 
             return operation
 
-        return vp.Problem(
+        return vpx.Problem(
             model=model,
-            params=vp.parameter_surface(model),
+            params=vpx.parameter_surface(model),
             data=OneBatchData(),
             operator=operator,
             vectors=OneVectorProvider(),
             target=target,
-            runtime=vpx.RuntimeConfig(
+            runtime=runtime_config(
                 candidates,
                 operation_factory,
                 reference_check,
@@ -10196,25 +9330,25 @@ def test_tune_run_uses_generic_multi_key_cohort_constraint(tmp_path: Path) -> No
             ),
         )
 
-    run = vp.TuningRun(
+    run = vpx.TuningRun(
         target=target,
         families=(
-            vp.Family("a", operator_a),
-            vp.Family("b", operator_b, dependencies=("a",)),
-            vp.Family("c", operator_c),
+            vpx.Family("a", operator_a),
+            vpx.Family("b", operator_b, dependencies=("a",)),
+            vpx.Family("c", operator_c),
         ),
         problems=(
             make_problem(
                 "a",
                 operator_a,
                 (
-                    vp.Candidate(
+                    vpx.Candidate(
                         "a",
                         "a-first",
                         {"backend": "first", "chunk": 1},
                         admission_status="passed",
                     ),
-                    vp.Candidate(
+                    vpx.Candidate(
                         "a",
                         "a-second",
                         {"backend": "second", "chunk": 2},
@@ -10226,13 +9360,13 @@ def test_tune_run_uses_generic_multi_key_cohort_constraint(tmp_path: Path) -> No
                 "b",
                 operator_b,
                 (
-                    vp.Candidate(
+                    vpx.Candidate(
                         "b",
                         "b-first",
                         {"backend": "first", "chunk": 1},
                         admission_status="passed",
                     ),
-                    vp.Candidate(
+                    vpx.Candidate(
                         "b",
                         "b-second",
                         {"backend": "second", "chunk": 2},
@@ -10243,11 +9377,11 @@ def test_tune_run_uses_generic_multi_key_cohort_constraint(tmp_path: Path) -> No
             make_problem(
                 "c",
                 operator_c,
-                (vp.Candidate("c", "c-row", {}, admission_status="passed"),),
+                (vpx.Candidate("c", "c-row", {}, admission_status="passed"),),
             ),
         ),
         cohort_constraints=(
-            vp.CohortConstraint(
+            vpx.CohortConstraint(
                 name="backend_chunk",
                 settings_keys=("backend", "chunk"),
                 assignments=(
@@ -10344,7 +9478,7 @@ def test_tune_run_uses_generic_multi_key_cohort_constraint(tmp_path: Path) -> No
         plan,
         selected=first_selected,
         records=first_records,
-        cohort_assignment=vp.CohortAssignment(
+        cohort_assignment=vpx.CohortAssignment(
             assignment_id=str(first_assignment_record["assignment_id"]),
             values=dict(first_assignment_record["values"]),
             constraints=tuple(
@@ -10371,7 +9505,7 @@ def test_tune_run_cohort_subset_handles_cross_boundary_dependencies(
     tmp_path: Path,
 ) -> None:
     target = cpu_target(
-        vp.TimingPolicy(
+        vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
@@ -10379,21 +9513,21 @@ def test_tune_run_cohort_subset_handles_cross_boundary_dependencies(
         )
     )
     model = torch.nn.Linear(1, 1)
-    operator_a = vp.gradient("a", "loss", aggregation="sum")
-    operator_b = vp.gradient("b", "loss", aggregation="sum")
-    operator_c = vp.gradient("c", "loss", aggregation="sum")
+    operator_a = ops.gradient("a", "loss", aggregation="sum")
+    operator_b = ops.gradient("b", "loss", aggregation="sum")
+    operator_c = ops.gradient("c", "loss", aggregation="sum")
     calls = []
 
     def make_problem(
         name: str,
-        operator: vp.OperatorSpec,
-        candidates: tuple[vp.Candidate, ...],
-    ) -> vp.Problem:
+        operator: vpx.OperatorSpec,
+        candidates: tuple[vpx.Candidate, ...],
+    ) -> vpx.Problem:
         def reference_check(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
-        ) -> vp.ReferenceResult:
+            vector: vpx.TensorTree,
+        ) -> vpx.ReferenceResult:
             assert candidate.family == name
             assert batch["source"] == "reference"
             assert isinstance(vector, torch.Tensor)
@@ -10401,9 +9535,9 @@ def test_tune_run_cohort_subset_handles_cross_boundary_dependencies(
             return reference_passed()
 
         def operation_factory(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
+            vector: vpx.TensorTree,
         ) -> vpx.CandidateOperation:
             assert batch["source"] == "probe"
             assert isinstance(vector, torch.Tensor)
@@ -10415,14 +9549,14 @@ def test_tune_run_cohort_subset_handles_cross_boundary_dependencies(
 
             return operation
 
-        return vp.Problem(
+        return vpx.Problem(
             model=model,
-            params=vp.parameter_surface(model),
+            params=vpx.parameter_surface(model),
             data=OneBatchData(),
             operator=operator,
             vectors=OneVectorProvider(),
             target=target,
-            runtime=vpx.RuntimeConfig(
+            runtime=runtime_config(
                 candidates,
                 operation_factory,
                 reference_check,
@@ -10432,25 +9566,25 @@ def test_tune_run_cohort_subset_handles_cross_boundary_dependencies(
             ),
         )
 
-    run = vp.TuningRun(
+    run = vpx.TuningRun(
         target=target,
         families=(
-            vp.Family("a", operator_a),
-            vp.Family("b", operator_b, dependencies=("a",)),
-            vp.Family("c", operator_c, dependencies=("b",)),
+            vpx.Family("a", operator_a),
+            vpx.Family("b", operator_b, dependencies=("a",)),
+            vpx.Family("c", operator_c, dependencies=("b",)),
         ),
         problems=(
             make_problem(
                 "a",
                 operator_a,
                 (
-                    vp.Candidate(
+                    vpx.Candidate(
                         "a",
                         "a-first",
                         {"backend": "first"},
                         admission_status="passed",
                     ),
-                    vp.Candidate(
+                    vpx.Candidate(
                         "a",
                         "a-second",
                         {"backend": "second"},
@@ -10461,19 +9595,19 @@ def test_tune_run_cohort_subset_handles_cross_boundary_dependencies(
             make_problem(
                 "b",
                 operator_b,
-                (vp.Candidate("b", "b-row", {}, admission_status="passed"),),
+                (vpx.Candidate("b", "b-row", {}, admission_status="passed"),),
             ),
             make_problem(
                 "c",
                 operator_c,
                 (
-                    vp.Candidate(
+                    vpx.Candidate(
                         "c",
                         "c-first",
                         {"backend": "first"},
                         admission_status="passed",
                     ),
-                    vp.Candidate(
+                    vpx.Candidate(
                         "c",
                         "c-second",
                         {"backend": "second"},
@@ -10483,7 +9617,7 @@ def test_tune_run_cohort_subset_handles_cross_boundary_dependencies(
             ),
         ),
         cohort_constraints=(
-            vp.CohortConstraint(
+            vpx.CohortConstraint(
                 name="backend",
                 settings_keys=("backend",),
                 assignments=({"backend": "first"}, {"backend": "second"}),
@@ -10528,7 +9662,7 @@ def test_tune_run_cohort_subset_handles_cross_boundary_dependencies(
 
 def test_tune_run_writes_prerequisite_failed_descendants(tmp_path: Path) -> None:
     target = cpu_target(
-        vp.TimingPolicy(
+        vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
@@ -10536,21 +9670,21 @@ def test_tune_run_writes_prerequisite_failed_descendants(tmp_path: Path) -> None
         )
     )
     model = torch.nn.Linear(1, 1)
-    operator_a = vp.gradient("a", "loss", aggregation="sum")
-    operator_b = vp.gradient("b", "loss", aggregation="sum")
-    operator_c = vp.gradient("c", "loss", aggregation="sum")
+    operator_a = ops.gradient("a", "loss", aggregation="sum")
+    operator_b = ops.gradient("b", "loss", aggregation="sum")
+    operator_c = ops.gradient("c", "loss", aggregation="sum")
     calls = []
 
     def make_problem(
         name: str,
-        operator: vp.OperatorSpec,
-        candidates: tuple[vp.Candidate, ...],
-    ) -> vp.Problem:
+        operator: vpx.OperatorSpec,
+        candidates: tuple[vpx.Candidate, ...],
+    ) -> vpx.Problem:
         def reference_check(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
-        ) -> vp.ReferenceResult:
+            vector: vpx.TensorTree,
+        ) -> vpx.ReferenceResult:
             assert batch["source"] == "reference"
             assert isinstance(vector, torch.Tensor)
 
@@ -10561,9 +9695,9 @@ def test_tune_run_writes_prerequisite_failed_descendants(tmp_path: Path) -> None
             return reference_passed()
 
         def operation_factory(
-            candidate: vp.Candidate,
+            candidate: vpx.Candidate,
             batch: Mapping[str, object],
-            vector: vp.TensorTree,
+            vector: vpx.TensorTree,
         ) -> vpx.CandidateOperation:
             assert batch["source"] == "probe"
             assert isinstance(vector, torch.Tensor)
@@ -10575,14 +9709,14 @@ def test_tune_run_writes_prerequisite_failed_descendants(tmp_path: Path) -> None
 
             return operation
 
-        return vp.Problem(
+        return vpx.Problem(
             model=model,
-            params=vp.parameter_surface(model),
+            params=vpx.parameter_surface(model),
             data=OneBatchData(),
             operator=operator,
             vectors=OneVectorProvider(),
             target=target,
-            runtime=vpx.RuntimeConfig(
+            runtime=runtime_config(
                 candidates,
                 operation_factory,
                 reference_check,
@@ -10592,25 +9726,25 @@ def test_tune_run_writes_prerequisite_failed_descendants(tmp_path: Path) -> None
             ),
         )
 
-    run = vp.TuningRun(
+    run = vpx.TuningRun(
         target=target,
         families=(
-            vp.Family("a", operator_a),
-            vp.Family("b", operator_b, dependencies=("a",)),
-            vp.Family("c", operator_c),
+            vpx.Family("a", operator_a),
+            vpx.Family("b", operator_b, dependencies=("a",)),
+            vpx.Family("c", operator_c),
         ),
         problems=(
             make_problem(
                 "a",
                 operator_a,
                 (
-                    vp.Candidate(
+                    vpx.Candidate(
                         "a",
                         "a-first",
                         {"backend": "first"},
                         admission_status="passed",
                     ),
-                    vp.Candidate(
+                    vpx.Candidate(
                         "a",
                         "a-second",
                         {"backend": "second"},
@@ -10622,13 +9756,13 @@ def test_tune_run_writes_prerequisite_failed_descendants(tmp_path: Path) -> None
                 "b",
                 operator_b,
                 (
-                    vp.Candidate(
+                    vpx.Candidate(
                         "b",
                         "b-first",
                         {"backend": "first"},
                         admission_status="passed",
                     ),
-                    vp.Candidate(
+                    vpx.Candidate(
                         "b",
                         "b-second",
                         {"backend": "second"},
@@ -10640,13 +9774,13 @@ def test_tune_run_writes_prerequisite_failed_descendants(tmp_path: Path) -> None
                 "c",
                 operator_c,
                 (
-                    vp.Candidate(
+                    vpx.Candidate(
                         "c",
                         "c-first",
                         {"backend": "first"},
                         admission_status="passed",
                     ),
-                    vp.Candidate(
+                    vpx.Candidate(
                         "c",
                         "c-second",
                         {"backend": "second"},
@@ -10656,7 +9790,7 @@ def test_tune_run_writes_prerequisite_failed_descendants(tmp_path: Path) -> None
             ),
         ),
         cohort_constraints=(
-            vp.CohortConstraint(
+            vpx.CohortConstraint(
                 name="backend",
                 settings_keys=("backend",),
                 assignments=({"backend": "first"}, {"backend": "second"}),
@@ -10694,7 +9828,7 @@ def test_tune_run_propagates_candidate_validation_errors_inside_cohort(
     tmp_path: Path,
 ) -> None:
     target = cpu_target(
-        vp.TimingPolicy(
+        vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
@@ -10702,21 +9836,21 @@ def test_tune_run_propagates_candidate_validation_errors_inside_cohort(
         )
     )
     model = torch.nn.Linear(1, 1)
-    operator = vp.gradient("family", "loss", aggregation="sum")
+    operator = ops.gradient("family", "loss", aggregation="sum")
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "duplicate",
             {"backend": "first"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "duplicate",
             {"backend": "first"},
             admission_status="passed",
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "family",
             "valid",
             {"backend": "second"},
@@ -10725,10 +9859,10 @@ def test_tune_run_propagates_candidate_validation_errors_inside_cohort(
     )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.family == "family"
         assert batch["source"] == "reference"
         assert isinstance(vector, torch.Tensor)
@@ -10736,9 +9870,9 @@ def test_tune_run_propagates_candidate_validation_errors_inside_cohort(
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.family == "family"
         assert batch["source"] == "probe"
@@ -10749,14 +9883,14 @@ def test_tune_run_propagates_candidate_validation_errors_inside_cohort(
 
         return operation
 
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
         operator=operator,
         vectors=OneVectorProvider(),
         target=target,
-        runtime=vpx.RuntimeConfig(
+        runtime=runtime_config(
             candidates,
             operation_factory,
             reference_check,
@@ -10765,12 +9899,12 @@ def test_tune_run_propagates_candidate_validation_errors_inside_cohort(
             {"generator": "validation-error"},
         ),
     )
-    run = vp.TuningRun(
+    run = vpx.TuningRun(
         target=target,
-        families=(vp.Family("family", operator),),
+        families=(vpx.Family("family", operator),),
         problems=(problem,),
         cohort_constraints=(
-            vp.CohortConstraint(
+            vpx.CohortConstraint(
                 name="backend",
                 settings_keys=("backend",),
                 assignments=({"backend": "first"}, {"backend": "second"}),

@@ -98,6 +98,17 @@ def _require_string_mapping(value: Any, label: str) -> None:
     raise MaterializationError(message)
 
 
+def _selected_name(family: str | None, name: str | None) -> str | None:
+    if family is not None and name is not None and family != name:
+        message = "materialize name and family selectors differ"
+        raise MaterializationError(message)
+
+    if name is not None:
+        return name
+
+    return family
+
+
 def _require_output_field_paths(
     value: Mapping[str, tuple[str | int, ...]],
 ) -> None:
@@ -148,6 +159,18 @@ class CandidateOperation(Protocol):
         """Run the candidate operation."""
 
 
+class OperationFactoryCallback(Protocol):
+    """Callable wrapped by an identity-bearing operation factory."""
+
+    def __call__(
+        self,
+        candidate: "Candidate",
+        batch: Batch,
+        vector: TensorTree,
+    ) -> CandidateOperation:
+        """Return the operation to measure."""
+
+
 class OperationFactory(Protocol):
     """Create a measured operation for one candidate."""
 
@@ -160,6 +183,25 @@ class OperationFactory(Protocol):
         """Return the operation to measure."""
 
 
+class RuntimeOperationFactory(OperationFactory, Protocol):
+    """Identity-bearing operation factory stored in a runtime config."""
+
+    def identity(self) -> Mapping[str, Any]:
+        """Return stable operation-factory identity."""
+
+
+class ReferenceCheckCallback(Protocol):
+    """Callable wrapped by an identity-bearing reference check."""
+
+    def __call__(
+        self,
+        candidate: "Candidate",
+        batch: Batch,
+        vector: TensorTree,
+    ) -> "ReferenceResult":
+        """Return reference measurements or raise on failure."""
+
+
 class ReferenceCheck(Protocol):
     """Check one candidate against an anchor."""
 
@@ -170,6 +212,71 @@ class ReferenceCheck(Protocol):
         vector: TensorTree,
     ) -> "ReferenceResult":
         """Return reference measurements or raise on failure."""
+
+
+class RuntimeReferenceCheck(ReferenceCheck, Protocol):
+    """Identity-bearing reference check stored in a runtime config."""
+
+    def identity(self) -> Mapping[str, Any]:
+        """Return stable reference-check identity."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CallableOperationFactory:
+    """Identity-bearing wrapper for operation factory callbacks."""
+
+    factory_id: str
+    factory_version: str
+    settings: Mapping[str, Any]
+    callback_identity: Mapping[str, Any]
+    callback: OperationFactoryCallback
+
+    def identity(self) -> Mapping[str, Any]:
+        """Return stable operation-factory identity."""
+        return {
+            "factory_id": self.factory_id,
+            "factory_version": self.factory_version,
+            "settings": dict(self.settings),
+            "callback": dict(self.callback_identity),
+        }
+
+    def __call__(
+        self,
+        candidate: "Candidate",
+        batch: Batch,
+        vector: TensorTree,
+    ) -> CandidateOperation:
+        """Return the operation to measure."""
+        return self.callback(candidate, batch, vector)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CallableReferenceCheck:
+    """Identity-bearing wrapper for reference check callbacks."""
+
+    check_id: str
+    check_version: str
+    settings: Mapping[str, Any]
+    callback_identity: Mapping[str, Any]
+    callback: ReferenceCheckCallback
+
+    def identity(self) -> Mapping[str, Any]:
+        """Return stable reference-check identity."""
+        return {
+            "check_id": self.check_id,
+            "check_version": self.check_version,
+            "settings": dict(self.settings),
+            "callback": dict(self.callback_identity),
+        }
+
+    def __call__(
+        self,
+        candidate: "Candidate",
+        batch: Batch,
+        vector: TensorTree,
+    ) -> "ReferenceResult":
+        """Return reference measurements or raise on failure."""
+        return self.callback(candidate, batch, vector)
 
 
 class FullSizeCheck(Protocol):
@@ -230,6 +337,7 @@ class CallableMaterializer:
     materializer_id: str
     materializer_version: str
     settings: Mapping[str, Any]
+    callback_identity: Mapping[str, Any]
     callback: MaterializerCallback
 
     def identity(self) -> Mapping[str, Any]:
@@ -238,6 +346,7 @@ class CallableMaterializer:
             "materializer_id": self.materializer_id,
             "materializer_version": self.materializer_version,
             "settings": dict(self.settings),
+            "callback": dict(self.callback_identity),
         }
 
     def __call__(
@@ -512,14 +621,19 @@ class RuntimeConfig:
     """Typed runtime settings for one problem."""
 
     candidates: tuple["Candidate", ...]
-    operation_factory: OperationFactory
-    reference_check: ReferenceCheck
+    operation_factory: RuntimeOperationFactory
+    reference_check: RuntimeReferenceCheck
     materializer: Materializer
     axis_registry: CandidateAdmitter | None
     signature: Mapping[str, Any]
     autobatch_domains: tuple[AutobatchDomain, ...] = ()
     full_size_check: FullSizeCheck | None = None
     reference_check_name: str = "tree_close"
+
+    def __post_init__(self) -> None:
+        """Validate runtime callables that affect replay identity."""
+        _require_identity_method(self.operation_factory, "operation_factory")
+        _require_identity_method(self.reference_check, "reference_check")
 
     def identity(self) -> dict[str, Any]:
         """Return stable runtime identity."""
@@ -532,6 +646,14 @@ class RuntimeConfig:
 
         return {
             **dict(self.signature),
+            "operation_factory": _identity_payload(
+                self.operation_factory.identity(),
+                "operation_factory.identity",
+            ),
+            "reference_check": _identity_payload(
+                self.reference_check.identity(),
+                "reference_check.identity",
+            ),
             "axis_registry": axis_signature,
             "materializer": dict(self.materializer.identity()),
             "autobatch_domains": tuple(
@@ -540,6 +662,24 @@ class RuntimeConfig:
             "full_size_check": full_size_check_identity,
             "reference_check_name": self.reference_check_name,
         }
+
+
+def _require_identity_method(value: Any, name: str) -> None:
+    identity = getattr(value, "identity", None)
+
+    if not callable(identity):
+        message = f"RuntimeConfig {name} must expose identity()"
+        raise MaterializationError(message)
+
+    _identity_payload(identity(), f"{name}.identity")
+
+
+def _identity_payload(value: Mapping[str, Any], name: str) -> Any:
+    try:
+        return to_json_value(value)
+    except TypeError as error:
+        message = f"{name} must be JSON-compatible"
+        raise MaterializationError(message) from error
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -897,36 +1037,83 @@ class Family:
     materialization_rule: str = "selected_operator"
 
     def __post_init__(self) -> None:
-        """Derive composition dependencies from ordered children.
+        """Derive dependencies from operator semantics.
 
         Raises:
-            MaterializationError: If composition dependencies are invalid.
+            MaterializationError: If operator dependencies are invalid.
         """
-        if self.operator.kind != "composition":
+        dependencies = operator_dependencies(self.operator)
+
+        if not dependencies:
             return
 
         if self.dependencies:
-            message = "composition family dependencies are derived from children"
+            message = "family dependencies are derived from operator semantics"
             raise MaterializationError(message)
 
-        children = self.operator.semantics.get("children")
+        object.__setattr__(self, "dependencies", dependencies)
 
-        if not isinstance(children, Sequence) or isinstance(children, str):
-            message = "composition operator must declare ordered children"
+
+def operator_dependencies(operator: OperatorSpec) -> tuple[str, ...]:
+    """Return product dependencies declared by an operator."""
+    if operator.kind == "composition":
+        return _composition_dependencies(operator)
+
+    dependency = _matrix_free_metric_dependency(operator)
+
+    if dependency is None:
+        return ()
+
+    return (dependency,)
+
+
+def _composition_dependencies(operator: OperatorSpec) -> tuple[str, ...]:
+    children = operator.semantics.get("children")
+
+    if not isinstance(children, Sequence) or isinstance(children, str):
+        message = "composition operator must declare ordered children"
+        raise MaterializationError(message)
+
+    child_order = tuple(children)
+
+    if not child_order:
+        message = "composition operator must declare ordered children"
+        raise MaterializationError(message)
+
+    for child in child_order:
+        if not isinstance(child, str) or not child:
+            message = "composition children must be non-empty strings"
             raise MaterializationError(message)
 
-        child_order = tuple(children)
+    return child_order
 
-        if not child_order:
-            message = "composition operator must declare ordered children"
-            raise MaterializationError(message)
 
-        for child in child_order:
-            if not isinstance(child, str) or not child:
-                message = "composition children must be non-empty strings"
-                raise MaterializationError(message)
+def _matrix_free_metric_dependency(operator: OperatorSpec) -> str | None:
+    if operator.kind not in {
+        "metric",
+        "sqrt_metric",
+        "inverse_sqrt_metric",
+        "metric_inner",
+        "inverse_metric",
+        "inverse_metric_inner",
+    }:
+        return None
 
-        object.__setattr__(self, "dependencies", child_order)
+    representation = operator.semantics.get("representation")
+
+    if not isinstance(representation, Mapping):
+        return None
+
+    if representation.get("kind") != "matrix_free":
+        return None
+
+    product = representation.get("operator")
+
+    if not isinstance(product, str) or not product:
+        message = "matrix_free metric requires a named sibling product"
+        raise MaterializationError(message)
+
+    return product
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1265,14 +1452,19 @@ class Plan:
 
         return self.selected[selected_family]
 
-    def materialize(self, family: str | None = None) -> Any:
+    def materialize(
+        self,
+        family: str | None = None,
+        *,
+        name: str | None = None,
+    ) -> Any:
         """Return the materialized selected implementation.
 
         Raises:
             MaterializationError: If the family or materializer is missing.
         """
         self.validate_dependency_identities()
-        selected_family = self._selected_family(family)
+        selected_family = self._selected_family(_selected_name(family, name))
         candidate = self.selected[selected_family]
         record = self.records.get(selected_family)
 

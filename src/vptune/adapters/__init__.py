@@ -1,5 +1,7 @@
 """Adapter helpers."""
 
+from vptune.adapters import distributed as distributed
+from vptune.adapters import transformers as transformers
 from vptune.adapters.distributed import (
     DistributedAdmissionPolicy,
     DistributedCommunicationBindings,
@@ -11,6 +13,7 @@ from vptune.adapters.distributed import (
     DistributedProcessGroupBindings,
     DistributedRankReport,
     DistributedSequenceParallelBindings,
+    DistributedSpace,
     DistributedStrategyBindings,
     DistributedTensorParallelBindings,
     RankCompileTiming,
@@ -34,7 +37,9 @@ from vptune.adapters.distributed import (
     collective_all_gather_into_tensor,
     collective_all_to_all_single,
     collective_reduce_scatter_tensor,
+    distributed_axis_descriptors,
     distributed_axis_manifest,
+    distributed_axis_registry,
     distributed_full_size_check,
     distributed_identity,
     distributed_materializer,
@@ -52,6 +57,9 @@ from vptune.adapters.distributed import (
     resolve_process_group_backend,
     run_with_loss_parallel,
     wait_collective,
+)
+from vptune.adapters.distributed import (
+    space as distributed_space,
 )
 from vptune.adapters.pilot import (
     PILOT_ACCEPTANCE_FAMILIES,
@@ -80,6 +88,7 @@ from vptune.adapters.pilot import (
 )
 from vptune.adapters.transformers import (
     TransformersAttentionPolicy,
+    TransformersAttentionSpace,
     TransformersFullSizeCheck,
     TransformersModelIdentity,
     admit_transformers_attention,
@@ -88,6 +97,7 @@ from vptune.adapters.transformers import (
     load_transformers_model,
     register_transformers_attention,
     set_transformers_attention_implementation,
+    set_transformers_attention_mask_formatter,
     transformers_attention_axis,
     transformers_attention_location,
     transformers_attn_implementation,
@@ -96,6 +106,9 @@ from vptune.adapters.transformers import (
     transformers_operation_factory,
     transformers_reference_check,
     transformers_runtime_config,
+)
+from vptune.adapters.transformers import (
+    attention_space as transformers_attention_space,
 )
 
 __all__ = [
@@ -110,6 +123,7 @@ __all__ = [
     "DistributedProcessGroupBindings",
     "DistributedRankReport",
     "DistributedSequenceParallelBindings",
+    "DistributedSpace",
     "DistributedStrategyBindings",
     "DistributedTensorParallelBindings",
     "PilotReadiness",
@@ -117,6 +131,7 @@ __all__ = [
     "RankSelectedSettings",
     "RankStatus",
     "TransformersAttentionPolicy",
+    "TransformersAttentionSpace",
     "TransformersFullSizeCheck",
     "TransformersModelIdentity",
     "admit_distributed_candidate",
@@ -140,7 +155,10 @@ __all__ = [
     "collective_all_gather_into_tensor",
     "collective_all_to_all_single",
     "collective_reduce_scatter_tensor",
+    "distributed",
+    "distributed_axis_descriptors",
     "distributed_axis_manifest",
+    "distributed_axis_registry",
     "distributed_full_size_check",
     "distributed_identity",
     "distributed_materializer",
@@ -148,6 +166,7 @@ __all__ = [
     "distributed_record",
     "distributed_reference_check",
     "distributed_runtime_config",
+    "distributed_space",
     "distributed_strategy_applier",
     "distributed_strategy_axis",
     "initialize_process_group",
@@ -167,8 +186,11 @@ __all__ = [
     "resolve_process_group_backend",
     "run_with_loss_parallel",
     "set_transformers_attention_implementation",
+    "set_transformers_attention_mask_formatter",
+    "transformers",
     "transformers_attention_axis",
     "transformers_attention_location",
+    "transformers_attention_space",
     "transformers_attn_implementation",
     "transformers_full_size_check",
     "transformers_model_identity",

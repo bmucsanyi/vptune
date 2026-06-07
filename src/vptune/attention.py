@@ -10,9 +10,10 @@ import torch
 from torch.nn import functional
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from vptune.candidates import AxisDescriptor
+from vptune.candidates import AxisDescriptor, AxisRegistry
 from vptune.checks import tree_error_measurements, validate_thresholds
 from vptune.data import (
+    PACKAGE_VERSION,
     Batch,
     Candidate,
     CandidateOperation,
@@ -241,17 +242,89 @@ def core_attention_axis(
         name="core_attention_frontend",
         settings_keys=("attention.frontend",),
         allowed_values=tuple(frontends),
-        optional_settings_keys=(
-            "attention.sdpa_kernel",
-            "attention.sdpa_priority_list",
-            "attention.partition",
-            "attention.padding",
-            "chunk.sequence_position_block_size",
-        ),
+        optional_settings_keys=("attention.sdpa_priority_list",),
         adapter_id="vptune.core_attention",
-        adapter_version="0.0.1",
+        adapter_version=PACKAGE_VERSION,
         admission_rule=admit_core_attention,
     )
+
+
+def core_attention_axis_descriptors(
+    frontends: Sequence[str] = CORE_ATTENTION_FRONTENDS,
+) -> tuple[AxisDescriptor, ...]:
+    """Return package-owned attention axis descriptors."""
+    return (
+        core_attention_axis(frontends),
+        _attention_axis(
+            "attention.sdpa_kernel",
+            tuple(SDPA_BACKENDS),
+        ),
+        _attention_axis("attention.partition", ATTENTION_PARTITIONS),
+        _attention_axis("attention.padding", ATTENTION_PADDING),
+        _attention_axis(
+            "chunk.sequence_position_block_size",
+            (),
+            admission_rule=_positive_int_axis("chunk.sequence_position_block_size"),
+        ),
+    )
+
+
+def core_attention_axis_registry(
+    frontends: Sequence[str] = CORE_ATTENTION_FRONTENDS,
+) -> AxisRegistry:
+    """Return a registry populated with package-owned attention axes."""
+    registry = AxisRegistry()
+
+    for axis in core_attention_axis_descriptors(frontends):
+        registry.register(axis)
+
+    return registry
+
+
+def _attention_axis(
+    axis_key: str,
+    allowed_values: tuple[Any, ...],
+    *,
+    admission_rule: Callable[[Candidate], tuple[bool, str | None]] | None = None,
+) -> AxisDescriptor:
+    rule = _attention_axis_rule(axis_key, admission_rule)
+
+    return AxisDescriptor(
+        name=axis_key,
+        settings_keys=(axis_key,),
+        allowed_values=allowed_values,
+        adapter_id="vptune.core_attention",
+        adapter_version=PACKAGE_VERSION,
+        admission_rule=rule,
+    )
+
+
+def _attention_axis_rule(
+    axis_key: str,
+    admission_rule: Callable[[Candidate], tuple[bool, str | None]] | None,
+) -> Callable[[Candidate], tuple[bool, str | None]]:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        if "attention.frontend" not in candidate.settings:
+            return False, f"{axis_key} requires attention.frontend"
+
+        if admission_rule is None:
+            return True, None
+
+        return admission_rule(candidate)
+
+    return admit
+
+
+def _positive_int_axis(axis_key: str) -> Callable[[Candidate], tuple[bool, str | None]]:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings[axis_key]
+
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            return False, f"{axis_key} must be a positive integer"
+
+        return True, None
+
+    return admit
 
 
 def admit_core_attention(candidate: Candidate) -> tuple[bool, str | None]:

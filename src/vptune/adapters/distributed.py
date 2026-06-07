@@ -6,13 +6,20 @@ from typing import Any, Protocol
 
 import torch
 
-from vptune.candidates import AxisDescriptor
+from vptune.candidates import (
+    FSDP_RESHARD_AFTER_FORWARD_DOMAIN,
+    INTEGER_DOMAIN,
+    AxisDescriptor,
+    AxisRegistry,
+)
 from vptune.checks import tree_error_measurements, validate_thresholds
 from vptune.data import (
     PACKAGE_VERSION,
     Batch,
     BufferTree,
     CallableMaterializer,
+    CallableOperationFactory,
+    CallableReferenceCheck,
     Candidate,
     CandidateAdmitter,
     CandidateOperation,
@@ -28,6 +35,7 @@ from vptune.data import (
     ReferenceCheck,
     ReferenceResult,
     RuntimeConfig,
+    RuntimeOperationFactory,
     ScalarObjective,
 )
 from vptune.errors import AdmissionError, MaterializationError
@@ -75,6 +83,22 @@ DISTRIBUTED_RUNTIME_SETTING_PREFIXES = (
     "comm.",
 )
 DISTRIBUTED_LAYOUT_VALUES = ("per_shard", "dtensor")
+DISTRIBUTED_STRATEGY_ADMISSION_SETTINGS = (
+    "dtensor.module_class",
+    "dtensor.to_local_grad_placement",
+    "dtensor.from_local_check",
+    "dtensor.uneven_shard_handling",
+    "dtensor.async_local_tensor_handling",
+    "dtensor.higher_order_diff_status",
+    "fsdp.hook_entry_points",
+    "fsdp.hook_entry_policy",
+    "fsdp.forward_prefetch",
+    "fsdp.backward_prefetch",
+    "fsdp.bypasses_hooks",
+    "fsdp.bottom_up_order",
+    "fsdp.mutated_modules",
+    "fsdp.collectives",
+)
 
 
 class DistributedStrategyApplier(Protocol):
@@ -137,13 +161,14 @@ class DistributedFSDPBindings:
     """Runtime inputs for FSDP2 and HSDP lowering."""
 
     fully_shard: Callable[..., torch.nn.Module]
+    configure_forward_prefetch: Callable[[torch.nn.Module, str], None]
+    configure_backward_prefetch: Callable[[torch.nn.Module, str], None]
     mixed_precision_policy: Callable[..., Any]
     offload_policy: Callable[[], Any]
     cpu_offload_policy: Callable[..., Any]
     data_parallel_mesh_dims: Callable[..., Any]
     shard_placement_fns: Mapping[str, Callable[..., Any]]
     ignored_params: Mapping[str, torch.nn.Parameter]
-    reshard_group_size: int | None
     cpu_offload_pin_memory: bool
     hsdp_replicate_mesh_dims: str | tuple[str, ...] | None
 
@@ -1020,7 +1045,7 @@ def _apply_declared_fsdp(
     wrap_granularity = _required_string_setting(settings, "fsdp.wrap_granularity")
 
     if wrap_granularity == "root":
-        return apply_fsdp2(
+        sharded = apply_fsdp2(
             fsdp.fully_shard,
             module,
             mesh=mesh,
@@ -1032,6 +1057,8 @@ def _apply_declared_fsdp(
             dp_mesh_dims=dp_mesh_dims,
         )
 
+        return _configure_fsdp_prefetch(sharded, settings, fsdp)
+
     modules = list(
         named_modules_for_distributed_wrap(
             module,
@@ -1039,7 +1066,7 @@ def _apply_declared_fsdp(
         )
     )
 
-    return apply_fsdp2_group(
+    sharded = apply_fsdp2_group(
         fsdp.fully_shard,
         modules,
         mesh=mesh,
@@ -1050,6 +1077,8 @@ def _apply_declared_fsdp(
         ignored_params=ignored_params,
         dp_mesh_dims=dp_mesh_dims,
     )
+
+    return _configure_fsdp_prefetch(sharded, settings, fsdp)
 
 
 def _apply_declared_tensor_parallel(
@@ -1468,11 +1497,35 @@ def _declared_ignored_params(
     return tuple(params)
 
 
-def _fsdp_reshard_after_forward(
+def _configure_fsdp_prefetch(
+    module: torch.nn.Module,
     settings: Mapping[str, Any],
     bindings: DistributedFSDPBindings,
+) -> torch.nn.Module:
+    forward_prefetch = _required_string_setting(settings, "fsdp.forward_prefetch")
+    backward_prefetch = _required_string_setting(settings, "fsdp.backward_prefetch")
+
+    if forward_prefetch == "next-forward":
+        bindings.configure_forward_prefetch(module, forward_prefetch)
+    elif forward_prefetch != "disabled":
+        message = f"unsupported FSDP forward prefetch setting: {forward_prefetch}"
+        raise MaterializationError(message)
+
+    if backward_prefetch == "backward-pre":
+        bindings.configure_backward_prefetch(module, backward_prefetch)
+    elif backward_prefetch != "disabled":
+        message = f"unsupported FSDP backward prefetch setting: {backward_prefetch}"
+        raise MaterializationError(message)
+
+    return module
+
+
+def _fsdp_reshard_after_forward(
+    settings: Mapping[str, Any],
+    _: DistributedFSDPBindings,
 ) -> bool | int | None:
-    value = _required_string_setting(settings, "fsdp.reshard_after_forward")
+    key = "fsdp.reshard_after_forward"
+    value = settings.get(key)
 
     if value == "true":
         return True
@@ -1480,12 +1533,8 @@ def _fsdp_reshard_after_forward(
     if value == "false":
         return False
 
-    if value == "positive_integer_group_size":
-        if bindings.reshard_group_size is None or bindings.reshard_group_size < 1:
-            message = "positive_integer_group_size requires a positive group size"
-            raise MaterializationError(message)
-
-        return bindings.reshard_group_size
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
 
     message = f"unsupported FSDP2 reshard setting: {value}"
     raise MaterializationError(message)
@@ -1591,7 +1640,7 @@ def _required_declared_setting(settings: Mapping[str, Any], key: str) -> Any:
 def _required_int_setting(settings: Mapping[str, Any], key: str) -> int:
     value = settings.get(key)
 
-    if not isinstance(value, int) or value < 1:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         message = f"{key} must be a positive integer"
         raise MaterializationError(message)
 
@@ -1605,7 +1654,10 @@ def _tuple_of_ints(settings: Mapping[str, Any], key: str) -> tuple[int, ...]:
         message = f"{key} must be a non-empty tuple of positive integers"
         raise MaterializationError(message)
 
-    if not all(isinstance(item, int) and item > 0 for item in value):
+    if not all(
+        isinstance(item, int) and not isinstance(item, bool) and item > 0
+        for item in value
+    ):
         message = f"{key} must be a non-empty tuple of positive integers"
         raise MaterializationError(message)
 
@@ -1814,6 +1866,84 @@ class DistributedAdmissionPolicy:
         }
 
 
+def distributed_manifest_axis_descriptors() -> tuple[AxisDescriptor, ...]:
+    """Return distributed descriptors for the full package manifest."""
+    return distributed_axis_descriptors(
+        DISTRIBUTED_STRATEGIES,
+        policy=_distributed_manifest_policy(),
+    )
+
+
+def _distributed_manifest_policy() -> DistributedAdmissionPolicy:
+    return DistributedAdmissionPolicy(
+        candidate_generator_version=PACKAGE_VERSION,
+        device_mesh={"shape": (2,), "names": ("data",)},
+        rank_count=2,
+        per_rank_placements=(
+            {"rank": 0, "device": "cuda:0"},
+            {"rank": 1, "device": "cuda:1"},
+        ),
+        communication={"backend": "nccl"},
+        fsdp2={
+            "allowed_fsdp.hook_entry_policy": ("root-forward", "layer-forward"),
+            "allowed_fsdp.wrap_granularity": (
+                "root",
+                "transformer_block",
+                "block_group",
+            ),
+            "allowed_fsdp.forward_prefetch": ("disabled", "next-forward"),
+            "allowed_fsdp.backward_prefetch": ("disabled", "backward-pre"),
+            "allowed_fsdp.reshard_after_forward": ("false", "true", 1),
+            "allowed_fsdp.shard_placement_fn": ("none", "declared_fn"),
+            "allowed_fsdp.mp_policy.param_dtype": ("fp32", "bf16", "fp16"),
+            "allowed_fsdp.mp_policy.reduce_dtype": ("fp32", "bf16", "fp16"),
+            "allowed_fsdp.mp_policy.output_dtype": ("fp32", "bf16", "fp16"),
+            "allowed_fsdp.mp_policy.cast_forward_inputs": ("false", "true"),
+            "allowed_fsdp.offload_policy": ("none", "cpu"),
+        },
+        dtensor={
+            "allowed_dtensor.module_class": ("torch.nn.Linear",),
+            "allowed_dtensor.to_local_grad_placement": ("redistribute",),
+            "allowed_dtensor.from_local_check": ("strict",),
+            "allowed_dtensor.uneven_shard_handling": ("reject",),
+            "allowed_dtensor.async_local_tensor_handling": ("sync",),
+            "allowed_dtensor.redistribute_schedule": (
+                "none",
+                "before_forward",
+                "before_backward",
+                "between_operator_parts",
+                "before_output",
+            ),
+            "allowed_higher_order_diff_status": ("supported", "rejected"),
+        },
+        tensor_parallel={
+            "allowed_tp.plan": ("registered",),
+            "allowed_tp.qkv_projection": ("colwise", "rowwise", "replicated"),
+            "allowed_tp.output_projection": ("rowwise", "colwise", "replicated"),
+            "allowed_tp.mlp_up_gate": ("colwise", "rowwise", "replicated"),
+            "allowed_tp.mlp_down": ("rowwise", "colwise", "replicated"),
+            "allowed_tp.embedding": ("replicated", "rowwise", "colwise"),
+            "allowed_tp.lm_head": ("replicated", "vocab_sharded"),
+            "allowed_tp.prepare_module_input": ("registered",),
+            "allowed_tp.prepare_module_output": ("registered",),
+            "allowed_tp.loss_parallel": ("false", "true"),
+        },
+        sequence_parallel={
+            "allowed_sequence_parallel.enabled": ("false", "true"),
+            "allowed_sequence_parallel.norm_modules": ("registered",),
+            "allowed_sequence_parallel.output_placement_policy": (
+                "preserve_sequence_shard",
+                "redistribute_to_declared_output",
+            ),
+        },
+        context_parallel={
+            "allowed_context_parallel.enabled": ("false", "true"),
+            "allowed_context_parallel.rotate_method": ("all_gather", "all_to_all"),
+            "allowed_context_parallel.sequence_dim": (0, 1),
+        },
+    )
+
+
 def distributed_strategy_axis(
     strategies: Sequence[str],
     *,
@@ -1836,63 +1966,7 @@ def distributed_strategy_axis(
         name="distributed.strategy",
         settings_keys=("distributed.strategy",),
         allowed_values=tuple(strategies),
-        optional_settings_keys=(
-            "distributed.launch",
-            "distributed.process_group_backend",
-            "distributed.local_rank_binding",
-            "distributed.mesh_shape",
-            "distributed.mesh_dim_names",
-            "dtensor.params_placement",
-            "dtensor.vector_placement",
-            "dtensor.logits_placement",
-            "dtensor.tangent_placement",
-            "dtensor.cotangent_placement",
-            "dtensor.output_placement",
-            "dtensor.redistribute_schedule",
-            "dtensor.module_class",
-            "dtensor.to_local_grad_placement",
-            "dtensor.from_local_check",
-            "dtensor.uneven_shard_handling",
-            "dtensor.async_local_tensor_handling",
-            "dtensor.higher_order_diff_status",
-            "fsdp.hook_entry_points",
-            "fsdp.hook_entry_policy",
-            "fsdp.wrap_granularity",
-            "fsdp.forward_prefetch",
-            "fsdp.backward_prefetch",
-            "fsdp.reshard_after_forward",
-            "fsdp.shard_placement_fn",
-            "fsdp.mp_policy.param_dtype",
-            "fsdp.mp_policy.reduce_dtype",
-            "fsdp.mp_policy.output_dtype",
-            "fsdp.mp_policy.cast_forward_inputs",
-            "fsdp.offload_policy",
-            "fsdp.ignored_params",
-            "fsdp.dp_mesh_dims",
-            "fsdp.bypasses_hooks",
-            "fsdp.bottom_up_order",
-            "fsdp.mutated_modules",
-            "fsdp.collectives",
-            "tp.plan",
-            "tp.qkv_projection",
-            "tp.output_projection",
-            "tp.mlp_up_gate",
-            "tp.mlp_down",
-            "tp.embedding",
-            "tp.lm_head",
-            "tp.prepare_module_input",
-            "tp.prepare_module_output",
-            "tp.loss_parallel",
-            "sequence_parallel.enabled",
-            "sequence_parallel.norm_modules",
-            "sequence_parallel.output_placement_policy",
-            "context_parallel.enabled",
-            "context_parallel.rotate_method",
-            "context_parallel.sequence_dim",
-            "comm.overlap",
-            "comm.prefetch",
-            "comm.collective_bucket_size",
-        ),
+        optional_settings_keys=DISTRIBUTED_STRATEGY_ADMISSION_SETTINGS,
         adapter_id="vptune.distributed",
         adapter_version=PACKAGE_VERSION,
         admission_rule=lambda candidate: admit_distributed_candidate(
@@ -1903,13 +1977,377 @@ def distributed_strategy_axis(
     )
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class DistributedSpace:
+    """Public search-space component for distributed strategy axes."""
+
+    strategies: tuple[str, ...]
+    policy: DistributedAdmissionPolicy
+
+    def __post_init__(self) -> None:
+        """Validate distributed strategies.
+
+        Raises:
+            AdmissionError: If a strategy is invalid.
+        """
+        if not self.strategies:
+            message = "distributed strategy must be nonempty"
+            raise AdmissionError(message)
+
+        unsupported = tuple(
+            strategy
+            for strategy in self.strategies
+            if strategy not in DISTRIBUTED_STRATEGIES
+        )
+
+        if unsupported:
+            message = f"unsupported distributed strategies: {unsupported}"
+            raise AdmissionError(message)
+
+        if len(set(self.strategies)) != len(self.strategies):
+            message = "distributed strategies must be unique"
+            raise AdmissionError(message)
+
+        object.__setattr__(self, "strategies", tuple(self.strategies))
+
+    def axes_for(self, operator: object) -> Mapping[str, Sequence[Any]]:
+        """Return distributed axes for a public operator."""
+        _ = operator
+
+        return {"distributed.strategy": self.strategies}
+
+    def axis_descriptors(self) -> tuple[AxisDescriptor, ...]:
+        """Return adapter descriptors registered by this component."""
+        return distributed_axis_descriptors(self.strategies, policy=self.policy)
+
+    def settings_for(self, operator: object) -> Mapping[str, Any]:
+        """Return fixed distributed settings for generated rows."""
+        _ = operator
+
+        return _distributed_space_common_settings(self.policy)
+
+
+def space(
+    *,
+    strategy: Sequence[str],
+    policy: DistributedAdmissionPolicy | None = None,
+) -> DistributedSpace:
+    """Build a public search-space component for distributed strategies.
+
+    Returns:
+        Distributed search-space component.
+    """
+    distributed_policy = _distributed_manifest_policy() if policy is None else policy
+
+    return DistributedSpace(tuple(strategy), distributed_policy)
+
+
+def _distributed_space_common_settings(
+    policy: DistributedAdmissionPolicy,
+) -> Mapping[str, Any]:
+    shape = policy.device_mesh.get("shape")
+    names = policy.device_mesh.get("names")
+    backend = policy.communication.get("backend")
+
+    if not isinstance(shape, tuple) or not shape:
+        message = "distributed policy device_mesh.shape must be a tuple"
+        raise AdmissionError(message)
+
+    if not isinstance(names, tuple) or not names:
+        message = "distributed policy device_mesh.names must be a tuple"
+        raise AdmissionError(message)
+
+    if not isinstance(backend, str) or not backend:
+        message = "distributed policy communication.backend must be a string"
+        raise AdmissionError(message)
+
+    return {
+        "distributed.launch": "torchrun" if policy.rank_count > 1 else "single_process",
+        "distributed.process_group_backend": backend,
+        "distributed.local_rank_binding": "cuda_local_rank",
+        "distributed.mesh_shape": shape,
+        "distributed.mesh_dim_names": names,
+    }
+
+
+def distributed_axis_descriptors(
+    strategies: Sequence[str],
+    *,
+    policy: DistributedAdmissionPolicy,
+) -> tuple[AxisDescriptor, ...]:
+    """Return adapter-owned distributed axis descriptors."""
+    return (
+        distributed_strategy_axis(strategies, policy=policy),
+        _distributed_axis(
+            "distributed.launch",
+            ("single_process", "torchrun"),
+        ),
+        _distributed_axis(
+            "distributed.process_group_backend",
+            ("nccl", "gloo", "ucc_when_available"),
+        ),
+        _distributed_axis(
+            "distributed.local_rank_binding",
+            ("cuda_local_rank", "explicit_device_map"),
+        ),
+        _distributed_axis(
+            "distributed.mesh_shape",
+            (),
+            admission_rule=_positive_int_tuple_axis("distributed.mesh_shape"),
+        ),
+        _distributed_axis(
+            "distributed.mesh_dim_names",
+            (),
+            admission_rule=_non_empty_string_tuple_axis(
+                "distributed.mesh_dim_names",
+            ),
+        ),
+        *tuple(
+            _distributed_axis(
+                key,
+                ("replicate", "shard_dim", "partial"),
+            )
+            for key in DTENSOR_PLACEMENT_KEYS
+        ),
+        _distributed_axis(
+            "dtensor.redistribute_schedule",
+            (
+                "none",
+                "before_forward",
+                "before_backward",
+                "between_operator_parts",
+                "before_output",
+            ),
+        ),
+        _distributed_axis(
+            "fsdp.wrap_granularity",
+            ("root", "transformer_block", "block_group"),
+        ),
+        _distributed_axis(
+            "fsdp.reshard_after_forward",
+            FSDP_RESHARD_AFTER_FORWARD_DOMAIN,
+        ),
+        _distributed_axis("fsdp.shard_placement_fn", ("none", "declared_fn")),
+        _distributed_axis("fsdp.mp_policy.param_dtype", ("fp32", "bf16", "fp16")),
+        _distributed_axis("fsdp.mp_policy.reduce_dtype", ("fp32", "bf16", "fp16")),
+        _distributed_axis("fsdp.mp_policy.output_dtype", ("fp32", "bf16", "fp16")),
+        _distributed_axis("fsdp.mp_policy.cast_forward_inputs", ("false", "true")),
+        _distributed_axis("fsdp.offload_policy", ("none", "cpu")),
+        _distributed_axis(
+            "fsdp.ignored_params",
+            (),
+            admission_rule=_string_tuple_axis("fsdp.ignored_params"),
+        ),
+        _distributed_axis(
+            "fsdp.dp_mesh_dims",
+            (),
+            admission_rule=_non_empty_string_tuple_axis("fsdp.dp_mesh_dims"),
+        ),
+        _distributed_axis(
+            "tp.plan",
+            (),
+            admission_rule=_non_empty_string_axis("tp.plan"),
+        ),
+        _distributed_axis("tp.qkv_projection", ("colwise", "rowwise", "replicated")),
+        _distributed_axis("tp.output_projection", ("rowwise", "colwise", "replicated")),
+        _distributed_axis("tp.mlp_up_gate", ("colwise", "rowwise", "replicated")),
+        _distributed_axis("tp.mlp_down", ("rowwise", "colwise", "replicated")),
+        _distributed_axis("tp.embedding", ("replicated", "rowwise", "colwise")),
+        _distributed_axis("tp.lm_head", ("replicated", "vocab_sharded")),
+        _distributed_axis(
+            "tp.prepare_module_input",
+            (),
+            admission_rule=_non_empty_string_axis("tp.prepare_module_input"),
+        ),
+        _distributed_axis(
+            "tp.prepare_module_output",
+            (),
+            admission_rule=_non_empty_string_axis("tp.prepare_module_output"),
+        ),
+        _distributed_axis("tp.loss_parallel", ("false", "true")),
+        _distributed_axis("sequence_parallel.enabled", ("false", "true")),
+        _distributed_axis(
+            "sequence_parallel.norm_modules",
+            (),
+            admission_rule=_non_empty_string_tuple_axis(
+                "sequence_parallel.norm_modules",
+            ),
+        ),
+        _distributed_axis(
+            "sequence_parallel.output_placement_policy",
+            ("preserve_sequence_shard", "redistribute_to_declared_output"),
+        ),
+        _distributed_axis("context_parallel.enabled", ("false", "true")),
+        _distributed_axis(
+            "context_parallel.rotate_method", ("all_gather", "all_to_all")
+        ),
+        _distributed_axis(
+            "context_parallel.sequence_dim",
+            (),
+            admission_rule=_nonnegative_int_axis("context_parallel.sequence_dim"),
+        ),
+        _distributed_axis(
+            "comm.overlap",
+            ("none", "all_gather_overlap", "reduce_scatter_overlap", "both"),
+        ),
+        _distributed_axis("comm.prefetch", ("none", "forward", "backward", "both")),
+        _distributed_axis(
+            "comm.collective_bucket_size",
+            (),
+            admission_rule=_positive_int_axis("comm.collective_bucket_size"),
+        ),
+    )
+
+
+def distributed_axis_registry(
+    strategies: Sequence[str],
+    *,
+    policy: DistributedAdmissionPolicy,
+) -> AxisRegistry:
+    """Return a registry populated with distributed adapter axes."""
+    registry = AxisRegistry()
+
+    for axis in distributed_axis_descriptors(strategies, policy=policy):
+        registry.register(axis)
+
+    return registry
+
+
 def distributed_axis_manifest(
     strategies: Sequence[str],
     *,
     policy: DistributedAdmissionPolicy,
+) -> tuple[AxisDescriptor, ...]:
+    """Return the distributed adapter axis descriptors."""
+    return distributed_axis_descriptors(strategies, policy=policy)
+
+
+def _distributed_axis(
+    axis_key: str,
+    allowed_values: tuple[Any, ...],
+    *,
+    admission_rule: Callable[[Candidate], tuple[bool, str | None]] | None = None,
 ) -> AxisDescriptor:
-    """Return the distributed adapter axis descriptor."""
-    return distributed_strategy_axis(strategies, policy=policy)
+    rule = _distributed_axis_rule(axis_key, admission_rule)
+
+    return AxisDescriptor(
+        name=axis_key,
+        settings_keys=(axis_key,),
+        allowed_values=allowed_values,
+        adapter_id="vptune.distributed",
+        adapter_version=PACKAGE_VERSION,
+        admission_rule=rule,
+    )
+
+
+def _distributed_axis_rule(
+    axis_key: str,
+    admission_rule: Callable[[Candidate], tuple[bool, str | None]] | None,
+) -> Callable[[Candidate], tuple[bool, str | None]]:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        if "distributed.strategy" not in candidate.settings:
+            return False, f"{axis_key} requires distributed.strategy"
+
+        if admission_rule is None:
+            return True, None
+
+        return admission_rule(candidate)
+
+    return admit
+
+
+def _positive_int_axis(axis_key: str) -> Callable[[Candidate], tuple[bool, str | None]]:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings[axis_key]
+
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            return False, f"{axis_key} must be a positive integer"
+
+        return True, None
+
+    return admit
+
+
+def _nonnegative_int_axis(
+    axis_key: str,
+) -> Callable[[Candidate], tuple[bool, str | None]]:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings[axis_key]
+
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return False, f"{axis_key} must be a non-negative integer"
+
+        return True, None
+
+    return admit
+
+
+def _positive_int_tuple_axis(
+    axis_key: str,
+) -> Callable[[Candidate], tuple[bool, str | None]]:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings[axis_key]
+
+        if not isinstance(value, tuple) or not value:
+            return False, f"{axis_key} must be a positive integer tuple"
+
+        if not all(
+            isinstance(item, int) and not isinstance(item, bool) and item > 0
+            for item in value
+        ):
+            return False, f"{axis_key} must be a positive integer tuple"
+
+        return True, None
+
+    return admit
+
+
+def _non_empty_string_axis(
+    axis_key: str,
+) -> Callable[[Candidate], tuple[bool, str | None]]:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings[axis_key]
+
+        if not isinstance(value, str) or not value:
+            return False, f"{axis_key} must be a non-empty string"
+
+        return True, None
+
+    return admit
+
+
+def _string_tuple_axis(
+    axis_key: str,
+) -> Callable[[Candidate], tuple[bool, str | None]]:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings[axis_key]
+
+        if not isinstance(value, tuple):
+            return False, f"{axis_key} must be a tuple of strings"
+
+        if not all(isinstance(item, str) and item for item in value):
+            return False, f"{axis_key} must be a tuple of strings"
+
+        return True, None
+
+    return admit
+
+
+def _non_empty_string_tuple_axis(
+    axis_key: str,
+) -> Callable[[Candidate], tuple[bool, str | None]]:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings[axis_key]
+
+        if not isinstance(value, tuple) or not value:
+            return False, f"{axis_key} must be a non-empty tuple of strings"
+
+        if not all(isinstance(item, str) and item for item in value):
+            return False, f"{axis_key} must be a non-empty tuple of strings"
+
+        return True, None
+
+    return admit
 
 
 def admit_distributed_candidate(
@@ -2355,10 +2793,20 @@ def _allowed_policy(
     if isinstance(value, str) and len(value) == 0:
         return f"{key} must be declared"
 
-    if not isinstance(allowed, tuple) or value not in allowed:
+    if not isinstance(allowed, tuple) or not _policy_value_allowed(value, allowed):
         return f"{key} is not allowed by distributed admission policy: {value}"
 
     return None
+
+
+def _policy_value_allowed(value: Any, allowed: tuple[Any, ...]) -> bool:
+    if any(value == item for item in allowed):
+        return True
+
+    if INTEGER_DOMAIN not in allowed:
+        return False
+
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def reduce_rank_statuses(statuses: Sequence[RankStatus]) -> dict[str, Any]:
@@ -2747,6 +3195,40 @@ def distributed_runtime_config(
         scalar_objectives=scalar_objectives,
         function_objectives=function_objectives,
     )
+    runtime_signature = {
+        "runtime": "distributed",
+        "operator": operator.signature(),
+        "model": module_identity(model),
+        "reference_model": module_identity(reference_model),
+        "params": tree_signature(params),
+        "buffers": tree_signature(buffers),
+        "parameter_surface": (
+            None if parameter_surface is None else parameter_surface.signature()
+        ),
+        "thresholds": dict(thresholds),
+        "numeric_bound_fields": {}
+        if numeric_bound_fields is None
+        else dict(numeric_bound_fields),
+        "objective": dict(objective_signature),
+        "module_call": module_call.signature(),
+        "distributed": dict(identity),
+        "expected_rank_count": expected_rank_count,
+        "global_parameter_surface": dict(global_parameter_surface),
+    }
+    operation_factory = CallableOperationFactory(
+        "vptune.distributed_operation_factory",
+        PACKAGE_VERSION,
+        runtime_signature,
+        {"callback": "vptune.adapters.distributed.distributed_operation_factory"},
+        operation_factory,
+    )
+    reference_check = CallableReferenceCheck(
+        "vptune.distributed_reference_check",
+        PACKAGE_VERSION,
+        runtime_signature,
+        {"callback": "vptune.adapters.distributed.distributed_reference_check"},
+        reference_check,
+    )
     full_size_check = distributed_full_size_check(
         operation_factory=operation_factory,
         reference_check=reference_check,
@@ -2764,39 +3246,21 @@ def distributed_runtime_config(
         reference_check=reference_check,
         materializer=materializer,
         axis_registry=axis_registry,
-        signature={
-            "runtime": "distributed",
-            "operator": operator.signature(),
-            "model": module_identity(model),
-            "reference_model": module_identity(reference_model),
-            "params": tree_signature(params),
-            "buffers": tree_signature(buffers),
-            "parameter_surface": (
-                None if parameter_surface is None else parameter_surface.signature()
-            ),
-            "thresholds": dict(thresholds),
-            "numeric_bound_fields": {}
-            if numeric_bound_fields is None
-            else dict(numeric_bound_fields),
-            "objective": dict(objective_signature),
-            "module_call": module_call.signature(),
-            "distributed": dict(identity),
-            "expected_rank_count": expected_rank_count,
-            "global_parameter_surface": dict(global_parameter_surface),
-        },
+        signature=runtime_signature,
         full_size_check=full_size_check,
         reference_check_name="standard_anchor",
     )
 
 
 def distributed_materializer(
-    operation_factory: OperationFactory,
+    operation_factory: RuntimeOperationFactory,
 ) -> CallableMaterializer:
     """Return a materializer for selected distributed rows."""
     return CallableMaterializer(
         "vptune.distributed_runtime",
         PACKAGE_VERSION,
-        {"operation_factory": "distributed_operation_factory"},
+        {"operation_factory": dict(operation_factory.identity())},
+        {"callback": "_materialize_distributed_selected"},
         lambda candidate, record: _materialize_distributed_selected(
             operation_factory,
             candidate,

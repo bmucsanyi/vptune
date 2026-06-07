@@ -7,7 +7,13 @@ from typing import Any, Protocol
 
 import torch
 
-from vptune.data import Candidate, FullSizeRecord, Measurement, TimingPolicy
+from vptune.data import (
+    PACKAGE_VERSION,
+    Candidate,
+    FullSizeRecord,
+    Measurement,
+    TimingPolicy,
+)
 from vptune.errors import MeasurementError
 from vptune.tensor_tree import TensorTree, tree_detach, tree_leaves, tree_signature
 
@@ -39,7 +45,7 @@ class CPUMemoryBackend:
         """Return stable CPU memory measurement identity."""
         return {
             "backend_id": "vptune.cpu_memory",
-            "backend_version": "0.0.1",
+            "backend_version": PACKAGE_VERSION,
             "devices": ("cpu",),
             "prepare": "none",
             "synchronize": "none",
@@ -90,7 +96,7 @@ class CUDAMemoryBackend:
         """Return stable CUDA memory measurement identity."""
         return {
             "backend_id": "vptune.cuda_memory",
-            "backend_version": "0.0.1",
+            "backend_version": PACKAGE_VERSION,
             "devices": self.devices,
             "prepare": "empty_cache_reset_peak_synchronize",
             "synchronize": "cuda_synchronize_all_devices",

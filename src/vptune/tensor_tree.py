@@ -166,17 +166,6 @@ def tree_zeros_like(tree: TensorTree) -> TensorTree:
     return tree_map(torch.zeros_like, tree)
 
 
-def tree_zeros_like_foreach(tree: TensorTree) -> TensorTree:
-    """Return a zero tree using PyTorch foreach kernels."""
-    leaves = tree_leaves(tree)
-    results = [leaf.clone() for leaf in leaves]
-
-    for _, group in _foreach_groups(tuple(results)):
-        _torch_foreach("_foreach_zero_")(group)
-
-    return tree_from_leaves(tree, tuple(results))
-
-
 def tree_add(left: TensorTree, right: TensorTree) -> TensorTree:
     """Return tree-wise sum."""
     return tree_map2(torch.add, left, right)
@@ -197,18 +186,6 @@ def tree_add_foreach(left: TensorTree, right: TensorTree) -> TensorTree:
 def tree_sub(left: TensorTree, right: TensorTree) -> TensorTree:
     """Return tree-wise difference."""
     return tree_map2(torch.sub, left, right)
-
-
-def tree_sub_foreach(left: TensorTree, right: TensorTree) -> TensorTree:
-    """Return tree-wise difference using PyTorch foreach kernels."""
-    left_leaves, right_leaves = _matching_leaf_pairs(left, right)
-
-    return _binary_foreach_tree(
-        _torch_foreach("_foreach_sub"),
-        left,
-        left_leaves,
-        right_leaves,
-    )
 
 
 def tree_mul(tree: TensorTree, scalar: float) -> TensorTree:
@@ -316,35 +293,9 @@ def tree_max_abs(tree: TensorTree) -> torch.Tensor:
     return result
 
 
-def tree_max_abs_foreach(tree: TensorTree) -> torch.Tensor:
-    """Return max absolute value across leaves using foreach abs."""
-    leaves = tree_leaves(tree)
-
-    if not leaves:
-        return torch.tensor(0.0)
-
-    values = list(leaves)
-
-    for indices, group in _foreach_groups(leaves):
-        absolutes = _torch_foreach("_foreach_abs")(group)
-        _write_foreach_results(values, indices, absolutes)
-
-    result = values[0].detach().max()
-
-    for value in values[1:]:
-        result = torch.maximum(result, value.detach().max())
-
-    return result
-
-
 def tree_l2_norm(tree: TensorTree) -> torch.Tensor:
     """Return L2 norm across leaves."""
     return torch.sqrt(tree_dot(tree, tree))
-
-
-def tree_l2_norm_foreach(tree: TensorTree) -> torch.Tensor:
-    """Return L2 norm across leaves using foreach dot."""
-    return torch.sqrt(tree_dot_foreach(tree, tree))
 
 
 def tree_signature(tree: TensorTree) -> dict[str, Any]:

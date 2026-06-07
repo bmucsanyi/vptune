@@ -10,8 +10,10 @@ from torch._dynamo import config as torch_dynamo_config
 import vptune as vp
 import vptune.ext as vpx
 import vptune.runtime as runtime_module
+from vptune import operators as ops
 from vptune.io import read_record
 from vptune.measure import CPUMemoryBackend
+from vptune.run import tune as tune_problem
 from vptune.tensor_tree import tree_leaves, tree_map
 
 
@@ -38,6 +40,51 @@ class MatrixParameterModule(torch.nn.Module):
 @dataclasses.dataclass(frozen=True, slots=True)
 class TinyModelOutput:
     logits: torch.Tensor
+
+
+class IdentifiedTeacherObjective:
+    def __init__(self, version: str) -> None:
+        self.version = version
+
+    def __call__(
+        self,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
+        assert params
+        assert buffers == {}
+        assert batch
+        assert context.family == "gradient"
+
+        return {"logits": torch.tensor([1.0], dtype=torch.float64)}
+
+    def identity(self) -> Mapping[str, object]:
+        return {"version": self.version}
+
+
+class RecordingTeacherObjective:
+    def __init__(self, version: str, calls: list[object]) -> None:
+        self.version = version
+        self.calls = calls
+
+    def __call__(
+        self,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
+        assert params["w"] is not None
+        assert buffers == {}
+        assert context.family == "gradient"
+        self.calls.append(batch["family"])
+
+        return {"logits": batch["teacher_seed"] + 1.0}
+
+    def identity(self) -> Mapping[str, object]:
+        return {"version": self.version}
 
 
 class StatefulScalarModule(torch.nn.Module):
@@ -145,13 +192,13 @@ class ParameterVectorProvider:
         return {"case": "parameter_vector"}
 
     @staticmethod
-    def reference_vectors(family: str) -> vp.TensorTree:
+    def reference_vectors(family: str) -> vpx.TensorTree:
         assert family
 
         return {"w": torch.tensor([3.0], dtype=torch.float64)}
 
     @staticmethod
-    def probe_vectors(family: str) -> Sequence[vp.TensorTree]:
+    def probe_vectors(family: str) -> Sequence[vpx.TensorTree]:
         assert family
 
         return ({"w": torch.tensor([3.0], dtype=torch.float64)},)
@@ -296,6 +343,51 @@ class KFACMetricData:
         return ({"kfac_factors": cls.factors()},)
 
 
+class EKFACMetricData:
+    @staticmethod
+    def signature() -> Mapping[str, object]:
+        return {"case": "ekfac_metric"}
+
+    @staticmethod
+    def factors() -> Mapping[str, Mapping[str, torch.Tensor]]:
+        scale = 2.0**-0.5
+
+        return {
+            "ekfac_eigvecs_a": {
+                "w": torch.tensor(
+                    [[scale, -scale], [scale, scale]],
+                    dtype=torch.float64,
+                )
+            },
+            "ekfac_eigvecs_g": {
+                "w": torch.tensor(
+                    [[0.8, -0.6], [0.6, 0.8]],
+                    dtype=torch.float64,
+                )
+            },
+            "ekfac_corrected_eigenvalues": {
+                "w": torch.tensor([[2.0, 3.0], [5.0, 7.0]], dtype=torch.float64)
+            },
+        }
+
+    @classmethod
+    def reference_batch(
+        cls,
+        family: str,
+        check_name: str,
+    ) -> Mapping[str, object]:
+        assert family
+        assert check_name
+
+        return cls.factors()
+
+    @classmethod
+    def probe_batches(cls, family: str) -> Sequence[Mapping[str, object]]:
+        assert family
+
+        return (cls.factors(),)
+
+
 class GGNMetricData:
     @staticmethod
     def signature() -> Mapping[str, object]:
@@ -335,13 +427,13 @@ class TwoParameterVectorProvider:
         return {"case": "two_parameter_vector"}
 
     @staticmethod
-    def reference_vectors(family: str) -> vp.TensorTree:
+    def reference_vectors(family: str) -> vpx.TensorTree:
         assert family
 
         return {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
 
     @staticmethod
-    def probe_vectors(family: str) -> Sequence[vp.TensorTree]:
+    def probe_vectors(family: str) -> Sequence[vpx.TensorTree]:
         assert family
 
         return ({"w": torch.tensor([1.0, 2.0], dtype=torch.float64)},)
@@ -353,7 +445,7 @@ class MatrixVectorProvider:
         return {"case": "matrix_vector"}
 
     @staticmethod
-    def reference_vectors(family: str) -> vp.TensorTree:
+    def reference_vectors(family: str) -> vpx.TensorTree:
         assert family
 
         return {
@@ -364,7 +456,7 @@ class MatrixVectorProvider:
         }
 
     @staticmethod
-    def probe_vectors(family: str) -> Sequence[vp.TensorTree]:
+    def probe_vectors(family: str) -> Sequence[vpx.TensorTree]:
         assert family
 
         return (
@@ -389,28 +481,28 @@ class SequenceClock:
         return value
 
 
-def cpu_target() -> vp.Target:
-    return vp.Target(
+def cpu_target() -> vpx.Target:
+    return vpx.Target(
         devices=("cpu",),
         accelerator="cpu",
         allowed_dtypes=("float64", "float32", "bfloat16", "float16"),
         allowed_attention_frontends=(),
         allowed_sdpa_kernels=(),
         allowed_sharding_modes=("single_device",),
-        timing_policy=vp.TimingPolicy(
+        timing_policy=vpx.TimingPolicy(
             short_seconds=0.0,
             medium_seconds=0.0,
             long_warmups=0,
             long_measured_calls=1,
         ),
-        selection_policy=vp.SelectionPolicy(),
-        search_policy=vp.SearchPolicy(strategy="exhaustive"),
+        selection_policy=vpx.SelectionPolicy(),
+        search_policy=vpx.SearchPolicy(strategy="exhaustive"),
         determinism_policy={},
         environment_capture={"runtime": "test"},
     )
 
 
-def replay_context_for_plan(plan: vp.Plan) -> vp.ReplayContext:
+def replay_context_for_plan(plan: vpx.Plan) -> vpx.ReplayContext:
     family_input_signatures = {
         family: record.input_signature for family, record in plan.records.items()
     }
@@ -418,7 +510,7 @@ def replay_context_for_plan(plan: vp.Plan) -> vp.ReplayContext:
     for record in plan.check_records:
         family_input_signatures.setdefault(record.family, record.input_signature)
 
-    return vp.ReplayContext(
+    return vpx.ReplayContext(
         input_signature=plan.input_signature,
         family_input_signatures=family_input_signatures,
         materializer_identities=plan.materializer_identities(),
@@ -431,10 +523,10 @@ def replay_context_for_plan(plan: vp.Plan) -> vp.ReplayContext:
 
 
 def quadratic_scalar(
-    params: vp.ParameterTree,
-    buffers: vp.BufferTree,
-    batch: vp.Batch,
-    context: vp.ObjectiveContext,
+    params: vpx.ParameterTree,
+    buffers: vpx.BufferTree,
+    batch: vpx.Batch,
+    context: vpx.ObjectiveContext,
 ) -> torch.Tensor:
     assert buffers == {}
     assert context.family
@@ -443,10 +535,10 @@ def quadratic_scalar(
 
 
 def mutating_buffer_scalar(
-    params: vp.ParameterTree,
-    buffers: vp.BufferTree,
-    batch: vp.Batch,
-    context: vp.ObjectiveContext,
+    params: vpx.ParameterTree,
+    buffers: vpx.BufferTree,
+    batch: vpx.Batch,
+    context: vpx.ObjectiveContext,
 ) -> torch.Tensor:
     assert batch == {}
     assert context.family == "gradient"
@@ -456,10 +548,10 @@ def mutating_buffer_scalar(
 
 
 def failing_mutating_buffer_scalar(
-    params: vp.ParameterTree,
-    buffers: vp.BufferTree,
-    batch: vp.Batch,
-    context: vp.ObjectiveContext,
+    params: vpx.ParameterTree,
+    buffers: vpx.BufferTree,
+    batch: vpx.Batch,
+    context: vpx.ObjectiveContext,
 ) -> torch.Tensor:
     assert params["w"] is not None
     assert batch == {}
@@ -498,11 +590,11 @@ def declared_restored_functional_call_settings(
 
 
 def square_function(
-    params: vp.ParameterTree,
-    buffers: vp.BufferTree,
-    batch: vp.Batch,
-    context: vp.ObjectiveContext,
-) -> vp.TensorTree:
+    params: vpx.ParameterTree,
+    buffers: vpx.BufferTree,
+    batch: vpx.Batch,
+    context: vpx.ObjectiveContext,
+) -> vpx.TensorTree:
     assert buffers == {}
     assert batch["scale"]
     assert context.family
@@ -511,10 +603,10 @@ def square_function(
 
 
 def square_tensor_function(
-    params: vp.ParameterTree,
-    buffers: vp.BufferTree,
-    batch: vp.Batch,
-    context: vp.ObjectiveContext,
+    params: vpx.ParameterTree,
+    buffers: vpx.BufferTree,
+    batch: vpx.Batch,
+    context: vpx.ObjectiveContext,
 ) -> torch.Tensor:
     assert buffers == {}
     assert batch["loss_hessian"] is not None
@@ -523,35 +615,35 @@ def square_tensor_function(
     return params["w"].pow(2)
 
 
-def multiply_component(batch: vp.Batch, vector: vp.TensorTree) -> vp.TensorTree:
+def multiply_component(batch: vpx.Batch, vector: vpx.TensorTree) -> vpx.TensorTree:
     scale = batch["scale"]
     assert isinstance(scale, float)
 
     return tree_map(lambda tensor: tensor * scale, vector)
 
 
-def shift_component(batch: vp.Batch, vector: vp.TensorTree) -> vp.TensorTree:
+def shift_component(batch: vpx.Batch, vector: vpx.TensorTree) -> vpx.TensorTree:
     assert batch["scale"]
 
     return tree_map(lambda tensor: tensor + 1.0, vector)
 
 
-def wrong_shift_component(batch: vp.Batch, vector: vp.TensorTree) -> vp.TensorTree:
+def wrong_shift_component(batch: vpx.Batch, vector: vpx.TensorTree) -> vpx.TensorTree:
     assert batch["scale"]
 
     return tree_map(lambda tensor: tensor + 2.0, vector)
 
 
-def identity_component(batch: vp.Batch, vector: vp.TensorTree) -> vp.TensorTree:
+def identity_component(batch: vpx.Batch, vector: vpx.TensorTree) -> vpx.TensorTree:
     assert batch["scale"]
 
     return vector
 
 
 def fused_multiply_shift_component(
-    batch: vp.Batch,
-    vector: vp.TensorTree,
-) -> vp.TensorTree:
+    batch: vpx.Batch,
+    vector: vpx.TensorTree,
+) -> vpx.TensorTree:
     return shift_component(batch, multiply_component(batch, vector))
 
 
@@ -635,6 +727,46 @@ def kfac_metric_representation() -> dict[str, object]:
             },
         ),
     }
+
+
+def ekfac_metric_representation() -> dict[str, object]:
+    return {"kind": "ekfac_factors"}
+
+
+def ekfac_dense_matrix(
+    factors: Mapping[str, Mapping[str, torch.Tensor]],
+    key: str = "w",
+) -> torch.Tensor:
+    eigvecs_a = factors["ekfac_eigvecs_a"][key]
+    eigvecs_g = factors["ekfac_eigvecs_g"][key]
+    eigenvalues = factors["ekfac_corrected_eigenvalues"][key]
+    basis = torch.kron(eigvecs_a, eigvecs_g)
+
+    return basis @ torch.diag(eigenvalues.reshape(-1)) @ basis.T
+
+
+def ekfac_square_root_product(
+    factors: Mapping[str, Mapping[str, torch.Tensor]],
+    vector: torch.Tensor,
+    *,
+    inverse: bool,
+    damping: float = 0.0,
+    key: str = "w",
+) -> torch.Tensor:
+    eigvecs_a = factors["ekfac_eigvecs_a"][key]
+    eigvecs_g = factors["ekfac_eigvecs_g"][key]
+    eigenvalues = factors["ekfac_corrected_eigenvalues"][key]
+    spectrum = eigenvalues + damping if inverse else eigenvalues
+    coeffs = eigvecs_a.T @ vector @ eigvecs_g
+    factors_matrix = torch.rsqrt(spectrum) if inverse else torch.sqrt(spectrum)
+
+    return eigvecs_a @ (factors_matrix * coeffs) @ eigvecs_g.T
+
+
+def symmetric_square_root(matrix: torch.Tensor) -> torch.Tensor:
+    eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+
+    return eigenvectors @ torch.diag(torch.sqrt(eigenvalues)) @ eigenvectors.T
 
 
 def ggn_metric_representation() -> dict[str, object]:
@@ -794,6 +926,24 @@ def empirical_dense_settings() -> dict[str, object]:
     return {"empirical_fisher.accumulation": "materialize_per_example_gradients"}
 
 
+def per_example_gradient_settings(
+    *,
+    accumulation: str = "stacked_leading_axis",
+    block_size: int | None = None,
+) -> dict[str, object]:
+    if block_size is None:
+        return {
+            "per_example_gradient.grad_path": "torch_autograd_grad_loop",
+            "per_example_gradient.accumulation": accumulation,
+        }
+
+    return {
+        "per_example_gradient.grad_path": "torch_autograd_grad_loop",
+        "per_example_gradient.accumulation": accumulation,
+        "batch.per_example_block_size": block_size,
+    }
+
+
 def composition_settings(
     *,
     execution: str = "stream_child_outputs",
@@ -828,6 +978,160 @@ def compile_settings(
         "compile.cuda_graphs": cuda_graphs,
         "compile.cache_state": cache_state,
     }
+
+
+def test_per_example_gradient_stacked_and_blockwise_execute_declared_rows() -> None:
+    params = {"w": torch.tensor([1.0, -1.0], dtype=torch.float64)}
+    batch = {"x": torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)}
+    expected = torch.tensor(
+        [[1.0, 1.0], [2.0, 4.0], [3.0, 9.0]],
+        dtype=torch.float64,
+    )
+
+    def score_rows(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert context.family == "per_example"
+        x = batch["x"].reshape(-1)
+
+        return x * params["w"][0] + x.square() * params["w"][1]
+
+    factory = vpx.standard_operation_factory(
+        ops.per_example_gradient(
+            "per_example",
+            "scores",
+            aggregation="sum",
+            example_loss_reduction="per_example",
+        ),
+        params=params,
+        buffers={},
+        function_objectives={"scores": score_rows},
+    )
+    registry = vpx.standard_axis_registry()
+
+    for candidate_id, settings in (
+        ("stacked", per_example_gradient_settings()),
+        (
+            "blockwise",
+            per_example_gradient_settings(
+                accumulation="blockwise_stacked",
+                block_size=2,
+            ),
+        ),
+    ):
+        candidate = registry.admit(vpx.Candidate("per_example", candidate_id, settings))
+        assert candidate.admission_status == "passed"
+        output = factory(candidate, batch, {})()
+
+        torch.testing.assert_close(tensor_mapping(output)["w"], expected)
+
+
+def test_per_example_gradient_reference_check_and_empirical_outer_product() -> None:
+    params = {"w": torch.tensor([1.0, -1.0], dtype=torch.float64)}
+    batch = {"x": torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([0.25, -0.5], dtype=torch.float64)}
+
+    def score_rows(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert context.family == "per_example"
+        x = batch["x"].reshape(-1)
+
+        return x * params["w"][0] + x.square() * params["w"][1]
+
+    operator = ops.per_example_gradient(
+        "per_example",
+        "scores",
+        aggregation="sum",
+        example_loss_reduction="per_example",
+    )
+    check = vpx.standard_reference_check(
+        operator,
+        params=params,
+        buffers={},
+        thresholds={"max_abs_diff": 1e-12, "max_rel_diff": 1e-12},
+        function_objectives={"scores": score_rows},
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+        function_objectives={"scores": score_rows},
+    )
+    registry = vpx.standard_axis_registry()
+    stacked = registry.admit(
+        vpx.Candidate(
+            "per_example",
+            "stacked",
+            per_example_gradient_settings(),
+        )
+    )
+    blockwise = registry.admit(
+        vpx.Candidate(
+            "per_example",
+            "blockwise",
+            per_example_gradient_settings(
+                accumulation="blockwise_stacked",
+                block_size=2,
+            ),
+        )
+    )
+
+    assert stacked.admission_status == "passed"
+    assert blockwise.admission_status == "passed"
+
+    for candidate in (stacked, blockwise):
+        result = check(candidate, batch, {})
+
+        assert result.measurements["max_abs_diff"] == pytest.approx(0.0)
+        assert result.measurements["max_rel_diff"] == pytest.approx(0.0)
+
+    rows = tensor_mapping(factory(blockwise, batch, {})())["w"]
+    empirical_factory = vpx.standard_operation_factory(
+        ops.empirical_fisher_vp(
+            "empirical",
+            "scores",
+            aggregation="mean_per_example",
+            example_loss_reduction="per_example",
+            denominator="batch_normalization",
+        ),
+        params=params,
+        buffers={},
+    )
+    empirical_output = empirical_factory(
+        vpx.Candidate(
+            "empirical",
+            "outer-product",
+            empirical_dense_settings(),
+            admission_status="passed",
+        ),
+        {"per_example_gradients": rows, "normalization": 3.0},
+        vector,
+    )()
+    expected = rows.T @ (rows @ vector["w"]) / 3.0
+
+    torch.testing.assert_close(tensor_mapping(empirical_output)["w"], expected)
+
+
+def test_per_example_gradient_block_size_requires_blockwise_accumulation() -> None:
+    candidate = vpx.standard_axis_registry().admit(
+        vpx.Candidate(
+            "per_example",
+            "bad-block-size",
+            per_example_gradient_settings(block_size=2),
+        )
+    )
+
+    assert candidate.admission_status == "failed"
+    assert "blockwise_stacked" in str(candidate.admission_error)
 
 
 def test_compile_backend_accepts_concrete_registered_backend(
@@ -894,8 +1198,8 @@ def numeric_bound_fields(
     }
 
 
-def score_terms_fisher(family: str, objective_id: str) -> vp.OperatorSpec:
-    return vp.fisher_vp(
+def score_terms_fisher(family: str, objective_id: str) -> vpx.OperatorSpec:
+    return ops.fisher_vp(
         family,
         objective_id,
         aggregation="mean_per_example",
@@ -907,13 +1211,22 @@ def score_terms_fisher(family: str, objective_id: str) -> vp.OperatorSpec:
     )
 
 
+def valid_sampling_bound() -> dict[str, object]:
+    return {
+        "kind": "abs_or_rel",
+        "max_abs_diff": 1e-12,
+        "max_rel_diff": 1e-12,
+        "norm_floor": 1e-12,
+    }
+
+
 def score_terms_sampled_fisher(
     family: str,
     objective_id: str,
     *,
     sample_source: str = "fixed_seed_and_count",
-) -> vp.OperatorSpec:
-    return vp.sampled_fisher_vp(
+) -> vpx.OperatorSpec:
+    return ops.sampled_fisher_vp(
         family,
         objective_id,
         aggregation="mean_per_example",
@@ -921,14 +1234,14 @@ def score_terms_sampled_fisher(
         label_policy="sampled_labels",
         sample_count=2,
         sample_source=sample_source,
-        sampling_bound={"kind": "fixed_test"},
+        sampling_bound=valid_sampling_bound(),
         score_reduction="none",
         denominator="num_examples",
     )
 
 
-def score_terms_fisher_sum(family: str, objective_id: str) -> vp.OperatorSpec:
-    return vp.fisher_vp(
+def score_terms_fisher_sum(family: str, objective_id: str) -> vpx.OperatorSpec:
+    return ops.fisher_vp(
         family,
         objective_id,
         aggregation="sum",
@@ -945,8 +1258,8 @@ def score_terms_sampled_fisher_sum(
     objective_id: str,
     *,
     sample_source: str = "fixed_seed_and_count",
-) -> vp.OperatorSpec:
-    return vp.sampled_fisher_vp(
+) -> vpx.OperatorSpec:
+    return ops.sampled_fisher_vp(
         family,
         objective_id,
         aggregation="sum",
@@ -954,14 +1267,14 @@ def score_terms_sampled_fisher_sum(
         label_policy="sampled_labels",
         sample_count=2,
         sample_source=sample_source,
-        sampling_bound={"kind": "fixed_test"},
+        sampling_bound=valid_sampling_bound(),
         score_reduction="none",
         denominator="one",
     )
 
 
-def empirical_fisher_sum(family: str, objective_id: str) -> vp.OperatorSpec:
-    return vp.empirical_fisher_vp(
+def empirical_fisher_sum(family: str, objective_id: str) -> vpx.OperatorSpec:
+    return ops.empirical_fisher_vp(
         family,
         objective_id,
         aggregation="sum",
@@ -970,35 +1283,35 @@ def empirical_fisher_sum(family: str, objective_id: str) -> vp.OperatorSpec:
     )
 
 
-def add_one_component(batch: vp.Batch, vector: vp.TensorTree) -> vp.TensorTree:
+def add_one_component(batch: vpx.Batch, vector: vpx.TensorTree) -> vpx.TensorTree:
     assert batch["scale"]
 
     return tree_map(lambda tensor: tensor + 1.0, vector)
 
 
-def subtract_one_component(batch: vp.Batch, vector: vp.TensorTree) -> vp.TensorTree:
+def subtract_one_component(batch: vpx.Batch, vector: vpx.TensorTree) -> vpx.TensorTree:
     assert batch["scale"]
 
     return tree_map(lambda tensor: tensor - 1.0, vector)
 
 
 def passed_child_reference(
-    candidate: vp.Candidate,
-    batch: vp.Batch,
-    vector: vp.TensorTree,
-) -> vp.ReferenceResult:
+    candidate: vpx.Candidate,
+    batch: vpx.Batch,
+    vector: vpx.TensorTree,
+) -> vpx.ReferenceResult:
     assert candidate.family == "child"
     assert batch["scale"]
     assert vector
 
-    return vp.ReferenceResult("child_anchor", {}, {"child_value": 0.0})
+    return vpx.ReferenceResult("child_anchor", {}, {"child_value": 0.0})
 
 
 def failed_child_reference(
-    candidate: vp.Candidate,
-    batch: vp.Batch,
-    vector: vp.TensorTree,
-) -> vp.ReferenceResult:
+    candidate: vpx.Candidate,
+    batch: vpx.Batch,
+    vector: vpx.TensorTree,
+) -> vpx.ReferenceResult:
     assert candidate.family == "child"
     assert batch["scale"]
     assert vector
@@ -1015,31 +1328,31 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
     cotangent = {"y": torch.tensor([4.0], dtype=torch.float64)}
 
     gradient_factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers=buffers,
         scalar_objectives={"loss": quadratic_scalar},
     )
     jvp_factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="none"),
+        ops.jvp("jvp", "function", aggregation="none"),
         params=params,
         buffers=buffers,
         function_objectives={"function": square_function},
     )
     vjp_factory = vpx.standard_operation_factory(
-        vp.vjp("vjp", "function", aggregation="none"),
+        ops.vjp("vjp", "function", aggregation="none"),
         params=params,
         buffers=buffers,
         function_objectives={"function": square_function},
     )
     hvp_factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers=buffers,
         scalar_objectives={"loss": quadratic_scalar},
     )
     gradient = gradient_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "row",
             {"gradient.path": "torch_autograd_grad"},
@@ -1049,7 +1362,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         vector,
     )()
     gradient_torch_func = gradient_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "row",
             {
@@ -1062,7 +1375,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         vector,
     )()
     gradient_torch_func_value = gradient_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "row",
             {
@@ -1075,7 +1388,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         vector,
     )()
     gradient_materialized = gradient_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "row",
             {"gradient.path": "backward_materialized_grad"},
@@ -1085,7 +1398,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         vector,
     )()
     jvp = jvp_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "row",
             {
@@ -1098,7 +1411,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         vector,
     )()
     forward_ad_jvp = jvp_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "row",
             {
@@ -1112,7 +1425,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         vector,
     )()
     linearize_jvp = jvp_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "row",
             {
@@ -1125,7 +1438,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         vector,
     )()
     vjp = vjp_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "row",
             {
@@ -1138,7 +1451,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         cotangent,
     )()
     vjp_autograd = vjp_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "row",
             {"vjp.path": "autograd_grad_outputs"},
@@ -1148,7 +1461,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         cotangent,
     )()
     vjp_materialized = vjp_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "row",
             {"vjp.path": "backward_materialized_grad"},
@@ -1158,7 +1471,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         cotangent,
     )()
     hvp = hvp_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "row",
             {
@@ -1171,7 +1484,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         vector,
     )()
     hvp_from_linearize = hvp_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "row",
             {
@@ -1184,7 +1497,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         vector,
     )()
     hvp_from_forward_ad = hvp_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "row",
             {
@@ -1198,7 +1511,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         vector,
     )()
     hvp_from_hvp = hvp_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "row",
             hvp_settings("autograd_functional_hvp"),
@@ -1208,7 +1521,7 @@ def test_standard_operation_factory_runs_core_derivative_products() -> None:
         vector,
     )()
     hvp_from_vhp = hvp_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "row",
             hvp_settings("autograd_functional_vhp"),
@@ -1302,10 +1615,10 @@ def test_numeric_loss_scaling_scales_gradient_source_and_unscales_output() -> No
             return (grad_output * 2.0 * value,)
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["scale"] == pytest.approx(1.0)
@@ -1314,13 +1627,13 @@ def test_numeric_loss_scaling_scales_gradient_source_and_unscales_output() -> No
         return RecordedSquare.apply(params["w"])
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "scaled",
             {
@@ -1342,7 +1655,7 @@ def test_numeric_loss_scaling_scales_gradient_source_and_unscales_output() -> No
 
 def test_numeric_loss_scaling_rejects_wrong_operator_degree() -> None:
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -1350,7 +1663,7 @@ def test_numeric_loss_scaling_rejects_wrong_operator_degree() -> None:
 
     with pytest.raises(vp.MaterializationError, match="does not match operator"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "wrong-degree",
                 {
@@ -1367,7 +1680,7 @@ def test_numeric_loss_scaling_rejects_wrong_operator_degree() -> None:
 def test_gradient_value_reuse_axis_requires_value_and_gradient_path() -> None:
     registry = vpx.standard_axis_registry()
     admitted = registry.admit(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "good",
             {
@@ -1378,7 +1691,7 @@ def test_gradient_value_reuse_axis_requires_value_and_gradient_path() -> None:
         )
     )
     rejected = registry.admit(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "bad",
             {
@@ -1400,10 +1713,10 @@ def test_gradient_value_reuse_executes_value_and_gradient_path() -> None:
     calls = []
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["scale"] == pytest.approx(1.0)
@@ -1413,13 +1726,13 @@ def test_gradient_value_reuse_executes_value_and_gradient_path() -> None:
         return params["w"].pow(2).sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([3.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "reuse-value",
             {
@@ -1442,10 +1755,10 @@ def test_gradient_value_reuse_executes_value_and_gradient_path() -> None:
 
 def test_gradient_value_reuse_rejects_nonfinite_primal_value() -> None:
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["scale"] == pytest.approx(1.0)
@@ -1454,7 +1767,7 @@ def test_gradient_value_reuse_rejects_nonfinite_primal_value() -> None:
         return params["w"].sum() + torch.tensor(float("nan"), dtype=torch.float64)
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([3.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": scalar},
@@ -1462,7 +1775,7 @@ def test_gradient_value_reuse_rejects_nonfinite_primal_value() -> None:
 
     with pytest.raises(vp.MaterializationError, match="gradient primal value"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "reuse-value",
                 {
@@ -1480,7 +1793,7 @@ def test_gradient_value_reuse_rejects_nonfinite_primal_value() -> None:
 def test_jvp_linearize_reuse_axis_requires_linearize_path() -> None:
     registry = vpx.standard_axis_registry()
     admitted = registry.admit(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "good",
             {
@@ -1491,7 +1804,7 @@ def test_jvp_linearize_reuse_axis_requires_linearize_path() -> None:
         )
     )
     rejected = registry.admit(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "bad",
             {
@@ -1515,11 +1828,11 @@ def test_jvp_linearize_reuse_prepares_linear_function_once(
     events = []
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> vp.TensorTree:
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
         assert buffers == {}
         assert batch["scale"] == pytest.approx(1.0)
         assert context.family == "jvp"
@@ -1528,13 +1841,13 @@ def test_jvp_linearize_reuse_prepares_linear_function_once(
         return {"y": params["w"] * 2.0}
 
     def fake_linearize(
-        tensor_function: Callable[[vp.ParameterTree], vp.TensorTree],
-        params: vp.ParameterTree,
-    ) -> tuple[vp.TensorTree, Callable[[vp.TensorTree], vp.TensorTree]]:
+        tensor_function: Callable[[vpx.ParameterTree], vpx.TensorTree],
+        params: vpx.ParameterTree,
+    ) -> tuple[vpx.TensorTree, Callable[[vpx.TensorTree], vpx.TensorTree]]:
         events.append("linearize")
         primal = tensor_function(params)
 
-        def jvp_function(vector: vp.TensorTree) -> vp.TensorTree:
+        def jvp_function(vector: vpx.TensorTree) -> vpx.TensorTree:
             events.append("jvp")
 
             return {"y": tree_leaves(vector)[0] * 7.0}
@@ -1543,13 +1856,13 @@ def test_jvp_linearize_reuse_prepares_linear_function_once(
 
     monkeypatch.setattr(runtime_module.torch.func, "linearize", fake_linearize)
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="none"),
+        ops.jvp("jvp", "function", aggregation="none"),
         params={"w": torch.tensor([3.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"function": function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "reuse-linearize",
             {
@@ -1582,11 +1895,11 @@ def test_jvp_linearize_reuse_none_rebuilds_linear_function_per_call(
     events = []
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> vp.TensorTree:
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
         assert buffers == {}
         assert batch["scale"] == pytest.approx(1.0)
         assert context.family == "jvp"
@@ -1595,13 +1908,13 @@ def test_jvp_linearize_reuse_none_rebuilds_linear_function_per_call(
         return {"y": params["w"] * 2.0}
 
     def fake_linearize(
-        tensor_function: Callable[[vp.ParameterTree], vp.TensorTree],
-        params: vp.ParameterTree,
-    ) -> tuple[vp.TensorTree, Callable[[vp.TensorTree], vp.TensorTree]]:
+        tensor_function: Callable[[vpx.ParameterTree], vpx.TensorTree],
+        params: vpx.ParameterTree,
+    ) -> tuple[vpx.TensorTree, Callable[[vpx.TensorTree], vpx.TensorTree]]:
         events.append("linearize")
         primal = tensor_function(params)
 
-        def jvp_function(vector: vp.TensorTree) -> vp.TensorTree:
+        def jvp_function(vector: vpx.TensorTree) -> vpx.TensorTree:
             events.append("jvp")
 
             return {"y": tree_leaves(vector)[0] * 7.0}
@@ -1610,13 +1923,13 @@ def test_jvp_linearize_reuse_none_rebuilds_linear_function_per_call(
 
     monkeypatch.setattr(runtime_module.torch.func, "linearize", fake_linearize)
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="none"),
+        ops.jvp("jvp", "function", aggregation="none"),
         params={"w": torch.tensor([3.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"function": function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "rebuild-linearize",
             {
@@ -1653,7 +1966,7 @@ def test_jvp_linearize_reuse_none_rebuilds_linear_function_per_call(
 def test_vjp_closure_reuse_axis_requires_torch_func_vjp_path() -> None:
     registry = vpx.standard_axis_registry()
     admitted = registry.admit(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "good",
             {
@@ -1664,7 +1977,7 @@ def test_vjp_closure_reuse_axis_requires_torch_func_vjp_path() -> None:
         )
     )
     rejected = registry.admit(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "bad",
             {
@@ -1687,11 +2000,11 @@ def test_vjp_closure_reuse_prepares_pullback_once(
     events = []
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> vp.TensorTree:
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
         assert buffers == {}
         assert batch["scale"] == pytest.approx(1.0)
         assert context.family == "vjp"
@@ -1700,16 +2013,16 @@ def test_vjp_closure_reuse_prepares_pullback_once(
         return {"y": params["w"] * 2.0}
 
     def fake_vjp(
-        tensor_function: Callable[[vp.ParameterTree], vp.TensorTree],
-        params: vp.ParameterTree,
+        tensor_function: Callable[[vpx.ParameterTree], vpx.TensorTree],
+        params: vpx.ParameterTree,
         *,
         has_aux: bool,
-    ) -> tuple[vp.TensorTree, Callable[[vp.TensorTree], tuple[vp.TensorTree]]]:
+    ) -> tuple[vpx.TensorTree, Callable[[vpx.TensorTree], tuple[vpx.TensorTree]]]:
         assert has_aux is False
         events.append("vjp")
         output = tensor_function(params)
 
-        def pullback(cotangent: vp.TensorTree) -> tuple[vp.TensorTree]:
+        def pullback(cotangent: vpx.TensorTree) -> tuple[vpx.TensorTree]:
             events.append("pullback")
 
             return ({"w": tree_leaves(cotangent)[0] * 11.0},)
@@ -1718,13 +2031,13 @@ def test_vjp_closure_reuse_prepares_pullback_once(
 
     monkeypatch.setattr(runtime_module.torch.func, "vjp", fake_vjp)
     factory = vpx.standard_operation_factory(
-        vp.vjp("vjp", "function", aggregation="none"),
+        ops.vjp("vjp", "function", aggregation="none"),
         params={"w": torch.tensor([3.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"function": function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "reuse-pullback",
             {
@@ -1757,11 +2070,11 @@ def test_vjp_closure_reuse_none_rebuilds_pullback_per_call(
     events = []
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> vp.TensorTree:
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
         assert buffers == {}
         assert batch["scale"] == pytest.approx(1.0)
         assert context.family == "vjp"
@@ -1770,16 +2083,16 @@ def test_vjp_closure_reuse_none_rebuilds_pullback_per_call(
         return {"y": params["w"] * 2.0}
 
     def fake_vjp(
-        tensor_function: Callable[[vp.ParameterTree], vp.TensorTree],
-        params: vp.ParameterTree,
+        tensor_function: Callable[[vpx.ParameterTree], vpx.TensorTree],
+        params: vpx.ParameterTree,
         *,
         has_aux: bool,
-    ) -> tuple[vp.TensorTree, Callable[[vp.TensorTree], tuple[vp.TensorTree]]]:
+    ) -> tuple[vpx.TensorTree, Callable[[vpx.TensorTree], tuple[vpx.TensorTree]]]:
         assert has_aux is False
         events.append("vjp")
         output = tensor_function(params)
 
-        def pullback(cotangent: vp.TensorTree) -> tuple[vp.TensorTree]:
+        def pullback(cotangent: vpx.TensorTree) -> tuple[vpx.TensorTree]:
             events.append("pullback")
 
             return ({"w": tree_leaves(cotangent)[0] * 11.0},)
@@ -1788,13 +2101,13 @@ def test_vjp_closure_reuse_none_rebuilds_pullback_per_call(
 
     monkeypatch.setattr(runtime_module.torch.func, "vjp", fake_vjp)
     factory = vpx.standard_operation_factory(
-        vp.vjp("vjp", "function", aggregation="none"),
+        ops.vjp("vjp", "function", aggregation="none"),
         params={"w": torch.tensor([3.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"function": function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "rebuild-pullback",
             {
@@ -1837,13 +2150,13 @@ def test_jvp_single_loop_vectorization_runs_batched_vectors() -> None:
         )
     }
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="none"),
+        ops.jvp("jvp", "function", aggregation="none"),
         params=params,
         buffers={},
         function_objectives={"function": square_function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "single-loop-vectors",
             {
@@ -1882,13 +2195,13 @@ def test_jvp_vmap_vectorization_runs_batched_vectors(
 
     monkeypatch.setattr(runtime_module, "_torch_func_vmap", recording_vmap)
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="none"),
+        ops.jvp("jvp", "function", aggregation="none"),
         params=params,
         buffers={},
         function_objectives={"function": square_function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "vmap-vectors",
             {
@@ -1932,7 +2245,7 @@ def test_jvp_manual_batch_vectorization_runs_declared_chunks(
     calls = []
     original_single_loop = runtime_module._run_jvp_vector_single_loop
 
-    def recording_single_loop(execution: Any) -> vp.TensorTree:
+    def recording_single_loop(execution: Any) -> vpx.TensorTree:
         in_dims = runtime_module._vector_tree_in_dims(
             execution.vector,
             execution.candidate.settings,
@@ -1947,13 +2260,13 @@ def test_jvp_manual_batch_vectorization_runs_declared_chunks(
         recording_single_loop,
     )
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="none"),
+        ops.jvp("jvp", "function", aggregation="none"),
         params=params,
         buffers={},
         function_objectives={"function": square_function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "manual-batch-vectors",
             {
@@ -1983,13 +2296,13 @@ def test_vjp_single_loop_vectorization_runs_batched_cotangents() -> None:
         )
     }
     factory = vpx.standard_operation_factory(
-        vp.vjp("vjp", "function", aggregation="none"),
+        ops.vjp("vjp", "function", aggregation="none"),
         params=params,
         buffers={},
         function_objectives={"function": square_function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "single-loop-cotangents",
             {
@@ -2028,13 +2341,13 @@ def test_vjp_vmap_vectorization_runs_batched_cotangents(
 
     monkeypatch.setattr(runtime_module, "_torch_func_vmap", recording_vmap)
     factory = vpx.standard_operation_factory(
-        vp.vjp("vjp", "function", aggregation="none"),
+        ops.vjp("vjp", "function", aggregation="none"),
         params=params,
         buffers={},
         function_objectives={"function": square_function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "vmap-cotangents",
             {
@@ -2078,7 +2391,7 @@ def test_vjp_manual_batch_vectorization_runs_declared_chunks(
     calls = []
     original_single_loop = runtime_module._run_vjp_vector_single_loop
 
-    def recording_single_loop(execution: Any) -> vp.TensorTree:
+    def recording_single_loop(execution: Any) -> vpx.TensorTree:
         in_dims = runtime_module._vector_tree_in_dims(
             execution.vector,
             execution.candidate.settings,
@@ -2093,13 +2406,13 @@ def test_vjp_manual_batch_vectorization_runs_declared_chunks(
         recording_single_loop,
     )
     factory = vpx.standard_operation_factory(
-        vp.vjp("vjp", "function", aggregation="none"),
+        ops.vjp("vjp", "function", aggregation="none"),
         params=params,
         buffers={},
         function_objectives={"function": square_function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "manual-batch-cotangents",
             {
@@ -2124,7 +2437,7 @@ def test_vjp_manual_batch_vectorization_runs_declared_chunks(
     ("operator", "settings", "vector", "message"),
     [
         (
-            vp.jvp("jvp", "function", aggregation="none"),
+            ops.jvp("jvp", "function", aggregation="none"),
             {
                 **jvp_settings("torch_func_jvp"),
                 **torch_func_settings(requires_forward_ad=True),
@@ -2135,7 +2448,7 @@ def test_vjp_manual_batch_vectorization_runs_declared_chunks(
             "vectorization.batch_size",
         ),
         (
-            vp.vjp("vjp", "function", aggregation="none"),
+            ops.vjp("vjp", "function", aggregation="none"),
             {
                 **vjp_settings(),
                 **torch_func_settings(requires_forward_ad=False),
@@ -2147,7 +2460,7 @@ def test_vjp_manual_batch_vectorization_runs_declared_chunks(
             "positive",
         ),
         (
-            vp.jvp("jvp", "function", aggregation="none"),
+            ops.jvp("jvp", "function", aggregation="none"),
             {
                 **jvp_settings("torch_func_jvp"),
                 **torch_func_settings(requires_forward_ad=True),
@@ -2161,9 +2474,9 @@ def test_vjp_manual_batch_vectorization_runs_declared_chunks(
     ],
 )
 def test_jvp_and_vjp_manual_batch_vectorization_validate_batch_size(
-    operator: vp.OperatorSpec,
+    operator: vpx.OperatorSpec,
     settings: Mapping[str, object],
-    vector: vp.TensorTree,
+    vector: vpx.TensorTree,
     message: str,
 ) -> None:
     factory = vpx.standard_operation_factory(
@@ -2175,7 +2488,7 @@ def test_jvp_and_vjp_manual_batch_vectorization_validate_batch_size(
 
     with pytest.raises(vp.MaterializationError, match=message):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 operator.family,
                 "bad-manual-batch",
                 settings,
@@ -2195,17 +2508,16 @@ def test_ggn_single_loop_vectorization_runs_batched_vectors() -> None:
         )
     }
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": square_tensor_function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "single-loop-vectors",
             {
-                "ggn.jvp_path": "dense_global",
                 "ggn.loss_hessian_path": "autodiff_loss_hvp",
                 "ggn.loss_hessian_kernel": "dense_global",
                 "vectorization.mode": "single_loop",
@@ -2241,13 +2553,13 @@ def test_ggn_vmap_vectorization_runs_batched_vectors(
 
     monkeypatch.setattr(runtime_module, "_torch_func_vmap", recording_vmap)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": square_tensor_function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "vmap-vectors",
             {
@@ -2290,7 +2602,7 @@ def test_ggn_manual_batch_vectorization_runs_declared_chunks(
     calls = []
     original_single_loop = runtime_module._run_ggnvp_vector_single_loop
 
-    def recording_single_loop(execution: Any) -> vp.TensorTree:
+    def recording_single_loop(execution: Any) -> vpx.TensorTree:
         in_dims = runtime_module._vector_tree_in_dims(
             execution.vector,
             execution.candidate.settings,
@@ -2305,17 +2617,16 @@ def test_ggn_manual_batch_vectorization_runs_declared_chunks(
         recording_single_loop,
     )
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": square_tensor_function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "manual-batch-vectors",
             {
-                "ggn.jvp_path": "dense_global",
                 "ggn.loss_hessian_path": "autodiff_loss_hvp",
                 "ggn.loss_hessian_kernel": "dense_global",
                 "vectorization.mode": "manual_batch",
@@ -2335,7 +2646,7 @@ def test_ggn_manual_batch_vectorization_runs_declared_chunks(
 
 def test_ggn_vectorization_rejects_inner_compile_boundary() -> None:
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_tensor_function},
@@ -2343,7 +2654,7 @@ def test_ggn_vectorization_rejects_inner_compile_boundary() -> None:
 
     with pytest.raises(vp.MaterializationError, match="ggn_jvp"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "ggn",
                 "bad-inner-compile",
                 {
@@ -2387,9 +2698,9 @@ def test_ggn_vectorization_rejects_inner_compile_boundary() -> None:
     ],
 )
 def test_fisher_family_single_loop_vectorization_runs_batched_vectors(
-    operator: vp.OperatorSpec,
+    operator: vpx.OperatorSpec,
     settings: Mapping[str, object],
-    batch: vp.Batch,
+    batch: vpx.Batch,
 ) -> None:
     vector = {
         "w": torch.tensor(
@@ -2403,7 +2714,7 @@ def test_fisher_family_single_loop_vectorization_runs_batched_vectors(
         buffers={},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             operator.family,
             "single-loop-vectors",
             {
@@ -2443,7 +2754,7 @@ def test_parameter_order_vector_is_prepared_before_operation(
         buffers={},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             operator.family,
             "cached-vector",
             fisher_settings("materialize_score_gradients"),
@@ -2493,9 +2804,9 @@ def test_parameter_order_vector_is_prepared_before_operation(
     ],
 )
 def test_fisher_family_manual_batch_vectorization_runs_batched_vectors(
-    operator: vp.OperatorSpec,
+    operator: vpx.OperatorSpec,
     settings: Mapping[str, object],
-    batch: vp.Batch,
+    batch: vpx.Batch,
 ) -> None:
     vector = {
         "w": torch.tensor(
@@ -2509,7 +2820,7 @@ def test_fisher_family_manual_batch_vectorization_runs_batched_vectors(
         buffers={},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             operator.family,
             "manual-batch-vectors",
             {
@@ -2530,7 +2841,7 @@ def test_fisher_family_manual_batch_vectorization_runs_batched_vectors(
 def test_ggn_vjp_path_axis_requires_valid_jvp_hessian_vjp_row() -> None:
     registry = vpx.standard_axis_registry()
     admitted = registry.admit(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "good",
             {
@@ -2540,7 +2851,7 @@ def test_ggn_vjp_path_axis_requires_valid_jvp_hessian_vjp_row() -> None:
         )
     )
     rejected_wrong_key = registry.admit(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "dense-on-jvp-key",
             {
@@ -2550,7 +2861,7 @@ def test_ggn_vjp_path_axis_requires_valid_jvp_hessian_vjp_row() -> None:
         )
     )
     rejected_missing_fields = registry.admit(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "missing-torch-func-fields",
             {
@@ -2574,10 +2885,10 @@ def test_ggn_vjp_path_axis_requires_valid_jvp_hessian_vjp_row() -> None:
 
 def test_ggn_vjp_path_autograd_grad_outputs_matches_torch_func_vjp() -> None:
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is not None
@@ -2586,7 +2897,7 @@ def test_ggn_vjp_path_autograd_grad_outputs_matches_torch_func_vjp() -> None:
         return torch.stack((params["w"][0].pow(2), 3.0 * params["w"][0]))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": function},
@@ -2594,7 +2905,7 @@ def test_ggn_vjp_path_autograd_grad_outputs_matches_torch_func_vjp() -> None:
     batch = {"loss_hessian": torch.diag(torch.tensor([5.0, 7.0], dtype=torch.float64))}
     vector = {"w": torch.tensor([11.0], dtype=torch.float64)}
     torch_func_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "torch-func-vjp",
             {
@@ -2609,7 +2920,7 @@ def test_ggn_vjp_path_autograd_grad_outputs_matches_torch_func_vjp() -> None:
         vector,
     )()
     autograd_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "autograd-vjp",
             {
@@ -2635,7 +2946,7 @@ def test_ggn_vjp_path_autograd_grad_outputs_matches_torch_func_vjp() -> None:
 
 def test_ggn_vjp_path_is_required_for_jvp_hessian_vjp_rows() -> None:
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
@@ -2643,7 +2954,7 @@ def test_ggn_vjp_path_is_required_for_jvp_hessian_vjp_rows() -> None:
 
     with pytest.raises(vp.MaterializationError, match=r"ggn\.vjp_path is required"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "ggn",
                 "missing-vjp-path",
                 {
@@ -2664,13 +2975,13 @@ def test_standard_operation_factory_enforces_direct_admission_fields() -> None:
     batch = {"scale": 1.0}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     jvp_factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="none"),
+        ops.jvp("jvp", "function", aggregation="none"),
         params=params,
         buffers={},
         function_objectives={"function": square_function},
     )
     gradient_factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -2678,7 +2989,7 @@ def test_standard_operation_factory_enforces_direct_admission_fields() -> None:
 
     with pytest.raises(vp.MaterializationError, match=r"jvp\.path"):
         jvp_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "jvp",
                 "missing-path",
                 {},
@@ -2690,7 +3001,7 @@ def test_standard_operation_factory_enforces_direct_admission_fields() -> None:
 
     with pytest.raises(vp.MaterializationError, match="missing fields"):
         jvp_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "jvp",
                 "missing-fields",
                 jvp_settings("torch_func_jvp"),
@@ -2702,7 +3013,7 @@ def test_standard_operation_factory_enforces_direct_admission_fields() -> None:
 
     with pytest.raises(vp.MaterializationError, match="contains_autograd_call"):
         jvp_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "jvp",
                 "invalid-torch-func",
                 {
@@ -2718,7 +3029,7 @@ def test_standard_operation_factory_enforces_direct_admission_fields() -> None:
 
     with pytest.raises(vp.MaterializationError, match="unsupported"):
         jvp_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "jvp",
                 "unsupported-forward-ad",
                 {
@@ -2734,7 +3045,7 @@ def test_standard_operation_factory_enforces_direct_admission_fields() -> None:
 
     with pytest.raises(vp.MaterializationError, match="missing fields"):
         gradient_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "functional-call-field",
                 {**gradient_settings(), "tie_weights": True},
@@ -2754,9 +3065,9 @@ def test_standard_operation_factory_rejects_singleton_operator_path() -> None:
     metric_batch = {"metric_matrix": torch.eye(1, dtype=torch.float64)}
     cases = (
         (
-            vp.gradient("gradient", "loss", aggregation="sum"),
+            ops.gradient("gradient", "loss", aggregation="sum"),
             vpx.standard_operation_factory(
-                vp.gradient("gradient", "loss", aggregation="sum"),
+                ops.gradient("gradient", "loss", aggregation="sum"),
                 params=params,
                 buffers=buffers,
                 scalar_objectives={"loss": quadratic_scalar},
@@ -2766,9 +3077,9 @@ def test_standard_operation_factory_rejects_singleton_operator_path() -> None:
             "autograd_grad",
         ),
         (
-            vp.vjp("vjp", "function", aggregation="none"),
+            ops.vjp("vjp", "function", aggregation="none"),
             vpx.standard_operation_factory(
-                vp.vjp("vjp", "function", aggregation="none"),
+                ops.vjp("vjp", "function", aggregation="none"),
                 params=params,
                 buffers=buffers,
                 function_objectives={"function": square_function},
@@ -2778,14 +3089,14 @@ def test_standard_operation_factory_rejects_singleton_operator_path() -> None:
             "torch_func_vjp",
         ),
         (
-            vp.metric(
+            ops.metric(
                 "metric",
                 "dense",
                 aggregation="sum",
                 representation=dense_metric_representation(),
             ),
             vpx.standard_operation_factory(
-                vp.metric(
+                ops.metric(
                     "metric",
                     "dense",
                     aggregation="sum",
@@ -2799,7 +3110,7 @@ def test_standard_operation_factory_rejects_singleton_operator_path() -> None:
             "dense_metric",
         ),
         (
-            vp.inverse_metric(
+            ops.inverse_metric(
                 "inverse_metric",
                 "dense",
                 aggregation="sum",
@@ -2807,7 +3118,7 @@ def test_standard_operation_factory_rejects_singleton_operator_path() -> None:
                 damping=0.0,
             ),
             vpx.standard_operation_factory(
-                vp.inverse_metric(
+                ops.inverse_metric(
                     "inverse_metric",
                     "dense",
                     aggregation="sum",
@@ -2826,7 +3137,7 @@ def test_standard_operation_factory_rejects_singleton_operator_path() -> None:
     for operator, factory, runtime_batch, runtime_vector, path in cases:
         with pytest.raises(vp.MaterializationError, match="operator_path"):
             factory(
-                vp.Candidate(
+                vpx.Candidate(
                     operator.family,
                     "path-supplied",
                     {"operator_path": path},
@@ -2843,7 +3154,7 @@ def test_standard_operation_factory_requires_metric_spec_path_keys() -> None:
     batch = {"metric_matrix": torch.eye(1, dtype=torch.float64)}
     cases = (
         (
-            vp.metric(
+            ops.metric(
                 "metric",
                 "dense",
                 aggregation="sum",
@@ -2852,7 +3163,7 @@ def test_standard_operation_factory_requires_metric_spec_path_keys() -> None:
             "metric.multiply_path",
         ),
         (
-            vp.inverse_metric(
+            ops.inverse_metric(
                 "inverse_metric",
                 "dense",
                 aggregation="sum",
@@ -2872,7 +3183,7 @@ def test_standard_operation_factory_requires_metric_spec_path_keys() -> None:
 
         with pytest.raises(vp.MaterializationError, match=required_key):
             factory(
-                vp.Candidate(
+                vpx.Candidate(
                     operator.family,
                     "missing-path",
                     {},
@@ -2888,7 +3199,7 @@ def test_standard_reference_check_requires_thresholds() -> None:
 
     with pytest.raises(vp.MaterializationError):
         vpx.standard_reference_check(
-            vp.hvp("hvp", "loss", aggregation="sum"),
+            ops.hvp("hvp", "loss", aggregation="sum"),
             params=params,
             buffers={},
             thresholds={},
@@ -2901,10 +3212,10 @@ def test_standard_reference_check_preserves_candidate_context_identity() -> None
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["scale"]
@@ -2913,7 +3224,7 @@ def test_standard_reference_check_preserves_candidate_context_identity() -> None
         return params["w"].pow(2).sum()
 
     check = vpx.standard_reference_check(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -2925,7 +3236,7 @@ def test_standard_reference_check_preserves_candidate_context_identity() -> None
         },
         scalar_objectives={"loss": scalar},
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "hvp",
         "candidate-row",
         {
@@ -2953,7 +3264,7 @@ def test_standard_reference_check_preserves_candidate_context_identity() -> None
 def test_hvp_reference_check_records_symmetry_error() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     check_without_symmetry_threshold = vpx.standard_reference_check(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -2965,7 +3276,7 @@ def test_hvp_reference_check_records_symmetry_error() -> None:
         scalar_objectives={"loss": quadratic_scalar},
     )
     check = vpx.standard_reference_check(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -2978,7 +3289,7 @@ def test_hvp_reference_check_records_symmetry_error() -> None:
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "row",
             {
@@ -2998,7 +3309,7 @@ def test_hvp_reference_check_records_symmetry_error() -> None:
 
     with pytest.raises(vp.ReferenceFailedError, match="symmetry_max_abs_diff"):
         check_without_symmetry_threshold(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "row",
                 {
@@ -3016,7 +3327,7 @@ def test_hvp_reference_check_records_symmetry_error() -> None:
 
     with pytest.raises(vp.ReferenceFailedError, match="symmetry_vector"):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "row",
                 {
@@ -3033,7 +3344,7 @@ def test_hvp_reference_check_records_symmetry_error() -> None:
 def test_hvp_reference_check_accepts_functional_hvp_path() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     check = vpx.standard_reference_check(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -3046,7 +3357,7 @@ def test_hvp_reference_check_accepts_functional_hvp_path() -> None:
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "row",
             hvp_settings("autograd_functional_hvp"),
@@ -3071,13 +3382,13 @@ def test_hvp_runtime_accepts_spec_path_keys_and_rejects_mixed_path_keys() -> Non
         "symmetry_vector": {"w": torch.tensor([4.0], dtype=torch.float64)},
     }
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     check = vpx.standard_reference_check(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -3089,25 +3400,25 @@ def test_hvp_runtime_accepts_spec_path_keys_and_rejects_mixed_path_keys() -> Non
         },
         scalar_objectives={"loss": quadratic_scalar},
     )
-    reverse = vp.Candidate(
+    reverse = vpx.Candidate(
         "hvp",
         "reverse",
         {"hvp.path": "reverse_over_reverse"},
         admission_status="passed",
     )
-    functional = vp.Candidate(
+    functional = vpx.Candidate(
         "hvp",
         "functional",
         {"hvp.path": "autograd_functional_hvp"},
         admission_status="passed",
     )
-    vhp = vp.Candidate(
+    vhp = vpx.Candidate(
         "hvp",
         "vhp",
         {"hvp.path": "autograd_functional_vhp"},
         admission_status="passed",
     )
-    jvp_grad = vp.Candidate(
+    jvp_grad = vpx.Candidate(
         "hvp",
         "jvp-grad",
         {
@@ -3116,7 +3427,7 @@ def test_hvp_runtime_accepts_spec_path_keys_and_rejects_mixed_path_keys() -> Non
         },
         admission_status="passed",
     )
-    mixed = vp.Candidate(
+    mixed = vpx.Candidate(
         "hvp",
         "mixed",
         {"hvp.path": "reverse_over_reverse", "operator_path": "functional_hvp"},
@@ -3147,18 +3458,64 @@ def test_hvp_runtime_accepts_spec_path_keys_and_rejects_mixed_path_keys() -> Non
         factory(mixed, batch, vector)()
 
 
-def test_hvp_linearize_grad_reuses_prepared_gradient_closure() -> None:
+def test_hvp_jvp_grad_does_not_call_functional_hvp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
-    batch = {"scale": 1.0}
+
+    def forbidden_functional_hvp(*_: Any, **__: Any) -> Any:
+        message = "jvp_grad HVP called functional HVP"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(
+        runtime_module.torch.autograd.functional,
+        "hvp",
+        forbidden_functional_hvp,
+    )
+    monkeypatch.setattr(
+        runtime_module.torch.autograd.functional,
+        "vhp",
+        forbidden_functional_hvp,
+    )
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
+            "hvp",
+            "jvp-grad",
+            {
+                **hvp_settings("jvp_grad"),
+                **torch_func_settings(requires_forward_ad=True),
+            },
+            admission_status="passed",
+        ),
+        {"scale": 1.0},
+        vector,
+    )()
+
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        torch.tensor([6.0], dtype=torch.float64),
+    )
+
+
+def test_hvp_linearize_grad_reuses_prepared_gradient_closure() -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
+    batch = {"scale": 1.0}
+    factory = vpx.standard_operation_factory(
+        ops.hvp("hvp", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+    )
+    result = factory(
+        vpx.Candidate(
             "hvp",
             "reuse-gradient-closure",
             hvp_gradient_reuse_settings(),
@@ -3183,13 +3540,13 @@ def test_hvp_single_loop_vectorization_runs_batched_vectors() -> None:
         )
     }
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "single-loop-vectors",
             {
@@ -3225,7 +3582,7 @@ def test_hvp_manual_batch_vectorization_runs_declared_chunks(
     calls = []
     original_single_loop = runtime_module._run_hvp_vector_single_loop
 
-    def recording_single_loop(execution: Any) -> vp.TensorTree:
+    def recording_single_loop(execution: Any) -> vpx.TensorTree:
         in_dims = runtime_module._vector_tree_in_dims(
             execution.vector,
             execution.candidate.settings,
@@ -3240,13 +3597,13 @@ def test_hvp_manual_batch_vectorization_runs_declared_chunks(
         recording_single_loop,
     )
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "manual-batch-vectors",
             {
@@ -3298,7 +3655,7 @@ def test_hvp_manual_batch_vectorization_validates_batch_size(
     message: str,
 ) -> None:
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -3306,7 +3663,7 @@ def test_hvp_manual_batch_vectorization_validates_batch_size(
 
     with pytest.raises(vp.MaterializationError, match=message):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "bad-manual-batch",
                 {**hvp_settings("reverse_over_reverse"), **settings},
@@ -3331,10 +3688,10 @@ def test_hvp_retains_graph_across_batched_vectors(
     original_grad = runtime_module.torch.autograd.grad
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         calls["scalar"] += 1
 
@@ -3348,13 +3705,13 @@ def test_hvp_retains_graph_across_batched_vectors(
 
     monkeypatch.setattr(runtime_module.torch.autograd, "grad", recording_grad)
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "retain-graph-vectors",
             {
@@ -3388,10 +3745,10 @@ def test_hvp_reuses_primal_and_rebuilds_gradient_per_vector(
     original_grad = runtime_module.torch.autograd.grad
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         calls["scalar"] += 1
 
@@ -3405,13 +3762,13 @@ def test_hvp_reuses_primal_and_rebuilds_gradient_per_vector(
 
     monkeypatch.setattr(runtime_module.torch.autograd, "grad", recording_grad)
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "reuse-primal-vectors",
             {
@@ -3451,13 +3808,13 @@ def test_hvp_vmap_vectorization_runs_linearized_batched_vectors(
 
     monkeypatch.setattr(runtime_module, "_torch_func_vmap", recording_vmap)
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "vmap-vectors",
             {
@@ -3484,7 +3841,7 @@ def test_hvp_vmap_vectorization_rejects_non_linearized_path() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([[3.0]], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -3492,7 +3849,7 @@ def test_hvp_vmap_vectorization_rejects_non_linearized_path() -> None:
 
     with pytest.raises(vp.MaterializationError, match="linearize_grad HVP"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "bad-vmap-vectors",
                 {
@@ -3513,7 +3870,7 @@ def test_hvp_retain_graph_requires_primal_reuse() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([[3.0]], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -3521,7 +3878,7 @@ def test_hvp_retain_graph_requires_primal_reuse() -> None:
 
     with pytest.raises(vp.MaterializationError, match=r"hvp[.]primal_reuse"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "retain-with-recompute",
                 {
@@ -3564,7 +3921,7 @@ def test_hvp_reuse_rejects_rows_without_required_execution_surface(
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -3575,7 +3932,7 @@ def test_hvp_reuse_rejects_rows_without_required_execution_surface(
         match=r"linearize_grad|reverse_over_reverse",
     ):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "bad-reuse",
                 settings,
@@ -3589,7 +3946,7 @@ def test_hvp_reuse_rejects_rows_without_required_execution_surface(
 def test_gradient_reference_check_records_directional_agreement() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     check = vpx.standard_reference_check(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -3601,7 +3958,7 @@ def test_gradient_reference_check_records_directional_agreement() -> None:
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "row",
             {"gradient.path": "torch_autograd_grad"},
@@ -3617,7 +3974,7 @@ def test_gradient_reference_check_records_directional_agreement() -> None:
 def test_jvp_reference_check_records_finite_difference_agreement() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     check = vpx.standard_reference_check(
-        vp.jvp("jvp", "function", aggregation="none"),
+        ops.jvp("jvp", "function", aggregation="none"),
         params=params,
         buffers={},
         thresholds={
@@ -3629,7 +3986,7 @@ def test_jvp_reference_check_records_finite_difference_agreement() -> None:
         function_objectives={"function": square_function},
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "row",
             {
@@ -3649,7 +4006,7 @@ def test_jvp_reference_check_records_finite_difference_agreement() -> None:
 def test_vjp_reference_check_records_dot_identity() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     check_without_inner_threshold = vpx.standard_reference_check(
-        vp.vjp("vjp", "function", aggregation="none"),
+        ops.vjp("vjp", "function", aggregation="none"),
         params=params,
         buffers={},
         thresholds={
@@ -3659,7 +4016,7 @@ def test_vjp_reference_check_records_dot_identity() -> None:
         function_objectives={"function": square_function},
     )
     check = vpx.standard_reference_check(
-        vp.vjp("vjp", "function", aggregation="none"),
+        ops.vjp("vjp", "function", aggregation="none"),
         params=params,
         buffers={},
         thresholds={
@@ -3670,7 +4027,7 @@ def test_vjp_reference_check_records_dot_identity() -> None:
         function_objectives={"function": square_function},
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "row",
             {
@@ -3690,7 +4047,7 @@ def test_vjp_reference_check_records_dot_identity() -> None:
 
     with pytest.raises(vp.ReferenceFailedError, match="inner_abs_diff"):
         check_without_inner_threshold(
-            vp.Candidate(
+            vpx.Candidate(
                 "vjp",
                 "row",
                 {
@@ -3708,7 +4065,7 @@ def test_vjp_reference_check_records_dot_identity() -> None:
 
     with pytest.raises(vp.ReferenceFailedError, match="tangent_vector"):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "vjp",
                 "row",
                 {
@@ -3721,11 +4078,47 @@ def test_vjp_reference_check_records_dot_identity() -> None:
             {"y": torch.tensor([4.0], dtype=torch.float64)},
         )
 
+    with pytest.raises(vp.ReferenceFailedError, match="min_probe_norm"):
+        check(
+            vpx.Candidate(
+                "vjp",
+                "row",
+                {
+                    "vjp.path": "torch_func_vjp",
+                    **torch_func_settings(requires_forward_ad=False),
+                },
+                admission_status="passed",
+            ),
+            {
+                "scale": 1.0,
+                "tangent_vector": {"w": torch.tensor([0.0], dtype=torch.float64)},
+            },
+            {"y": torch.tensor([4.0], dtype=torch.float64)},
+        )
+
+    with pytest.raises(vp.ReferenceFailedError, match="min_probe_norm"):
+        check(
+            vpx.Candidate(
+                "vjp",
+                "row",
+                {
+                    "vjp.path": "torch_func_vjp",
+                    **torch_func_settings(requires_forward_ad=False),
+                },
+                admission_status="passed",
+            ),
+            {
+                "scale": 1.0,
+                "tangent_vector": {"w": torch.tensor([3.0], dtype=torch.float64)},
+            },
+            {"y": torch.tensor([0.0], dtype=torch.float64)},
+        )
+
 
 def test_vhp_reference_check_requires_symmetry_and_directional_checks() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     check_without_symmetry = vpx.standard_reference_check(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -3737,7 +4130,7 @@ def test_vhp_reference_check_requires_symmetry_and_directional_checks() -> None:
         scalar_objectives={"loss": quadratic_scalar},
     )
     check_with_symmetry = vpx.standard_reference_check(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -3749,7 +4142,7 @@ def test_vhp_reference_check_requires_symmetry_and_directional_checks() -> None:
         },
         scalar_objectives={"loss": quadratic_scalar},
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "hvp",
         "vhp",
         hvp_settings("autograd_functional_vhp"),
@@ -3773,15 +4166,35 @@ def test_vhp_reference_check_requires_symmetry_and_directional_checks() -> None:
             {"w": torch.tensor([3.0], dtype=torch.float64)},
         )
 
+    with pytest.raises(vp.ReferenceFailedError, match="min_probe_norm"):
+        check_with_symmetry(
+            candidate,
+            {
+                "scale": 1.0,
+                "symmetry_vector": {"w": torch.tensor([4.0], dtype=torch.float64)},
+            },
+            {"w": torch.tensor([0.0], dtype=torch.float64)},
+        )
+
+    with pytest.raises(vp.ReferenceFailedError, match="min_probe_norm"):
+        check_with_symmetry(
+            candidate,
+            {
+                "scale": 1.0,
+                "symmetry_vector": {"w": torch.tensor([0.0], dtype=torch.float64)},
+            },
+            {"w": torch.tensor([3.0], dtype=torch.float64)},
+        )
+
 
 def test_standard_reference_check_honors_strict_thresholds() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["scale"]
@@ -3790,7 +4203,7 @@ def test_standard_reference_check_honors_strict_thresholds() -> None:
         return multiplier * params["w"].pow(2).sum()
 
     check = vpx.standard_reference_check(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -3802,7 +4215,7 @@ def test_standard_reference_check_honors_strict_thresholds() -> None:
         },
         scalar_objectives={"loss": scalar},
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "hvp",
         "candidate-row",
         {
@@ -3825,8 +4238,8 @@ def test_standard_reference_check_honors_strict_thresholds() -> None:
 
 def test_standard_reference_check_applies_numeric_error_bound_fields() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
-    operator = vp.gradient("gradient", "loss", aggregation="sum")
-    candidate = vp.Candidate(
+    operator = ops.gradient("gradient", "loss", aggregation="sum")
+    candidate = vpx.Candidate(
         "gradient",
         "high-matmul",
         {
@@ -3879,8 +4292,8 @@ def test_standard_reference_check_applies_numeric_error_bound_fields() -> None:
 
 def test_dtype_accumulation_requires_numeric_error_bound_fields() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
-    operator = vp.gradient("gradient", "loss", aggregation="sum")
-    candidate = vp.Candidate(
+    operator = ops.gradient("gradient", "loss", aggregation="sum")
+    candidate = vpx.Candidate(
         "gradient",
         "bf16-accumulation",
         {
@@ -3913,7 +4326,7 @@ def test_dtype_accumulation_requires_numeric_error_bound_fields() -> None:
 def test_standard_reference_check_low_precision_anchor() -> None:
     params = {"w": torch.tensor([1.0], dtype=torch.float64)}
     check = vpx.standard_reference_check(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -3932,7 +4345,7 @@ def test_standard_reference_check_low_precision_anchor() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "metric",
                 "float32",
                 {**metric_settings(), "dtype.output": "fp32"},
@@ -3946,7 +4359,7 @@ def test_standard_reference_check_low_precision_anchor() -> None:
 def test_metric_reference_check_rejects_nonsymmetric_metric() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     check = vpx.standard_reference_check(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -3965,7 +4378,7 @@ def test_metric_reference_check_rejects_nonsymmetric_metric() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "metric",
                 "row",
                 metric_settings(),
@@ -3983,7 +4396,7 @@ def test_metric_reference_check_rejects_nonsymmetric_metric() -> None:
 def test_metric_reference_check_rejects_indefinite_metric() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     check = vpx.standard_reference_check(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -4001,7 +4414,7 @@ def test_metric_reference_check_rejects_indefinite_metric() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "metric",
                 "row",
                 metric_settings(),
@@ -4022,10 +4435,10 @@ def test_standard_operation_factory_rejects_missing_declared_batch_input() -> No
     calls = []
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert params["w"] is not None
         assert buffers == {}
@@ -4036,7 +4449,7 @@ def test_standard_operation_factory_rejects_missing_declared_batch_input() -> No
         return params["w"]
 
     ggn_factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4044,7 +4457,7 @@ def test_standard_operation_factory_rejects_missing_declared_batch_input() -> No
 
     with pytest.raises(vp.MaterializationError, match="loss_hessian"):
         ggn_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "ggn",
                 "row",
                 ggn_dense_kernel_settings(),
@@ -4062,10 +4475,10 @@ def test_dense_standard_paths_reject_nonfinite_inputs() -> None:
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is not None
@@ -4074,7 +4487,7 @@ def test_dense_standard_paths_reject_nonfinite_inputs() -> None:
         return params["w"]
 
     ggn_factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4085,7 +4498,7 @@ def test_dense_standard_paths_reject_nonfinite_inputs() -> None:
         buffers={},
     )
     metric_factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -4097,7 +4510,7 @@ def test_dense_standard_paths_reject_nonfinite_inputs() -> None:
 
     with pytest.raises(vp.MaterializationError, match="nonfinite"):
         ggn_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "ggn",
                 "row",
                 ggn_dense_kernel_settings(),
@@ -4109,7 +4522,7 @@ def test_dense_standard_paths_reject_nonfinite_inputs() -> None:
 
     with pytest.raises(vp.MaterializationError, match="nonfinite"):
         fisher_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "fisher",
                 "row",
                 fisher_settings("materialize_score_gradients"),
@@ -4124,7 +4537,7 @@ def test_dense_standard_paths_reject_nonfinite_inputs() -> None:
 
     with pytest.raises(vp.MaterializationError, match="nonfinite"):
         metric_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "metric",
                 "row",
                 metric_settings(),
@@ -4156,10 +4569,10 @@ def test_ggnvp_closed_form_ce_kl_kernels_match_dense_loss_hessian(
     }
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch == {}
@@ -4168,13 +4581,13 @@ def test_ggnvp_closed_form_ce_kl_kernels_match_dense_loss_hessian(
         return params["logits"]
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             f"closed-form-{kernel}",
             ggn_closed_form_ce_kl_settings(kernel),
@@ -4221,10 +4634,10 @@ def test_ggnvp_closed_form_ce_kl_token_blocks_match_dense_loss_hessian(
     }
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch == {}
@@ -4238,13 +4651,13 @@ def test_ggnvp_closed_form_ce_kl_token_blocks_match_dense_loss_hessian(
         "chunk.token_block_size": 2,
     }
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             f"token-block-{kernel}",
             settings,
@@ -4285,10 +4698,10 @@ def test_ggnvp_closed_form_ce_kl_reference_matches_dense_anchor(
     }
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is not None
@@ -4297,7 +4710,7 @@ def test_ggnvp_closed_form_ce_kl_reference_matches_dense_anchor(
         return params["logits"]
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -4310,7 +4723,7 @@ def test_ggnvp_closed_form_ce_kl_reference_matches_dense_anchor(
         function_objectives={"model_output": function},
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             f"closed-form-{kernel}",
             ggn_closed_form_ce_kl_settings(kernel),
@@ -4344,10 +4757,10 @@ def test_ggnvp_reuse_rows_match_dense_loss_hessian(
     loss_hessian = torch.diag(torch.tensor([3.0, 5.0], dtype=torch.float64))
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -4359,13 +4772,13 @@ def test_ggnvp_reuse_rows_match_dense_loss_hessian(
         ))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             f"{jvp_reuse}-{cotangent_reuse}",
             ggn_reuse_settings(jvp_reuse, cotangent_reuse),
@@ -4403,10 +4816,10 @@ def test_ggnvp_reuses_primal_from_jvp(
     calls = []
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -4419,7 +4832,7 @@ def test_ggnvp_reuses_primal_from_jvp(
         ))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4431,7 +4844,7 @@ def test_ggnvp_reuses_primal_from_jvp(
         "ggn.loss_hessian_kernel": "dense_global",
     }
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             f"reuse-primal-{jvp_path}",
             settings,
@@ -4448,6 +4861,68 @@ def test_ggnvp_reuses_primal_from_jvp(
     result_map = tensor_mapping(result)
 
     assert len(calls) == expected_calls
+    torch.testing.assert_close(result_map["w"], expected)
+
+
+def test_ggnvp_jvp_hessian_vjp_does_not_call_dense_jacobian_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params = {"w": torch.tensor([0.5, -0.25], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.5, -2.0], dtype=torch.float64)}
+    loss_hessian = torch.diag(torch.tensor([3.0, 5.0], dtype=torch.float64))
+
+    def forbidden_dense_jacobian(*_: Any, **__: Any) -> Any:
+        message = "GGN JVP path called dense Jacobian helper"
+        raise AssertionError(message)
+
+    def function(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert batch["loss_hessian"] is loss_hessian
+        assert context.family == "ggn"
+
+        return torch.stack((
+            params["w"][0] ** 2 + params["w"][1],
+            params["w"][0] - params["w"][1] ** 2,
+        ))
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_dense_jacobian_tree",
+        forbidden_dense_jacobian,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_dense_jacobian_row_block",
+        forbidden_dense_jacobian,
+    )
+    factory = vpx.standard_operation_factory(
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
+        params=params,
+        buffers={},
+        function_objectives={"model_output": function},
+    )
+    result = factory(
+        vpx.Candidate(
+            "ggn",
+            "jvp-hessian-vjp",
+            ggn_dense_kernel_settings(),
+            admission_status="passed",
+        ),
+        {"loss_hessian": loss_hessian},
+        vector,
+    )()
+    jacobian = torch.tensor(
+        [[1.0, 1.0], [1.0, 0.5]],
+        dtype=torch.float64,
+    )
+    expected = jacobian.T @ (loss_hessian @ (jacobian @ vector["w"]))
+    result_map = tensor_mapping(result)
+
     torch.testing.assert_close(result_map["w"], expected)
 
 
@@ -4476,10 +4951,10 @@ def test_ggnvp_autodiff_loss_hvp_uses_output_space_ad(
         return result[0], result[1]
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -4492,13 +4967,13 @@ def test_ggnvp_autodiff_loss_hvp_uses_output_space_ad(
 
     monkeypatch.setattr(runtime_module.torch.func, "jvp", recording_jvp)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "autodiff-loss-hvp",
             ggn_dense_kernel_settings(),
@@ -4524,10 +4999,10 @@ def test_ggnvp_rejects_backward_materialized_vjp_path() -> None:
     loss_hessian = torch.tensor([[2.0, 0.5], [0.5, 4.0]], dtype=torch.float64)
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -4539,14 +5014,14 @@ def test_ggnvp_rejects_backward_materialized_vjp_path() -> None:
         ))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
     with pytest.raises(vp.MaterializationError, match=r"ggn\.vjp_path"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "ggn",
                 "backward-vjp",
                 {
@@ -4574,10 +5049,10 @@ def test_ggnvp_executes_intermediate_residency_at_jvp_and_cotangent_boundaries(
     calls = []
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -4600,13 +5075,13 @@ def test_ggnvp_executes_intermediate_residency_at_jvp_and_cotangent_boundaries(
 
     monkeypatch.setattr(runtime_module, "_residency_tensor", recording_residency)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "intermediate-residency",
             {
@@ -4642,10 +5117,10 @@ def test_ggnvp_executes_intermediate_transform_at_operator_part_boundaries() -> 
     calls = []
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -4656,20 +5131,20 @@ def test_ggnvp_executes_intermediate_transform_at_operator_part_boundaries() -> 
             params["w"][0] - params["w"][1] ** 2,
         ))
 
-    def intermediate_transform(tree: vp.TensorTree) -> vp.TensorTree:
+    def intermediate_transform(tree: vpx.TensorTree) -> vpx.TensorTree:
         calls.append(tree_leaves(tree)[0].detach().clone())
 
         return tree
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
         intermediate_transform=intermediate_transform,
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "intermediate-transform",
             ggn_reuse_settings("reuse_jvp", "reuse_output_cotangent"),
@@ -4701,10 +5176,10 @@ def test_ggnvp_chunks_output_cotangent_vjp(
     original_vjp = runtime_module._run_ggnvp_vjp_by_path
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -4718,9 +5193,9 @@ def test_ggnvp_chunks_output_cotangent_vjp(
 
     def recording_vjp(
         execution: runtime_module.StandardExecution,
-        tensor_function: Callable[[vp.ParameterTree], vp.TensorTree],
-        output_cotangent: vp.TensorTree,
-    ) -> vp.TensorTree:
+        tensor_function: Callable[[vpx.ParameterTree], vpx.TensorTree],
+        output_cotangent: vpx.TensorTree,
+    ) -> vpx.TensorTree:
         chunk_nonzeros.append(
             int(
                 torch.count_nonzero(
@@ -4733,13 +5208,13 @@ def test_ggnvp_chunks_output_cotangent_vjp(
 
     monkeypatch.setattr(runtime_module, "_run_ggnvp_vjp_by_path", recording_vjp)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "chunked-output-cotangent",
             {
@@ -4772,10 +5247,10 @@ def test_dense_ggnvp_executes_declared_row_batches(
     original_row_block = runtime_module._dense_jacobian_row_block
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -4808,17 +5283,16 @@ def test_dense_ggnvp_executes_declared_row_batches(
         runtime_module, "_dense_jacobian_row_block", recording_row_block
     )
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "row-batched-dense",
             {
-                "ggn.jvp_path": "dense_global",
                 "ggn.loss_hessian_path": "autodiff_loss_hvp",
                 "ggn.loss_hessian_kernel": "dense_global",
                 "batch.ggn_batch_size": 1,
@@ -4843,13 +5317,11 @@ def test_dense_ggnvp_executes_declared_row_batches(
     "settings",
     [
         {
-            "ggn.jvp_path": "dense_global",
             "ggn.loss_hessian_path": "autodiff_loss_hvp",
             "ggn.loss_hessian_kernel": "dense_global",
             "ggn.jvp_reuse": "reuse_jvp",
         },
         {
-            "ggn.jvp_path": "dense_global",
             "ggn.loss_hessian_path": "autodiff_loss_hvp",
             "ggn.loss_hessian_kernel": "dense_global",
             "ggn.cotangent_reuse": "reuse_output_cotangent",
@@ -4861,10 +5333,10 @@ def test_dense_ggnvp_rejects_reuse_settings(settings: dict[str, object]) -> None
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is not None
@@ -4873,7 +5345,7 @@ def test_dense_ggnvp_rejects_reuse_settings(settings: dict[str, object]) -> None
         return params["w"]
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
@@ -4881,7 +5353,7 @@ def test_dense_ggnvp_rejects_reuse_settings(settings: dict[str, object]) -> None
 
     with pytest.raises(vp.MaterializationError, match="reuse"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "ggn",
                 "dense-with-reuse",
                 settings,
@@ -4898,10 +5370,10 @@ def test_fisher_vp_rejects_empirical_vmap_path() -> None:
     vector = {"w": torch.tensor([0.5, -0.25], dtype=torch.float64)}
 
     def score_rows(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "fisher"
@@ -4917,7 +5389,7 @@ def test_fisher_vp_rejects_empirical_vmap_path() -> None:
 
     with pytest.raises(vp.MaterializationError, match=r"fisher\.expectation_path"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "fisher",
                 "vmap",
                 {
@@ -4941,10 +5413,10 @@ def test_fisher_score_grad_paths_match_loop_result() -> None:
     vector = {"w": torch.tensor([0.5, 0.25], dtype=torch.float64)}
 
     def score_rows(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["normalization"] == pytest.approx(3.0)
@@ -4960,7 +5432,7 @@ def test_fisher_score_grad_paths_match_loop_result() -> None:
         function_objectives={"scores": score_rows},
     )
     loop = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "loop",
             {
@@ -4976,7 +5448,7 @@ def test_fisher_score_grad_paths_match_loop_result() -> None:
         vector,
     )()
     torch_func = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "torch-func",
             {
@@ -4993,7 +5465,7 @@ def test_fisher_score_grad_paths_match_loop_result() -> None:
         vector,
     )()
     backward = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "backward",
             {
@@ -5009,7 +5481,7 @@ def test_fisher_score_grad_paths_match_loop_result() -> None:
         vector,
     )()
     vmap = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "vmap",
             {
@@ -5046,10 +5518,10 @@ def test_streaming_fisher_family_accumulates_without_score_matrix(
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def score_rows(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family in {"fisher", "sampled", "empirical"}
@@ -5092,7 +5564,7 @@ def test_streaming_fisher_family_accumulates_without_score_matrix(
         function_objectives={"scores": score_rows},
     )
     empirical_factory = vpx.standard_operation_factory(
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "scores",
             aggregation="mean_per_example",
@@ -5104,7 +5576,7 @@ def test_streaming_fisher_family_accumulates_without_score_matrix(
         function_objectives={"scores": score_rows},
     )
     fisher = fisher_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "streaming",
             {
@@ -5120,7 +5592,7 @@ def test_streaming_fisher_family_accumulates_without_score_matrix(
         vector,
     )()
     sampled = sampled_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "streaming",
             {
@@ -5133,7 +5605,7 @@ def test_streaming_fisher_family_accumulates_without_score_matrix(
         vector,
     )()
     empirical = empirical_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "streaming",
             {
@@ -5164,10 +5636,10 @@ def test_fisher_family_manual_per_example_schedule_runs_declared_subbatches() ->
     calls = []
 
     def score_rows(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         x_value = batch["x"]
@@ -5189,7 +5661,7 @@ def test_fisher_family_manual_per_example_schedule_runs_declared_subbatches() ->
         function_objectives={"scores": score_rows},
     )
     empirical_factory = vpx.standard_operation_factory(
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "scores",
             aggregation="mean_per_example",
@@ -5201,7 +5673,7 @@ def test_fisher_family_manual_per_example_schedule_runs_declared_subbatches() ->
         function_objectives={"scores": score_rows},
     )
     fisher_loop = fisher_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "loop",
             {
@@ -5217,7 +5689,7 @@ def test_fisher_family_manual_per_example_schedule_runs_declared_subbatches() ->
         vector,
     )()
     fisher_manual = fisher_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "manual",
             {
@@ -5233,7 +5705,7 @@ def test_fisher_family_manual_per_example_schedule_runs_declared_subbatches() ->
         vector,
     )()
     sampled_loop = sampled_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "loop",
             {
@@ -5246,7 +5718,7 @@ def test_fisher_family_manual_per_example_schedule_runs_declared_subbatches() ->
         vector,
     )()
     sampled_manual = sampled_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "manual",
             {
@@ -5259,7 +5731,7 @@ def test_fisher_family_manual_per_example_schedule_runs_declared_subbatches() ->
         vector,
     )()
     empirical_loop = empirical_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "loop",
             {
@@ -5272,7 +5744,7 @@ def test_fisher_family_manual_per_example_schedule_runs_declared_subbatches() ->
         vector,
     )()
     empirical_manual = empirical_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "manual",
             {
@@ -5318,10 +5790,10 @@ def test_manual_per_example_schedule_requires_declared_batch_size() -> None:
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def score_rows(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "fisher"
@@ -5340,7 +5812,7 @@ def test_manual_per_example_schedule_requires_declared_batch_size() -> None:
         match=r"batch[.]fisher_sample_batch_size is required",
     ):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "fisher",
                 "manual",
                 {
@@ -5360,7 +5832,7 @@ def test_manual_per_example_schedule_requires_declared_batch_size() -> None:
 def test_fisher_score_grad_path_axis_validates_torch_func_rows() -> None:
     registry = vpx.standard_axis_registry()
     admitted = registry.admit(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "vmap",
             {
@@ -5374,7 +5846,7 @@ def test_fisher_score_grad_path_axis_validates_torch_func_rows() -> None:
         )
     )
     rejected = registry.admit(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "missing-fields",
             fisher_settings(
@@ -5400,7 +5872,7 @@ def test_fisher_score_grad_path_is_required_only_for_streaming_rows() -> None:
 
     with pytest.raises(vp.MaterializationError, match=r"fisher\.score_grad_path"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "fisher",
                 "missing-score-path",
                 {
@@ -5415,7 +5887,7 @@ def test_fisher_score_grad_path_is_required_only_for_streaming_rows() -> None:
 
     with pytest.raises(vp.MaterializationError, match="not used"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "fisher",
                 "dense-with-score-path",
                 {
@@ -5434,7 +5906,7 @@ def test_fisher_score_grad_path_is_required_only_for_streaming_rows() -> None:
 
 def test_fisher_vp_rejects_categorical_and_requires_score_reduction() -> None:
     with pytest.raises(vp.MaterializationError, match="GGNVP"):
-        vp.fisher_vp(
+        ops.fisher_vp(
             "fisher",
             "logits",
             aggregation="mean_per_example",
@@ -5446,7 +5918,7 @@ def test_fisher_vp_rejects_categorical_and_requires_score_reduction() -> None:
         )
 
     with pytest.raises(vp.MaterializationError, match="score_reduction"):
-        vp.fisher_vp(
+        ops.fisher_vp(
             "fisher",
             "scores",
             aggregation="mean_per_example",
@@ -5461,7 +5933,7 @@ def test_fisher_vp_rejects_categorical_and_requires_score_reduction() -> None:
 def test_inverse_metric_reference_check_records_inverse_residual() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     check = vpx.standard_reference_check(
-        vp.inverse_metric(
+        ops.inverse_metric(
             "inverse",
             "dense",
             aggregation="sum",
@@ -5480,7 +5952,7 @@ def test_inverse_metric_reference_check_records_inverse_residual() -> None:
         },
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "row",
             inverse_metric_settings(),
@@ -5499,7 +5971,7 @@ def test_inverse_metric_reference_check_uses_declared_damping() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     matrix = torch.diag(torch.tensor([1.0, -0.1], dtype=torch.float64))
     vector = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "dense",
         aggregation="sum",
@@ -5522,7 +5994,7 @@ def test_inverse_metric_reference_check_uses_declared_damping() -> None:
         thresholds=thresholds,
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "row",
             inverse_metric_settings(),
@@ -5547,7 +6019,7 @@ def test_inverse_metric_reference_check_uses_declared_damping() -> None:
         buffers={},
     )
     operation_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "row",
             inverse_metric_settings(),
@@ -5568,7 +6040,7 @@ def test_inverse_metric_reference_check_uses_declared_damping() -> None:
 
     with pytest.raises(vp.ReferenceFailedError, match="damping_min"):
         failing_check(
-            vp.Candidate(
+            vpx.Candidate(
                 "inverse",
                 "row",
                 inverse_metric_settings(),
@@ -5583,7 +6055,7 @@ def test_inverse_metric_dense_direct_solve_paths_match_dense_solve() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "dense",
         aggregation="sum",
@@ -5611,7 +6083,7 @@ def test_inverse_metric_dense_direct_solve_paths_match_dense_solve() -> None:
     expected = torch.linalg.solve(matrix, vector["w"])
 
     for path in ("dense_solve", "cholesky_solve", "eigh_solve", "svd_solve"):
-        candidate = vp.Candidate(
+        candidate = vpx.Candidate(
             "inverse",
             path,
             inverse_metric_settings(path),
@@ -5628,7 +6100,7 @@ def test_inverse_metric_dense_direct_solve_paths_match_dense_solve() -> None:
 def test_inverse_metric_rejects_ill_conditioned_undamped_solve() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     check = vpx.standard_reference_check(
-        vp.inverse_metric(
+        ops.inverse_metric(
             "inverse",
             "dense",
             aggregation="sum",
@@ -5649,7 +6121,7 @@ def test_inverse_metric_rejects_ill_conditioned_undamped_solve() -> None:
 
     with pytest.raises(vp.ReferenceFailedError, match="condition_number_max"):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "inverse",
                 "ill-conditioned",
                 inverse_metric_settings(),
@@ -5679,7 +6151,7 @@ def test_inverse_metric_rejects_ill_conditioned_undamped_solve() -> None:
 def test_inverse_metric_direct_solve_rejects_iteration_budget(path: str) -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "dense",
         aggregation="sum",
@@ -5690,7 +6162,7 @@ def test_inverse_metric_direct_solve_rejects_iteration_budget(path: str) -> None
 
     with pytest.raises(vp.MaterializationError, match="conjugate_gradient"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "inverse",
                 "direct-budget",
                 {
@@ -5708,7 +6180,7 @@ def test_inverse_metric_refactor_each_rhs_is_executable() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "dense",
         aggregation="sum",
@@ -5721,7 +6193,7 @@ def test_inverse_metric_refactor_each_rhs_is_executable() -> None:
         buffers={},
     )
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "cholesky-refactor",
             {
@@ -5744,7 +6216,7 @@ def test_inverse_metric_reuse_factor_across_rhs_requires_multi_rhs() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "dense",
         aggregation="sum",
@@ -5757,20 +6229,76 @@ def test_inverse_metric_reuse_factor_across_rhs_requires_multi_rhs() -> None:
         buffers={},
     )
 
-    with pytest.raises(vp.MaterializationError, match="vectorized"):
+    with pytest.raises(vp.MaterializationError, match="multi_rhs"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "inverse",
                 "cholesky-reuse",
                 {
                     **inverse_metric_settings("cholesky_solve"),
                     "inverse_metric.factor_reuse": "reuse_factor_across_rhs",
+                    "vectorization.mode": "single_loop",
+                    "vectorization.in_dims": {"w": 0},
                 },
                 admission_status="passed",
             ),
             {"metric_matrix": matrix},
-            vector,
+            {"w": vector["w"].unsqueeze(0)},
         )
+
+
+@pytest.mark.parametrize(
+    ("multi_rhs", "expected_cholesky_calls"),
+    [("single_column", 3), ("block", 1)],
+)
+def test_inverse_metric_multi_rhs_controls_cholesky_rhs_batching(
+    monkeypatch: pytest.MonkeyPatch,
+    multi_rhs: str,
+    expected_cholesky_calls: int,
+) -> None:
+    params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    vector = {
+        "w": torch.tensor(
+            [[0.25, -0.75], [1.0, 2.0], [-0.5, 0.75]],
+            dtype=torch.float64,
+        )
+    }
+    calls = []
+    original_cholesky = runtime_module.torch.linalg.cholesky
+
+    def recording_cholesky(input_matrix: torch.Tensor) -> torch.Tensor:
+        calls.append(tuple(input_matrix.shape))
+
+        return original_cholesky(input_matrix)
+
+    monkeypatch.setattr(runtime_module.torch.linalg, "cholesky", recording_cholesky)
+    operator = ops.inverse_metric(
+        "inverse",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+        damping=0.0,
+    )
+    candidate = vpx.standard_axis_registry().admit(
+        vpx.Candidate(
+            "inverse",
+            f"cholesky-{multi_rhs}",
+            {
+                **inverse_metric_settings("cholesky_solve"),
+                "inverse_metric.multi_rhs": multi_rhs,
+                "vectorization.mode": "single_loop",
+                "vectorization.in_dims": {"w": 0},
+            },
+        )
+    )
+    assert candidate.admission_status == "passed"
+    factory = vpx.standard_operation_factory(operator, params=params, buffers={})
+    output = factory(candidate, {"metric_matrix": matrix}, vector)()
+    expected = torch.linalg.solve(matrix, vector["w"].T).T
+
+    torch.testing.assert_close(tree_leaves(output)[0], expected)
+    assert calls == [(2, 2)] * expected_cholesky_calls
 
 
 def test_inverse_metric_reuse_factor_across_rhs_solves_vectorized_rhs_once(
@@ -5786,7 +6314,7 @@ def test_inverse_metric_reuse_factor_across_rhs_solves_vectorized_rhs_once(
     }
     calls = []
     original_cholesky = runtime_module.torch.linalg.cholesky
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "dense",
         aggregation="sum",
@@ -5806,12 +6334,13 @@ def test_inverse_metric_reuse_factor_across_rhs_solves_vectorized_rhs_once(
         buffers={},
     )
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "cholesky-reuse-vectorized",
             {
                 **inverse_metric_settings("cholesky_solve"),
                 "inverse_metric.factor_reuse": "reuse_factor_across_rhs",
+                "inverse_metric.multi_rhs": "block",
                 "vectorization.mode": "single_loop",
                 "vectorization.in_dims": {"w": 0},
             },
@@ -5835,7 +6364,7 @@ def test_diagonal_inverse_metric_reuse_factor_across_rhs() -> None:
             dtype=torch.float64,
         )
     }
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "diagonal",
         aggregation="sum",
@@ -5844,12 +6373,13 @@ def test_diagonal_inverse_metric_reuse_factor_across_rhs() -> None:
     )
     factory = vpx.standard_operation_factory(operator, params=params, buffers={})
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "diagonal-reuse",
             {
                 **inverse_metric_settings("factorized_solve"),
                 "inverse_metric.factor_reuse": "reuse_factor_across_rhs",
+                "inverse_metric.multi_rhs": "block",
                 "vectorization.mode": "single_loop",
                 "vectorization.in_dims": {"w": 0},
             },
@@ -5881,7 +6411,7 @@ def test_block_inverse_metric_reuse_factor_across_rhs() -> None:
             dtype=torch.float64,
         ),
     }
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "blocks",
         aggregation="sum",
@@ -5890,12 +6420,13 @@ def test_block_inverse_metric_reuse_factor_across_rhs() -> None:
     )
     factory = vpx.standard_operation_factory(operator, params=params, buffers={})
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "block-reuse",
             {
                 **inverse_metric_settings("blockwise_solve"),
                 "inverse_metric.factor_reuse": "reuse_factor_across_rhs",
+                "inverse_metric.multi_rhs": "block",
                 "vectorization.mode": "single_loop",
                 "vectorization.in_dims": {"a": 0, "b": 0},
             },
@@ -5927,7 +6458,7 @@ def test_low_rank_inverse_metric_reuse_factor_across_rhs(path: str) -> None:
             dtype=torch.float64,
         )
     }
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "low_rank",
         aggregation="sum",
@@ -5936,12 +6467,13 @@ def test_low_rank_inverse_metric_reuse_factor_across_rhs(path: str) -> None:
     )
     factory = vpx.standard_operation_factory(operator, params=params, buffers={})
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "low-rank-reuse",
             {
                 **inverse_metric_settings(path),
                 "inverse_metric.factor_reuse": "reuse_factor_across_rhs",
+                "inverse_metric.multi_rhs": "block",
                 "vectorization.mode": "single_loop",
                 "vectorization.in_dims": {"w": 0},
             },
@@ -5974,7 +6506,7 @@ def test_kfac_inverse_metric_reuse_factor_across_rhs() -> None:
             dtype=torch.float64,
         )
     }
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "kfac",
         aggregation="sum",
@@ -5983,12 +6515,13 @@ def test_kfac_inverse_metric_reuse_factor_across_rhs() -> None:
     )
     factory = vpx.standard_operation_factory(operator, params=params, buffers={})
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "kfac-reuse",
             {
                 **inverse_metric_settings("factorized_solve"),
                 "inverse_metric.factor_reuse": "reuse_factor_across_rhs",
+                "inverse_metric.multi_rhs": "block",
                 "vectorization.mode": "single_loop",
                 "vectorization.in_dims": {"w": 0},
             },
@@ -6006,7 +6539,7 @@ def test_kfac_inverse_metric_reuse_factor_across_rhs() -> None:
     torch.testing.assert_close(tree_leaves(output)[0], expected)
 
 
-def test_ggn_inverse_metric_reuse_factor_across_rhs() -> None:
+def test_ggn_inverse_metric_reuse_factor_across_rhs_matches_reference() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = GGNMetricData.factors()
     vector = {
@@ -6015,7 +6548,7 @@ def test_ggn_inverse_metric_reuse_factor_across_rhs() -> None:
             dtype=torch.float64,
         )
     }
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "ggn",
         aggregation="sum",
@@ -6023,24 +6556,26 @@ def test_ggn_inverse_metric_reuse_factor_across_rhs() -> None:
         damping=0.25,
     )
     factory = vpx.standard_operation_factory(operator, params=params, buffers={})
-    output = factory(
-        vp.Candidate(
-            "inverse",
-            "ggn-reuse",
-            {
-                **inverse_metric_settings("factorized_solve"),
-                "inverse_metric.factor_reuse": "reuse_factor_across_rhs",
-                "vectorization.mode": "single_loop",
-                "vectorization.in_dims": {"w": 0},
-            },
-            admission_status="passed",
-        ),
-        {"ggn_factors": factors},
-        vector,
-    )()
-    matrix = factors["jacobian"].T @ factors["loss_hessian"] @ factors["jacobian"]
+    candidate = vpx.Candidate(
+        "inverse",
+        "ggn-reuse",
+        {
+            **inverse_metric_settings("factorized_solve"),
+            "inverse_metric.factor_reuse": "reuse_factor_across_rhs",
+            "inverse_metric.multi_rhs": "block",
+            "vectorization.mode": "single_loop",
+            "vectorization.in_dims": {"w": 0},
+        },
+        admission_status="passed",
+    )
+
+    output = factory(candidate, {"ggn_factors": factors}, vector)()
+
+    jacobian = factors["jacobian"]
+    loss_hessian = factors["loss_hessian"]
+    dense_matrix = jacobian.T @ loss_hessian @ jacobian
     expected = torch.linalg.solve(
-        matrix + 0.25 * torch.eye(2, dtype=torch.float64),
+        dense_matrix + 0.25 * torch.eye(2, dtype=torch.float64),
         vector["w"].T,
     ).T
 
@@ -6056,7 +6591,7 @@ def test_cg_inverse_metric_reuse_factor_across_rhs() -> None:
             dtype=torch.float64,
         )
     }
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "dense",
         aggregation="sum",
@@ -6065,7 +6600,7 @@ def test_cg_inverse_metric_reuse_factor_across_rhs() -> None:
     )
     factory = vpx.standard_operation_factory(operator, params=params, buffers={})
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "cg-reuse",
             {
@@ -6073,6 +6608,7 @@ def test_cg_inverse_metric_reuse_factor_across_rhs() -> None:
                 "inverse_metric.iteration_budget": 2,
                 "inverse_metric.preconditioner": "none",
                 "inverse_metric.factor_reuse": "reuse_factor_across_rhs",
+                "inverse_metric.multi_rhs": "block",
                 "metric.multiply_path": "dense_matmul",
                 "vectorization.mode": "single_loop",
                 "vectorization.in_dims": {"w": 0},
@@ -6091,7 +6627,7 @@ def test_diagonal_metric_paths_match_dense_reference() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     diagonal = {"w": torch.tensor([4.0, 5.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "diagonal",
         aggregation="sum",
@@ -6117,7 +6653,7 @@ def test_diagonal_metric_paths_match_dense_reference() -> None:
     batch = {"metric_diagonal": diagonal}
 
     for path in ("factorized_multiply", "streaming_multiply"):
-        candidate = vp.Candidate(
+        candidate = vpx.Candidate(
             "metric",
             path,
             metric_settings(path),
@@ -6131,6 +6667,1364 @@ def test_diagonal_metric_paths_match_dense_reference() -> None:
         assert reference_result.measurements["psd_violation"] == pytest.approx(0.0)
 
 
+def test_metric_inner_dense_paths_match_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    left = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
+    right = {"w": torch.tensor([3.0, -1.0], dtype=torch.float64)}
+    operator = ops.metric_inner(
+        "metric_inner",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    expected = left["w"] @ (matrix @ right["w"])
+
+    multiply_result = factory(
+        vpx.Candidate(
+            "metric_inner",
+            "multiply",
+            {
+                "metric_inner.reduction_path": "multiply_then_reduce",
+                "metric_inner.multi_rhs": "single_column",
+                **metric_settings("dense_matmul"),
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )()
+    sqrt_result = factory(
+        vpx.Candidate(
+            "metric_inner",
+            "sqrt",
+            {
+                "metric_inner.reduction_path": "sqrt_apply_reduce",
+                "metric_inner.multi_rhs": "single_column",
+                "sqrt_metric.factor_path": "cholesky_factor",
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )()
+
+    torch.testing.assert_close(multiply_result, expected)
+    torch.testing.assert_close(sqrt_result, expected)
+
+
+def test_sqrt_metric_cholesky_paths_match_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    damping = 0.5
+    vector = {"w": torch.tensor([3.0, -1.0], dtype=torch.float64)}
+    sqrt_factory = vpx.standard_operation_factory(
+        ops.sqrt_metric(
+            "sqrt_metric",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    inverse_sqrt_factory = vpx.standard_operation_factory(
+        ops.inverse_sqrt_metric(
+            "inverse_sqrt_metric",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+    )
+    sqrt_result = sqrt_factory(
+        vpx.Candidate(
+            "sqrt_metric",
+            "cholesky",
+            {"sqrt_metric.factor_path": "cholesky_factor"},
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        vector,
+    )()
+    inverse_sqrt_result = inverse_sqrt_factory(
+        vpx.Candidate(
+            "inverse_sqrt_metric",
+            "cholesky",
+            {"sqrt_metric.factor_path": "cholesky_factor"},
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        vector,
+    )()
+    expected_sqrt = torch.linalg.cholesky(matrix) @ vector["w"]
+    inverse_matrix = torch.linalg.inv(
+        matrix + damping * torch.eye(2, dtype=torch.float64)
+    )
+    expected_inverse_sqrt = torch.linalg.cholesky(inverse_matrix) @ vector["w"]
+
+    torch.testing.assert_close(tensor_mapping(sqrt_result)["w"], expected_sqrt)
+    torch.testing.assert_close(
+        tensor_mapping(inverse_sqrt_result)["w"],
+        expected_inverse_sqrt,
+    )
+
+
+def test_sqrt_metric_eigenbasis_paths_match_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[5.0, 2.0], [2.0, 4.0]], dtype=torch.float64)
+    damping = 0.25
+    vector = {"w": torch.tensor([0.5, -1.5], dtype=torch.float64)}
+    sqrt_factory = vpx.standard_operation_factory(
+        ops.sqrt_metric(
+            "sqrt_metric",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    inverse_sqrt_factory = vpx.standard_operation_factory(
+        ops.inverse_sqrt_metric(
+            "inverse_sqrt_metric",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+    )
+    settings = {"sqrt_metric.factor_path": "eigenbasis_factor"}
+    sqrt_result = sqrt_factory(
+        vpx.Candidate(
+            "sqrt_metric",
+            "eigenbasis",
+            settings,
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        vector,
+    )()
+    inverse_sqrt_result = inverse_sqrt_factory(
+        vpx.Candidate(
+            "inverse_sqrt_metric",
+            "eigenbasis",
+            settings,
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        vector,
+    )()
+    eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+    expected_sqrt = eigenvectors @ torch.diag(torch.sqrt(eigenvalues)) @ vector["w"]
+    inverse_matrix = torch.linalg.inv(
+        matrix + damping * torch.eye(2, dtype=torch.float64)
+    )
+    inverse_eigenvalues, inverse_eigenvectors = torch.linalg.eigh(inverse_matrix)
+    expected_inverse_sqrt = (
+        inverse_eigenvectors @ torch.diag(torch.sqrt(inverse_eigenvalues)) @ vector["w"]
+    )
+
+    torch.testing.assert_close(tensor_mapping(sqrt_result)["w"], expected_sqrt)
+    torch.testing.assert_close(
+        tensor_mapping(inverse_sqrt_result)["w"],
+        expected_inverse_sqrt,
+    )
+
+
+def test_sqrt_metric_closed_form_diagonal_paths_match_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    diagonal = {"w": torch.tensor([4.0, 9.0], dtype=torch.float64)}
+    damping = 0.75
+    vector = {"w": torch.tensor([0.5, -1.5], dtype=torch.float64)}
+    settings = {"sqrt_metric.factor_path": "closed_form_factor_square_root"}
+    sqrt_factory = vpx.standard_operation_factory(
+        ops.sqrt_metric(
+            "sqrt_metric",
+            "diagonal",
+            aggregation="sum",
+            representation=diagonal_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    inverse_sqrt_factory = vpx.standard_operation_factory(
+        ops.inverse_sqrt_metric(
+            "inverse_sqrt_metric",
+            "diagonal",
+            aggregation="sum",
+            representation=diagonal_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+    )
+    sqrt_result = sqrt_factory(
+        vpx.Candidate(
+            "sqrt_metric",
+            "closed-form",
+            settings,
+            admission_status="passed",
+        ),
+        {"metric_diagonal": diagonal},
+        vector,
+    )()
+    inverse_sqrt_result = inverse_sqrt_factory(
+        vpx.Candidate(
+            "inverse_sqrt_metric",
+            "closed-form",
+            settings,
+            admission_status="passed",
+        ),
+        {"metric_diagonal": diagonal},
+        vector,
+    )()
+
+    torch.testing.assert_close(
+        tensor_mapping(sqrt_result)["w"],
+        torch.sqrt(diagonal["w"]) * vector["w"],
+    )
+    torch.testing.assert_close(
+        tensor_mapping(inverse_sqrt_result)["w"],
+        torch.rsqrt(diagonal["w"] + damping) * vector["w"],
+    )
+
+
+def test_sqrt_metric_closed_form_low_rank_paths_match_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    factors = LowRankMetricData.factors()
+    damping = 0.75
+    latent = torch.tensor([0.5, -1.25, 2.0], dtype=torch.float64)
+    vector = {"w": torch.tensor([0.5, -1.5], dtype=torch.float64)}
+    settings = {"sqrt_metric.factor_path": "closed_form_factor_square_root"}
+    sqrt_factory = vpx.standard_operation_factory(
+        ops.sqrt_metric(
+            "sqrt_metric",
+            "low_rank",
+            aggregation="sum",
+            representation=low_rank_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    inverse_sqrt_factory = vpx.standard_operation_factory(
+        ops.inverse_sqrt_metric(
+            "inverse_sqrt_metric",
+            "low_rank",
+            aggregation="sum",
+            representation=low_rank_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+    )
+    sqrt_result = sqrt_factory(
+        vpx.Candidate(
+            "sqrt_metric",
+            "closed-form",
+            settings,
+            admission_status="passed",
+        ),
+        {"low_rank_factors": factors},
+        latent,
+    )()
+    inverse_sqrt_result = inverse_sqrt_factory(
+        vpx.Candidate(
+            "inverse_sqrt_metric",
+            "closed-form",
+            settings,
+            admission_status="passed",
+        ),
+        {"low_rank_factors": factors},
+        vector,
+    )()
+    basis = factors["basis"]
+    diagonal = factors["diagonal"]
+    rank = basis.shape[1]
+    expected_sqrt = basis @ latent[:rank] + torch.sqrt(diagonal) * latent[rank:]
+    base_diagonal = diagonal + damping
+    scaled_basis = basis / torch.sqrt(base_diagonal).unsqueeze(1)
+    core = symmetric_square_root(
+        torch.linalg.inv(
+            torch.eye(2, dtype=torch.float64) + scaled_basis @ scaled_basis.T
+        )
+    )
+    expected_inverse_sqrt = (core @ vector["w"]) / torch.sqrt(base_diagonal)
+
+    torch.testing.assert_close(tensor_mapping(sqrt_result)["w"], expected_sqrt)
+    torch.testing.assert_close(
+        tensor_mapping(inverse_sqrt_result)["w"],
+        expected_inverse_sqrt,
+    )
+
+
+def test_metric_inner_low_rank_sqrt_reduce_paths_match_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    factors = LowRankMetricData.factors()
+    damping = 0.25
+    left = {"w": torch.tensor([1.5, -0.5], dtype=torch.float64)}
+    right = {"w": torch.tensor([0.25, 2.0], dtype=torch.float64)}
+    settings = {
+        "sqrt_metric.factor_path": "closed_form_factor_square_root",
+    }
+    metric_factory = vpx.standard_operation_factory(
+        ops.metric_inner(
+            "metric_inner",
+            "low_rank",
+            aggregation="sum",
+            representation=low_rank_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    inverse_factory = vpx.standard_operation_factory(
+        ops.inverse_metric_inner(
+            "inverse_metric_inner",
+            "low_rank",
+            aggregation="sum",
+            representation=low_rank_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+    )
+    metric_result = metric_factory(
+        vpx.Candidate(
+            "metric_inner",
+            "sqrt-reduce",
+            {
+                "metric_inner.reduction_path": "sqrt_apply_reduce",
+                "metric_inner.multi_rhs": "single_column",
+                **settings,
+            },
+            admission_status="passed",
+        ),
+        {"low_rank_factors": factors},
+        (left, right),
+    )()
+    inverse_result = inverse_factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            "sqrt-reduce",
+            {
+                "inverse_metric_inner.reduction_path": "sqrt_apply_reduce",
+                "inverse_metric_inner.multi_rhs": "single_column",
+                **settings,
+            },
+            admission_status="passed",
+        ),
+        {"low_rank_factors": factors},
+        (left, right),
+    )()
+    matrix = factors["basis"] @ factors["basis"].T + torch.diag(factors["diagonal"])
+    damped = matrix + damping * torch.eye(2, dtype=torch.float64)
+
+    torch.testing.assert_close(metric_result, left["w"] @ (matrix @ right["w"]))
+    torch.testing.assert_close(
+        inverse_result,
+        left["w"] @ torch.linalg.solve(damped, right["w"]),
+    )
+
+
+def test_sqrt_metric_closed_form_ggn_paths_match_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    factors = GGNMetricData.factors()
+    damping = 0.75
+    latent = torch.tensor([0.5, -1.25], dtype=torch.float64)
+    vector = {"w": torch.tensor([0.5, -1.5], dtype=torch.float64)}
+    settings = {"sqrt_metric.factor_path": "closed_form_factor_square_root"}
+    sqrt_factory = vpx.standard_operation_factory(
+        ops.sqrt_metric(
+            "sqrt_metric",
+            "ggn",
+            aggregation="sum",
+            representation=ggn_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    inverse_sqrt_factory = vpx.standard_operation_factory(
+        ops.inverse_sqrt_metric(
+            "inverse_sqrt_metric",
+            "ggn",
+            aggregation="sum",
+            representation=ggn_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+    )
+    sqrt_result = sqrt_factory(
+        vpx.Candidate(
+            "sqrt_metric",
+            "closed-form",
+            settings,
+            admission_status="passed",
+        ),
+        {"ggn_factors": factors},
+        latent,
+    )()
+    inverse_sqrt_result = inverse_sqrt_factory(
+        vpx.Candidate(
+            "inverse_sqrt_metric",
+            "closed-form",
+            settings,
+            admission_status="passed",
+        ),
+        {"ggn_factors": factors},
+        vector,
+    )()
+    jacobian = factors["jacobian"]
+    loss_root = symmetric_square_root(factors["loss_hessian"])
+    expected_sqrt = jacobian.T @ (loss_root @ latent)
+    factor_basis = (loss_root @ jacobian).T
+    scaled_basis = factor_basis / torch.sqrt(torch.tensor(damping, dtype=torch.float64))
+    core = symmetric_square_root(
+        torch.linalg.inv(
+            torch.eye(2, dtype=torch.float64) + scaled_basis @ scaled_basis.T
+        )
+    )
+    expected_inverse_sqrt = (
+        core @ vector["w"] / torch.sqrt(torch.tensor(damping, dtype=torch.float64))
+    )
+
+    torch.testing.assert_close(tensor_mapping(sqrt_result)["w"], expected_sqrt)
+    torch.testing.assert_close(
+        tensor_mapping(inverse_sqrt_result)["w"],
+        expected_inverse_sqrt,
+    )
+
+
+def test_metric_inner_ggn_sqrt_reduce_paths_match_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    factors = GGNMetricData.factors()
+    damping = 0.25
+    left = {"w": torch.tensor([1.5, -0.5], dtype=torch.float64)}
+    right = {"w": torch.tensor([0.25, 2.0], dtype=torch.float64)}
+    settings = {
+        "sqrt_metric.factor_path": "closed_form_factor_square_root",
+    }
+    metric_factory = vpx.standard_operation_factory(
+        ops.metric_inner(
+            "metric_inner",
+            "ggn",
+            aggregation="sum",
+            representation=ggn_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    inverse_factory = vpx.standard_operation_factory(
+        ops.inverse_metric_inner(
+            "inverse_metric_inner",
+            "ggn",
+            aggregation="sum",
+            representation=ggn_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+    )
+    metric_result = metric_factory(
+        vpx.Candidate(
+            "metric_inner",
+            "sqrt-reduce",
+            {
+                "metric_inner.reduction_path": "sqrt_apply_reduce",
+                "metric_inner.multi_rhs": "single_column",
+                **settings,
+            },
+            admission_status="passed",
+        ),
+        {"ggn_factors": factors},
+        (left, right),
+    )()
+    inverse_result = inverse_factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            "sqrt-reduce",
+            {
+                "inverse_metric_inner.reduction_path": "sqrt_apply_reduce",
+                "inverse_metric_inner.multi_rhs": "single_column",
+                **settings,
+            },
+            admission_status="passed",
+        ),
+        {"ggn_factors": factors},
+        (left, right),
+    )()
+    matrix = factors["jacobian"].T @ factors["loss_hessian"] @ factors["jacobian"]
+    damped = matrix + damping * torch.eye(2, dtype=torch.float64)
+
+    torch.testing.assert_close(metric_result, left["w"] @ (matrix @ right["w"]))
+    torch.testing.assert_close(
+        inverse_result,
+        left["w"] @ torch.linalg.solve(damped, right["w"]),
+    )
+
+
+def test_sqrt_metric_matrix_free_lanczos_rejects_dense_backing() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    vector = {"w": torch.tensor([0.5, -1.5], dtype=torch.float64)}
+    settings = {
+        "sqrt_metric.factor_path": "matrix_free_lanczos",
+        "sqrt_metric.lanczos_iterations": 8,
+    }
+    factory = vpx.standard_operation_factory(
+        ops.sqrt_metric(
+            "sqrt_metric",
+            "diagonal",
+            aggregation="sum",
+            representation=diagonal_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+
+    with pytest.raises(
+        vp.MaterializationError,
+        match="metric representation kind is not supported by path",
+    ):
+        factory(
+            vpx.Candidate(
+                "sqrt_metric",
+                "matrix-free-lanczos",
+                settings,
+                admission_status="passed",
+            ),
+            {"metric_diagonal": {"w": torch.tensor([4.0, 9.0], dtype=torch.float64)}},
+            vector,
+        )
+
+
+def test_metric_inner_eigenbasis_sqrt_reduce_paths_match_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[5.0, 2.0], [2.0, 4.0]], dtype=torch.float64)
+    damping = 0.25
+    left = {"w": torch.tensor([1.5, -0.5], dtype=torch.float64)}
+    right = {"w": torch.tensor([0.25, 2.0], dtype=torch.float64)}
+    settings = {"sqrt_metric.factor_path": "eigenbasis_factor"}
+    metric_factory = vpx.standard_operation_factory(
+        ops.metric_inner(
+            "metric_inner",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    inverse_factory = vpx.standard_operation_factory(
+        ops.inverse_metric_inner(
+            "inverse_metric_inner",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+    )
+    metric_result = metric_factory(
+        vpx.Candidate(
+            "metric_inner",
+            "eigenbasis-sqrt-reduce",
+            {
+                "metric_inner.reduction_path": "sqrt_apply_reduce",
+                "metric_inner.multi_rhs": "single_column",
+                **settings,
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )()
+    inverse_result = inverse_factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            "eigenbasis-sqrt-reduce",
+            {
+                "inverse_metric_inner.reduction_path": "sqrt_apply_reduce",
+                "inverse_metric_inner.multi_rhs": "single_column",
+                **settings,
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )()
+    inverse_matrix = matrix + damping * torch.eye(2, dtype=torch.float64)
+
+    torch.testing.assert_close(metric_result, left["w"] @ (matrix @ right["w"]))
+    torch.testing.assert_close(
+        inverse_result,
+        left["w"] @ torch.linalg.solve(inverse_matrix, right["w"]),
+    )
+
+
+def test_metric_inner_diagonal_factored_gram_paths_match_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    diagonal = {"w": torch.tensor([4.0, 9.0], dtype=torch.float64)}
+    damping = 0.75
+    left = {"w": torch.tensor([1.5, -0.5], dtype=torch.float64)}
+    right = {"w": torch.tensor([0.25, 2.0], dtype=torch.float64)}
+    metric_factory = vpx.standard_operation_factory(
+        ops.metric_inner(
+            "metric_inner",
+            "diagonal",
+            aggregation="sum",
+            representation=diagonal_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    inverse_factory = vpx.standard_operation_factory(
+        ops.inverse_metric_inner(
+            "inverse_metric_inner",
+            "diagonal",
+            aggregation="sum",
+            representation=diagonal_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+    )
+    metric_result = metric_factory(
+        vpx.Candidate(
+            "metric_inner",
+            "factored-gram",
+            {
+                "metric_inner.reduction_path": "factored_gram",
+                "metric_inner.multi_rhs": "single_column",
+            },
+            admission_status="passed",
+        ),
+        {"metric_diagonal": diagonal},
+        (left, right),
+    )()
+    inverse_result = inverse_factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            "factored-gram",
+            {
+                "inverse_metric_inner.reduction_path": "factored_gram",
+                "inverse_metric_inner.multi_rhs": "single_column",
+            },
+            admission_status="passed",
+        ),
+        {"metric_diagonal": diagonal},
+        (left, right),
+    )()
+
+    torch.testing.assert_close(metric_result, left["w"] @ (diagonal["w"] * right["w"]))
+    torch.testing.assert_close(
+        inverse_result,
+        left["w"] @ (right["w"] / (diagonal["w"] + damping)),
+    )
+
+
+def test_metric_inner_low_rank_factored_gram_matches_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    factors = LowRankMetricData.factors()
+    left = {"w": torch.tensor([1.5, -0.5], dtype=torch.float64)}
+    right = {"w": torch.tensor([0.25, 2.0], dtype=torch.float64)}
+    operator = ops.metric_inner(
+        "metric_inner",
+        "low_rank",
+        aggregation="sum",
+        representation=low_rank_metric_representation(),
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "metric_inner",
+            "factored-gram",
+            {
+                "metric_inner.reduction_path": "factored_gram",
+                "metric_inner.multi_rhs": "single_column",
+            },
+            admission_status="passed",
+        ),
+        {"low_rank_factors": factors},
+        (left, right),
+    )()
+    matrix = factors["basis"] @ factors["basis"].T + torch.diag(factors["diagonal"])
+
+    torch.testing.assert_close(result, left["w"] @ (matrix @ right["w"]))
+
+
+def test_inverse_metric_inner_low_rank_factored_gram_matches_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    damping = 0.25
+    factors = LowRankMetricData.factors()
+    left = {"w": torch.tensor([1.5, -0.5], dtype=torch.float64)}
+    right = {"w": torch.tensor([0.25, 2.0], dtype=torch.float64)}
+    operator = ops.inverse_metric_inner(
+        "inverse_metric_inner",
+        "low_rank",
+        aggregation="sum",
+        representation=low_rank_metric_representation(),
+        damping=damping,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            "factored-gram",
+            {
+                "inverse_metric_inner.reduction_path": "factored_gram",
+                "inverse_metric_inner.multi_rhs": "single_column",
+            },
+            admission_status="passed",
+        ),
+        {"low_rank_factors": factors},
+        (left, right),
+    )()
+    matrix = factors["basis"] @ factors["basis"].T + torch.diag(factors["diagonal"])
+    damped = matrix + damping * torch.eye(2, dtype=torch.float64)
+
+    torch.testing.assert_close(
+        result,
+        left["w"] @ torch.linalg.solve(damped, right["w"]),
+    )
+
+
+def test_metric_inner_kfac_factored_gram_matches_reference() -> None:
+    params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
+    factors = KFACMetricData.factors()
+    left = {"w": torch.tensor([[1.5, -0.5], [0.75, 0.25]], dtype=torch.float64)}
+    right = {"w": torch.tensor([[0.25, 2.0], [-1.0, 0.5]], dtype=torch.float64)}
+    operator = ops.metric_inner(
+        "metric_inner",
+        "kfac",
+        aggregation="sum",
+        representation=kfac_metric_representation(),
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "metric_inner",
+            "factored-gram",
+            {
+                "metric_inner.reduction_path": "factored_gram",
+                "metric_inner.multi_rhs": "single_column",
+            },
+            admission_status="passed",
+        ),
+        {"kfac_factors": factors},
+        (left, right),
+    )()
+    matrix = torch.kron(factors["w_left"], factors["w_right"])
+
+    torch.testing.assert_close(
+        result,
+        flatten_tree(left) @ (matrix @ flatten_tree(right)),
+    )
+
+
+def test_inverse_metric_inner_kfac_factored_gram_matches_reference() -> None:
+    params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
+    damping = 0.25
+    factors = KFACMetricData.factors()
+    left = {"w": torch.tensor([[1.5, -0.5], [0.75, 0.25]], dtype=torch.float64)}
+    right = {"w": torch.tensor([[0.25, 2.0], [-1.0, 0.5]], dtype=torch.float64)}
+    operator = ops.inverse_metric_inner(
+        "inverse_metric_inner",
+        "kfac",
+        aggregation="sum",
+        representation=kfac_metric_representation(),
+        damping=damping,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            "factored-gram",
+            {
+                "inverse_metric_inner.reduction_path": "factored_gram",
+                "inverse_metric_inner.multi_rhs": "single_column",
+            },
+            admission_status="passed",
+        ),
+        {"kfac_factors": factors},
+        (left, right),
+    )()
+    matrix = torch.kron(factors["w_left"], factors["w_right"])
+    damped = matrix + damping * torch.eye(4, dtype=torch.float64)
+
+    torch.testing.assert_close(
+        result,
+        flatten_tree(left) @ torch.linalg.solve(damped, flatten_tree(right)),
+    )
+
+
+def test_metric_inner_ggn_factored_gram_matches_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    factors = GGNMetricData.factors()
+    left = {"w": torch.tensor([1.5, -0.5], dtype=torch.float64)}
+    right = {"w": torch.tensor([0.25, 2.0], dtype=torch.float64)}
+    operator = ops.metric_inner(
+        "metric_inner",
+        "ggn",
+        aggregation="sum",
+        representation=ggn_metric_representation(),
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "metric_inner",
+            "factored-gram",
+            {
+                "metric_inner.reduction_path": "factored_gram",
+                "metric_inner.multi_rhs": "single_column",
+            },
+            admission_status="passed",
+        ),
+        {"ggn_factors": factors},
+        (left, right),
+    )()
+    matrix = factors["jacobian"].T @ factors["loss_hessian"] @ factors["jacobian"]
+
+    torch.testing.assert_close(result, left["w"] @ (matrix @ right["w"]))
+
+
+def test_inverse_metric_inner_ggn_factored_gram_matches_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    factors = GGNMetricData.factors()
+    left = {"w": torch.tensor([1.5, -0.5], dtype=torch.float64)}
+    right = {"w": torch.tensor([0.25, 2.0], dtype=torch.float64)}
+    damping = 0.25
+    operator = ops.inverse_metric_inner(
+        "inverse_metric_inner",
+        "ggn",
+        aggregation="sum",
+        representation=ggn_metric_representation(),
+        damping=damping,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            "factored-gram",
+            {
+                "inverse_metric_inner.reduction_path": "factored_gram",
+                "inverse_metric_inner.multi_rhs": "single_column",
+            },
+            admission_status="passed",
+        ),
+        {"ggn_factors": factors},
+        (left, right),
+    )()
+    matrix = factors["jacobian"].T @ factors["loss_hessian"] @ factors["jacobian"]
+    expected = left["w"] @ torch.linalg.solve(
+        matrix + damping * torch.eye(2, dtype=torch.float64),
+        right["w"],
+    )
+
+    torch.testing.assert_close(result, expected)
+
+
+def test_metric_inner_requires_declared_multi_rhs_mode() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    left = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
+    right = {"w": torch.tensor([3.0, -1.0], dtype=torch.float64)}
+    factory = vpx.standard_operation_factory(
+        ops.metric_inner(
+            "metric_inner",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+
+    with pytest.raises(vp.MaterializationError, match=r"metric_inner\.multi_rhs"):
+        factory(
+            vpx.Candidate(
+                "metric_inner",
+                "missing-multi-rhs",
+                {
+                    "metric_inner.reduction_path": "multiply_then_reduce",
+                    "metric.multiply_path": "dense_matmul",
+                },
+                admission_status="passed",
+            ),
+            {"metric_matrix": matrix},
+            (left, right),
+        )()
+
+
+def test_metric_inner_block_rhs_matches_single_column_gram() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    left = {"w": torch.tensor([[1.0, 2.0], [0.5, -1.0]], dtype=torch.float64)}
+    right = {"w": torch.tensor([[3.0, -1.0], [2.0, 1.0]], dtype=torch.float64)}
+    operator = ops.metric_inner(
+        "metric_inner",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "metric_inner",
+            "block",
+            {
+                "metric_inner.reduction_path": "multiply_then_reduce",
+                "metric.multiply_path": "dense_matmul",
+                "metric_inner.multi_rhs": "block",
+                "vectorization.mode": "single_loop",
+                "vectorization.in_dims": {"w": 0},
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )()
+    expected = left["w"] @ (right["w"] @ matrix.T).T
+
+    torch.testing.assert_close(result, expected)
+
+
+def test_metric_inner_manual_batch_block_rhs_matches_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    left = {"w": torch.tensor([[1.0, 2.0], [0.5, -1.0]], dtype=torch.float64)}
+    right = {
+        "w": torch.tensor(
+            [[3.0, 2.0, -0.5], [-1.0, 1.0, 0.75]],
+            dtype=torch.float64,
+        )
+    }
+    operator = ops.metric_inner(
+        "metric_inner",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "metric_inner",
+            "block-manual-batch",
+            {
+                "metric_inner.reduction_path": "multiply_then_reduce",
+                "metric.multiply_path": "dense_matmul",
+                "metric_inner.multi_rhs": "block",
+                "vectorization.mode": "manual_batch",
+                "vectorization.batch_size": 2,
+                "vectorization.in_dims": ({"w": 0}, {"w": 1}),
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )()
+    expected = left["w"] @ (matrix @ right["w"])
+
+    torch.testing.assert_close(result, expected)
+
+
+def test_metric_inner_vmap_block_rhs_matches_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    left = {"w": torch.tensor([[1.0, 2.0], [0.5, -1.0]], dtype=torch.float64)}
+    right = {
+        "w": torch.tensor(
+            [[3.0, 2.0, -0.5], [-1.0, 1.0, 0.75]],
+            dtype=torch.float64,
+        )
+    }
+    operator = ops.metric_inner(
+        "metric_inner",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "metric_inner",
+            "block-vmap",
+            {
+                "metric_inner.reduction_path": "multiply_then_reduce",
+                "metric.multiply_path": "dense_matmul",
+                "metric_inner.multi_rhs": "block",
+                "vectorization.mode": "vmap",
+                "vectorization.vmap_chunk_size": 2,
+                "vectorization.in_dims": ({"w": 0}, {"w": 1}),
+                **torch_func_settings(requires_forward_ad=False),
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )()
+    expected = left["w"] @ (matrix @ right["w"])
+
+    torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.parametrize(
+    ("settings", "candidate_id"),
+    [
+        (
+            {"metric_inner.reduction_path": "factored_gram"},
+            "block-vmap-factored-gram",
+        ),
+        (
+            {
+                "metric_inner.reduction_path": "sqrt_apply_reduce",
+                "sqrt_metric.factor_path": "closed_form_factor_square_root",
+            },
+            "block-vmap-sqrt-apply-reduce",
+        ),
+    ],
+)
+def test_metric_inner_vmap_block_factor_paths_match_reference(
+    settings: Mapping[str, object],
+    candidate_id: str,
+) -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    diagonal = {"w": torch.tensor([2.0, 5.0], dtype=torch.float64)}
+    left = {"w": torch.tensor([[1.0, 2.0], [0.5, -1.0]], dtype=torch.float64)}
+    right = {
+        "w": torch.tensor(
+            [[3.0, 2.0, -0.5], [-1.0, 1.0, 0.75]],
+            dtype=torch.float64,
+        )
+    }
+    operator = ops.metric_inner(
+        "metric_inner",
+        "diagonal",
+        aggregation="sum",
+        representation=diagonal_metric_representation(),
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "metric_inner",
+            candidate_id,
+            {
+                **settings,
+                "metric_inner.multi_rhs": "block",
+                "vectorization.mode": "vmap",
+                "vectorization.vmap_chunk_size": 2,
+                "vectorization.in_dims": ({"w": 0}, {"w": 1}),
+                **torch_func_settings(requires_forward_ad=False),
+            },
+            admission_status="passed",
+        ),
+        {"metric_diagonal": diagonal},
+        (left, right),
+    )()
+    expected = left["w"] @ (diagonal["w"].reshape(-1, 1) * right["w"])
+
+    torch.testing.assert_close(result, expected)
+
+
+def test_inverse_metric_inner_manual_batch_block_rhs_matches_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    damping = 0.5
+    left = {"w": torch.tensor([[1.0, 2.0], [0.5, -1.0]], dtype=torch.float64)}
+    right = {
+        "w": torch.tensor(
+            [[3.0, 2.0, -0.5], [-1.0, 1.0, 0.75]],
+            dtype=torch.float64,
+        )
+    }
+    operator = ops.inverse_metric_inner(
+        "inverse_metric_inner",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+        damping=damping,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            "block-manual-batch",
+            {
+                "inverse_metric_inner.reduction_path": "solve_then_reduce",
+                "inverse_metric_inner.multi_rhs": "block",
+                "inverse_metric.solve_path": "dense_solve",
+                "vectorization.mode": "manual_batch",
+                "vectorization.batch_size": 2,
+                "vectorization.in_dims": ({"w": 0}, {"w": 1}),
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )()
+    damped = matrix + damping * torch.eye(2, dtype=torch.float64)
+    expected = left["w"] @ torch.linalg.solve(damped, right["w"])
+
+    torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.parametrize(
+    ("settings", "candidate_id"),
+    [
+        (
+            {
+                "inverse_metric_inner.reduction_path": "factored_gram",
+            },
+            "block-vmap-inverse-factored-gram",
+        ),
+        (
+            {
+                "inverse_metric_inner.reduction_path": "sqrt_apply_reduce",
+                "sqrt_metric.factor_path": "closed_form_factor_square_root",
+            },
+            "block-vmap-inverse-sqrt-apply-reduce",
+        ),
+    ],
+)
+def test_inverse_metric_inner_vmap_block_factor_paths_match_reference(
+    settings: Mapping[str, object],
+    candidate_id: str,
+) -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    diagonal = {"w": torch.tensor([2.0, 5.0], dtype=torch.float64)}
+    damping = 0.5
+    left = {"w": torch.tensor([[1.0, 2.0], [0.5, -1.0]], dtype=torch.float64)}
+    right = {
+        "w": torch.tensor(
+            [[3.0, 2.0, -0.5], [-1.0, 1.0, 0.75]],
+            dtype=torch.float64,
+        )
+    }
+    operator = ops.inverse_metric_inner(
+        "inverse_metric_inner",
+        "diagonal",
+        aggregation="sum",
+        representation=diagonal_metric_representation(),
+        damping=damping,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            candidate_id,
+            {
+                **settings,
+                "inverse_metric_inner.multi_rhs": "block",
+                "vectorization.mode": "vmap",
+                "vectorization.vmap_chunk_size": 2,
+                "vectorization.in_dims": ({"w": 0}, {"w": 1}),
+                **torch_func_settings(requires_forward_ad=False),
+            },
+            admission_status="passed",
+        ),
+        {"metric_diagonal": diagonal},
+        (left, right),
+    )()
+    expected = left["w"] @ (right["w"] / (diagonal["w"] + damping).reshape(-1, 1))
+
+    torch.testing.assert_close(result, expected)
+
+
+def test_inverse_metric_inner_vmap_block_rhs_matches_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    damping = 0.5
+    left = {"w": torch.tensor([[1.0, 2.0], [0.5, -1.0]], dtype=torch.float64)}
+    right = {
+        "w": torch.tensor(
+            [[3.0, 2.0, -0.5], [-1.0, 1.0, 0.75]],
+            dtype=torch.float64,
+        )
+    }
+    operator = ops.inverse_metric_inner(
+        "inverse_metric_inner",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+        damping=damping,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            "block-vmap",
+            {
+                "inverse_metric_inner.reduction_path": "solve_then_reduce",
+                "inverse_metric_inner.multi_rhs": "block",
+                "inverse_metric.solve_path": "dense_solve",
+                "vectorization.mode": "vmap",
+                "vectorization.vmap_chunk_size": 2,
+                "vectorization.in_dims": ({"w": 0}, {"w": 1}),
+                **torch_func_settings(requires_forward_ad=False),
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )()
+    damped = matrix + damping * torch.eye(2, dtype=torch.float64)
+    expected = left["w"] @ torch.linalg.solve(damped, right["w"])
+
+    torch.testing.assert_close(result, expected)
+
+
+def test_inverse_metric_inner_solve_path_matches_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    damping = 0.5
+    left = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
+    right = {"w": torch.tensor([3.0, -1.0], dtype=torch.float64)}
+    operator = ops.inverse_metric_inner(
+        "inverse_metric_inner",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+        damping=damping,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    result = factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            "solve",
+            {
+                "inverse_metric_inner.reduction_path": "solve_then_reduce",
+                "inverse_metric_inner.multi_rhs": "single_column",
+                "inverse_metric.solve_path": "dense_solve",
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )()
+    expected = left["w"] @ torch.linalg.solve(
+        matrix + damping * torch.eye(2, dtype=torch.float64),
+        right["w"],
+    )
+
+    torch.testing.assert_close(result, expected)
+
+
+def test_metric_inner_norm_requires_sqrt_apply_reduce() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    vector = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
+    operator = ops.metric_inner(
+        "metric_inner",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+        as_norm=True,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+
+    with pytest.raises(vp.MaterializationError, match="sqrt_apply_reduce"):
+        factory(
+            vpx.Candidate(
+                "metric_inner",
+                "bad-norm",
+                {
+                    "metric_inner.reduction_path": "multiply_then_reduce",
+                    **metric_settings("dense_matmul"),
+                },
+                admission_status="passed",
+            ),
+            {"metric_matrix": matrix},
+            (vector, vector),
+        )()
+
+    result = factory(
+        vpx.Candidate(
+            "metric_inner",
+            "norm",
+            {
+                "metric_inner.reduction_path": "sqrt_apply_reduce",
+                "metric_inner.multi_rhs": "single_column",
+                "sqrt_metric.factor_path": "cholesky_factor",
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (vector, vector),
+    )()
+
+    assert isinstance(result, torch.Tensor)
+    assert result.item() >= 0.0
+
+
 def test_dtype_accumulation_reaches_metric_multiply_reductions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6140,7 +8034,7 @@ def test_dtype_accumulation_reaches_metric_multiply_reductions(
         dtype=torch.float64,
     )
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "dense",
         aggregation="sum",
@@ -6170,7 +8064,7 @@ def test_dtype_accumulation_reaches_metric_multiply_reductions(
         "_accumulation_tensor",
         recording_accumulation_tensor,
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "metric",
         "fp32-accumulation",
         {
@@ -6204,7 +8098,7 @@ def test_standard_runtime_executes_foreach_vector_ops_for_diagonal_metric(
         return original(left, right)
 
     monkeypatch.setattr(torch, "_foreach_mul", foreach_mul)
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "diagonal",
         aggregation="sum",
@@ -6215,7 +8109,7 @@ def test_standard_runtime_executes_foreach_vector_ops_for_diagonal_metric(
         params=params,
         buffers={},
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "metric",
         "foreach-diagonal",
         {
@@ -6234,7 +8128,7 @@ def test_non_dense_metric_paths_require_accumulation() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     diagonal = {"w": torch.tensor([4.0, 5.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "diagonal",
         aggregation="sum",
@@ -6245,7 +8139,7 @@ def test_non_dense_metric_paths_require_accumulation() -> None:
         params=params,
         buffers={},
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "metric",
         "missing-accumulation",
         {"metric.multiply_path": "factorized_multiply"},
@@ -6262,7 +8156,7 @@ def test_metric_accumulation_must_match_metric_path() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = LowRankMetricData.factors()
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "low_rank",
         aggregation="sum",
@@ -6273,7 +8167,7 @@ def test_metric_accumulation_must_match_metric_path() -> None:
         params=params,
         buffers={},
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "metric",
         "wrong-accumulation",
         {
@@ -6286,7 +8180,7 @@ def test_metric_accumulation_must_match_metric_path() -> None:
     with pytest.raises(vp.MaterializationError, match="must be materialized_blocks"):
         factory(candidate, {"low_rank_factors": factors}, vector)
 
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "metric",
         "wrong-streaming-accumulation",
         {
@@ -6304,7 +8198,7 @@ def test_standard_runtime_executes_metric_factor_dtype_axis() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = LowRankMetricData.factors()
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "low_rank",
         aggregation="sum",
@@ -6316,7 +8210,7 @@ def test_standard_runtime_executes_metric_factor_dtype_axis() -> None:
         buffers={},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "metric-factor-dtype",
             {
@@ -6343,13 +8237,13 @@ def test_standard_runtime_executes_vector_residency_axis() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "vector-residency",
             {
@@ -6387,7 +8281,7 @@ def test_standard_runtime_executes_pinned_vector_residency() -> None:
         return original(tensor, residency, key)
 
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -6396,7 +8290,7 @@ def test_standard_runtime_executes_pinned_vector_residency() -> None:
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(runtime_module, "_residency_tensor", recording_residency)
         result = factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "vector-residency-pinned",
                 {
@@ -6422,13 +8316,13 @@ def test_standard_runtime_executes_gpu_vector_residency() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64, device="cuda")}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "vector-residency-gpu",
             {
@@ -6462,7 +8356,7 @@ def test_standard_runtime_executes_metric_factor_residency_axis() -> None:
 
         return original(tensor, residency, key)
 
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "low_rank",
         aggregation="sum",
@@ -6477,7 +8371,7 @@ def test_standard_runtime_executes_metric_factor_residency_axis() -> None:
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(runtime_module, "_residency_tensor", recording_residency)
         result = factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "metric",
                 "factor-residency",
                 {
@@ -6502,47 +8396,32 @@ def test_standard_runtime_executes_metric_factor_residency_axis() -> None:
     )
 
 
-def test_standard_runtime_executes_default_memory_mapped_vector_residency(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_standard_runtime_rejects_memory_mapped_vector_residency_without_binding() -> (
+    None
+):
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
-    load_mmap_values = []
-    original_load = torch.load
-
-    def recording_load(
-        f: Any,
-        *args: Any,
-        **kwargs: Any,
-    ) -> object:
-        load_mmap_values.append(kwargs.get("mmap"))
-
-        return original_load(f, *args, **kwargs)
-
-    monkeypatch.setattr(torch, "load", recording_load)
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
-    result = factory(
-        vp.Candidate(
-            "hvp",
-            "vector-mmap",
-            {
-                "hvp.path": "reverse_over_reverse",
-                "memory.vector_residency": "mmap_cpu",
-            },
-            admission_status="passed",
-        ),
-        {"scale": 1.0},
-        vector,
-    )()
-    result_map = tensor_mapping(result)
 
-    assert load_mmap_values == [True]
-    assert torch.equal(result_map["w"], torch.tensor([6.0], dtype=torch.float64))
+    with pytest.raises(vp.MaterializationError, match="memory-mapped tensor metadata"):
+        factory(
+            vpx.Candidate(
+                "hvp",
+                "vector-mmap",
+                {
+                    "hvp.path": "reverse_over_reverse",
+                    "memory.vector_residency": "mmap_cpu",
+                },
+                admission_status="passed",
+            ),
+            {"scale": 1.0},
+            vector,
+        )
 
 
 def test_standard_runtime_executes_custom_memory_mapped_vector_residency() -> None:
@@ -6556,14 +8435,14 @@ def test_standard_runtime_executes_custom_memory_mapped_vector_residency() -> No
         return tensor.detach().clone()
 
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
         mmap_residency=mmap_residency,
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "vector-mmap",
             {
@@ -6581,26 +8460,13 @@ def test_standard_runtime_executes_custom_memory_mapped_vector_residency() -> No
     assert torch.equal(result_map["w"], torch.tensor([6.0], dtype=torch.float64))
 
 
-def test_standard_runtime_executes_default_memory_mapped_factor_residency(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_standard_runtime_rejects_memory_mapped_factor_residency_without_binding() -> (
+    None
+):
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = LowRankMetricData.factors()
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    load_mmap_values = []
-    original_load = torch.load
-
-    def recording_load(
-        f: Any,
-        *args: Any,
-        **kwargs: Any,
-    ) -> object:
-        load_mmap_values.append(kwargs.get("mmap"))
-
-        return original_load(f, *args, **kwargs)
-
-    monkeypatch.setattr(torch, "load", recording_load)
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "low_rank",
         aggregation="sum",
@@ -6611,39 +8477,31 @@ def test_standard_runtime_executes_default_memory_mapped_factor_residency(
         params=params,
         buffers={},
     )
-    result = factory(
-        vp.Candidate(
-            "metric",
-            "factor-mmap",
-            {
-                **metric_settings("factorized_multiply"),
-                "memory.factor_residency": "mmap_cpu",
-            },
-            admission_status="passed",
-        ),
-        {"low_rank_factors": factors},
-        vector,
-    )()
-    result_tensor = tree_leaves(result)[0]
-
-    assert load_mmap_values == [True, True]
-    assert torch.allclose(
-        result_tensor,
-        torch.tensor([-0.25, -6.25], dtype=torch.float64),
+    candidate = vpx.Candidate(
+        "metric",
+        "factor-mmap",
+        {
+            **metric_settings("factorized_multiply"),
+            "memory.factor_residency": "mmap_cpu",
+        },
+        admission_status="passed",
     )
+
+    with pytest.raises(vp.MaterializationError, match="memory-mapped tensor metadata"):
+        factory(candidate, {"low_rank_factors": factors}, vector)
 
 
 def test_standard_runtime_accepts_fresh_output_buffers() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "fresh-output",
             {
@@ -6664,13 +8522,13 @@ def test_standard_runtime_executes_preallocated_output_buffers() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "preallocated-output",
             {
@@ -6694,7 +8552,7 @@ def test_preallocated_output_buffers_execute_metric_multiply() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -6704,7 +8562,7 @@ def test_preallocated_output_buffers_execute_metric_multiply() -> None:
         buffers={},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "preallocated-metric",
             {
@@ -6729,7 +8587,7 @@ def test_preallocated_output_buffers_execute_inverse_metric_solve() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.inverse_metric(
+        ops.inverse_metric(
             "inverse",
             "dense",
             aggregation="sum",
@@ -6740,7 +8598,7 @@ def test_preallocated_output_buffers_execute_inverse_metric_solve() -> None:
         buffers={},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "preallocated-inverse",
             {
@@ -6768,13 +8626,13 @@ def test_preallocated_output_buffers_execute_jvp_function_output() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="none"),
+        ops.jvp("jvp", "function", aggregation="none"),
         params=params,
         buffers={},
         function_objectives={"function": square_function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "preallocated-output",
             {
@@ -6799,13 +8657,13 @@ def test_standard_runtime_accepts_retained_memory_outputs() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "retain-memory-outputs",
             {
@@ -6824,44 +8682,46 @@ def test_standard_runtime_accepts_retained_memory_outputs() -> None:
     assert torch.equal(result_map["w"], torch.tensor([6.0], dtype=torch.float64))
 
 
-def test_hvp_memory_primal_recompute_uses_primal_recompute_setting() -> None:
+def test_standard_runtime_rejects_hvp_memory_recompute_with_primal_reuse() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
-    result = factory(
-        vp.Candidate(
-            "hvp",
-            "recompute-primal-memory",
-            {
-                "hvp.path": "reverse_over_reverse",
-                "hvp.primal_reuse": "recompute_primal",
-                "memory.primal_outputs": "recompute",
-            },
-            admission_status="passed",
-        ),
-        {"scale": 1.0},
-        vector,
-    )()
-    result_map = tensor_mapping(result)
 
-    assert torch.equal(result_map["w"], torch.tensor([6.0], dtype=torch.float64))
+    with pytest.raises(
+        vp.MaterializationError,
+        match="package-owned output recompute lowering",
+    ):
+        factory(
+            vpx.Candidate(
+                "hvp",
+                "recompute-primal-memory",
+                {
+                    "hvp.path": "reverse_over_reverse",
+                    "hvp.primal_reuse": "recompute_primal",
+                    "memory.primal_outputs": "recompute",
+                },
+                admission_status="passed",
+            ),
+            {"scale": 1.0},
+            vector,
+        )
 
 
-def test_ggn_memory_recompute_uses_jvp_and_cotangent_recompute_settings() -> None:
+def test_standard_runtime_rejects_ggn_memory_recompute_with_reuse_settings() -> None:
     params = {"w": torch.tensor([0.5, -0.25], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.5, -2.0], dtype=torch.float64)}
     loss_hessian = torch.diag(torch.tensor([3.0, 5.0], dtype=torch.float64))
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -6873,36 +8733,33 @@ def test_ggn_memory_recompute_uses_jvp_and_cotangent_recompute_settings() -> Non
         ))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
-    result = factory(
-        vp.Candidate(
-            "ggn",
-            "memory-recompute",
-            {
-                **ggn_reuse_settings(
-                    "recompute_jvp",
-                    "recompute_output_cotangent",
-                ),
-                "memory.jvp_outputs": "recompute",
-                "memory.output_cotangents": "recompute",
-            },
-            admission_status="passed",
-        ),
-        {"loss_hessian": loss_hessian},
-        vector,
-    )()
-    jacobian = torch.tensor(
-        [[1.0, 1.0], [1.0, 0.5]],
-        dtype=torch.float64,
-    )
-    expected = jacobian.T @ (loss_hessian @ (jacobian @ vector["w"]))
-    result_map = tensor_mapping(result)
 
-    torch.testing.assert_close(result_map["w"], expected)
+    with pytest.raises(
+        vp.MaterializationError,
+        match="package-owned output recompute lowering",
+    ):
+        factory(
+            vpx.Candidate(
+                "ggn",
+                "memory-recompute",
+                {
+                    **ggn_reuse_settings(
+                        "recompute_jvp",
+                        "recompute_output_cotangent",
+                    ),
+                    "memory.jvp_outputs": "recompute",
+                    "memory.output_cotangents": "recompute",
+                },
+                admission_status="passed",
+            ),
+            {"loss_hessian": loss_hessian},
+            vector,
+        )
 
 
 @pytest.mark.parametrize(
@@ -6913,21 +8770,24 @@ def test_ggn_memory_recompute_uses_jvp_and_cotangent_recompute_settings() -> Non
         "memory.output_cotangents",
     ],
 )
-def test_standard_runtime_rejects_memory_recompute_without_closure(
+def test_standard_runtime_rejects_memory_recompute_without_lowering(
     setting_key: str,
 ) -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
 
-    with pytest.raises(vp.MaterializationError, match="matching operator recompute"):
+    with pytest.raises(
+        vp.MaterializationError,
+        match="package-owned output recompute lowering",
+    ):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "recompute-memory-output",
                 {"hvp.path": "reverse_over_reverse", setting_key: "recompute"},
@@ -6948,7 +8808,7 @@ def test_standard_runtime_rejects_intermediate_residency_without_boundaries(
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -6956,7 +8816,7 @@ def test_standard_runtime_rejects_intermediate_residency_without_boundaries(
 
     with pytest.raises(vp.MaterializationError, match="intermediate boundaries"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "intermediate-residency",
                 {
@@ -6970,59 +8830,17 @@ def test_standard_runtime_rejects_intermediate_residency_without_boundaries(
         )
 
 
-def test_standard_runtime_executes_intermediate_residency_boundary_callback() -> None:
-    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
-    vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
-    calls = []
-
-    def intermediate_residency(
-        candidate: vp.Candidate,
-        operation: vpx.CandidateOperation,
-    ) -> vpx.CandidateOperation:
-        calls.append(candidate.settings["memory.intermediate_residency"])
-
-        def wrapped_operation() -> vp.TensorTree:
-            return operation()
-
-        return wrapped_operation
-
-    factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
-        params=params,
-        buffers={},
-        scalar_objectives={"loss": quadratic_scalar},
-        intermediate_residency=intermediate_residency,
-    )
-    result = factory(
-        vp.Candidate(
-            "hvp",
-            "intermediate-residency",
-            {
-                "hvp.path": "reverse_over_reverse",
-                "memory.intermediate_residency": "cpu_staged",
-            },
-            admission_status="passed",
-        ),
-        {"scale": 1.0},
-        vector,
-    )()
-    result_map = tensor_mapping(result)
-
-    assert calls == ["cpu_staged"]
-    assert torch.equal(result_map["w"], torch.tensor([6.0], dtype=torch.float64))
-
-
 def test_standard_runtime_accepts_model_default_fusion_settings() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "model-default-fusion",
             {
@@ -7062,7 +8880,7 @@ def test_standard_runtime_rejects_fused_rows_without_registered_implementation(
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -7070,7 +8888,7 @@ def test_standard_runtime_rejects_fused_rows_without_registered_implementation(
 
     with pytest.raises(vp.MaterializationError, match="registered fused"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "fused-row",
                 {"hvp.path": "reverse_over_reverse", setting_key: setting_value},
@@ -7112,7 +8930,7 @@ def test_standard_runtime_executes_fused_row_with_registered_rewriter(
 
     def fusion_rewriter(
         module: torch.nn.Module,
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
     ) -> torch.nn.Module:
         events.append(candidate.settings[setting_key])
         assert isinstance(module, FusibleModule)
@@ -7123,15 +8941,15 @@ def test_standard_runtime_executes_fused_row_with_registered_rewriter(
 
     module = FusibleModule()
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=dict(module.named_parameters()),
         buffers={},
         module=module,
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
         fusion_rewriter=fusion_rewriter,
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "fused-row",
             {
@@ -7160,10 +8978,10 @@ def test_standard_runtime_executes_layout_contiguity_axis() -> None:
     observed = []
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert context.family == "gradient"
         observed.append((
@@ -7175,7 +8993,7 @@ def test_standard_runtime_executes_layout_contiguity_axis() -> None:
         return (params["w"] * batch["floating"]).sum() + buffers["b"].sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers=buffers,
         scalar_objectives={"loss": scalar},
@@ -7183,7 +9001,7 @@ def test_standard_runtime_executes_layout_contiguity_axis() -> None:
 
     for value in ("preserve_existing_strides", "contiguous"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 value,
                 {
@@ -7201,7 +9019,7 @@ def test_standard_runtime_executes_layout_contiguity_axis() -> None:
 
     with pytest.raises(vp.MaterializationError, match=r"layout\.flatten_order"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "bad-flatten-order",
                 {**gradient_settings(), "layout.flatten_order": "by_name"},
@@ -7223,10 +9041,10 @@ def test_standard_runtime_executes_layout_output_flat_contiguous() -> None:
     }
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["scale"]
@@ -7235,12 +9053,12 @@ def test_standard_runtime_executes_layout_output_flat_contiguous() -> None:
         return 0.5 * (params["a"].pow(2).sum() + params["b"].pow(2).sum())
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "gradient",
         "flat-output",
         {
@@ -7253,7 +9071,7 @@ def test_standard_runtime_executes_layout_output_flat_contiguous() -> None:
     )
     output = factory(candidate, {"scale": 1.0}, vector)()
     check = vpx.standard_reference_check(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -7281,7 +9099,7 @@ def test_standard_runtime_executes_layout_params_and_output_per_layer_flat() -> 
         "b": torch.tensor([3.0, 4.0], dtype=torch.float64),
         "c": torch.tensor([5.0], dtype=torch.float64),
     }
-    parameter_surface = vp.ParameterSurface(
+    parameter_surface = vpx.ParameterSurface(
         names=("a", "b", "c"),
         shapes=((1,), (2,), (1,)),
         trainable=(True, True, True),
@@ -7297,10 +9115,10 @@ def test_standard_runtime_executes_layout_params_and_output_per_layer_flat() -> 
         return tensor.untyped_storage()._cdata
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch == {}
@@ -7313,14 +9131,14 @@ def test_standard_runtime_executes_layout_params_and_output_per_layer_flat() -> 
         )
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         parameter_surface=parameter_surface,
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "per-layer",
             {
@@ -7348,7 +9166,7 @@ def test_standard_runtime_executes_layout_output_per_layer_flat() -> None:
         "b": torch.tensor([3.0, 4.0], dtype=torch.float64),
         "c": torch.tensor([5.0], dtype=torch.float64),
     }
-    parameter_surface = vp.ParameterSurface(
+    parameter_surface = vpx.ParameterSurface(
         names=("a", "b", "c"),
         shapes=((1,), (2,), (1,)),
         trainable=(True, True, True),
@@ -7364,10 +9182,10 @@ def test_standard_runtime_executes_layout_output_per_layer_flat() -> None:
         return tensor.untyped_storage()._cdata
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch == {}
@@ -7380,14 +9198,14 @@ def test_standard_runtime_executes_layout_output_per_layer_flat() -> None:
         )
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         parameter_surface=parameter_surface,
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "per-layer-output",
             {**gradient_settings(), "layout.output": "per_layer_flat"},
@@ -7411,7 +9229,7 @@ def test_standard_runtime_executes_layout_vector_per_layer_flat() -> None:
         "b": torch.tensor([0.0, 0.0], dtype=torch.float64),
         "c": torch.tensor([0.0], dtype=torch.float64),
     }
-    parameter_surface = vp.ParameterSurface(
+    parameter_surface = vpx.ParameterSurface(
         names=("a", "b", "c"),
         shapes=((1,), (2,), (1,)),
         trainable=(True, True, True),
@@ -7419,7 +9237,7 @@ def test_standard_runtime_executes_layout_vector_per_layer_flat() -> None:
     )
     vector = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -7430,7 +9248,7 @@ def test_standard_runtime_executes_layout_vector_per_layer_flat() -> None:
         parameter_surface=parameter_surface,
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "per-layer-vector",
             {
@@ -7462,7 +9280,7 @@ def test_standard_runtime_executes_layout_params_and_output_per_block_flat() -> 
         "b": torch.tensor([3.0, 4.0], dtype=torch.float64),
         "c": torch.tensor([5.0], dtype=torch.float64),
     }
-    parameter_surface = vp.ParameterSurface(
+    parameter_surface = vpx.ParameterSurface(
         names=("a", "b", "c"),
         shapes=((1,), (2,), (1,)),
         trainable=(True, True, True),
@@ -7478,10 +9296,10 @@ def test_standard_runtime_executes_layout_params_and_output_per_block_flat() -> 
         return tensor.untyped_storage()._cdata
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch == {}
@@ -7494,14 +9312,14 @@ def test_standard_runtime_executes_layout_params_and_output_per_block_flat() -> 
         )
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         parameter_surface=parameter_surface,
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "per-block",
             {
@@ -7529,7 +9347,7 @@ def test_standard_runtime_executes_layout_output_per_block_flat() -> None:
         "b": torch.tensor([3.0, 4.0], dtype=torch.float64),
         "c": torch.tensor([5.0], dtype=torch.float64),
     }
-    parameter_surface = vp.ParameterSurface(
+    parameter_surface = vpx.ParameterSurface(
         names=("a", "b", "c"),
         shapes=((1,), (2,), (1,)),
         trainable=(True, True, True),
@@ -7545,10 +9363,10 @@ def test_standard_runtime_executes_layout_output_per_block_flat() -> None:
         return tensor.untyped_storage()._cdata
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch == {}
@@ -7561,14 +9379,14 @@ def test_standard_runtime_executes_layout_output_per_block_flat() -> None:
         )
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         parameter_surface=parameter_surface,
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "per-block-output",
             {**gradient_settings(), "layout.output": "per_block_flat"},
@@ -7592,7 +9410,7 @@ def test_standard_runtime_executes_layout_vector_per_block_flat() -> None:
         "b": torch.tensor([0.0, 0.0], dtype=torch.float64),
         "c": torch.tensor([0.0], dtype=torch.float64),
     }
-    parameter_surface = vp.ParameterSurface(
+    parameter_surface = vpx.ParameterSurface(
         names=("a", "b", "c"),
         shapes=((1,), (2,), (1,)),
         trainable=(True, True, True),
@@ -7600,7 +9418,7 @@ def test_standard_runtime_executes_layout_vector_per_block_flat() -> None:
     )
     vector = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -7611,7 +9429,7 @@ def test_standard_runtime_executes_layout_vector_per_block_flat() -> None:
         parameter_surface=parameter_surface,
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "per-block-vector",
             {
@@ -7644,6 +9462,10 @@ def test_standard_runtime_executes_layout_vector_per_block_flat() -> None:
         ("layout.vector", "per_layer_flat"),
         ("layout.params", "per_block_flat"),
         ("layout.vector", "per_block_flat"),
+        ("layout.params", "per_shard"),
+        ("layout.vector", "per_shard"),
+        ("layout.params", "dtensor"),
+        ("layout.vector", "dtensor"),
     ],
 )
 def test_standard_runtime_rejects_non_tree_input_layout_without_reconstruction(
@@ -7653,20 +9475,53 @@ def test_standard_runtime_rejects_non_tree_input_layout_without_reconstruction(
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
 
-    group_label = "layer_groups" if value == "per_layer_flat" else "block_groups"
+    if value == "per_layer_flat":
+        match = "declared layer_groups"
+    elif value == "per_block_flat":
+        match = "declared block_groups"
+    else:
+        match = "tree reconstruction support"
 
-    with pytest.raises(vp.MaterializationError, match=f"declared {group_label}"):
+    with pytest.raises(vp.MaterializationError, match=match):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "non-tree-input-layout",
                 {**gradient_settings(), key: value},
+                admission_status="passed",
+            ),
+            {"scale": 1.0},
+            vector,
+        )
+
+
+@pytest.mark.parametrize("value", ["per_shard", "dtensor"])
+def test_standard_runtime_rejects_distributed_output_layout_without_adapter(
+    value: str,
+) -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+    factory = vpx.standard_operation_factory(
+        ops.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+    )
+
+    with pytest.raises(
+        vp.MaterializationError, match=r"layout[.]output is unsupported"
+    ):
+        factory(
+            vpx.Candidate(
+                "gradient",
+                "distributed-output-layout",
+                {**gradient_settings(), "layout.output": value},
                 admission_status="passed",
             ),
             {"scale": 1.0},
@@ -7693,10 +9548,10 @@ def test_standard_runtime_executes_layout_params_flat_contiguous() -> None:
     )
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch == {}
@@ -7709,13 +9564,13 @@ def test_standard_runtime_executes_layout_params_flat_contiguous() -> None:
         return 0.5 * (params["a"].pow(2).sum() + params["b"].pow(2).sum())
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "flat-params",
             settings,
@@ -7763,7 +9618,7 @@ def test_standard_runtime_rejects_flat_params_when_tied_aliases_must_preserve() 
 
 def test_standard_runtime_rejects_alias_preservation_on_deduplicated_surface() -> None:
     params = {"a": torch.tensor([2.0], dtype=torch.float64)}
-    parameter_surface = vp.ParameterSurface(
+    parameter_surface = vpx.ParameterSurface(
         names=("a",),
         shapes=((1,),),
         trainable=(True,),
@@ -7792,7 +9647,7 @@ def test_standard_runtime_rejects_alias_preservation_on_deduplicated_surface() -
     ],
 )
 def test_standard_runtime_executes_layout_vector_flat_contiguous(
-    vector: vp.TensorTree,
+    vector: vpx.TensorTree,
 ) -> None:
     params = {
         "a": torch.tensor([0.0], dtype=torch.float64),
@@ -7800,7 +9655,7 @@ def test_standard_runtime_executes_layout_vector_flat_contiguous(
     }
     matrix = torch.diag(torch.tensor([10.0, 20.0, 30.0], dtype=torch.float64))
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -7810,7 +9665,7 @@ def test_standard_runtime_executes_layout_vector_flat_contiguous(
         buffers={},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "flat-vector",
             {
@@ -7839,10 +9694,10 @@ def test_standard_runtime_executes_call_grad_mode_axis() -> None:
     observed = []
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch == {}
@@ -7852,7 +9707,7 @@ def test_standard_runtime_executes_call_grad_mode_axis() -> None:
         return params["w"].pow(2).sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
@@ -7860,7 +9715,7 @@ def test_standard_runtime_executes_call_grad_mode_axis() -> None:
 
     with torch.no_grad():
         result = factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "grad-enabled",
                 {**gradient_settings(), "call.grad_mode": "grad_enabled"},
@@ -7884,10 +9739,10 @@ def test_standard_runtime_executes_explicit_functional_call_settings() -> None:
     observed = []
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert batch == {}
         observed.append((
@@ -7899,7 +9754,7 @@ def test_standard_runtime_executes_explicit_functional_call_settings() -> None:
         return (params["w"] * buffers["b"]).sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers=buffers,
         scalar_objectives={"loss": scalar},
@@ -7916,7 +9771,7 @@ def test_standard_runtime_executes_explicit_functional_call_settings() -> None:
         "call.return_type": "raw_tensor_tree",
     }
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "functional-call",
             settings,
@@ -7942,10 +9797,10 @@ def test_standard_runtime_rejects_non_tree_raw_function_output() -> None:
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def tensor_function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> Any:
         assert isinstance(params["w"], torch.Tensor)
         assert buffers == {}
@@ -7955,7 +9810,7 @@ def test_standard_runtime_rejects_non_tree_raw_function_output() -> None:
         return object()
 
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="sum"),
+        ops.jvp("jvp", "function", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"function": tensor_function},
@@ -7963,7 +9818,7 @@ def test_standard_runtime_rejects_non_tree_raw_function_output() -> None:
 
     with pytest.raises(vp.MaterializationError, match="raw tensor tree"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "jvp",
                 "non-tree-output",
                 {
@@ -7984,10 +9839,10 @@ def test_standard_runtime_rejects_forbidden_functional_buffer_mutation() -> None
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert batch == {}
         assert context.family == "gradient"
@@ -7996,7 +9851,7 @@ def test_standard_runtime_rejects_forbidden_functional_buffer_mutation() -> None
         return (params["w"] * buffers["b"]).sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers=buffers,
         scalar_objectives={"loss": scalar},
@@ -8004,7 +9859,7 @@ def test_standard_runtime_rejects_forbidden_functional_buffer_mutation() -> None
 
     with pytest.raises(vp.MaterializationError, match="changed buffer value: b"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "forbidden-buffer-mutation",
                 {
@@ -8026,13 +9881,13 @@ def test_standard_runtime_restores_declared_functional_buffer_mutation() -> None
     buffers = {"b": torch.tensor([3.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers=buffers,
         scalar_objectives={"loss": mutating_buffer_scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "declared-restored-buffer-mutation",
             {
@@ -8054,7 +9909,7 @@ def test_standard_runtime_restores_declared_buffer_mutation_after_error() -> Non
     buffers = {"b": torch.tensor([3.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers=buffers,
         scalar_objectives={"loss": failing_mutating_buffer_scalar},
@@ -8062,7 +9917,7 @@ def test_standard_runtime_restores_declared_buffer_mutation_after_error() -> Non
 
     with pytest.raises(RuntimeError, match="declared mutation failure"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "declared-restored-buffer-mutation-error",
                 {
@@ -8095,14 +9950,14 @@ def test_standard_runtime_executes_stateful_module_gradient() -> None:
     original_parameter = module.w
     original_buffer = module.b
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=dict(module.named_parameters()),
         buffers=dict(module.named_buffers()),
         module=module,
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "stateful-module-gradient",
             {**gradient_settings(), **stateful_module_call_settings()},
@@ -8130,14 +9985,14 @@ def test_standard_runtime_restores_declared_stateful_module_buffer() -> None:
         "call.buffers": "module_buffers",
     }
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=dict(module.named_parameters()),
         buffers=buffers,
         module=module,
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "stateful-module-restored",
             {**gradient_settings(), **settings},
@@ -8158,17 +10013,17 @@ def test_standard_runtime_restores_declared_stateful_module_buffer() -> None:
 def test_standard_runtime_selects_stateful_module_output_fields_for_vjp() -> None:
     module = StatefulOutputModule()
     factory = vpx.standard_operation_factory(
-        vp.vjp("vjp", "model_output", aggregation="sum"),
+        ops.vjp("vjp", "model_output", aggregation="sum"),
         params=dict(module.named_parameters()),
         buffers=dict(module.named_buffers()),
         module=module,
-        module_call=vp.ModuleCallSpec(
+        module_call=vpx.ModuleCallSpec(
             positional_batch_keys=("scale",),
             output_fields={"logits": ("logits",)},
         ),
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "stateful-module-vjp",
             {
@@ -8192,14 +10047,14 @@ def test_standard_runtime_selects_stateful_module_output_fields_for_vjp() -> Non
 def test_standard_runtime_stateful_module_requires_binding() -> None:
     module = StatefulScalarModule()
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=dict(module.named_parameters()),
         buffers=dict(module.named_buffers()),
     )
 
     with pytest.raises(vp.MaterializationError, match="requires a module"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "stateful-module-missing-binding",
                 {**gradient_settings(), **stateful_module_call_settings()},
@@ -8212,7 +10067,7 @@ def test_standard_runtime_stateful_module_requires_binding() -> None:
 
 def test_standard_runtime_rejects_restore_mode_without_declared_mutation() -> None:
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={"b": torch.tensor([3.0], dtype=torch.float64)},
         scalar_objectives={"loss": quadratic_scalar},
@@ -8220,7 +10075,7 @@ def test_standard_runtime_rejects_restore_mode_without_declared_mutation() -> No
 
     with pytest.raises(vp.MaterializationError, match="mutates_state=True"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "restore-without-mutates-state",
                 {
@@ -8280,7 +10135,7 @@ def test_standard_runtime_rejects_call_rows_without_required_binding(
     message: str,
 ) -> None:
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -8288,7 +10143,7 @@ def test_standard_runtime_rejects_call_rows_without_required_binding(
 
     with pytest.raises(vp.MaterializationError, match=message):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "call-row",
                 {**gradient_settings(), **settings_override},
@@ -8305,10 +10160,10 @@ def test_standard_runtime_accepts_direct_input_schedule_settings() -> None:
     observed = []
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         observed.append(dict(context.settings))
@@ -8323,13 +10178,13 @@ def test_standard_runtime_accepts_direct_input_schedule_settings() -> None:
         "schedule.gradient_accumulation": "single_step",
     }
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "direct-input-schedule",
             settings,
@@ -8352,10 +10207,10 @@ def test_gradient_microbatch_accumulate_runs_declared_data_chunks() -> None:
     calls = []
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -8364,13 +10219,13 @@ def test_gradient_microbatch_accumulate_runs_declared_data_chunks() -> None:
         return (params["w"][0] * batch["x"]).sum() * batch["scale"]
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "microbatch",
             {
@@ -8408,7 +10263,7 @@ def test_standard_runtime_rejects_input_schedule_rows_without_binding(
     message: str,
 ) -> None:
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -8416,7 +10271,7 @@ def test_standard_runtime_rejects_input_schedule_rows_without_binding(
 
     with pytest.raises(vp.MaterializationError, match=message):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "input-schedule",
                 {**gradient_settings(), **settings_override},
@@ -8433,10 +10288,10 @@ def test_standard_runtime_executes_packed_input_layout_binding() -> None:
     calls = []
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -8444,7 +10299,7 @@ def test_standard_runtime_executes_packed_input_layout_binding() -> None:
 
         return params["w"][0] * restored.sum()
 
-    def batch_layout(candidate: vp.Candidate, batch: vp.Batch) -> vp.Batch:
+    def batch_layout(candidate: vpx.Candidate, batch: vpx.Batch) -> vpx.Batch:
         calls.append(candidate.settings["input.batch_layout"])
         permutation = torch.tensor([2, 0, 1])
         inverse_permutation = torch.tensor([1, 2, 0])
@@ -8455,14 +10310,14 @@ def test_standard_runtime_executes_packed_input_layout_binding() -> None:
         }
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
         batch_layout=batch_layout,
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "packed-input",
             {
@@ -8486,7 +10341,7 @@ def test_standard_runtime_executes_packed_input_layout_binding() -> None:
 
 def test_standard_runtime_rejects_unlowered_chunk_axis() -> None:
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -8494,7 +10349,7 @@ def test_standard_runtime_rejects_unlowered_chunk_axis() -> None:
 
     with pytest.raises(vp.MaterializationError, match=r"schedule[.]per_token"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "chunk-row",
                 {**gradient_settings(), "chunk.token_block_size": 2},
@@ -8511,17 +10366,17 @@ def test_standard_runtime_executes_lm_head_chunker_binding() -> None:
     calls = []
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
 
         return params["w"][0] * batch["logits"].sum()
 
-    def lm_head_chunker(candidate: vp.Candidate, batch: vp.Batch) -> vp.Batch:
+    def lm_head_chunker(candidate: vpx.Candidate, batch: vpx.Batch) -> vpx.Batch:
         calls.append(candidate.settings["chunk.lm_head_weight_chunk_bytes"])
         hidden = batch["hidden"]
         weight = batch["lm_head_weight"]
@@ -8530,14 +10385,14 @@ def test_standard_runtime_executes_lm_head_chunker_binding() -> None:
         return {**batch, "logits": logits}
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
         lm_head_chunker=lm_head_chunker,
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "lm-head-chunk",
             {
@@ -8565,7 +10420,7 @@ def test_standard_runtime_executes_lm_head_chunker_binding() -> None:
 
 def test_standard_runtime_rejects_lm_head_chunking_without_binding() -> None:
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -8573,7 +10428,7 @@ def test_standard_runtime_rejects_lm_head_chunking_without_binding() -> None:
 
     with pytest.raises(vp.MaterializationError, match="LM-head weight binding"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "lm-head-chunk",
                 {
@@ -8600,13 +10455,13 @@ def test_gradient_graph_schedule_build_once_reuses_prepared_gradient(
 
     monkeypatch.setattr(torch.func, "grad", recording_grad)
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "graph-schedule",
             {
@@ -8646,13 +10501,13 @@ def test_gradient_graph_schedule_rebuild_per_call_rebuilds_gradient(
 
     monkeypatch.setattr(torch.func, "grad", recording_grad)
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "graph-schedule",
             {
@@ -8712,7 +10567,7 @@ def test_gradient_microbatch_accumulate_rejects_invalid_settings(
     message: str,
 ) -> None:
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -8720,7 +10575,7 @@ def test_gradient_microbatch_accumulate_rejects_invalid_settings(
 
     with pytest.raises(vp.MaterializationError, match=message):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "microbatch",
                 {**gradient_settings(), **settings_override},
@@ -8735,10 +10590,10 @@ def test_jvp_microbatch_accumulate_runs_declared_data_chunks() -> None:
     calls = []
 
     def model(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "jvp"
@@ -8747,13 +10602,13 @@ def test_jvp_microbatch_accumulate_runs_declared_data_chunks() -> None:
         return (params["w"][0] * batch["x"]).sum() * batch["scale"]
 
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "model", aggregation="sum"),
+        ops.jvp("jvp", "model", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model": model},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "microbatch",
             {
@@ -8781,10 +10636,10 @@ def test_hvp_microbatch_accumulate_runs_declared_data_chunks() -> None:
     calls = []
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "hvp"
@@ -8793,13 +10648,13 @@ def test_hvp_microbatch_accumulate_runs_declared_data_chunks() -> None:
         return (params["w"][0].pow(2) * batch["x"]).sum() * batch["scale"]
 
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "microbatch",
             {
@@ -8825,10 +10680,10 @@ def test_hvp_microbatch_accumulate_runs_declared_data_chunks() -> None:
 
 def test_microbatch_accumulate_rejects_non_sum_operator() -> None:
     def model(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "jvp"
@@ -8836,13 +10691,13 @@ def test_microbatch_accumulate_rejects_non_sum_operator() -> None:
         return (params["w"][0] * batch["x"]).sum()
 
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "model", aggregation="none"),
+        ops.jvp("jvp", "model", aggregation="none"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model": model},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "microbatch",
             {
@@ -8892,10 +10747,10 @@ def test_standard_runtime_rejects_incompatible_per_example_schedule(
     message: str,
 ) -> None:
     def scores(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "fisher"
@@ -8907,7 +10762,7 @@ def test_standard_runtime_rejects_incompatible_per_example_schedule(
         settings = dict(settings_override)
         function_objectives = {"scores": scores}
     else:
-        operator = vp.gradient("gradient", "loss", aggregation="sum")
+        operator = ops.gradient("gradient", "loss", aggregation="sum")
         settings = {**gradient_settings(), **settings_override}
         function_objectives = {}
 
@@ -8921,7 +10776,7 @@ def test_standard_runtime_rejects_incompatible_per_example_schedule(
 
     with pytest.raises(vp.MaterializationError, match=message):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 operator.family,
                 "per-example",
                 settings,
@@ -8936,7 +10791,7 @@ def test_diagonal_inverse_metric_factorized_solve_matches_dense_reference() -> N
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     diagonal = {"w": torch.tensor([4.0, 5.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "diagonal",
         aggregation="sum",
@@ -8963,7 +10818,7 @@ def test_diagonal_inverse_metric_factorized_solve_matches_dense_reference() -> N
         },
     )
     batch = {"metric_diagonal": diagonal}
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "inverse",
         "factorized",
         inverse_metric_settings("factorized_solve"),
@@ -8992,7 +10847,7 @@ def test_block_metric_paths_match_dense_reference() -> None:
         "a": torch.tensor([0.25], dtype=torch.float64),
         "b": torch.tensor([-0.75, 0.5], dtype=torch.float64),
     }
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "blocks",
         aggregation="sum",
@@ -9018,7 +10873,7 @@ def test_block_metric_paths_match_dense_reference() -> None:
     expected = torch.block_diag(*blocks) @ flatten_tree(vector)
 
     for path in ("blockwise_multiply", "streaming_multiply"):
-        candidate = vp.Candidate(
+        candidate = vpx.Candidate(
             "metric",
             path,
             metric_settings(path),
@@ -9045,7 +10900,7 @@ def test_block_metric_schedule_must_match_representation() -> None:
         "a": torch.tensor([0.25], dtype=torch.float64),
         "b": torch.tensor([-0.75, 0.5], dtype=torch.float64),
     }
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "blocks",
         aggregation="sum",
@@ -9057,7 +10912,7 @@ def test_block_metric_schedule_must_match_representation() -> None:
         buffers={},
     )
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "custom-blocks",
             {
@@ -9079,7 +10934,7 @@ def test_block_metric_schedule_must_match_representation() -> None:
         match=r"metric[.]block_schedule must match representation[.]block_schedule",
     ):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "metric",
                 "layer-blocks",
                 {
@@ -9106,7 +10961,7 @@ def test_block_inverse_metric_solve_matches_dense_reference() -> None:
         "a": torch.tensor([0.25], dtype=torch.float64),
         "b": torch.tensor([-0.75, 0.5], dtype=torch.float64),
     }
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "blocks",
         aggregation="sum",
@@ -9138,7 +10993,7 @@ def test_block_inverse_metric_solve_matches_dense_reference() -> None:
         dense_matrix + 0.25 * torch.eye(3, dtype=torch.float64),
         flatten_tree(vector),
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "inverse",
         "blockwise",
         inverse_metric_settings("blockwise_solve"),
@@ -9166,7 +11021,7 @@ def test_block_inverse_metric_schedule_must_match_representation() -> None:
         "a": torch.tensor([0.25], dtype=torch.float64),
         "b": torch.tensor([-0.75, 0.5], dtype=torch.float64),
     }
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "blocks",
         aggregation="sum",
@@ -9178,7 +11033,7 @@ def test_block_inverse_metric_schedule_must_match_representation() -> None:
         params=params,
         buffers={},
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "inverse",
         "module-blocks",
         {
@@ -9200,7 +11055,7 @@ def test_block_inverse_metric_schedule_must_match_representation() -> None:
         match=r"inverse_metric[.]block_schedule.*representation[.]block_schedule",
     ):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "inverse",
                 "custom-blocks",
                 {
@@ -9221,7 +11076,7 @@ def test_low_rank_metric_paths_match_dense_reference() -> None:
         "diagonal": torch.tensor([4.0, 5.0], dtype=torch.float64),
     }
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "low_rank",
         aggregation="sum",
@@ -9250,7 +11105,7 @@ def test_low_rank_metric_paths_match_dense_reference() -> None:
     batch = {"low_rank_factors": factors}
 
     for path in ("factorized_multiply", "streaming_multiply"):
-        candidate = vp.Candidate(
+        candidate = vpx.Candidate(
             "metric",
             path,
             metric_settings(path),
@@ -9270,7 +11125,7 @@ def test_low_rank_streaming_metric_uses_streaming_accumulation(
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = LowRankMetricData.factors()
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "low_rank",
         aggregation="sum",
@@ -9299,7 +11154,7 @@ def test_low_rank_streaming_metric_uses_streaming_accumulation(
         forbidden_low_rank_metric_multiply,
     )
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "streaming",
             metric_settings("streaming_multiply"),
@@ -9322,7 +11177,7 @@ def test_low_rank_inverse_metric_paths_match_dense_reference() -> None:
         "diagonal": torch.tensor([4.0, 5.0], dtype=torch.float64),
     }
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "low_rank",
         aggregation="sum",
@@ -9358,7 +11213,7 @@ def test_low_rank_inverse_metric_paths_match_dense_reference() -> None:
     batch = {"low_rank_factors": factors}
 
     for path in ("factorized_solve", "woodbury_low_rank_solve"):
-        candidate = vp.Candidate(
+        candidate = vpx.Candidate(
             "inverse",
             path,
             inverse_metric_settings(path),
@@ -9377,7 +11232,7 @@ def test_kfac_metric_paths_match_dense_reference() -> None:
     params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
     factors = KFACMetricData.factors()
     vector = {"w": torch.tensor([[0.25, -0.75], [0.5, 1.25]], dtype=torch.float64)}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "kfac",
         aggregation="sum",
@@ -9404,7 +11259,7 @@ def test_kfac_metric_paths_match_dense_reference() -> None:
     batch = {"kfac_factors": factors}
 
     for path in ("factorized_multiply", "streaming_multiply"):
-        candidate = vp.Candidate(
+        candidate = vpx.Candidate(
             "metric",
             path,
             metric_settings(path),
@@ -9424,7 +11279,7 @@ def test_kfac_streaming_metric_uses_streaming_blocks(
     params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
     factors = KFACMetricData.factors()
     vector = {"w": torch.tensor([[0.25, -0.75], [0.5, 1.25]], dtype=torch.float64)}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "kfac",
         aggregation="sum",
@@ -9437,7 +11292,7 @@ def test_kfac_streaming_metric_uses_streaming_blocks(
     )
 
     def forbidden_kfac_metric_multiply(
-        operator: vp.OperatorSpec,
+        operator: vpx.OperatorSpec,
         batch: Mapping[str, object],
         vector_tree: object,
         settings: Mapping[str, object],
@@ -9455,7 +11310,7 @@ def test_kfac_streaming_metric_uses_streaming_blocks(
         forbidden_kfac_metric_multiply,
     )
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "streaming",
             metric_settings("streaming_multiply"),
@@ -9475,7 +11330,7 @@ def test_kfac_inverse_metric_factorized_solve_matches_dense_reference() -> None:
     params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
     factors = KFACMetricData.factors()
     vector = {"w": torch.tensor([[0.25, -0.75], [0.5, 1.25]], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "kfac",
         aggregation="sum",
@@ -9507,7 +11362,7 @@ def test_kfac_inverse_metric_factorized_solve_matches_dense_reference() -> None:
         vector["w"].reshape(-1),
     )
     batch = {"kfac_factors": factors}
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "inverse",
         "factorized",
         inverse_metric_settings("factorized_solve"),
@@ -9522,11 +11377,233 @@ def test_kfac_inverse_metric_factorized_solve_matches_dense_reference() -> None:
     assert reference_result.measurements["damping_min"] == pytest.approx(0.25)
 
 
+def test_ekfac_metric_paths_match_dense_reference() -> None:
+    params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
+    factors = EKFACMetricData.factors()
+    vector = {"w": torch.tensor([[0.25, -0.75], [0.5, 1.25]], dtype=torch.float64)}
+    operator = ops.metric(
+        "metric",
+        "ekfac",
+        aggregation="sum",
+        representation=ekfac_metric_representation(),
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    check = vpx.standard_reference_check(
+        operator,
+        params=params,
+        buffers={},
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "symmetry_max_abs_diff": 1e-12,
+            "psd_violation": 1e-12,
+        },
+    )
+    expected = ekfac_dense_matrix(factors) @ vector["w"].reshape(-1)
+
+    for path in ("factorized_multiply", "streaming_multiply"):
+        candidate = vpx.Candidate(
+            "metric",
+            path,
+            metric_settings(path),
+            admission_status="passed",
+        )
+        output = factory(candidate, factors, vector)()
+        reference_result = check(candidate, factors, vector)
+
+        torch.testing.assert_close(flatten_tree(output), expected)
+        assert reference_result.measurements["max_abs_diff"] == pytest.approx(0.0)
+        assert reference_result.measurements["psd_violation"] == pytest.approx(0.0)
+
+
+def test_ekfac_inverse_metric_factorized_solve_matches_dense_reference() -> None:
+    params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
+    factors = EKFACMetricData.factors()
+    vector = {"w": torch.tensor([[0.25, -0.75], [0.5, 1.25]], dtype=torch.float64)}
+    damping = 0.25
+    operator = ops.inverse_metric(
+        "inverse",
+        "ekfac",
+        aggregation="sum",
+        representation=ekfac_metric_representation(),
+        damping=damping,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    check = vpx.standard_reference_check(
+        operator,
+        params=params,
+        buffers={},
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "symmetry_max_abs_diff": 1e-12,
+            "psd_violation": 1e-12,
+            "inverse_residual": 1e-12,
+            "damping_min": 0.1,
+            "condition_number_max": 20.0,
+        },
+    )
+    dense_matrix = ekfac_dense_matrix(factors)
+    expected = torch.linalg.solve(
+        dense_matrix + damping * torch.eye(4, dtype=torch.float64),
+        vector["w"].reshape(-1),
+    )
+    candidate = vpx.Candidate(
+        "inverse",
+        "factorized",
+        inverse_metric_settings("factorized_solve"),
+        admission_status="passed",
+    )
+    output = factory(candidate, factors, vector)()
+    reference_result = check(candidate, factors, vector)
+
+    torch.testing.assert_close(flatten_tree(output), expected)
+    assert reference_result.measurements["max_abs_diff"] == pytest.approx(0.0)
+    assert reference_result.measurements["inverse_residual"] == pytest.approx(0.0)
+
+
+def test_ekfac_closed_form_square_root_paths_match_reference() -> None:
+    params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
+    factors = EKFACMetricData.factors()
+    vector = {"w": torch.tensor([[0.25, -0.75], [0.5, 1.25]], dtype=torch.float64)}
+    damping = 0.25
+    settings = {"sqrt_metric.factor_path": "closed_form_factor_square_root"}
+    sqrt_factory = vpx.standard_operation_factory(
+        ops.sqrt_metric(
+            "sqrt_metric",
+            "ekfac",
+            aggregation="sum",
+            representation=ekfac_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    inverse_sqrt_factory = vpx.standard_operation_factory(
+        ops.inverse_sqrt_metric(
+            "inverse_sqrt_metric",
+            "ekfac",
+            aggregation="sum",
+            representation=ekfac_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+    )
+    sqrt_result = sqrt_factory(
+        vpx.Candidate(
+            "sqrt_metric",
+            "closed-form",
+            settings,
+            admission_status="passed",
+        ),
+        factors,
+        vector,
+    )()
+    inverse_sqrt_result = inverse_sqrt_factory(
+        vpx.Candidate(
+            "inverse_sqrt_metric",
+            "closed-form",
+            settings,
+            admission_status="passed",
+        ),
+        factors,
+        vector,
+    )()
+
+    torch.testing.assert_close(
+        tensor_mapping(sqrt_result)["w"],
+        ekfac_square_root_product(factors, vector["w"], inverse=False),
+    )
+    torch.testing.assert_close(
+        tensor_mapping(inverse_sqrt_result)["w"],
+        ekfac_square_root_product(
+            factors,
+            vector["w"],
+            inverse=True,
+            damping=damping,
+        ),
+    )
+
+
+def test_ekfac_metric_inner_factored_gram_matches_reference() -> None:
+    params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
+    factors = EKFACMetricData.factors()
+    left = {"w": torch.tensor([[1.5, -0.5], [0.75, 0.25]], dtype=torch.float64)}
+    right = {"w": torch.tensor([[0.25, 2.0], [-1.0, 0.5]], dtype=torch.float64)}
+    damping = 0.25
+    metric_factory = vpx.standard_operation_factory(
+        ops.metric_inner(
+            "metric_inner",
+            "ekfac",
+            aggregation="sum",
+            representation=ekfac_metric_representation(),
+        ),
+        params=params,
+        buffers={},
+    )
+    inverse_factory = vpx.standard_operation_factory(
+        ops.inverse_metric_inner(
+            "inverse_metric_inner",
+            "ekfac",
+            aggregation="sum",
+            representation=ekfac_metric_representation(),
+            damping=damping,
+        ),
+        params=params,
+        buffers={},
+    )
+    metric_result = metric_factory(
+        vpx.Candidate(
+            "metric_inner",
+            "factored-gram",
+            {
+                "metric_inner.reduction_path": "factored_gram",
+                "metric_inner.multi_rhs": "single_column",
+            },
+            admission_status="passed",
+        ),
+        factors,
+        (left, right),
+    )()
+    inverse_result = inverse_factory(
+        vpx.Candidate(
+            "inverse_metric_inner",
+            "factored-gram",
+            {
+                "inverse_metric_inner.reduction_path": "factored_gram",
+                "inverse_metric_inner.multi_rhs": "single_column",
+            },
+            admission_status="passed",
+        ),
+        factors,
+        (left, right),
+    )()
+    dense_matrix = ekfac_dense_matrix(factors)
+    damped = dense_matrix + damping * torch.eye(4, dtype=torch.float64)
+
+    torch.testing.assert_close(
+        metric_result,
+        flatten_tree(left) @ (dense_matrix @ flatten_tree(right)),
+    )
+    torch.testing.assert_close(
+        inverse_result,
+        flatten_tree(left) @ torch.linalg.solve(damped, flatten_tree(right)),
+    )
+
+
 def test_ggn_metric_paths_match_dense_reference() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = GGNMetricData.factors()
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "ggn",
         aggregation="sum",
@@ -9555,7 +11632,7 @@ def test_ggn_metric_paths_match_dense_reference() -> None:
     batch = {"ggn_factors": factors}
 
     for path in ("factorized_multiply", "streaming_multiply"):
-        candidate = vp.Candidate(
+        candidate = vpx.Candidate(
             "metric",
             path,
             metric_settings(path),
@@ -9575,7 +11652,7 @@ def test_ggn_streaming_metric_uses_streaming_accumulation(
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = GGNMetricData.factors()
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "ggn",
         aggregation="sum",
@@ -9604,7 +11681,7 @@ def test_ggn_streaming_metric_uses_streaming_accumulation(
         forbidden_ggn_metric_multiply,
     )
     output = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "streaming",
             metric_settings("streaming_multiply"),
@@ -9624,7 +11701,7 @@ def test_ggn_inverse_metric_factorized_solve_matches_dense_reference() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = GGNMetricData.factors()
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "ggn",
         aggregation="sum",
@@ -9636,20 +11713,16 @@ def test_ggn_inverse_metric_factorized_solve_matches_dense_reference() -> None:
         params=params,
         buffers={},
     )
-    check = vpx.standard_reference_check(
-        operator,
-        params=params,
-        buffers={},
-        thresholds={
-            "max_abs_diff": 1e-12,
-            "max_rel_diff": 1e-12,
-            "symmetry_max_abs_diff": 1e-12,
-            "psd_violation": 1e-12,
-            "inverse_residual": 1e-12,
-            "damping_min": 0.1,
-            "condition_number_max": 10.0,
-        },
+    batch = {"ggn_factors": factors}
+    candidate = vpx.Candidate(
+        "inverse",
+        "factorized",
+        inverse_metric_settings("factorized_solve"),
+        admission_status="passed",
     )
+
+    output = factory(candidate, batch, vector)()
+
     jacobian = factors["jacobian"]
     loss_hessian = factors["loss_hessian"]
     dense_matrix = jacobian.T @ loss_hessian @ jacobian
@@ -9657,27 +11730,15 @@ def test_ggn_inverse_metric_factorized_solve_matches_dense_reference() -> None:
         dense_matrix + 0.25 * torch.eye(2, dtype=torch.float64),
         vector["w"],
     )
-    batch = {"ggn_factors": factors}
-    candidate = vp.Candidate(
-        "inverse",
-        "factorized",
-        inverse_metric_settings("factorized_solve"),
-        admission_status="passed",
-    )
-    output = factory(candidate, batch, vector)()
-    reference_result = check(candidate, batch, vector)
 
-    assert torch.allclose(tree_leaves(output)[0], expected)
-    assert reference_result.measurements["max_abs_diff"] == pytest.approx(0.0)
-    assert reference_result.measurements["inverse_residual"] == pytest.approx(0.0)
-    assert reference_result.measurements["damping_min"] == pytest.approx(0.25)
+    torch.testing.assert_close(tree_leaves(output)[0], expected)
 
 
 def test_inverse_metric_cg_dense_preconditioners_match_reference() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "dense",
         aggregation="sum",
@@ -9709,7 +11770,7 @@ def test_inverse_metric_cg_dense_preconditioners_match_reference() -> None:
     )
 
     for preconditioner in ("none", "diagonal"):
-        candidate = vp.Candidate(
+        candidate = vpx.Candidate(
             "inverse",
             preconditioner,
             {
@@ -9726,6 +11787,44 @@ def test_inverse_metric_cg_dense_preconditioners_match_reference() -> None:
         assert torch.allclose(tree_leaves(output)[0], expected)
         assert reference_result.measurements["max_abs_diff"] == pytest.approx(0.0)
         assert reference_result.measurements["inverse_residual"] == pytest.approx(0.0)
+
+
+def test_inverse_metric_matrix_free_preconditioner_rejects_without_product() -> None:
+    params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
+    operator = ops.inverse_metric(
+        "inverse",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+        damping=0.25,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+
+    with pytest.raises(
+        vp.MaterializationError,
+        match="named sibling product lowering",
+    ):
+        factory(
+            vpx.Candidate(
+                "inverse",
+                "matrix-free-preconditioner",
+                {
+                    "inverse_metric.solve_path": "conjugate_gradient",
+                    "inverse_metric.iteration_budget": 2,
+                    "inverse_metric.preconditioner": "matrix_free",
+                    "metric.multiply_path": "dense_matmul",
+                },
+                admission_status="passed",
+            ),
+            {"metric_matrix": matrix},
+            vector,
+        )()
 
 
 def test_inverse_metric_cg_factor_reuse_does_not_filter_zero_rows(
@@ -9746,7 +11845,7 @@ def test_inverse_metric_cg_factor_reuse_does_not_filter_zero_rows(
             dtype=torch.float64,
         )
     }
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "dense",
         aggregation="sum",
@@ -9759,7 +11858,7 @@ def test_inverse_metric_cg_factor_reuse_does_not_filter_zero_rows(
         buffers={},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "cg-factor-reuse",
             {
@@ -9767,6 +11866,7 @@ def test_inverse_metric_cg_factor_reuse_does_not_filter_zero_rows(
                 "inverse_metric.iteration_budget": 2,
                 "inverse_metric.preconditioner": "none",
                 "inverse_metric.factor_reuse": "reuse_factor_across_rhs",
+                "inverse_metric.multi_rhs": "block",
                 "metric.multiply_path": "dense_matmul",
                 "vectorization.mode": "single_loop",
                 "vectorization.in_dims": {"w": 0},
@@ -9786,7 +11886,7 @@ def test_inverse_metric_cg_requires_metric_accumulation_for_non_dense_inner_path
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = LowRankMetricData.factors()
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "low_rank",
         aggregation="sum",
@@ -9798,7 +11898,7 @@ def test_inverse_metric_cg_requires_metric_accumulation_for_non_dense_inner_path
         params=params,
         buffers={},
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "inverse",
         "missing-accumulation",
         {
@@ -9820,7 +11920,7 @@ def test_inverse_metric_cg_uses_declared_inner_metric_path() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "dense",
         aggregation="sum",
@@ -9832,7 +11932,7 @@ def test_inverse_metric_cg_uses_declared_inner_metric_path() -> None:
         params=params,
         buffers={},
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "inverse",
         "blockwise-inner",
         {
@@ -9849,6 +11949,200 @@ def test_inverse_metric_cg_uses_declared_inner_metric_path() -> None:
         operation()
 
 
+def test_inverse_metric_cg_stops_at_declared_tol() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.diag(torch.tensor([1.0, 4.0], dtype=torch.float64))
+    vector = {"w": torch.ones(2, dtype=torch.float64)}
+    operator = ops.inverse_metric(
+        "inverse",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+        damping=0.0,
+        tol=0.7,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    output = factory(
+        vpx.Candidate(
+            "inverse",
+            "cg-tol",
+            {
+                **inverse_metric_settings("conjugate_gradient"),
+                "inverse_metric.iteration_budget": 4,
+                "inverse_metric.preconditioner": "none",
+                **metric_settings("dense_matmul"),
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        vector,
+    )()
+    one_step = torch.tensor([0.4, 0.4], dtype=torch.float64)
+    exact = torch.linalg.solve(matrix, vector["w"])
+    result = tree_leaves(output)[0]
+
+    torch.testing.assert_close(result, one_step)
+    assert not torch.allclose(result, exact)
+
+
+def test_inverse_metric_tol_requires_conjugate_gradient_path() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.eye(2, dtype=torch.float64)
+    vector = {"w": torch.ones(2, dtype=torch.float64)}
+    operator = ops.inverse_metric(
+        "inverse",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+        damping=0.0,
+        tol=1e-4,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+
+    with pytest.raises(
+        vp.MaterializationError, match="tol requires conjugate_gradient"
+    ):
+        factory(
+            vpx.Candidate(
+                "inverse",
+                "direct-solve",
+                inverse_metric_settings("dense_solve"),
+                admission_status="passed",
+            ),
+            {"metric_matrix": matrix},
+            vector,
+        )
+
+
+def test_inverse_metric_reference_check_uses_declared_tol_threshold() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.diag(torch.tensor([1.0, 4.0], dtype=torch.float64))
+    vector = {"w": torch.ones(2, dtype=torch.float64)}
+    check = vpx.standard_reference_check(
+        ops.inverse_metric(
+            "inverse",
+            "dense",
+            aggregation="sum",
+            representation=dense_metric_representation(),
+            damping=0.0,
+            tol=0.7,
+        ),
+        params=params,
+        buffers={},
+        thresholds={
+            "max_abs_diff": 10.0,
+            "max_rel_diff": 10.0,
+            "symmetry_max_abs_diff": 1e-12,
+            "psd_violation": 1e-12,
+            "inverse_residual": 1e-12,
+            "condition_number_max": 10.0,
+        },
+    )
+    result = check(
+        vpx.Candidate(
+            "inverse",
+            "cg-tol",
+            {
+                **inverse_metric_settings("conjugate_gradient"),
+                "inverse_metric.iteration_budget": 4,
+                "inverse_metric.preconditioner": "none",
+                **metric_settings("dense_matmul"),
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        vector,
+    )
+
+    assert result.thresholds["inverse_residual"] == pytest.approx(0.7)
+    assert result.measurements["inverse_residual"] == pytest.approx(0.6)
+
+
+def test_inverse_metric_inner_cg_uses_declared_tol_before_reduction() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.diag(torch.tensor([1.0, 4.0], dtype=torch.float64))
+    left = {"w": torch.tensor([1.0, 0.0], dtype=torch.float64)}
+    right = {"w": torch.ones(2, dtype=torch.float64)}
+    operator = ops.inverse_metric_inner(
+        "inner",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+        damping=0.0,
+        tol=0.7,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    output = factory(
+        vpx.Candidate(
+            "inner",
+            "cg-tol",
+            {
+                "inverse_metric_inner.reduction_path": "solve_then_reduce",
+                "inverse_metric_inner.multi_rhs": "single_column",
+                **inverse_metric_settings("conjugate_gradient"),
+                "inverse_metric.iteration_budget": 4,
+                "inverse_metric.preconditioner": "none",
+                **metric_settings("dense_matmul"),
+            },
+            admission_status="passed",
+        ),
+        {"metric_matrix": matrix},
+        (left, right),
+    )()
+
+    torch.testing.assert_close(output, torch.tensor(0.4, dtype=torch.float64))
+
+
+def test_inverse_metric_inner_tol_requires_solve_then_reduce() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.eye(2, dtype=torch.float64)
+    vector = (
+        {"w": torch.ones(2, dtype=torch.float64)},
+        {"w": torch.ones(2, dtype=torch.float64)},
+    )
+    operator = ops.inverse_metric_inner(
+        "inner",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+        damping=0.0,
+        tol=1e-4,
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+
+    with pytest.raises(vp.MaterializationError, match="tol requires solve_then_reduce"):
+        factory(
+            vpx.Candidate(
+                "inner",
+                "sqrt-reduce",
+                {
+                    "inverse_metric_inner.reduction_path": "sqrt_apply_reduce",
+                    "inverse_metric_inner.multi_rhs": "single_column",
+                    "sqrt_metric.factor_path": "cholesky_factor",
+                },
+                admission_status="passed",
+            ),
+            {"metric_matrix": matrix},
+            vector,
+        )
+
+
 def test_inverse_metric_cg_block_preconditioner_matches_reference() -> None:
     params = {
         "a": torch.tensor([1.0], dtype=torch.float64),
@@ -9862,7 +12156,7 @@ def test_inverse_metric_cg_block_preconditioner_matches_reference() -> None:
         "a": torch.tensor([0.25], dtype=torch.float64),
         "b": torch.tensor([-0.75, 0.5], dtype=torch.float64),
     }
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "blocks",
         aggregation="sum",
@@ -9879,7 +12173,7 @@ def test_inverse_metric_cg_block_preconditioner_matches_reference() -> None:
         dense_matrix + 0.25 * torch.eye(3, dtype=torch.float64),
         flatten_tree(vector),
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "inverse",
         "cg-block",
         {
@@ -9899,7 +12193,7 @@ def test_inverse_metric_cg_factorized_preconditioner_matches_reference() -> None
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = LowRankMetricData.factors()
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse",
         "low_rank",
         aggregation="sum",
@@ -9918,7 +12212,7 @@ def test_inverse_metric_cg_factorized_preconditioner_matches_reference() -> None
         dense_matrix + 0.25 * torch.eye(2, dtype=torch.float64),
         vector["w"],
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "inverse",
         "cg-factorized",
         {
@@ -9937,7 +12231,7 @@ def test_inverse_metric_cg_factorized_preconditioner_matches_reference() -> None
 def test_inverse_metric_reference_check_rejects_indefinite_metric() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     check = vpx.standard_reference_check(
-        vp.inverse_metric(
+        ops.inverse_metric(
             "inverse",
             "dense",
             aggregation="sum",
@@ -9958,7 +12252,7 @@ def test_inverse_metric_reference_check_rejects_indefinite_metric() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "inverse",
                 "row",
                 inverse_metric_settings(),
@@ -9977,10 +12271,10 @@ def test_ggnvp_reference_check_rejects_nonsymmetric_loss_hessian() -> None:
     params = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is not None
@@ -9989,7 +12283,7 @@ def test_ggnvp_reference_check_rejects_nonsymmetric_loss_hessian() -> None:
         return torch.stack((params["w"][0], 2.0 * params["w"][0]))
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -10003,7 +12297,7 @@ def test_ggnvp_reference_check_rejects_nonsymmetric_loss_hessian() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "ggn",
                 "row",
                 ggn_dense_kernel_settings(),
@@ -10024,10 +12318,10 @@ def test_ggnvp_reference_check_rejects_indefinite_loss_hessian() -> None:
     params = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is not None
@@ -10036,7 +12330,7 @@ def test_ggnvp_reference_check_rejects_indefinite_loss_hessian() -> None:
         return torch.stack((params["w"][0], 2.0 * params["w"][0]))
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -10051,7 +12345,7 @@ def test_ggnvp_reference_check_rejects_indefinite_loss_hessian() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "ggn",
                 "row",
                 ggn_dense_kernel_settings(),
@@ -10070,62 +12364,14 @@ def test_ggnvp_reference_check_rejects_indefinite_loss_hessian() -> None:
         )
 
 
-def test_ggnvp_rejects_non_psd_loss_metric_semantics() -> None:
-    params = {"w": torch.tensor([1.0], dtype=torch.float64)}
-
-    def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> torch.Tensor:
-        assert buffers == {}
-        assert batch["loss_hessian"] is not None
-        assert context.family == "ggn"
-
-        return torch.stack((params["w"][0], 2.0 * params["w"][0]))
-
-    operator = dataclasses.replace(
-        vp.ggnvp(
-            "ggn",
-            "model_output",
-            aggregation="sum",
-        ),
-        semantics={"loss_geometry": "linear_map"},
-    )
-    factory = vpx.standard_operation_factory(
-        operator,
-        params=params,
-        buffers={},
-        function_objectives={"model_output": function},
-    )
-
-    with pytest.raises(vp.MaterializationError, match="PSD output-space loss metric"):
-        factory(
-            vp.Candidate(
-                "ggn",
-                "row",
-                ggn_dense_kernel_settings(),
-                admission_status="passed",
-            ),
-            {
-                "loss_hessian": torch.tensor(
-                    [[1.0, 2.0], [0.0, 1.0]],
-                    dtype=torch.float64,
-                )
-            },
-            {"w": torch.tensor([1.0], dtype=torch.float64)},
-        )()
-
-
 def test_ggnvp_reference_check_uses_jvp_hessian_vjp_anchor() -> None:
     params = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is not None
@@ -10136,7 +12382,7 @@ def test_ggnvp_reference_check_uses_jvp_hessian_vjp_anchor() -> None:
         return multiplier * torch.stack((params["w"][0], 3.0 * params["w"][0]))
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -10151,7 +12397,7 @@ def test_ggnvp_reference_check_uses_jvp_hessian_vjp_anchor() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "ggn",
                 "row",
                 {
@@ -10174,10 +12420,10 @@ def test_ggnvp_reference_check_cross_checks_jvp_path_with_dense_anchor() -> None
     params = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is not None
@@ -10188,7 +12434,7 @@ def test_ggnvp_reference_check_cross_checks_jvp_path_with_dense_anchor() -> None
         return multiplier * torch.stack((params["w"][0], 3.0 * params["w"][0]))
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -10203,7 +12449,7 @@ def test_ggnvp_reference_check_cross_checks_jvp_path_with_dense_anchor() -> None
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "ggn",
                 "row",
                 {
@@ -10226,10 +12472,10 @@ def test_ggnvp_reference_check_records_dense_anchor_errors() -> None:
     params = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is not None
@@ -10238,7 +12484,7 @@ def test_ggnvp_reference_check_records_dense_anchor_errors() -> None:
         return torch.stack((params["w"][0], 3.0 * params["w"][0]))
 
     check = vpx.standard_reference_check(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -10251,7 +12497,7 @@ def test_ggnvp_reference_check_records_dense_anchor_errors() -> None:
         function_objectives={"model_output": function},
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "jvp",
             {
@@ -10269,7 +12515,7 @@ def test_ggnvp_reference_check_records_dense_anchor_errors() -> None:
         {"w": torch.tensor([1.0], dtype=torch.float64)},
     )
     linearize_result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "linearize",
             {
@@ -10287,7 +12533,7 @@ def test_ggnvp_reference_check_records_dense_anchor_errors() -> None:
         {"w": torch.tensor([1.0], dtype=torch.float64)},
     )
     forward_ad_result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "forward-ad",
             {
@@ -10317,6 +12563,46 @@ def test_ggnvp_reference_check_records_dense_anchor_errors() -> None:
         "max_abs_diff": 0.0,
         "max_rel_diff": 0.0,
     }
+
+    with pytest.raises(vp.ReferenceFailedError, match="min_probe_norm"):
+        check(
+            vpx.Candidate(
+                "ggn",
+                "zero-vector",
+                {
+                    **ggn_settings("torch_func_jvp"),
+                    **torch_func_settings(requires_forward_ad=True),
+                    "ggn.loss_hessian_path": "autodiff_loss_hvp",
+                    "ggn.loss_hessian_kernel": "dense_global",
+                },
+                admission_status="passed",
+            ),
+            {
+                "loss_hessian": torch.eye(2, dtype=torch.float64),
+                "symmetry_vector": {"w": torch.tensor([2.0], dtype=torch.float64)},
+            },
+            {"w": torch.tensor([0.0], dtype=torch.float64)},
+        )
+
+    with pytest.raises(vp.ReferenceFailedError, match="min_probe_norm"):
+        check(
+            vpx.Candidate(
+                "ggn",
+                "zero-symmetry-vector",
+                {
+                    **ggn_settings("torch_func_jvp"),
+                    **torch_func_settings(requires_forward_ad=True),
+                    "ggn.loss_hessian_path": "autodiff_loss_hvp",
+                    "ggn.loss_hessian_kernel": "dense_global",
+                },
+                admission_status="passed",
+            ),
+            {
+                "loss_hessian": torch.eye(2, dtype=torch.float64),
+                "symmetry_vector": {"w": torch.tensor([0.0], dtype=torch.float64)},
+            },
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+        )
     assert result.measurements["inner_abs_diff"] == pytest.approx(0.0)
     assert linearize_result.measurements["inner_abs_diff"] == pytest.approx(0.0)
     assert forward_ad_result.measurements["inner_abs_diff"] == pytest.approx(0.0)
@@ -10327,10 +12613,10 @@ def test_fisher_references_use_declared_per_example_objectives() -> None:
     vector = {"w": torch.tensor([0.4, -0.7], dtype=torch.float64)}
 
     def per_example_scores(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["normalization"] == pytest.approx(3.0)
@@ -10356,7 +12642,7 @@ def test_fisher_references_use_declared_per_example_objectives() -> None:
         function_objectives={"scores": per_example_scores},
     )
     empirical_check = vpx.standard_reference_check(
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "scores",
             aggregation="mean_per_example",
@@ -10369,7 +12655,7 @@ def test_fisher_references_use_declared_per_example_objectives() -> None:
         function_objectives={"scores": per_example_scores},
     )
     fisher_result = fisher_check(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "row",
             fisher_settings("materialize_score_gradients"),
@@ -10379,7 +12665,7 @@ def test_fisher_references_use_declared_per_example_objectives() -> None:
         vector,
     )
     empirical_result = empirical_check(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "row",
             empirical_dense_settings(),
@@ -10394,7 +12680,7 @@ def test_fisher_references_use_declared_per_example_objectives() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         fisher_check(
-            vp.Candidate(
+            vpx.Candidate(
                 "fisher",
                 "row",
                 fisher_settings("materialize_score_gradients"),
@@ -10406,7 +12692,7 @@ def test_fisher_references_use_declared_per_example_objectives() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         empirical_check(
-            vp.Candidate(
+            vpx.Candidate(
                 "empirical",
                 "row",
                 empirical_dense_settings(),
@@ -10433,7 +12719,7 @@ def test_fisher_references_use_declared_per_example_objectives() -> None:
             "sampled_score_gradients",
         ),
         (
-            vp.empirical_fisher_vp(
+            ops.empirical_fisher_vp(
                 "empirical",
                 "scores",
                 aggregation="mean_per_example",
@@ -10447,7 +12733,7 @@ def test_fisher_references_use_declared_per_example_objectives() -> None:
     ],
 )
 def test_numeric_loss_scaling_unscales_degree_two_fisher_family_output(
-    operator: vp.OperatorSpec,
+    operator: vpx.OperatorSpec,
     family: str,
     settings: Mapping[str, object],
     batch_key: str,
@@ -10470,7 +12756,7 @@ def test_numeric_loss_scaling_unscales_degree_two_fisher_family_output(
         function_objectives={},
     )
     unscaled = factory(
-        vp.Candidate(
+        vpx.Candidate(
             family,
             "unscaled",
             settings,
@@ -10480,7 +12766,7 @@ def test_numeric_loss_scaling_unscales_degree_two_fisher_family_output(
         vector,
     )()
     scaled = factory(
-        vp.Candidate(
+        vpx.Candidate(
             family,
             "scaled",
             {
@@ -10506,10 +12792,10 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
     }
 
     def per_example_losses(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "empirical"
@@ -10521,7 +12807,7 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
         return (params["w"][0] * x_value - y_value).square()
 
     factory = vpx.standard_operation_factory(
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "losses",
             aggregation="mean_per_example",
@@ -10533,7 +12819,7 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
         function_objectives={"losses": per_example_losses},
     )
     loop_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "loop",
             {
@@ -10546,7 +12832,7 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
         vector,
     )()
     torch_func_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "torch-func",
             {
@@ -10560,7 +12846,7 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
         vector,
     )()
     materialized_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "materialized",
             {
@@ -10573,7 +12859,7 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
         vector,
     )()
     vmap_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "vmap",
             {
@@ -10587,7 +12873,7 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
         vector,
     )()
     check = vpx.standard_reference_check(
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "losses",
             aggregation="mean_per_example",
@@ -10600,7 +12886,7 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
         function_objectives={"losses": per_example_losses},
     )
     reference_result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "vmap-reference",
             {
@@ -10630,7 +12916,7 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
         match=r"vectorization\.vmap_chunk_size",
     ):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "empirical",
                 "bad-loop",
                 {
@@ -10645,7 +12931,7 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
 
     with pytest.raises(vp.MaterializationError, match=r"schedule\.per_example"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "empirical",
                 "missing-schedule",
                 {
@@ -10664,7 +12950,7 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
         match=r"batch\.fisher_sample_batch_size",
     ):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "empirical",
                 "wrong-batch-size-key",
                 {
@@ -10680,7 +12966,7 @@ def test_empirical_fisher_vmap_path_matches_loop_path() -> None:
         )()
 
     vector_axis_vmap_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "vector-axis-vmap",
             {
@@ -10706,10 +12992,10 @@ def test_empirical_fisher_vmap_path_rejects_invalid_batch_shape() -> None:
     vector = {"w": torch.tensor([1.7], dtype=torch.float64)}
 
     def per_example_losses(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert params
         assert buffers == {}
@@ -10720,7 +13006,7 @@ def test_empirical_fisher_vmap_path_rejects_invalid_batch_shape() -> None:
         return x_value * 0.0
 
     factory = vpx.standard_operation_factory(
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "losses",
             aggregation="mean_per_example",
@@ -10734,7 +13020,7 @@ def test_empirical_fisher_vmap_path_rejects_invalid_batch_shape() -> None:
 
     with pytest.raises(vp.MaterializationError, match="leading dimensions differ"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "empirical",
                 "vmap",
                 {
@@ -10758,10 +13044,10 @@ def test_per_example_schedule_rejects_non_batch_data_axis() -> None:
     vector = {"w": torch.tensor([1.7], dtype=torch.float64)}
 
     def per_example_losses(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert params
         assert buffers == {}
@@ -10771,7 +13057,7 @@ def test_per_example_schedule_rejects_non_batch_data_axis() -> None:
         return torch.tensor([1.0, 2.0], dtype=torch.float64)
 
     operator = dataclasses.replace(
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "losses",
             aggregation="mean_per_example",
@@ -10789,7 +13075,7 @@ def test_per_example_schedule_rejects_non_batch_data_axis() -> None:
 
     with pytest.raises(vp.MaterializationError, match="data_axis=batch"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "empirical",
                 "vmap",
                 {
@@ -10811,7 +13097,7 @@ def test_microbatch_accumulation_rejects_non_batch_data_axis() -> None:
     params = {"w": torch.tensor([0.4], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.7], dtype=torch.float64)}
     operator = dataclasses.replace(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         data_axis="sequence",
     )
     factory = vpx.standard_operation_factory(
@@ -10823,7 +13109,7 @@ def test_microbatch_accumulation_rejects_non_batch_data_axis() -> None:
 
     with pytest.raises(vp.MaterializationError, match="data_axis=batch"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "microbatch",
                 {
@@ -10862,10 +13148,10 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
     loss_hessian = torch.diag(torch.tensor([3.0, 5.0], dtype=torch.float64))
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -10877,7 +13163,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         ))
 
     ggn_factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers=buffers,
         function_objectives={"model_output": function},
@@ -10893,7 +13179,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         buffers=buffers,
     )
     empirical_factory = vpx.standard_operation_factory(
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "scores",
             aggregation="mean_per_example",
@@ -10904,7 +13190,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         buffers=buffers,
     )
     metric_factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -10914,7 +13200,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         buffers=buffers,
     )
     inverse_factory = vpx.standard_operation_factory(
-        vp.inverse_metric(
+        ops.inverse_metric(
             "inverse",
             "dense",
             aggregation="sum",
@@ -10925,7 +13211,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         buffers=buffers,
     )
     ggn_result = ggn_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "row",
             ggn_dense_kernel_settings(),
@@ -10935,7 +13221,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         vector,
     )()
     fisher_result = fisher_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "row",
             fisher_settings("materialize_score_gradients"),
@@ -10945,7 +13231,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         vector,
     )()
     fisher_blockwise_result = fisher_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "blockwise",
             fisher_settings("blockwise_score_matrix"),
@@ -10955,7 +13241,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         vector,
     )()
     sampled_fisher_result = sampled_fisher_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "row",
             sampled_fisher_settings("materialize_score_gradients"),
@@ -10965,7 +13251,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         vector,
     )()
     sampled_fisher_blockwise_result = sampled_fisher_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "blockwise",
             sampled_fisher_settings("blockwise_score_matrix"),
@@ -10978,7 +13264,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         vector,
     )()
     empirical_result = empirical_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "row",
             empirical_dense_settings(),
@@ -10988,7 +13274,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         vector,
     )()
     empirical_blockwise_result = empirical_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "blockwise",
             {"empirical_fisher.accumulation": "blockwise_gradient_matrix"},
@@ -10998,7 +13284,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         vector,
     )()
     metric_result = metric_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "row",
             metric_settings(),
@@ -11008,7 +13294,7 @@ def test_standard_operation_factory_runs_dense_metric_and_fisher_families() -> N
         vector,
     )()
     inverse_result = inverse_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "row",
             inverse_metric_settings(),
@@ -11075,7 +13361,7 @@ def test_parameter_block_size_chunks_score_matrix_product(
         buffers={},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "parameter-blocks",
             {
@@ -11107,7 +13393,7 @@ def test_layer_block_size_chunks_score_matrix_product(
         "b": torch.tensor([0.0, 0.0], dtype=torch.float64),
         "c": torch.tensor([0.0], dtype=torch.float64),
     }
-    parameter_surface = vp.ParameterSurface(
+    parameter_surface = vpx.ParameterSurface(
         names=("a", "b", "c"),
         shapes=((1,), (2,), (1,)),
         trainable=(True, True, True),
@@ -11145,7 +13431,7 @@ def test_layer_block_size_chunks_score_matrix_product(
         parameter_surface=parameter_surface,
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "layer-blocks",
             {
@@ -11193,10 +13479,10 @@ def test_parameter_block_size_chunks_dense_ggn_transpose_product(
         return original_matmul(settings, left, right)
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -11209,17 +13495,16 @@ def test_parameter_block_size_chunks_dense_ggn_transpose_product(
 
     monkeypatch.setattr(runtime_module, "_matmul_runtime", recording_matmul)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "parameter-blocks",
             {
-                "ggn.jvp_path": "dense_global",
                 "ggn.loss_hessian_path": "autodiff_loss_hvp",
                 "ggn.loss_hessian_kernel": "dense_global",
                 "chunk.parameter_block_size": 2,
@@ -11253,7 +13538,7 @@ def test_layer_block_size_chunks_dense_ggn_transpose_product(
         "b": torch.tensor([-1.0, 2.0], dtype=torch.float64),
         "c": torch.tensor([1.5], dtype=torch.float64),
     }
-    parameter_surface = vp.ParameterSurface(
+    parameter_surface = vpx.ParameterSurface(
         names=("a", "b", "c"),
         shapes=((1,), (2,), (1,)),
         trainable=(True, True, True),
@@ -11283,10 +13568,10 @@ def test_layer_block_size_chunks_dense_ggn_transpose_product(
         return original_matmul(settings, left, right)
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -11299,18 +13584,17 @@ def test_layer_block_size_chunks_dense_ggn_transpose_product(
 
     monkeypatch.setattr(runtime_module, "_matmul_runtime", recording_matmul)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         parameter_surface=parameter_surface,
         function_objectives={"model_output": function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "layer-blocks",
             {
-                "ggn.jvp_path": "dense_global",
                 "ggn.loss_hessian_path": "autodiff_loss_hvp",
                 "ggn.loss_hessian_kernel": "dense_global",
                 "chunk.layer_block_size": 1,
@@ -11350,7 +13634,7 @@ def test_parameter_block_size_rejects_non_dense_parameter_matrix_path() -> None:
 
     with pytest.raises(vp.MaterializationError, match="parameter-column"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "fisher",
                 "bad-parameter-blocks",
                 {
@@ -11375,7 +13659,7 @@ def test_layer_block_size_requires_declared_layer_groups() -> None:
 
     with pytest.raises(vp.MaterializationError, match="declared layer_groups"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "fisher",
                 "missing-layer-groups",
                 {
@@ -11394,7 +13678,7 @@ def test_layer_block_size_requires_declared_layer_groups() -> None:
 
 def test_parameter_and_layer_block_sizes_are_mutually_exclusive() -> None:
     params = {"w": torch.tensor([0.0, 0.0], dtype=torch.float64)}
-    parameter_surface = vp.ParameterSurface(
+    parameter_surface = vpx.ParameterSurface(
         names=("w",),
         shapes=((2,),),
         trainable=(True,),
@@ -11410,7 +13694,7 @@ def test_parameter_and_layer_block_sizes_are_mutually_exclusive() -> None:
 
     with pytest.raises(vp.MaterializationError, match="cannot both be set"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "fisher",
                 "conflicting-chunks",
                 {
@@ -11432,13 +13716,13 @@ def test_hvp_row_batch_size_executes_reverse_rows() -> None:
     params = {"w": torch.tensor([2.0, -1.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.5, -0.5], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "row-batched",
             {
@@ -11459,7 +13743,7 @@ def test_hvp_row_batch_size_executes_reverse_rows() -> None:
 
 def test_hvp_row_batch_size_rejects_non_reverse_path() -> None:
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params={"w": torch.tensor([1.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -11467,7 +13751,7 @@ def test_hvp_row_batch_size_rejects_non_reverse_path() -> None:
 
     with pytest.raises(vp.MaterializationError, match="reverse_over_reverse"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "bad-row-batch",
                 {
@@ -11516,7 +13800,7 @@ def test_fisher_family_vmap_vectorization_runs_batched_dense_vectors() -> None:
         buffers={},
     )
     empirical_factory = vpx.standard_operation_factory(
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "scores",
             aggregation="sum",
@@ -11527,7 +13811,7 @@ def test_fisher_family_vmap_vectorization_runs_batched_dense_vectors() -> None:
         buffers={},
     )
     fisher_result = fisher_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "dense-vmap",
             {
@@ -11541,7 +13825,7 @@ def test_fisher_family_vmap_vectorization_runs_batched_dense_vectors() -> None:
         vector,
     )()
     fisher_blockwise_result = fisher_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "blockwise-vmap",
             {
@@ -11555,7 +13839,7 @@ def test_fisher_family_vmap_vectorization_runs_batched_dense_vectors() -> None:
         vector,
     )()
     sampled_result = sampled_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "dense-vmap",
             {
@@ -11573,7 +13857,7 @@ def test_fisher_family_vmap_vectorization_runs_batched_dense_vectors() -> None:
         vector,
     )()
     empirical_result = empirical_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "dense-vmap",
             {**empirical_dense_settings(), **vector_settings, **vector_admission},
@@ -11627,10 +13911,10 @@ def test_fisher_vector_vmap_composes_with_per_example_vmap_score_path() -> None:
     }
 
     def scores(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "fisher"
@@ -11644,7 +13928,7 @@ def test_fisher_vector_vmap_composes_with_per_example_vmap_score_path() -> None:
         function_objectives={"scores": scores},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "score-vmap-vector-vmap",
             {
@@ -11669,23 +13953,23 @@ def test_fisher_vector_vmap_composes_with_per_example_vmap_score_path() -> None:
 def test_standard_metric_materializer_returns_metric_object(tmp_path: Path) -> None:
     model = TwoParameterModule()
     params = {"w": model.w.detach().clone()}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "dense",
         aggregation="sum",
         representation=dense_metric_representation(),
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "dense",
             metric_settings(),
             changed_axes=("metric.multiply_path",),
         ),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=DenseMetricData(),
         operator=operator,
         vectors=TwoParameterVectorProvider(),
@@ -11705,7 +13989,7 @@ def test_standard_metric_materializer_returns_metric_object(tmp_path: Path) -> N
             axis_registry=vpx.standard_axis_registry(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -11725,10 +14009,8 @@ def test_standard_metric_materializer_returns_metric_object(tmp_path: Path) -> N
         tree_leaves(selected.multiply(batch, vector))[0],
         DenseMetricData.matrix @ vector["w"],
     )
-    assert torch.allclose(
-        tree_leaves(selected.inverse_multiply(batch, vector))[0],
-        torch.linalg.solve(DenseMetricData.matrix, vector["w"]),
-    )
+    with pytest.raises(vp.MaterializationError, match="inverse_metric selection"):
+        selected.inverse_multiply(batch, vector)
     assert torch.allclose(
         selected.inner(batch, vector, right),
         vector["w"] @ (DenseMetricData.matrix @ right["w"]),
@@ -11740,23 +14022,23 @@ def test_standard_metric_materializer_preserves_diagonal_representation(
 ) -> None:
     model = TwoParameterModule()
     params = {"w": model.w.detach().clone()}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "diagonal",
         aggregation="sum",
         representation=diagonal_metric_representation(),
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "factorized",
             metric_settings("factorized_multiply"),
             changed_axes=("metric.multiply_path",),
         ),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=DiagonalMetricData(),
         operator=operator,
         vectors=TwoParameterVectorProvider(),
@@ -11776,7 +14058,7 @@ def test_standard_metric_materializer_preserves_diagonal_representation(
             axis_registry=vpx.standard_axis_registry(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -11804,23 +14086,23 @@ def test_standard_metric_materializer_preserves_block_representation(
 ) -> None:
     model = TwoParameterModule()
     params = {"w": model.w.detach().clone()}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "blocks",
         aggregation="sum",
         representation=block_metric_representation(),
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "blockwise",
             metric_settings("blockwise_multiply"),
             changed_axes=("metric.multiply_path",),
         ),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=BlockMetricData(),
         operator=operator,
         vectors=TwoParameterVectorProvider(),
@@ -11840,7 +14122,7 @@ def test_standard_metric_materializer_preserves_block_representation(
             axis_registry=vpx.standard_axis_registry(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -11869,23 +14151,23 @@ def test_standard_metric_materializer_preserves_low_rank_representation(
 ) -> None:
     model = TwoParameterModule()
     params = {"w": model.w.detach().clone()}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "low_rank",
         aggregation="sum",
         representation=low_rank_metric_representation(),
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "factorized",
             metric_settings("factorized_multiply"),
             changed_axes=("metric.multiply_path",),
         ),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=LowRankMetricData(),
         operator=operator,
         vectors=TwoParameterVectorProvider(),
@@ -11905,7 +14187,7 @@ def test_standard_metric_materializer_preserves_low_rank_representation(
             axis_registry=vpx.standard_axis_registry(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -11936,7 +14218,7 @@ def test_standard_inverse_metric_materializer_preserves_low_rank_representation(
 ) -> None:
     model = TwoParameterModule()
     params = {"w": model.w.detach().clone()}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse_metric",
         "low_rank",
         aggregation="sum",
@@ -11944,16 +14226,16 @@ def test_standard_inverse_metric_materializer_preserves_low_rank_representation(
         damping=0.25,
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "inverse_metric",
             "woodbury",
             inverse_metric_settings("woodbury_low_rank_solve"),
             changed_axes=("inverse_metric.solve_path",),
         ),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=LowRankMetricData(),
         operator=operator,
         vectors=TwoParameterVectorProvider(),
@@ -11976,7 +14258,7 @@ def test_standard_inverse_metric_materializer_preserves_low_rank_representation(
             axis_registry=vpx.standard_axis_registry(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -12005,23 +14287,23 @@ def test_standard_metric_materializer_preserves_kfac_representation(
 ) -> None:
     model = MatrixParameterModule()
     params = {"w": model.w.detach().clone()}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "kfac",
         aggregation="sum",
         representation=kfac_metric_representation(),
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "factorized",
             metric_settings("factorized_multiply"),
             changed_axes=("metric.multiply_path",),
         ),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=KFACMetricData(),
         operator=operator,
         vectors=MatrixVectorProvider(),
@@ -12041,7 +14323,7 @@ def test_standard_metric_materializer_preserves_kfac_representation(
             axis_registry=vpx.standard_axis_registry(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -12065,7 +14347,7 @@ def test_standard_inverse_metric_materializer_preserves_kfac_representation(
 ) -> None:
     model = MatrixParameterModule()
     params = {"w": model.w.detach().clone()}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse_metric",
         "kfac",
         aggregation="sum",
@@ -12073,16 +14355,16 @@ def test_standard_inverse_metric_materializer_preserves_kfac_representation(
         damping=0.25,
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "inverse_metric",
             "factorized",
             inverse_metric_settings("factorized_solve"),
             changed_axes=("inverse_metric.solve_path",),
         ),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=KFACMetricData(),
         operator=operator,
         vectors=MatrixVectorProvider(),
@@ -12105,7 +14387,7 @@ def test_standard_inverse_metric_materializer_preserves_kfac_representation(
             axis_registry=vpx.standard_axis_registry(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -12132,23 +14414,23 @@ def test_standard_metric_materializer_preserves_ggn_representation(
 ) -> None:
     model = TwoParameterModule()
     params = {"w": model.w.detach().clone()}
-    operator = vp.metric(
+    operator = ops.metric(
         "metric",
         "ggn",
         aggregation="sum",
         representation=ggn_metric_representation(),
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "factorized",
             metric_settings("factorized_multiply"),
             changed_axes=("metric.multiply_path",),
         ),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=GGNMetricData(),
         operator=operator,
         vectors=TwoParameterVectorProvider(),
@@ -12168,7 +14450,7 @@ def test_standard_metric_materializer_preserves_ggn_representation(
             axis_registry=vpx.standard_axis_registry(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -12189,12 +14471,10 @@ def test_standard_metric_materializer_preserves_ggn_representation(
     )
 
 
-def test_standard_inverse_metric_materializer_preserves_ggn_representation(
-    tmp_path: Path,
-) -> None:
+def test_inverse_metric_materializer_preserves_ggn_representation() -> None:
     model = TwoParameterModule()
     params = {"w": model.w.detach().clone()}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse_metric",
         "ggn",
         aggregation="sum",
@@ -12202,81 +14482,65 @@ def test_standard_inverse_metric_materializer_preserves_ggn_representation(
         damping=0.25,
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "inverse_metric",
             "factorized",
             inverse_metric_settings("factorized_solve"),
             changed_axes=("inverse_metric.solve_path",),
         ),
     )
-    problem = vp.Problem(
-        model=model,
-        params=vp.parameter_surface(model),
-        data=GGNMetricData(),
-        operator=operator,
-        vectors=TwoParameterVectorProvider(),
-        target=cpu_target(),
-        runtime=vpx.standard_runtime_config(
-            operator,
-            params=params,
-            buffers={},
-            candidates=candidates,
-            thresholds={
-                "max_abs_diff": 1e-12,
-                "max_rel_diff": 1e-12,
-                "symmetry_max_abs_diff": 1e-12,
-                "psd_violation": 1e-12,
-                "inverse_residual": 1e-12,
-                "damping_min": 0.1,
-                "condition_number_max": 10.0,
-            },
-            objective_signature={"ggn": "inverse-metric-v1"},
-            axis_registry=vpx.standard_axis_registry(),
-        ),
+    runtime = vpx.standard_runtime_config(
+        operator,
+        params=params,
+        buffers={},
+        candidates=candidates,
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "symmetry_max_abs_diff": 1e-12,
+            "psd_violation": 1e-12,
+            "inverse_residual": 1e-12,
+            "damping_min": 0.1,
+            "condition_number_max": 10.0,
+        },
+        objective_signature={"ggn": "inverse-metric-v1"},
+        axis_registry=vpx.standard_axis_registry(),
     )
-    plan = vp.tune(
-        problem,
-        run_dir=tmp_path,
-        memory_backend=CPUMemoryBackend(),
-        clock=SequenceClock((0.0, 1.0)),
-    )
-    selected = vp.materialize(plan, family="inverse_metric")
     factors = GGNMetricData.factors()
     jacobian = factors["jacobian"]
     loss_hessian = factors["loss_hessian"]
-    matrix = jacobian.T @ loss_hessian @ jacobian
+    dense_matrix = jacobian.T @ loss_hessian @ jacobian
     batch = {"ggn_factors": factors}
     vector = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
 
-    assert isinstance(selected, vpx.StandardMetricOperator)
-    assert torch.allclose(
-        tree_leaves(selected(batch, vector))[0],
-        torch.linalg.solve(
-            matrix + 0.25 * torch.eye(2, dtype=torch.float64),
-            vector["w"],
-        ),
+    output = runtime.operation_factory(candidates[0], batch, vector)()
+    expected = torch.linalg.solve(
+        dense_matrix + 0.25 * torch.eye(2, dtype=torch.float64),
+        vector["w"],
     )
+
+    torch.testing.assert_close(tree_leaves(output)[0], expected)
 
 
 def test_standard_problem_and_plan_handle_common_path(tmp_path: Path) -> None:
     model = OneParameterModule()
-    operator = vp.gradient("gradient", "loss", aggregation="sum")
+    operator = ops.gradient("gradient", "loss", aggregation="sum")
     observed_reference_checks = []
 
     def recording_quadratic_scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         if "check" in batch:
             observed_reference_checks.append(batch["check"])
 
         return quadratic_scalar(params, buffers, batch, context)
 
-    problem = vp.standard_problem(
+    problem = runtime_module.standard_problem(
         model=model,
-        parameter_surface=vp.parameter_surface(model),
+        parameter_surface=vpx.parameter_surface(model),
         parameter_values={"w": model.w},
         buffers={},
         data=ScaleData(),
@@ -12293,7 +14557,7 @@ def test_standard_problem_and_plan_handle_common_path(tmp_path: Path) -> None:
         objective_signature={"loss": "quadratic-v1"},
         scalar_objectives={"loss": recording_quadratic_scalar},
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -12328,56 +14592,15 @@ def test_standard_problem_and_plan_handle_common_path(tmp_path: Path) -> None:
     )
 
 
-def test_autotune_builds_and_tunes_standard_problem(tmp_path: Path) -> None:
-    model = OneParameterModule()
-    plan = vp.autotune(
-        model=model,
-        parameter_surface=vp.parameter_surface(model),
-        parameter_values={"w": model.w},
-        buffers={},
-        data=ScaleData(),
-        operator=vp.gradient("gradient", "loss", aggregation="sum"),
-        vectors=ParameterVectorProvider(),
-        target=cpu_target(),
-        candidates={"autograd": gradient_settings()},
-        thresholds={
-            "max_abs_diff": 1e-6,
-            "max_rel_diff": 1e-6,
-            "directional_abs_diff": 1e-3,
-            "directional_rel_diff": 1e-3,
-        },
-        objective_signature={"loss": "quadratic-v1"},
-        scalar_objectives={"loss": quadratic_scalar},
-        run_dir=tmp_path,
-        memory_backend=CPUMemoryBackend(),
-        clock=SequenceClock((0.0, 1.0)),
-    )
-
-    assert plan.selected_candidate().candidate_id == "autograd"
-
-
 def test_runtime_config_propagates_recomputed_teacher_objective(tmp_path: Path) -> None:
     model = OneParameterModule()
     calls = []
 
-    def teacher_objective(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> vp.TensorTree:
-        assert params["w"] is not None
-        assert buffers == {}
-        assert context.family == "gradient"
-        calls.append(batch["family"])
-
-        return {"logits": batch["teacher_seed"] + 1.0}
-
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -12388,12 +14611,12 @@ def test_runtime_config_propagates_recomputed_teacher_objective(tmp_path: Path) 
 
         return batch["scale"] * params["w"].pow(2).sum() + logits.sum() * 0.0
 
-    operator = vp.gradient("gradient", "loss", aggregation="sum")
+    operator = ops.gradient("gradient", "loss", aggregation="sum")
     settings = {
         **gradient_settings(),
         "teacher_outputs": "recomputed_with_equality_check",
     }
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "gradient",
         "teacher-recompute",
         settings,
@@ -12413,13 +14636,13 @@ def test_runtime_config_propagates_recomputed_teacher_objective(tmp_path: Path) 
         thresholds=thresholds,
         objective_signature={"loss": "quadratic-with-teacher-v1"},
         axis_registry=vpx.standard_axis_registry(),
-        parameter_surface=vp.parameter_surface(model),
+        parameter_surface=vpx.parameter_surface(model),
         scalar_objectives={"loss": scalar},
-        teacher_objective=teacher_objective,
+        teacher_objective=RecordingTeacherObjective("teacher-v1", calls),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=TeacherOutputData(),
         operator=operator,
         vectors=ParameterVectorProvider(),
@@ -12429,7 +14652,7 @@ def test_runtime_config_propagates_recomputed_teacher_objective(tmp_path: Path) 
         replay_policy={},
         adapter_identity={"adapter_id": "test", "adapter_version": "1"},
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -12440,17 +14663,111 @@ def test_runtime_config_propagates_recomputed_teacher_objective(tmp_path: Path) 
     assert calls == ["gradient", "gradient"]
 
 
+def test_standard_runtime_identity_records_callback_identity() -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
+    candidate = vpx.Candidate(
+        "gradient",
+        "teacher-recompute",
+        {**gradient_settings(), "teacher_outputs": "recomputed_with_equality_check"},
+        admission_status="passed",
+    )
+    first = vpx.standard_runtime_config(
+        ops.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        candidates=(candidate,),
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "directional_abs_diff": 1e-12,
+            "directional_rel_diff": 1e-12,
+        },
+        objective_signature={"loss": "identity-test"},
+        axis_registry=vpx.standard_axis_registry(),
+        scalar_objectives={"loss": quadratic_scalar},
+        teacher_objective=IdentifiedTeacherObjective("first"),
+    )
+    second = vpx.standard_runtime_config(
+        ops.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        candidates=(candidate,),
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "directional_abs_diff": 1e-12,
+            "directional_rel_diff": 1e-12,
+        },
+        objective_signature={"loss": "identity-test"},
+        axis_registry=vpx.standard_axis_registry(),
+        scalar_objectives={"loss": quadratic_scalar},
+        teacher_objective=IdentifiedTeacherObjective("second"),
+    )
+
+    assert first.identity()["teacher_objective"] == {
+        "kind": "explicit_identity",
+        "value": {"version": "first"},
+    }
+    assert first.identity() != second.identity()
+
+
+def test_standard_runtime_identity_rejects_closure_callbacks() -> None:
+    calls = []
+
+    def teacher_objective(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
+        assert params
+        assert buffers == {}
+        assert batch
+        assert context.family == "gradient"
+        calls.append(context.candidate_id)
+
+        return {"logits": torch.tensor([1.0], dtype=torch.float64)}
+
+    with pytest.raises(vp.MaterializationError, match="closes over runtime state"):
+        vpx.standard_runtime_config(
+            ops.gradient("gradient", "loss", aggregation="sum"),
+            params={"w": torch.tensor([2.0], dtype=torch.float64)},
+            buffers={},
+            candidates=(
+                vpx.Candidate(
+                    "gradient",
+                    "teacher-recompute",
+                    {
+                        **gradient_settings(),
+                        "teacher_outputs": "recomputed_with_equality_check",
+                    },
+                    admission_status="passed",
+                ),
+            ),
+            thresholds={
+                "max_abs_diff": 1e-12,
+                "max_rel_diff": 1e-12,
+                "directional_abs_diff": 1e-12,
+                "directional_rel_diff": 1e-12,
+            },
+            objective_signature={"loss": "identity-test"},
+            axis_registry=vpx.standard_axis_registry(),
+            scalar_objectives={"loss": quadratic_scalar},
+            teacher_objective=teacher_objective,
+        )
+
+
 def test_standard_problem_rejects_composition_without_tuning_run() -> None:
     model = OneParameterModule()
 
     with pytest.raises(vp.MaterializationError, match="TuningRun"):
-        vp.standard_problem(
+        runtime_module.standard_problem(
             model=model,
-            parameter_surface=vp.parameter_surface(model),
+            parameter_surface=vpx.parameter_surface(model),
             parameter_values={"w": model.w},
             buffers={},
             data=ScaleData(),
-            operator=vp.composition(
+            operator=ops.composition(
                 "compose",
                 "identity",
                 aggregation="none",
@@ -12467,7 +14784,7 @@ def test_standard_problem_rejects_composition_without_tuning_run() -> None:
 def test_inverse_metric_materializer_calls_inverse_by_default(tmp_path: Path) -> None:
     model = TwoParameterModule()
     params = {"w": model.w.detach().clone()}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse_metric",
         "dense",
         aggregation="sum",
@@ -12475,16 +14792,16 @@ def test_inverse_metric_materializer_calls_inverse_by_default(tmp_path: Path) ->
         damping=0.25,
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "inverse_metric",
             "cholesky",
             inverse_metric_settings("cholesky_solve"),
             changed_axes=("inverse_metric.solve_path",),
         ),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=DenseMetricData(),
         operator=operator,
         vectors=TwoParameterVectorProvider(),
@@ -12507,7 +14824,7 @@ def test_inverse_metric_materializer_calls_inverse_by_default(tmp_path: Path) ->
             axis_registry=vpx.standard_axis_registry(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -12520,6 +14837,13 @@ def test_inverse_metric_materializer_calls_inverse_by_default(tmp_path: Path) ->
     assert isinstance(selected, vpx.StandardMetricOperator)
     assert torch.allclose(
         tree_leaves(selected(batch, vector))[0],
+        torch.linalg.solve(
+            DenseMetricData.matrix + 0.25 * torch.eye(2, dtype=torch.float64),
+            vector["w"],
+        ),
+    )
+    assert torch.allclose(
+        tree_leaves(selected.inverse_multiply(batch, vector))[0],
         torch.linalg.solve(
             DenseMetricData.matrix + 0.25 * torch.eye(2, dtype=torch.float64),
             vector["w"],
@@ -12532,7 +14856,7 @@ def test_inverse_metric_materializer_preserves_conjugate_gradient_path(
 ) -> None:
     model = TwoParameterModule()
     params = {"w": model.w.detach().clone()}
-    operator = vp.inverse_metric(
+    operator = ops.inverse_metric(
         "inverse_metric",
         "dense",
         aggregation="sum",
@@ -12540,7 +14864,7 @@ def test_inverse_metric_materializer_preserves_conjugate_gradient_path(
         damping=0.25,
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "inverse_metric",
             "cg",
             {
@@ -12552,9 +14876,9 @@ def test_inverse_metric_materializer_preserves_conjugate_gradient_path(
             changed_axes=("inverse_metric.solve_path",),
         ),
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=DenseMetricData(),
         operator=operator,
         vectors=TwoParameterVectorProvider(),
@@ -12577,7 +14901,7 @@ def test_inverse_metric_materializer_preserves_conjugate_gradient_path(
             axis_registry=vpx.standard_axis_registry(),
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -12597,7 +14921,7 @@ def test_inverse_metric_materializer_preserves_conjugate_gradient_path(
     )
 
 
-def flatten_tree(tree: vp.TensorTree) -> torch.Tensor:
+def flatten_tree(tree: vpx.TensorTree) -> torch.Tensor:
     return torch.cat(tuple(value.reshape(-1) for value in tree_leaves(tree)))
 
 
@@ -12681,7 +15005,7 @@ def test_fisher_style_runtime_rejects_invalid_normalization() -> None:
         buffers={},
     )
     sum_factory = vpx.standard_operation_factory(
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "scores",
             aggregation="sum",
@@ -12694,7 +15018,7 @@ def test_fisher_style_runtime_rejects_invalid_normalization() -> None:
 
     with pytest.raises(vp.MaterializationError):
         mean_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "fisher",
                 "row",
                 fisher_settings("materialize_score_gradients"),
@@ -12706,7 +15030,7 @@ def test_fisher_style_runtime_rejects_invalid_normalization() -> None:
 
     with pytest.raises(vp.MaterializationError, match="score_gradients"):
         mean_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "fisher",
                 "row",
                 fisher_settings("materialize_score_gradients"),
@@ -12718,7 +15042,7 @@ def test_fisher_style_runtime_rejects_invalid_normalization() -> None:
 
     with pytest.raises(vp.MaterializationError):
         sum_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "empirical",
                 "row",
                 empirical_dense_settings(),
@@ -12747,7 +15071,7 @@ def test_fisher_style_runtime_rejects_invalid_normalization() -> None:
             {"num_examples": 1},
         ),
         (
-            vp.empirical_fisher_vp(
+            ops.empirical_fisher_vp(
                 "empirical",
                 "scores",
                 aggregation="mean_per_example",
@@ -12762,7 +15086,7 @@ def test_fisher_style_runtime_rejects_invalid_normalization() -> None:
     ],
 )
 def test_fisher_style_runtime_rejects_empty_score_surface(
-    operator: vp.OperatorSpec,
+    operator: vpx.OperatorSpec,
     family: str,
     settings: Mapping[str, object],
     batch_key: str,
@@ -12778,7 +15102,7 @@ def test_fisher_style_runtime_rejects_empty_score_surface(
 
     with pytest.raises(vp.MaterializationError, match="at least one row"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 family,
                 "empty-score-surface",
                 settings,
@@ -12810,7 +15134,7 @@ def test_fisher_style_runtime_rejects_empty_score_surface(
             {"num_examples": 1},
         ),
         (
-            vp.empirical_fisher_vp(
+            ops.empirical_fisher_vp(
                 "empirical",
                 "scores",
                 aggregation="mean_per_example",
@@ -12825,7 +15149,7 @@ def test_fisher_style_runtime_rejects_empty_score_surface(
     ],
 )
 def test_fisher_style_runtime_rejects_empty_score_blocks(
-    operator: vp.OperatorSpec,
+    operator: vpx.OperatorSpec,
     family: str,
     settings: Mapping[str, object],
     batch_key: str,
@@ -12841,7 +15165,7 @@ def test_fisher_style_runtime_rejects_empty_score_blocks(
 
     with pytest.raises(vp.MaterializationError, match="at least one row"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 family,
                 "empty-score-blocks",
                 settings,
@@ -12876,7 +15200,7 @@ def test_fisher_style_runtime_rejects_empty_score_blocks(
             {"num_examples": 1},
         ),
         (
-            vp.empirical_fisher_vp(
+            ops.empirical_fisher_vp(
                 "empirical",
                 "scores",
                 aggregation="mean_per_example",
@@ -12891,7 +15215,7 @@ def test_fisher_style_runtime_rejects_empty_score_blocks(
     ],
 )
 def test_fisher_style_runtime_maps_zero_vector_to_zero(
-    operator: vp.OperatorSpec,
+    operator: vpx.OperatorSpec,
     family: str,
     settings: Mapping[str, object],
     batch_key: str,
@@ -12905,7 +15229,7 @@ def test_fisher_style_runtime_maps_zero_vector_to_zero(
         buffers={},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             family,
             "zero-vector",
             settings,
@@ -12943,7 +15267,7 @@ def test_fisher_style_runtime_maps_zero_vector_to_zero(
             {"num_examples": 1},
         ),
         (
-            vp.empirical_fisher_vp(
+            ops.empirical_fisher_vp(
                 "empirical",
                 "scores",
                 aggregation="mean_per_example",
@@ -12958,7 +15282,7 @@ def test_fisher_style_runtime_maps_zero_vector_to_zero(
     ],
 )
 def test_fisher_style_runtime_maps_zero_vector_to_zero_with_blocks(
-    operator: vp.OperatorSpec,
+    operator: vpx.OperatorSpec,
     family: str,
     settings: Mapping[str, object],
     batch_key: str,
@@ -12972,7 +15296,7 @@ def test_fisher_style_runtime_maps_zero_vector_to_zero_with_blocks(
         buffers={},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             family,
             "zero-vector-blocks",
             settings,
@@ -13004,7 +15328,7 @@ def test_dense_metric_uses_vector_order_and_fisher_uses_parameter_order() -> Non
     matrix = torch.arange(16.0, dtype=torch.float64).reshape(4, 4)
     score_gradients = torch.eye(4, dtype=torch.float64)
     metric_factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -13019,7 +15343,7 @@ def test_dense_metric_uses_vector_order_and_fisher_uses_parameter_order() -> Non
         buffers={},
     )
     empirical_factory = vpx.standard_operation_factory(
-        vp.empirical_fisher_vp(
+        ops.empirical_fisher_vp(
             "empirical",
             "scores",
             aggregation="sum",
@@ -13030,7 +15354,7 @@ def test_dense_metric_uses_vector_order_and_fisher_uses_parameter_order() -> Non
         buffers={},
     )
     metric_result = metric_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "row",
             metric_settings(),
@@ -13040,7 +15364,7 @@ def test_dense_metric_uses_vector_order_and_fisher_uses_parameter_order() -> Non
         vector,
     )()
     fisher_result = fisher_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "fisher",
             "row",
             fisher_settings("materialize_score_gradients"),
@@ -13050,7 +15374,7 @@ def test_dense_metric_uses_vector_order_and_fisher_uses_parameter_order() -> Non
         vector,
     )()
     empirical_result = empirical_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "empirical",
             "row",
             empirical_dense_settings(),
@@ -13091,10 +15415,10 @@ def test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order() -> None:
     }
 
     def sampled_scores(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["num_examples"] == 2
@@ -13115,7 +15439,7 @@ def test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order() -> None:
         function_objectives={"sampled_scores": sampled_scores},
     )
     dense_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "dense",
             sampled_fisher_settings("materialize_score_gradients"),
@@ -13125,7 +15449,7 @@ def test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order() -> None:
         vector,
     )()
     loop_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "loop",
             {
@@ -13145,7 +15469,7 @@ def test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order() -> None:
         function_objectives={"sampled_scores": sampled_scores},
     )
     reference_result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "dense-reference",
             sampled_fisher_settings("materialize_score_gradients"),
@@ -13166,7 +15490,7 @@ def test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order() -> None:
     assert torch.allclose(loop_map["b"], expected_flat[2:].reshape(2, 1))
     assert reference_result.measurements["max_abs_diff"] == pytest.approx(0.0)
 
-    bounded_operator = vp.sampled_fisher_vp(
+    bounded_operator = ops.sampled_fisher_vp(
         "sampled",
         "sampled_scores",
         aggregation="mean_per_example",
@@ -13190,7 +15514,7 @@ def test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order() -> None:
         function_objectives={"sampled_scores": sampled_scores},
     )
     bounded_result = bounded_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "bounded",
             sampled_fisher_settings(
@@ -13212,7 +15536,7 @@ def test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order() -> None:
 
     with pytest.raises(vp.MaterializationError, match="exceeded bound"):
         bounded_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "sampled",
                 "bounded-failed",
                 sampled_fisher_settings(
@@ -13230,7 +15554,7 @@ def test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "sampled",
                 "wrong-dense-reference",
                 sampled_fisher_settings("materialize_score_gradients"),
@@ -13253,10 +15577,10 @@ def test_sampled_fisher_vp_score_grad_paths_match_loop_path() -> None:
     }
 
     def sampled_scores(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "sampled"
@@ -13272,7 +15596,7 @@ def test_sampled_fisher_vp_score_grad_paths_match_loop_path() -> None:
         function_objectives={"sampled_scores": sampled_scores},
     )
     loop_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "loop",
             sampled_fisher_grad_settings("torch_autograd_grad_loop"),
@@ -13282,7 +15606,7 @@ def test_sampled_fisher_vp_score_grad_paths_match_loop_path() -> None:
         vector,
     )()
     torch_func_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "torch-func",
             {
@@ -13296,7 +15620,7 @@ def test_sampled_fisher_vp_score_grad_paths_match_loop_path() -> None:
         vector,
     )()
     backward_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "backward",
             {
@@ -13309,7 +15633,7 @@ def test_sampled_fisher_vp_score_grad_paths_match_loop_path() -> None:
         vector,
     )()
     vmap_result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "sampled",
             "vmap",
             {
@@ -13347,10 +15671,10 @@ def test_sampled_fisher_vp_rejects_inconsistent_rows() -> None:
     }
 
     def sampled_scores(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["num_examples"] == 2
@@ -13368,7 +15692,7 @@ def test_sampled_fisher_vp_rejects_inconsistent_rows() -> None:
 
     with pytest.raises(vp.MaterializationError, match=r"sampled_fisher\.accumulation"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "sampled",
                 "missing-accumulation",
                 {
@@ -13383,7 +15707,7 @@ def test_sampled_fisher_vp_rejects_inconsistent_rows() -> None:
 
     with pytest.raises(vp.MaterializationError, match="score_grad_path"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "sampled",
                 "missing-score-path",
                 sampled_fisher_settings("streaming_dot_accumulate"),
@@ -13395,7 +15719,7 @@ def test_sampled_fisher_vp_rejects_inconsistent_rows() -> None:
 
     with pytest.raises(vp.MaterializationError, match="not used"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "sampled",
                 "dense-with-score-path",
                 {
@@ -13410,7 +15734,7 @@ def test_sampled_fisher_vp_rejects_inconsistent_rows() -> None:
 
     with pytest.raises(vp.MaterializationError, match="sample_source"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "sampled",
                 "missing-source",
                 {
@@ -13425,7 +15749,7 @@ def test_sampled_fisher_vp_rejects_inconsistent_rows() -> None:
 
     with pytest.raises(vp.MaterializationError, match="differs from operator"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "sampled",
                 "different-source",
                 {
@@ -13438,9 +15762,9 @@ def test_sampled_fisher_vp_rejects_inconsistent_rows() -> None:
             vector,
         )()
 
-    with pytest.raises(vp.MaterializationError, match=r"sampling_bound\.kind"):
+    with pytest.raises(vp.MaterializationError, match="exact_fisher_vp"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "sampled",
                 "exact-check",
                 sampled_fisher_settings(
@@ -13466,10 +15790,10 @@ def test_dense_ggnvp_supports_parameter_tree_order() -> None:
     loss_hessian = torch.diag(torch.tensor([2.0, 3.0], dtype=torch.float64))
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch["loss_hessian"] is loss_hessian
@@ -13481,13 +15805,13 @@ def test_dense_ggnvp_supports_parameter_tree_order() -> None:
         ))
 
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
         buffers={},
         function_objectives={"model_output": function},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "row",
             ggn_dense_kernel_settings(),
@@ -13521,10 +15845,10 @@ def test_hvp_vhp_path_supports_parameter_tree_order() -> None:
     }
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert isinstance(batch["scale"], float)
@@ -13533,13 +15857,13 @@ def test_hvp_vhp_path_supports_parameter_tree_order() -> None:
         return batch["scale"] * (params["a"].pow(2).sum() + params["b"].pow(2).sum())
 
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "row",
             hvp_settings("autograd_functional_vhp"),
@@ -13563,7 +15887,7 @@ def test_standard_runtime_executes_dtype_and_backend_axes() -> None:
     matrix = torch.eye(1, dtype=torch.float64)
     observed = {}
     metric_factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -13574,10 +15898,10 @@ def test_standard_runtime_executes_dtype_and_backend_axes() -> None:
     )
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert context.family == "gradient"
         observed["param_dtype"] = params["w"].dtype
@@ -13597,13 +15921,13 @@ def test_standard_runtime_executes_dtype_and_backend_axes() -> None:
         return batch["floating"].sum() * params["w"].pow(2).sum() + buffers["b"].sum()
 
     gradient_factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers=buffers,
         scalar_objectives={"loss": scalar},
     )
     result = metric_factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "row",
             {**metric_settings(), "dtype.output": "fp32"},
@@ -13630,7 +15954,7 @@ def test_standard_runtime_executes_dtype_and_backend_axes() -> None:
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
         torch.use_deterministic_algorithms(False)
         gradient_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "row",
                 {
@@ -13685,7 +16009,7 @@ def test_standard_runtime_executes_dtype_and_backend_axes() -> None:
 
     with pytest.raises(vp.MaterializationError):
         gradient_factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "row",
                 {**gradient_settings(), "batch_size": 2},
@@ -13703,10 +16027,10 @@ def test_standard_runtime_executes_autodiff_compute_dtype_axis() -> None:
     observed = {}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert context.family == "gradient"
         observed["param_dtype"] = params["w"].dtype
@@ -13716,13 +16040,13 @@ def test_standard_runtime_executes_autodiff_compute_dtype_axis() -> None:
         return batch["floating"].sum() * params["w"].pow(2).sum() + buffers["b"].sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers=buffers,
         scalar_objectives={"loss": scalar},
     )
     factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "autodiff-dtype",
             {**gradient_settings(), "dtype.autodiff_compute": "fp32"},
@@ -13746,10 +16070,10 @@ def test_standard_runtime_applies_fp8_storage_before_model_compute() -> None:
     observed = {}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert context.family == "gradient"
         observed["param_dtype"] = params["w"].dtype
@@ -13761,13 +16085,13 @@ def test_standard_runtime_applies_fp8_storage_before_model_compute() -> None:
         return (params["w"] + buffers["b"] + batch["scale"]).sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers=buffers,
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "fp8-storage",
             {
@@ -13802,10 +16126,10 @@ def test_standard_runtime_executes_fp8_model_compute_boundary() -> None:
     observed = {}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -13815,13 +16139,13 @@ def test_standard_runtime_executes_fp8_model_compute_boundary() -> None:
         return (params["w"].float() * batch["scale"].float()).sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "fp8-compute",
             {
@@ -13845,14 +16169,14 @@ def test_standard_runtime_executes_fp8_model_compute_boundary() -> None:
 def test_standard_runtime_executes_split_model_and_autodiff_compute_dtypes() -> None:
     module = DtypeObservingStatefulModule()
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=dict(module.named_parameters()),
         buffers=dict(module.named_buffers()),
         module=module,
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "split-dtype-stateful",
             {
@@ -13882,7 +16206,7 @@ def test_standard_runtime_rejects_split_dtypes_without_model_call() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -13890,7 +16214,7 @@ def test_standard_runtime_rejects_split_dtypes_without_model_call() -> None:
 
     with pytest.raises(vp.MaterializationError, match="stateful_module"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "split-dtype",
                 {
@@ -13905,70 +16229,27 @@ def test_standard_runtime_rejects_split_dtypes_without_model_call() -> None:
         )
 
 
-def test_standard_runtime_uses_checkpoint_operation_for_activation_recompute(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    params = {"w": torch.tensor([2.0], dtype=torch.float64, requires_grad=True)}
+def test_standard_runtime_rejects_unlowered_non_reentrant_layer_checkpoint() -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
-    calls = []
-
-    def recording_checkpoint_operation(
-        candidate: vp.Candidate,
-        function: Callable[..., vp.TensorTree],
-        args: Sequence[object],
-        *,
-        policy_key: str,
-        activation_pack_hooks: Mapping[str, Callable[[torch.Tensor], object]]
-        | None = None,
-        activation_unpack_hooks: Mapping[str, Callable[[object], torch.Tensor]]
-        | None = None,
-        checkpoint_contexts: Mapping[str, Callable[[], object]] | None = None,
-    ) -> vpx.CandidateOperation:
-        assert activation_pack_hooks == {}
-        assert activation_unpack_hooks == {}
-        assert checkpoint_contexts == {}
-        calls.append({
-            "policy_key": policy_key,
-            "recompute": candidate.settings["activation.recompute"],
-            "arg_count": len(args),
-        })
-
-        def operation() -> vp.TensorTree:
-            return function(*args)
-
-        return operation
-
-    monkeypatch.setattr(
-        runtime_module,
-        "checkpoint_operation",
-        recording_checkpoint_operation,
-    )
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
-    result = factory(
-        vp.Candidate(
-            "gradient",
-            "checkpoint-row",
-            {**gradient_settings(), **standard_checkpoint_settings()},
-            admission_status="passed",
-        ),
-        {"scale": 1.0},
-        vector,
-    )()
-    result_map = tensor_mapping(result)
 
-    assert calls == [
-        {
-            "policy_key": "activation.recompute",
-            "recompute": "checkpoint_non_reentrant_by_layer",
-            "arg_count": 2,
-        }
-    ]
-    assert torch.equal(result_map["w"], torch.tensor([4.0], dtype=torch.float64))
+    with pytest.raises(vp.MaterializationError, match="layer checkpoint lowering"):
+        factory(
+            vpx.Candidate(
+                "gradient",
+                "checkpoint-row",
+                {**gradient_settings(), **standard_checkpoint_settings()},
+                admission_status="passed",
+            ),
+            {"scale": 1.0},
+            vector,
+        )
 
 
 def test_standard_runtime_rejects_selective_checkpoint_without_context_pair() -> None:
@@ -13979,7 +16260,7 @@ def test_standard_runtime_rejects_selective_checkpoint_without_context_pair() ->
         "activation.recompute": "checkpoint_selective",
     }
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -13987,7 +16268,7 @@ def test_standard_runtime_rejects_selective_checkpoint_without_context_pair() ->
 
     with pytest.raises(vp.MaterializationError, match="declared_context_pair"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "checkpoint-selective",
                 {**gradient_settings(), **settings},
@@ -14009,8 +16290,8 @@ def test_standard_runtime_executes_selective_checkpoint_with_context_pair(
         return object(), object()
 
     def recording_checkpoint_operation(
-        candidate: vp.Candidate,
-        function: Callable[..., vp.TensorTree],
+        candidate: vpx.Candidate,
+        function: Callable[..., vpx.TensorTree],
         args: Sequence[object],
         *,
         policy_key: str,
@@ -14031,7 +16312,7 @@ def test_standard_runtime_executes_selective_checkpoint_with_context_pair(
             "arg_count": len(args),
         })
 
-        def operation() -> vp.TensorTree:
+        def operation() -> vpx.TensorTree:
             return function(*args)
 
         return operation
@@ -14042,14 +16323,14 @@ def test_standard_runtime_executes_selective_checkpoint_with_context_pair(
         recording_checkpoint_operation,
     )
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
         checkpoint_contexts={"selective": context_fn},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "checkpoint-selective",
             {
@@ -14078,7 +16359,7 @@ def test_standard_runtime_executes_selective_checkpoint_with_context_pair(
     assert torch.equal(result_map["w"], torch.tensor([4.0], dtype=torch.float64))
 
 
-def test_standard_runtime_executes_package_owned_manual_recompute() -> None:
+def test_standard_runtime_rejects_manual_recompute_without_callback() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     settings = {
@@ -14089,24 +16370,23 @@ def test_standard_runtime_executes_package_owned_manual_recompute() -> None:
         "checkpoint.determinism_check": "none",
     }
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
-    result = factory(
-        vp.Candidate(
-            "gradient",
-            "manual-recompute",
-            {**gradient_settings(), **settings},
-            admission_status="passed",
-        ),
-        {"scale": 1.0},
-        vector,
-    )()
-    result_map = tensor_mapping(result)
 
-    assert torch.equal(result_map["w"], torch.tensor([4.0], dtype=torch.float64))
+    with pytest.raises(vp.MaterializationError, match="declared recompute callback"):
+        factory(
+            vpx.Candidate(
+                "gradient",
+                "manual-recompute",
+                {**gradient_settings(), **settings},
+                admission_status="passed",
+            ),
+            {"scale": 1.0},
+            vector,
+        )
 
 
 def test_standard_runtime_executes_manual_recompute_callback_override() -> None:
@@ -14115,7 +16395,7 @@ def test_standard_runtime_executes_manual_recompute_callback_override() -> None:
     calls = []
 
     def manual_recompute(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         operation: vpx.CandidateOperation,
         args: tuple[torch.Tensor, ...],
     ) -> vpx.CandidateOperation:
@@ -14124,7 +16404,7 @@ def test_standard_runtime_executes_manual_recompute_callback_override() -> None:
             "arg_count": len(args),
         })
 
-        def recomputed_operation() -> vp.TensorTree:
+        def recomputed_operation() -> vpx.TensorTree:
             return operation()
 
         return recomputed_operation
@@ -14137,14 +16417,14 @@ def test_standard_runtime_executes_manual_recompute_callback_override() -> None:
         "checkpoint.determinism_check": "none",
     }
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
         manual_recompute=manual_recompute,
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "manual-recompute",
             {**gradient_settings(), **settings},
@@ -14174,6 +16454,18 @@ def test_manual_recompute_executes_custom_saved_tensor_hooks() -> None:
 
         return tensor
 
+    def manual_recompute(
+        candidate: vpx.Candidate,
+        operation: vpx.CandidateOperation,
+        args: tuple[torch.Tensor, ...],
+    ) -> vpx.CandidateOperation:
+        events.append(f"manual:{candidate.candidate_id}:{len(args)}")
+
+        def recomputed_operation() -> vpx.TensorTree:
+            return operation()
+
+        return recomputed_operation
+
     settings = {
         **standard_checkpoint_settings(),
         "activation.recompute": "manual_recompute",
@@ -14185,15 +16477,16 @@ def test_manual_recompute_executes_custom_saved_tensor_hooks() -> None:
         "checkpoint.determinism_check": "none",
     }
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
         activation_pack_hooks={"recording": pack_hook},
         activation_unpack_hooks={"recording": unpack_hook},
+        manual_recompute=manual_recompute,
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "manual-offload",
             {**gradient_settings(), **settings},
@@ -14204,7 +16497,7 @@ def test_manual_recompute_executes_custom_saved_tensor_hooks() -> None:
     )()
     result_map = tensor_mapping(result)
 
-    assert events == ["pack", "unpack"]
+    assert events == ["manual:manual-offload:2", "pack", "unpack"]
     assert torch.equal(result_map["w"], torch.tensor([4.0], dtype=torch.float64))
 
 
@@ -14224,7 +16517,7 @@ def test_standard_runtime_executes_custom_saved_tensor_hooks() -> None:
         return tensor
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -14232,7 +16525,7 @@ def test_standard_runtime_executes_custom_saved_tensor_hooks() -> None:
         activation_unpack_hooks={"recording": unpack_hook},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "activation-offload",
             {
@@ -14263,10 +16556,10 @@ def test_standard_runtime_executes_cpu_saved_tensor_hooks(
     original_unpack = runtime_module._cpu_unpack_hook
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert batch == {"scale": 1.0}
@@ -14288,13 +16581,13 @@ def test_standard_runtime_executes_cpu_saved_tensor_hooks(
     monkeypatch.setattr(runtime_module, "_cpu_pack_hook", recording_pack)
     monkeypatch.setattr(runtime_module, "_cpu_unpack_hook", recording_unpack)
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "cpu-saved-hooks",
             {
@@ -14329,7 +16622,7 @@ def test_reference_check_rejects_custom_saved_tensor_hooks_that_change_values() 
         return torch.zeros_like(tensor)
 
     check = vpx.standard_reference_check(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -14345,7 +16638,7 @@ def test_reference_check_rejects_custom_saved_tensor_hooks_that_change_values() 
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "bad-hooks",
                 {
@@ -14378,7 +16671,7 @@ def test_activation_offload_preserves_higher_order_hvp() -> None:
         return tensor
 
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -14386,7 +16679,7 @@ def test_activation_offload_preserves_higher_order_hvp() -> None:
         activation_unpack_hooks={"recording": unpack_hook},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "activation-offload",
             {
@@ -14421,7 +16714,7 @@ def test_higher_order_reference_rejects_custom_hooks_that_change_values() -> Non
         return torch.zeros_like(tensor)
 
     check = vpx.standard_reference_check(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params=params,
         buffers={},
         thresholds={
@@ -14438,7 +16731,7 @@ def test_higher_order_reference_rejects_custom_hooks_that_change_values() -> Non
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "bad-hooks",
                 {
@@ -14464,18 +16757,18 @@ def test_standard_runtime_moves_inputs_outside_measured_call(
     original = runtime_module._runtime_batch_input_residency
 
     def recording_input_residency(
-        batch: vp.Batch,
+        batch: vpx.Batch,
         settings: Mapping[str, Any],
-    ) -> vp.Batch:
+    ) -> vpx.Batch:
         calls.append(settings["input.host_to_device"])
 
         return original(batch, settings)
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -14490,13 +16783,13 @@ def test_standard_runtime_moves_inputs_outside_measured_call(
         recording_input_residency,
     )
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "input-outside",
             {
@@ -14528,18 +16821,18 @@ def test_standard_runtime_moves_inputs_inside_measured_call(
     original = runtime_module._runtime_batch_input_residency
 
     def recording_input_residency(
-        batch: vp.Batch,
+        batch: vpx.Batch,
         settings: Mapping[str, Any],
-    ) -> vp.Batch:
+    ) -> vpx.Batch:
         calls.append(settings["input.host_to_device"])
 
         return original(batch, settings)
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -14554,13 +16847,13 @@ def test_standard_runtime_moves_inputs_inside_measured_call(
         recording_input_residency,
     )
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "input-inside",
             {
@@ -14594,10 +16887,10 @@ def test_standard_runtime_moves_inputs_to_pinned_cpu() -> None:
     observed = {}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -14608,13 +16901,13 @@ def test_standard_runtime_moves_inputs_to_pinned_cpu() -> None:
         return params["w"].pow(2).sum() * scale.sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "input-pinned",
             {
@@ -14640,10 +16933,10 @@ def test_standard_runtime_moves_inputs_to_gpu() -> None:
     observed = {}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -14654,13 +16947,13 @@ def test_standard_runtime_moves_inputs_to_gpu() -> None:
         return params["w"].pow(2).sum() * scale.cpu().sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "input-gpu",
             {
@@ -14683,10 +16976,10 @@ def test_standard_runtime_executes_precomputed_cpu_teacher_outputs() -> None:
     observed = {}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -14697,13 +16990,13 @@ def test_standard_runtime_executes_precomputed_cpu_teacher_outputs() -> None:
         return params["w"].pow(2).sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "teacher-cpu",
             {**gradient_settings(), "teacher_outputs": "precomputed_cpu"},
@@ -14727,10 +17020,10 @@ def test_standard_runtime_executes_precomputed_pinned_teacher_outputs() -> None:
     observed = {}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -14741,13 +17034,13 @@ def test_standard_runtime_executes_precomputed_pinned_teacher_outputs() -> None:
         return params["w"].pow(2).sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "teacher-pinned",
             {**gradient_settings(), "teacher_outputs": "precomputed_cpu_pinned"},
@@ -14769,10 +17062,10 @@ def test_standard_runtime_executes_precomputed_gpu_teacher_outputs() -> None:
     observed = {}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -14783,13 +17076,13 @@ def test_standard_runtime_executes_precomputed_gpu_teacher_outputs() -> None:
         return params["w"].pow(2).sum()
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
     )
     factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "teacher-gpu",
             {**gradient_settings(), "teacher_outputs": "precomputed_gpu"},
@@ -14806,7 +17099,7 @@ def test_standard_runtime_teacher_outputs_require_fixed_batch_field() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -14814,7 +17107,7 @@ def test_standard_runtime_teacher_outputs_require_fixed_batch_field() -> None:
 
     with pytest.raises(vp.MaterializationError, match="teacher_outputs"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "teacher-missing",
                 {**gradient_settings(), "teacher_outputs": "precomputed_cpu"},
@@ -14829,7 +17122,7 @@ def test_standard_runtime_recomputed_teacher_outputs_need_objective() -> None:
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -14837,7 +17130,7 @@ def test_standard_runtime_recomputed_teacher_outputs_need_objective() -> None:
 
     with pytest.raises(vp.MaterializationError, match="teacher objective"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "gradient",
                 "teacher-recompute",
                 {
@@ -14857,11 +17150,11 @@ def test_standard_runtime_recomputes_teacher_outputs_inside_operation() -> None:
     events = []
 
     def teacher_objective(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> vp.TensorTree:
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
         assert params["w"] is not None
         assert buffers == {}
         assert context.family == "gradient"
@@ -14870,10 +17163,10 @@ def test_standard_runtime_recomputes_teacher_outputs_inside_operation() -> None:
         return {"logits": batch["teacher_seed"] + 1.0}
 
     def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == "gradient"
@@ -14886,14 +17179,14 @@ def test_standard_runtime_recomputes_teacher_outputs_inside_operation() -> None:
         return params["w"].pow(2).sum() + logits.sum() * 0.0
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": scalar},
         teacher_objective=teacher_objective,
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "teacher-recompute",
             {
@@ -14925,11 +17218,11 @@ def test_standard_runtime_rejects_mismatched_recomputed_teacher_outputs() -> Non
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
 
     def teacher_objective(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> vp.TensorTree:
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
         assert params["w"] is not None
         assert buffers == {}
         assert batch["teacher_outputs"]
@@ -14938,14 +17231,14 @@ def test_standard_runtime_rejects_mismatched_recomputed_teacher_outputs() -> Non
         return {"logits": torch.tensor([4.0], dtype=torch.float64)}
 
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
         teacher_objective=teacher_objective,
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "teacher-recompute",
             {
@@ -14967,7 +17260,7 @@ def test_standard_runtime_rejects_cuda_autocast_without_cuda() -> None:
         pytest.skip("CUDA is available")
 
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -14979,7 +17272,7 @@ def test_standard_runtime_rejects_cuda_autocast_without_cuda() -> None:
 
     with pytest.raises(vp.MaterializationError, match="CUDA autocast requires CUDA"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "metric",
                 "autocast",
                 {**metric_settings(), "autocast": "cuda_bf16"},
@@ -15018,7 +17311,7 @@ def test_standard_runtime_enters_cuda_autocast_context(
     monkeypatch.setattr(runtime_module.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(runtime_module.torch, "autocast", fake_autocast)
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -15028,7 +17321,7 @@ def test_standard_runtime_enters_cuda_autocast_context(
         buffers={},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "autocast",
             {**metric_settings(), "autocast": autocast},
@@ -15070,7 +17363,7 @@ def test_standard_runtime_compiles_whole_operator(
             "options": options,
         })
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             events.append({"compiled_call": True})
 
             return operation()
@@ -15079,7 +17372,7 @@ def test_standard_runtime_compiles_whole_operator(
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -15089,7 +17382,7 @@ def test_standard_runtime_compiles_whole_operator(
         buffers={},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "compiled",
             {
@@ -15125,14 +17418,14 @@ def test_standard_runtime_compiles_stateful_model_forward_boundary(
     events = []
 
     def fake_compile(
-        operation: Callable[[vp.Batch], object],
+        operation: Callable[[vpx.Batch], object],
         *,
         backend: str,
         mode: str | None,
         fullgraph: bool,
         dynamic: bool | None,
         options: Mapping[str, bool] | None,
-    ) -> Callable[[vp.Batch], object]:
+    ) -> Callable[[vpx.Batch], object]:
         events.append({
             "backend": backend,
             "mode": mode,
@@ -15141,7 +17434,7 @@ def test_standard_runtime_compiles_stateful_model_forward_boundary(
             "options": options,
         })
 
-        def compiled(batch: vp.Batch) -> object:
+        def compiled(batch: vpx.Batch) -> object:
             events.append({"compiled_model_forward": tuple(batch)})
 
             return operation(batch)
@@ -15150,14 +17443,14 @@ def test_standard_runtime_compiles_stateful_model_forward_boundary(
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=dict(module.named_parameters()),
         buffers=dict(module.named_buffers()),
         module=module,
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "compiled-model-forward",
             {
@@ -15192,7 +17485,7 @@ def test_standard_runtime_runs_real_torch_compile_whole_operator() -> None:
     matrix = torch.eye(2, dtype=torch.float64)
     vector = {"w": torch.tensor([3.0, 4.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -15202,7 +17495,7 @@ def test_standard_runtime_runs_real_torch_compile_whole_operator() -> None:
         buffers={},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "compiled",
             {
@@ -15224,7 +17517,7 @@ def test_standard_runtime_runs_real_torch_compile_fullgraph_whole_operator() -> 
     matrix = torch.eye(2, dtype=torch.float64)
     vector = {"w": torch.tensor([3.0, 4.0], dtype=torch.float64)}
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -15239,7 +17532,7 @@ def test_standard_runtime_runs_real_torch_compile_fullgraph_whole_operator() -> 
         "compile.fullgraph": "true",
     }
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "compiled-fullgraph",
             settings,
@@ -15255,13 +17548,13 @@ def test_standard_runtime_runs_real_torch_compile_fullgraph_whole_operator() -> 
 
 def test_standard_runtime_runs_real_torch_compile_gradient_closure() -> None:
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "compiled-gradient",
             {
@@ -15284,14 +17577,14 @@ def test_standard_runtime_runs_real_torch_compile_gradient_closure() -> None:
 def test_standard_runtime_runs_real_torch_compile_model_forward() -> None:
     module = StatefulScalarModule()
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params=dict(module.named_parameters()),
         buffers=dict(module.named_buffers()),
         module=module,
-        module_call=vp.ModuleCallSpec(positional_batch_keys=("scale",)),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "compiled-model-forward",
             {
@@ -15314,13 +17607,13 @@ def test_standard_runtime_runs_real_torch_compile_model_forward() -> None:
 
 def test_standard_runtime_runs_real_torch_compile_loss_closure() -> None:
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "compiled-loss",
             {
@@ -15344,7 +17637,7 @@ def test_standard_runtime_runs_real_torch_compile_loss_closure() -> None:
     ("operator", "settings", "batch", "vector", "expected"),
     [
         (
-            vp.metric(
+            ops.metric(
                 "metric",
                 "dense",
                 aggregation="sum",
@@ -15364,7 +17657,7 @@ def test_standard_runtime_runs_real_torch_compile_loss_closure() -> None:
             torch.tensor([3.0, 6.5], dtype=torch.float64),
         ),
         (
-            vp.inverse_metric(
+            ops.inverse_metric(
                 "inverse",
                 "dense",
                 aggregation="sum",
@@ -15387,9 +17680,9 @@ def test_standard_runtime_runs_real_torch_compile_loss_closure() -> None:
     ],
 )
 def test_standard_runtime_runs_real_torch_compile_linear_algebra_boundaries(
-    operator: vp.OperatorSpec,
+    operator: vpx.OperatorSpec,
     settings: Mapping[str, object],
-    batch: vp.Batch,
+    batch: vpx.Batch,
     vector: dict[str, torch.Tensor],
     expected: torch.Tensor,
 ) -> None:
@@ -15399,7 +17692,7 @@ def test_standard_runtime_runs_real_torch_compile_linear_algebra_boundaries(
         buffers={},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             operator.family,
             "compiled-boundary",
             settings,
@@ -15415,24 +17708,24 @@ def test_standard_runtime_runs_real_torch_compile_linear_algebra_boundaries(
 
 def test_standard_runtime_runs_real_torch_compile_jvp_closure() -> None:
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> vp.TensorTree:
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
         assert buffers == {}
         assert context.family == "jvp"
 
         return {"w": params["w"] * batch["scale"]}
 
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="sum"),
+        ops.jvp("jvp", "function", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"function": function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "compiled-jvp",
             {
@@ -15455,24 +17748,24 @@ def test_standard_runtime_runs_real_torch_compile_jvp_closure() -> None:
 
 def test_standard_runtime_runs_real_torch_compile_vjp_closure() -> None:
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> vp.TensorTree:
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
         assert buffers == {}
         assert context.family == "vjp"
 
         return {"w": params["w"] * batch["scale"]}
 
     factory = vpx.standard_operation_factory(
-        vp.vjp("vjp", "function", aggregation="sum"),
+        ops.vjp("vjp", "function", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"function": function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "compiled-vjp",
             {
@@ -15495,13 +17788,13 @@ def test_standard_runtime_runs_real_torch_compile_vjp_closure() -> None:
 
 def test_standard_runtime_runs_real_torch_compile_hvp_single_vector() -> None:
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0, -1.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "compiled-hvp",
             {
@@ -15524,7 +17817,7 @@ def test_standard_runtime_runs_real_torch_compile_hvp_single_vector() -> None:
 
 def test_standard_runtime_runs_real_torch_compile_hvp_batched_vectors() -> None:
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0, -1.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -15536,7 +17829,7 @@ def test_standard_runtime_runs_real_torch_compile_hvp_batched_vectors() -> None:
         )
     }
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "compiled-hvp-batched",
             {
@@ -15558,13 +17851,13 @@ def test_standard_runtime_runs_real_torch_compile_hvp_batched_vectors() -> None:
 
 def test_standard_runtime_runs_real_torch_compile_ggn_full_product() -> None:
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "compiled-ggn-full",
             {
@@ -15589,13 +17882,13 @@ def test_standard_runtime_runs_real_torch_compile_ggn_full_product() -> None:
 
 def test_standard_runtime_runs_real_torch_compile_ggn_loss_product() -> None:
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "compiled-ggn",
             {
@@ -15623,13 +17916,13 @@ def test_standard_runtime_runs_real_torch_compile_ggn_partial_boundary(
     boundary: str,
 ) -> None:
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             f"compiled-{boundary}",
             {
@@ -15688,7 +17981,7 @@ def test_standard_runtime_runs_real_torch_compile_ggn_partial_boundary(
             torch.tensor([7.0 / 3.0, 14.0 / 3.0], dtype=torch.float64),
         ),
         (
-            vp.empirical_fisher_vp(
+            ops.empirical_fisher_vp(
                 "empirical",
                 "scores",
                 aggregation="mean_per_example",
@@ -15708,20 +18001,38 @@ def test_standard_runtime_runs_real_torch_compile_ggn_partial_boundary(
             },
             torch.tensor([14.0 / 3.0, 28.0 / 3.0], dtype=torch.float64),
         ),
+        (
+            ops.per_example_gradient(
+                "per_example",
+                "scores",
+                aggregation="sum",
+                example_loss_reduction="per_example",
+            ),
+            {
+                **per_example_gradient_settings(),
+                **compile_settings(boundary="per_example_gradient"),
+            },
+            "per_example",
+            {"x": torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)},
+            torch.tensor(
+                [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]],
+                dtype=torch.float64,
+            ),
+        ),
     ],
 )
 def test_standard_runtime_runs_real_torch_compile_score_grad_boundary(
-    operator: vp.OperatorSpec,
+    operator: vpx.OperatorSpec,
     settings: Mapping[str, object],
     family: str,
-    batch: vp.Batch,
+    batch: vpx.Batch,
     expected: torch.Tensor,
 ) -> None:
     def score_rows(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family == family
@@ -15736,7 +18047,7 @@ def test_standard_runtime_runs_real_torch_compile_score_grad_boundary(
         function_objectives={"scores": score_rows},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             family,
             "compiled-score",
             settings,
@@ -15773,7 +18084,7 @@ def test_standard_runtime_warms_compile_cache(
         assert dynamic is None
         assert options is None
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             compiled_calls.append("called")
 
             return operation()
@@ -15782,7 +18093,7 @@ def test_standard_runtime_warms_compile_cache(
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -15792,7 +18103,7 @@ def test_standard_runtime_warms_compile_cache(
         buffers={},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "compiled",
             {
@@ -15830,7 +18141,7 @@ def test_standard_runtime_accepts_operator_specific_compile_boundary(
         assert dynamic is None
         assert options is None
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             compiled_calls.append("called")
 
             return operation()
@@ -15839,7 +18150,7 @@ def test_standard_runtime_accepts_operator_specific_compile_boundary(
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -15849,7 +18160,7 @@ def test_standard_runtime_accepts_operator_specific_compile_boundary(
         buffers={},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "compiled",
             {
@@ -15895,7 +18206,7 @@ def test_standard_runtime_compiles_metric_multiply_boundary_only(
         assert options is None
         events.append(("compile", compiled_active()))
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             compiled_stack.append(True)
 
             try:
@@ -15905,7 +18216,7 @@ def test_standard_runtime_compiles_metric_multiply_boundary_only(
 
         return compiled
 
-    def recording_require_finite_tree(tree: vp.TensorTree, name: str) -> None:
+    def recording_require_finite_tree(tree: vpx.TensorTree, name: str) -> None:
         events.append(("finite_tree", name, compiled_active()))
         original_require_finite_tree(tree, name)
 
@@ -15916,7 +18227,7 @@ def test_standard_runtime_compiles_metric_multiply_boundary_only(
         recording_require_finite_tree,
     )
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -15926,7 +18237,7 @@ def test_standard_runtime_compiles_metric_multiply_boundary_only(
         buffers={},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "metric",
             "compiled",
             {
@@ -15976,7 +18287,7 @@ def test_standard_runtime_compiles_inverse_metric_solve_boundary_only(
         assert options is None
         events.append(("compile", compiled_active()))
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             compiled_stack.append(True)
 
             try:
@@ -15986,7 +18297,7 @@ def test_standard_runtime_compiles_inverse_metric_solve_boundary_only(
 
         return compiled
 
-    def recording_require_finite_tree(tree: vp.TensorTree, name: str) -> None:
+    def recording_require_finite_tree(tree: vpx.TensorTree, name: str) -> None:
         events.append(("finite_tree", name, compiled_active()))
         original_require_finite_tree(tree, name)
 
@@ -15997,7 +18308,7 @@ def test_standard_runtime_compiles_inverse_metric_solve_boundary_only(
         recording_require_finite_tree,
     )
     factory = vpx.standard_operation_factory(
-        vp.inverse_metric(
+        ops.inverse_metric(
             "inverse",
             "dense",
             aggregation="sum",
@@ -16008,7 +18319,7 @@ def test_standard_runtime_compiles_inverse_metric_solve_boundary_only(
         buffers={},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "inverse",
             "compiled",
             {
@@ -16058,7 +18369,7 @@ def test_standard_runtime_compiles_gradient_closure_boundary_only(
         assert options is None
         events.append(("compile", compiled_active()))
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             compiled_stack.append(True)
 
             try:
@@ -16069,10 +18380,10 @@ def test_standard_runtime_compiles_gradient_closure_boundary_only(
         return compiled
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
@@ -16080,13 +18391,13 @@ def test_standard_runtime_compiles_gradient_closure_boundary_only(
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "compiled",
             {
@@ -16122,14 +18433,14 @@ def test_standard_runtime_compiles_gradient_loss_closure_boundary_only(
         return len(compiled_stack) > 0
 
     def fake_compile(
-        operation: Callable[[vp.ParameterTree], torch.Tensor],
+        operation: Callable[[vpx.ParameterTree], torch.Tensor],
         *,
         backend: str,
         mode: str | None,
         fullgraph: bool,
         dynamic: bool | None,
         options: Mapping[str, bool] | None,
-    ) -> Callable[[vp.ParameterTree], torch.Tensor]:
+    ) -> Callable[[vpx.ParameterTree], torch.Tensor]:
         assert backend == "inductor"
         assert mode == "default"
         assert fullgraph is False
@@ -16137,7 +18448,7 @@ def test_standard_runtime_compiles_gradient_loss_closure_boundary_only(
         assert options is None
         events.append(("compile", compiled_active()))
 
-        def compiled(params: vp.ParameterTree) -> torch.Tensor:
+        def compiled(params: vpx.ParameterTree) -> torch.Tensor:
             compiled_stack.append(True)
             events.append(("compiled_loss", compiled_active()))
 
@@ -16154,10 +18465,10 @@ def test_standard_runtime_compiles_gradient_loss_closure_boundary_only(
         return original_grad(*args, **kwargs)
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
@@ -16166,13 +18477,13 @@ def test_standard_runtime_compiles_gradient_loss_closure_boundary_only(
     monkeypatch.setattr(runtime_module.torch.autograd, "grad", recording_grad)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "compiled-loss",
             {
@@ -16224,7 +18535,7 @@ def test_standard_runtime_compiles_jvp_closure_boundary_only(
         assert options is None
         events.append(("compile", compiled_active()))
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             compiled_stack.append(True)
 
             try:
@@ -16235,20 +18546,20 @@ def test_standard_runtime_compiles_jvp_closure_boundary_only(
         return compiled
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> vp.TensorTree:
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
         assert buffers == {}
         assert context.family == "jvp"
 
@@ -16257,13 +18568,13 @@ def test_standard_runtime_compiles_jvp_closure_boundary_only(
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="sum"),
+        ops.jvp("jvp", "function", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"function": function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "jvp",
             "compiled",
             {
@@ -16314,7 +18625,7 @@ def test_standard_runtime_compiles_vjp_closure_boundary_only(
         assert options is None
         events.append(("compile", compiled_active()))
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             compiled_stack.append(True)
 
             try:
@@ -16325,20 +18636,20 @@ def test_standard_runtime_compiles_vjp_closure_boundary_only(
         return compiled
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
 
     def function(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> vp.TensorTree:
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> vpx.TensorTree:
         assert buffers == {}
         assert context.family == "vjp"
 
@@ -16347,13 +18658,13 @@ def test_standard_runtime_compiles_vjp_closure_boundary_only(
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.vjp("vjp", "function", aggregation="sum"),
+        ops.vjp("vjp", "function", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"function": function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "vjp",
             "compiled",
             {
@@ -16438,7 +18749,7 @@ def test_standard_runtime_compiles_hvp_boundary_only(
         assert options is None
         events.append(("compile", boundary, compiled_active()))
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             compiled_stack.append(True)
 
             try:
@@ -16449,10 +18760,10 @@ def test_standard_runtime_compiles_hvp_boundary_only(
         return compiled
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", boundary, compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
@@ -16460,13 +18771,13 @@ def test_standard_runtime_compiles_hvp_boundary_only(
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0, -1.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "compiled",
             settings,
@@ -16496,14 +18807,14 @@ def test_standard_runtime_compiles_hvp_loss_closure_boundary_only(
         return len(compiled_stack) > 0
 
     def fake_compile(
-        operation: Callable[[vp.ParameterTree], torch.Tensor],
+        operation: Callable[[vpx.ParameterTree], torch.Tensor],
         *,
         backend: str,
         mode: str | None,
         fullgraph: bool,
         dynamic: bool | None,
         options: Mapping[str, bool] | None,
-    ) -> Callable[[vp.ParameterTree], torch.Tensor]:
+    ) -> Callable[[vpx.ParameterTree], torch.Tensor]:
         assert backend == "inductor"
         assert mode == "default"
         assert fullgraph is False
@@ -16511,7 +18822,7 @@ def test_standard_runtime_compiles_hvp_loss_closure_boundary_only(
         assert options is None
         events.append(("compile", compiled_active()))
 
-        def compiled(params: vp.ParameterTree) -> torch.Tensor:
+        def compiled(params: vpx.ParameterTree) -> torch.Tensor:
             compiled_stack.append(True)
             events.append(("compiled_loss", compiled_active()))
 
@@ -16528,10 +18839,10 @@ def test_standard_runtime_compiles_hvp_loss_closure_boundary_only(
         return original_grad(*args, **kwargs)
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
@@ -16540,13 +18851,13 @@ def test_standard_runtime_compiles_hvp_loss_closure_boundary_only(
     monkeypatch.setattr(runtime_module.torch.autograd, "grad", recording_grad)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0, -1.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "compiled-loss",
             {
@@ -16599,7 +18910,7 @@ def test_standard_runtime_compiles_ggn_full_product_boundary_only(
         assert options is None
         events.append(("compile", compiled_active()))
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             compiled_stack.append(True)
 
             try:
@@ -16610,10 +18921,10 @@ def test_standard_runtime_compiles_ggn_full_product_boundary_only(
         return compiled
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
@@ -16621,13 +18932,13 @@ def test_standard_runtime_compiles_ggn_full_product_boundary_only(
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "compiled",
             {
@@ -16682,7 +18993,7 @@ def test_standard_runtime_compiles_ggn_jvp_boundary_only(
         assert options is None
         events.append(("compile", compiled_active()))
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             compiled_stack.append(True)
             events.append(("compiled_jvp", compiled_active()))
 
@@ -16695,27 +19006,27 @@ def test_standard_runtime_compiles_ggn_jvp_boundary_only(
 
     def recording_loss_product(
         execution: runtime_module.StandardExecution,
-        output: vp.TensorTree,
-        output_jvp: vp.TensorTree,
-    ) -> vp.TensorTree:
+        output: vpx.TensorTree,
+        output_jvp: vpx.TensorTree,
+    ) -> vpx.TensorTree:
         events.append(("loss_hessian", compiled_active()))
 
         return original_loss_product(execution, output, output_jvp)
 
     def recording_vjp(
         execution: runtime_module.StandardExecution,
-        tensor_function: Callable[[vp.ParameterTree], vp.TensorTree],
-        output_cotangent: vp.TensorTree,
-    ) -> vp.TensorTree:
+        tensor_function: Callable[[vpx.ParameterTree], vpx.TensorTree],
+        output_cotangent: vpx.TensorTree,
+    ) -> vpx.TensorTree:
         events.append(("vjp", compiled_active()))
 
         return original_vjp(execution, tensor_function, output_cotangent)
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
@@ -16729,13 +19040,13 @@ def test_standard_runtime_compiles_ggn_jvp_boundary_only(
     monkeypatch.setattr(runtime_module, "_run_ggnvp_vjp", recording_vjp)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "compiled",
             {
@@ -16777,14 +19088,14 @@ def test_standard_runtime_compiles_ggn_loss_product_boundary_only(
         return len(compiled_stack) > 0
 
     def fake_compile(
-        operation: Callable[[vp.TensorTree, vp.TensorTree], vp.TensorTree],
+        operation: Callable[[vpx.TensorTree, vpx.TensorTree], vpx.TensorTree],
         *,
         backend: str,
         mode: str | None,
         fullgraph: bool,
         dynamic: bool | None,
         options: Mapping[str, bool] | None,
-    ) -> Callable[[vp.TensorTree, vp.TensorTree], vp.TensorTree]:
+    ) -> Callable[[vpx.TensorTree, vpx.TensorTree], vpx.TensorTree]:
         assert backend == "inductor"
         assert mode == "default"
         assert fullgraph is False
@@ -16793,9 +19104,9 @@ def test_standard_runtime_compiles_ggn_loss_product_boundary_only(
         events.append(("compile", compiled_active()))
 
         def compiled(
-            output: vp.TensorTree,
-            output_jvp: vp.TensorTree,
-        ) -> vp.TensorTree:
+            output: vpx.TensorTree,
+            output_jvp: vpx.TensorTree,
+        ) -> vpx.TensorTree:
             compiled_stack.append(True)
             events.append(("compiled_loss_product", compiled_active()))
 
@@ -16808,18 +19119,18 @@ def test_standard_runtime_compiles_ggn_loss_product_boundary_only(
 
     def recording_vjp(
         execution: runtime_module.StandardExecution,
-        tensor_function: Callable[[vp.ParameterTree], vp.TensorTree],
-        output_cotangent: vp.TensorTree,
-    ) -> vp.TensorTree:
+        tensor_function: Callable[[vpx.ParameterTree], vpx.TensorTree],
+        output_cotangent: vpx.TensorTree,
+    ) -> vpx.TensorTree:
         events.append(("vjp", compiled_active()))
 
         return original_vjp(execution, tensor_function, output_cotangent)
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
@@ -16828,13 +19139,13 @@ def test_standard_runtime_compiles_ggn_loss_product_boundary_only(
     monkeypatch.setattr(runtime_module, "_run_ggnvp_vjp", recording_vjp)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "compiled",
             {
@@ -16873,14 +19184,14 @@ def test_standard_runtime_warms_ggn_loss_product_compile_boundary(
         return len(compiled_stack) > 0
 
     def fake_compile(
-        operation: Callable[[vp.TensorTree, vp.TensorTree], vp.TensorTree],
+        operation: Callable[[vpx.TensorTree, vpx.TensorTree], vpx.TensorTree],
         *,
         backend: str,
         mode: str | None,
         fullgraph: bool,
         dynamic: bool | None,
         options: Mapping[str, bool] | None,
-    ) -> Callable[[vp.TensorTree, vp.TensorTree], vp.TensorTree]:
+    ) -> Callable[[vpx.TensorTree, vpx.TensorTree], vpx.TensorTree]:
         assert backend == "inductor"
         assert mode == "default"
         assert fullgraph is False
@@ -16889,9 +19200,9 @@ def test_standard_runtime_warms_ggn_loss_product_compile_boundary(
         events.append(("compile", compiled_active()))
 
         def compiled(
-            output: vp.TensorTree,
-            output_jvp: vp.TensorTree,
-        ) -> vp.TensorTree:
+            output: vpx.TensorTree,
+            output_jvp: vpx.TensorTree,
+        ) -> vpx.TensorTree:
             compiled_stack.append(True)
             events.append(("compiled_loss_product", compiled_active()))
 
@@ -16904,13 +19215,13 @@ def test_standard_runtime_warms_ggn_loss_product_compile_boundary(
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "compiled",
             {
@@ -16956,14 +19267,14 @@ def test_standard_runtime_compiles_ggn_vjp_boundary_only(
         return len(compiled_stack) > 0
 
     def fake_compile(
-        operation: Callable[[vp.TensorTree], vp.TensorTree],
+        operation: Callable[[vpx.TensorTree], vpx.TensorTree],
         *,
         backend: str,
         mode: str | None,
         fullgraph: bool,
         dynamic: bool | None,
         options: Mapping[str, bool] | None,
-    ) -> Callable[[vp.TensorTree], vp.TensorTree]:
+    ) -> Callable[[vpx.TensorTree], vpx.TensorTree]:
         assert backend == "inductor"
         assert mode == "default"
         assert fullgraph is False
@@ -16971,7 +19282,7 @@ def test_standard_runtime_compiles_ggn_vjp_boundary_only(
         assert options is None
         events.append(("compile", compiled_active()))
 
-        def compiled(output_cotangent: vp.TensorTree) -> vp.TensorTree:
+        def compiled(output_cotangent: vpx.TensorTree) -> vpx.TensorTree:
             compiled_stack.append(True)
             events.append(("compiled_vjp", compiled_active()))
 
@@ -16984,18 +19295,18 @@ def test_standard_runtime_compiles_ggn_vjp_boundary_only(
 
     def recording_loss_product(
         execution: runtime_module.StandardExecution,
-        output: vp.TensorTree,
-        output_jvp: vp.TensorTree,
-    ) -> vp.TensorTree:
+        output: vpx.TensorTree,
+        output_jvp: vpx.TensorTree,
+    ) -> vpx.TensorTree:
         events.append(("loss_hessian", compiled_active()))
 
         return original_loss_product(execution, output, output_jvp)
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
@@ -17008,13 +19319,13 @@ def test_standard_runtime_compiles_ggn_vjp_boundary_only(
     )
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.standard_operation_factory(
-        vp.ggnvp("ggn", "model_output", aggregation="sum"),
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"model_output": square_function},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "ggn",
             "compiled",
             {
@@ -17075,7 +19386,7 @@ def test_standard_runtime_compiles_ggn_vjp_boundary_only(
             torch.tensor([7.0 / 3.0, 14.0 / 3.0], dtype=torch.float64),
         ),
         (
-            vp.empirical_fisher_vp(
+            ops.empirical_fisher_vp(
                 "empirical",
                 "scores",
                 aggregation="mean_per_example",
@@ -17094,7 +19405,7 @@ def test_standard_runtime_compiles_ggn_vjp_boundary_only(
 )
 def test_standard_runtime_compiles_score_matrix_boundary_only(
     monkeypatch: pytest.MonkeyPatch,
-    operator: vp.OperatorSpec,
+    operator: vpx.OperatorSpec,
     settings: Mapping[str, object],
     boundary: str,
     expected: torch.Tensor,
@@ -17105,10 +19416,10 @@ def test_standard_runtime_compiles_score_matrix_boundary_only(
     original_runtime_output = runtime_module._runtime_output
 
     def score_rows(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
     ) -> torch.Tensor:
         assert buffers == {}
         assert context.family in {"fisher", "sampled", "empirical"}
@@ -17163,10 +19474,10 @@ def test_standard_runtime_compiles_score_matrix_boundary_only(
         )
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", boundary, compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
@@ -17185,7 +19496,7 @@ def test_standard_runtime_compiles_score_matrix_boundary_only(
         function_objectives={"scores": score_rows},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             operator.family,
             "compiled",
             settings,
@@ -17210,7 +19521,7 @@ def test_standard_runtime_compiles_score_matrix_boundary_only(
 
 def test_standard_runtime_rejects_compile_boundary_without_matching_callable() -> None:
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params={"w": torch.tensor([1.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -17218,7 +19529,7 @@ def test_standard_runtime_rejects_compile_boundary_without_matching_callable() -
 
     with pytest.raises(vp.MaterializationError, match="hvp_batched_vectors"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "compiled",
                 {
@@ -17235,7 +19546,7 @@ def test_standard_runtime_rejects_compile_boundary_without_matching_callable() -
 
 def test_standard_runtime_rejects_loss_closure_boundary_without_scalar_loss() -> None:
     factory = vpx.standard_operation_factory(
-        vp.jvp("jvp", "function", aggregation="sum"),
+        ops.jvp("jvp", "function", aggregation="sum"),
         params={"w": torch.tensor([1.0], dtype=torch.float64)},
         buffers={},
         function_objectives={"function": square_function},
@@ -17243,7 +19554,7 @@ def test_standard_runtime_rejects_loss_closure_boundary_without_scalar_loss() ->
 
     with pytest.raises(vp.MaterializationError, match="loss_closure"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "jvp",
                 "bad-loss-boundary",
                 {
@@ -17279,7 +19590,7 @@ def test_standard_runtime_compiles_hvp_batched_vectors(
         assert options is None
         compiled_calls.append("compiled")
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             compiled_calls.append("called")
 
             return operation()
@@ -17288,7 +19599,7 @@ def test_standard_runtime_compiles_hvp_batched_vectors(
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0, -1.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -17300,7 +19611,7 @@ def test_standard_runtime_compiles_hvp_batched_vectors(
         )
     }
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "compiled-batched",
             {
@@ -17324,7 +19635,7 @@ def test_standard_runtime_rejects_single_vector_compile_boundary_for_batched_hvp
     None
 ):
     factory = vpx.standard_operation_factory(
-        vp.hvp("hvp", "loss", aggregation="sum"),
+        ops.hvp("hvp", "loss", aggregation="sum"),
         params={"w": torch.tensor([1.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
@@ -17332,7 +19643,7 @@ def test_standard_runtime_rejects_single_vector_compile_boundary_for_batched_hvp
 
     with pytest.raises(vp.MaterializationError, match="hvp_single_vector"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "hvp",
                 "compiled-bad-boundary",
                 {
@@ -17370,7 +19681,7 @@ def test_standard_runtime_enables_compiled_autograd_for_backward_operator(
         assert options is None
         events.append(("compile", torch_dynamo_config.compiled_autograd))
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             events.append(("call", torch_dynamo_config.compiled_autograd))
 
             return operation()
@@ -17379,13 +19690,13 @@ def test_standard_runtime_enables_compiled_autograd_for_backward_operator(
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
+        ops.gradient("gradient", "loss", aggregation="sum"),
         params={"w": torch.tensor([2.0], dtype=torch.float64)},
         buffers={},
         scalar_objectives={"loss": quadratic_scalar},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "gradient",
             "compiled-autograd",
             {
@@ -17410,7 +19721,7 @@ def test_standard_runtime_enables_compiled_autograd_for_backward_operator(
 
 def test_standard_runtime_rejects_compiled_autograd_without_backward_graph() -> None:
     factory = vpx.standard_operation_factory(
-        vp.metric(
+        ops.metric(
             "metric",
             "dense",
             aggregation="sum",
@@ -17422,7 +19733,7 @@ def test_standard_runtime_rejects_compiled_autograd_without_backward_graph() -> 
 
     with pytest.raises(vp.MaterializationError, match="backward or higher-order"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "metric",
                 "compiled-autograd",
                 {
@@ -17436,128 +19747,18 @@ def test_standard_runtime_rejects_compiled_autograd_without_backward_graph() -> 
         )
 
 
-def test_standard_operation_builds_runtime_inputs_before_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
-    buffers = {"b": torch.tensor([1.0], dtype=torch.float64)}
-    batch = {"scale": torch.tensor([2.0], dtype=torch.float64)}
-    vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
-    events = []
-    original_params = runtime_module._runtime_params
-    original_buffers = runtime_module._runtime_buffers
-    original_batch = runtime_module._runtime_batch
-    original_vector = runtime_module._runtime_vector
-
-    def runtime_params(
-        params: vp.ParameterTree,
-        settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None,
-    ) -> vp.ParameterTree:
-        events.append("params")
-
-        return original_params(params, settings, parameter_surface)
-
-    def runtime_buffers(
-        buffers: vp.BufferTree,
-        settings: Mapping[str, object],
-    ) -> vp.BufferTree:
-        events.append("buffers")
-
-        return original_buffers(buffers, settings)
-
-    def runtime_batch(
-        batch: vp.Batch,
-        settings: Mapping[str, object],
-        *,
-        move_input_residency: bool = True,
-        mmap_residency: Callable[[torch.Tensor, str], torch.Tensor] | None = None,
-    ) -> vp.Batch:
-        events.append("batch")
-
-        return original_batch(
-            batch,
-            settings,
-            move_input_residency=move_input_residency,
-            mmap_residency=mmap_residency,
-        )
-
-    def runtime_vector(
-        vector: vp.TensorTree,
-        settings: Mapping[str, object],
-        template: vp.TensorTree | None = None,
-        parameter_surface: vp.ParameterSurface | None = None,
-        mmap_residency: Callable[[torch.Tensor, str], torch.Tensor] | None = None,
-    ) -> vp.TensorTree:
-        events.append("vector")
-
-        return original_vector(
-            vector,
-            settings,
-            template,
-            parameter_surface,
-            mmap_residency=mmap_residency,
-        )
-
-    def scalar(
-        params: vp.ParameterTree,
-        buffers: vp.BufferTree,
-        batch: vp.Batch,
-        context: vp.ObjectiveContext,
-    ) -> torch.Tensor:
-        assert buffers["b"].dtype == torch.float32
-        assert batch["scale"].dtype == torch.float32
-        assert context.family == "gradient"
-        events.append("scalar")
-
-        return params["w"].pow(2).sum() * batch["scale"].sum()
-
-    monkeypatch.setattr(runtime_module, "_runtime_params", runtime_params)
-    monkeypatch.setattr(runtime_module, "_runtime_buffers", runtime_buffers)
-    monkeypatch.setattr(runtime_module, "_runtime_batch", runtime_batch)
-    monkeypatch.setattr(runtime_module, "_runtime_vector", runtime_vector)
-
-    factory = vpx.standard_operation_factory(
-        vp.gradient("gradient", "loss", aggregation="sum"),
-        params=params,
-        buffers=buffers,
-        scalar_objectives={"loss": scalar},
-    )
-    operation = factory(
-        vp.Candidate(
-            "gradient",
-            "row",
-            {
-                **gradient_settings(),
-                "dtype.parameter_storage": "fp32",
-                "dtype.model_compute": "fp32",
-            },
-            admission_status="passed",
-        ),
-        batch,
-        vector,
-    )
-
-    assert events == ["params", "buffers", "batch", "vector"]
-
-    events.append("before_call")
-    operation()
-
-    assert events == ["params", "buffers", "batch", "vector", "before_call", "scalar"]
-
-
 def test_composition_runtime_config_runs_and_materializes_selected_operator(
     tmp_path: Path,
 ) -> None:
     model = OneParameterModule()
-    operator = vp.composition(
+    operator = ops.composition(
         "compose",
         "scale_then_shift",
         aggregation="none",
         children=("multiply", "shift"),
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "row",
             composition_settings(),
@@ -17586,16 +19787,16 @@ def test_composition_runtime_config_runs_and_materializes_selected_operator(
         },
         axis_registry=None,
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=ScaleData(),
         operator=operator,
         vectors=ParameterVectorProvider(),
         target=cpu_target(),
         runtime=runtime,
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -17636,7 +19837,7 @@ def test_composition_single_loop_vectorization_runs_batched_vectors() -> None:
         )
     }
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "vectorized",
             aggregation="none",
@@ -17648,7 +19849,7 @@ def test_composition_single_loop_vectorization_runs_batched_vectors() -> None:
         },
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "single-loop-vectors",
             {
@@ -17681,15 +19882,15 @@ def test_composition_manual_batch_vectorization_runs_declared_chunks() -> None:
     calls = []
 
     def recording_multiply(
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vp.TensorTree:
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.TensorTree:
         calls.append(tree_leaves(vector)[0].shape[0])
 
         return multiply_component(batch, vector)
 
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "manual-vectorized",
             aggregation="none",
@@ -17701,7 +19902,7 @@ def test_composition_manual_batch_vectorization_runs_declared_chunks() -> None:
         },
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "manual-batch-vectors",
             {
@@ -17739,7 +19940,7 @@ def test_composition_vmap_vectorization_runs_batched_vectors(
 
     monkeypatch.setattr(runtime_module, "_torch_func_vmap", recording_vmap)
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "vmap-vectorized",
             aggregation="none",
@@ -17751,7 +19952,7 @@ def test_composition_vmap_vectorization_runs_batched_vectors(
         },
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "vmap-vectors",
             {
@@ -17779,7 +19980,7 @@ def test_composition_vmap_vectorization_runs_batched_vectors(
 
 def test_composition_reference_check_uses_anchor_components() -> None:
     check = vpx.composition_reference_check(
-        vp.composition(
+        ops.composition(
             "compose",
             "scale_then_shift",
             aggregation="none",
@@ -17798,7 +19999,7 @@ def test_composition_reference_check_uses_anchor_components() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "compose",
                 "row",
                 composition_settings(
@@ -17814,7 +20015,7 @@ def test_composition_reference_check_uses_anchor_components() -> None:
 
 def test_composition_reference_check_fails_intermediate_component_mismatch() -> None:
     check = vpx.composition_reference_check(
-        vp.composition(
+        ops.composition(
             "compose",
             "hidden_component_error",
             aggregation="none",
@@ -17833,7 +20034,7 @@ def test_composition_reference_check_fails_intermediate_component_mismatch() -> 
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "compose",
                 "row",
                 composition_settings(
@@ -17850,7 +20051,7 @@ def test_composition_reference_check_fails_intermediate_component_mismatch() -> 
 def test_composition_reference_check_runs_child_anchor() -> None:
     child = vpx.CompositionChild(
         name="first",
-        candidate=vp.Candidate(
+        candidate=vpx.Candidate(
             "child",
             "bad",
             {"operator_path": "child"},
@@ -17862,7 +20063,7 @@ def test_composition_reference_check_runs_child_anchor() -> None:
         input_signature={"child": "bad"},
     )
     check = vpx.composition_reference_check(
-        vp.composition(
+        ops.composition(
             "compose",
             "child_anchor",
             aggregation="none",
@@ -17876,7 +20077,7 @@ def test_composition_reference_check_runs_child_anchor() -> None:
 
     with pytest.raises(vp.ReferenceFailedError, match="child anchor failed"):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "compose",
                 "row",
                 composition_settings(
@@ -17892,7 +20093,7 @@ def test_composition_reference_check_runs_child_anchor() -> None:
 
 def test_composition_tune_writes_child_reference_rows(tmp_path: Path) -> None:
     model = OneParameterModule()
-    operator = vp.composition(
+    operator = ops.composition(
         "compose",
         "child_anchor",
         aggregation="none",
@@ -17900,7 +20101,7 @@ def test_composition_tune_writes_child_reference_rows(tmp_path: Path) -> None:
     )
     child = vpx.CompositionChild(
         name="identity",
-        candidate=vp.Candidate(
+        candidate=vpx.Candidate(
             "child",
             "identity",
             {"operator_path": "child"},
@@ -17912,7 +20113,7 @@ def test_composition_tune_writes_child_reference_rows(tmp_path: Path) -> None:
         input_signature={"child": "identity"},
     )
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "row",
             composition_settings(
@@ -17933,16 +20134,16 @@ def test_composition_tune_writes_child_reference_rows(tmp_path: Path) -> None:
         anchor_component_signature={"identity": "test.identity_component"},
         axis_registry=None,
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=ScaleData(),
         operator=operator,
         vectors=ParameterVectorProvider(),
         target=cpu_target(),
         runtime=runtime,
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -17975,7 +20176,7 @@ def test_composition_tune_writes_child_reference_rows(tmp_path: Path) -> None:
 
 def test_composition_selected_child_rows_drive_operation(tmp_path: Path) -> None:
     model = OneParameterModule()
-    operator = vp.composition(
+    operator = ops.composition(
         "compose",
         "selected_child",
         aggregation="none",
@@ -17983,7 +20184,7 @@ def test_composition_selected_child_rows_drive_operation(tmp_path: Path) -> None
     )
     child = vpx.CompositionChild(
         name="identity",
-        candidate=vp.Candidate(
+        candidate=vpx.Candidate(
             "child",
             "identity",
             {"operator_path": "child"},
@@ -17994,7 +20195,7 @@ def test_composition_selected_child_rows_drive_operation(tmp_path: Path) -> None
         reference_check=passed_child_reference,
         input_signature={"child": "identity"},
     )
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "compose",
         "row",
         composition_settings(
@@ -18014,16 +20215,16 @@ def test_composition_selected_child_rows_drive_operation(tmp_path: Path) -> None
         anchor_component_signature={"identity": "test.identity_component"},
         axis_registry=None,
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=ScaleData(),
         operator=operator,
         vectors=ParameterVectorProvider(),
         target=cpu_target(),
         runtime=runtime,
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -18041,124 +20242,9 @@ def test_composition_selected_child_rows_drive_operation(tmp_path: Path) -> None
     )
 
 
-def test_composition_materialize_each_child_uses_child_operations(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls = []
-    original_child_operation = runtime_module._composition_child_operation
-
-    def recording_child_operation(
-        name: str,
-        component: Callable[[vp.Batch, vp.TensorTree], vp.TensorTree],
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vpx.CandidateOperation:
-        calls.append(name)
-
-        return original_child_operation(name, component, batch, vector)
-
-    monkeypatch.setattr(
-        runtime_module,
-        "_composition_child_operation",
-        recording_child_operation,
-    )
-    child = vpx.CompositionChild(
-        name="identity",
-        candidate=vp.Candidate(
-            "child",
-            "identity",
-            {"operator_path": "child"},
-            admission_status="passed",
-        ),
-        component=identity_component,
-        anchor_component=identity_component,
-        reference_check=passed_child_reference,
-        input_signature={"child": "identity"},
-    )
-    factory = vpx.composition_operation_factory(
-        vp.composition(
-            "compose",
-            "materialized_child",
-            aggregation="none",
-            children=("identity",),
-        ),
-        components={"identity": wrong_shift_component},
-        children=(child,),
-    )
-    result = factory(
-        vp.Candidate(
-            "compose",
-            "materialize-child",
-            composition_settings(
-                execution="materialize_each_child",
-                child_evaluation="selected_child_rows",
-            ),
-            admission_status="passed",
-        ),
-        {"scale": 1.0},
-        {"w": torch.tensor([3.0], dtype=torch.float64)},
-    )()
-
-    assert calls == ["identity"]
-    torch.testing.assert_close(
-        tree_leaves(result)[0],
-        torch.tensor([3.0], dtype=torch.float64),
-    )
-
-
-def test_composition_stream_child_outputs_bypasses_child_operations(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def blocked_child_operation(
-        name: str,
-        component: Callable[[vp.Batch, vp.TensorTree], vp.TensorTree],
-        batch: vp.Batch,
-        vector: vp.TensorTree,
-    ) -> vpx.CandidateOperation:
-        assert name
-        assert component
-        assert batch
-        assert vector
-        message = "stream_child_outputs materialized a child operation"
-        raise AssertionError(message)
-
-    monkeypatch.setattr(
-        runtime_module,
-        "_composition_child_operation",
-        blocked_child_operation,
-    )
-    factory = vpx.composition_operation_factory(
-        vp.composition(
-            "compose",
-            "stream_child",
-            aggregation="none",
-            children=("multiply", "shift"),
-        ),
-        components={
-            "multiply": multiply_component,
-            "shift": shift_component,
-        },
-    )
-    result = factory(
-        vp.Candidate(
-            "compose",
-            "stream-child",
-            composition_settings(execution="stream_child_outputs"),
-            admission_status="passed",
-        ),
-        {"scale": 2.0},
-        {"w": torch.tensor([3.0], dtype=torch.float64)},
-    )()
-
-    torch.testing.assert_close(
-        tree_leaves(result)[0],
-        torch.tensor([7.0], dtype=torch.float64),
-    )
-
-
 def test_composition_materialize_each_child_rejects_inline_child_lowering() -> None:
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "bad_materialized_child",
             aggregation="none",
@@ -18169,7 +20255,7 @@ def test_composition_materialize_each_child_rejects_inline_child_lowering() -> N
 
     with pytest.raises(vp.MaterializationError, match="selected_child_rows"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "compose",
                 "bad-materialized-child",
                 composition_settings(execution="materialize_each_child"),
@@ -18202,13 +20288,13 @@ def test_composition_compile_whole_operator_uses_torch_compile(
             "options": options,
         })
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             return operation()
 
         return compiled
 
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
-    operator = vp.composition(
+    operator = ops.composition(
         "compose",
         "compiled_composition",
         aggregation="none",
@@ -18219,7 +20305,7 @@ def test_composition_compile_whole_operator_uses_torch_compile(
         components={"identity": identity_component},
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "compiled",
             {
@@ -18250,7 +20336,7 @@ def test_composition_compile_whole_operator_uses_torch_compile(
 
 def test_composition_runs_real_torch_compile_whole_composition() -> None:
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "compiled_composition",
             aggregation="none",
@@ -18262,7 +20348,7 @@ def test_composition_runs_real_torch_compile_whole_composition() -> None:
         },
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "compiled",
             {
@@ -18284,7 +20370,7 @@ def test_composition_runs_real_torch_compile_whole_composition() -> None:
 
 def test_composition_runs_real_torch_compile_child_boundary() -> None:
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "compiled_children",
             aggregation="none",
@@ -18296,7 +20382,7 @@ def test_composition_runs_real_torch_compile_child_boundary() -> None:
         },
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "compiled-children",
             {
@@ -18318,7 +20404,7 @@ def test_composition_runs_real_torch_compile_child_boundary() -> None:
 
 def test_composition_executes_preallocated_output_buffers() -> None:
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "preallocated_composition",
             aggregation="none",
@@ -18330,7 +20416,7 @@ def test_composition_executes_preallocated_output_buffers() -> None:
         },
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "preallocated",
             {
@@ -18356,13 +20442,13 @@ def test_composition_executes_intermediate_residency_between_children(
     calls = []
     second_inputs = []
 
-    def first_component(batch: vp.Batch, vector: vp.TensorTree) -> vp.TensorTree:
+    def first_component(batch: vpx.Batch, vector: vpx.TensorTree) -> vpx.TensorTree:
         assert "scale" in batch
         vector_map = tensor_mapping(vector)
 
         return {"w": vector_map["w"] * 2.0}
 
-    def second_component(batch: vp.Batch, vector: vp.TensorTree) -> vp.TensorTree:
+    def second_component(batch: vpx.Batch, vector: vpx.TensorTree) -> vpx.TensorTree:
         assert "scale" in batch
         vector_map = tensor_mapping(vector)
         second_inputs.append(vector_map["w"].data_ptr())
@@ -18381,7 +20467,7 @@ def test_composition_executes_intermediate_residency_between_children(
 
     monkeypatch.setattr(runtime_module, "_residency_tensor", recording_residency)
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "intermediate_residency",
             aggregation="none",
@@ -18393,7 +20479,7 @@ def test_composition_executes_intermediate_residency_between_children(
         },
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "intermediate-residency",
             {
@@ -18420,7 +20506,7 @@ def test_composition_executes_intermediate_residency_between_children(
 
 def test_composition_rejects_intermediate_residency_for_fused_children() -> None:
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "fused_intermediate_residency",
             aggregation="none",
@@ -18435,7 +20521,7 @@ def test_composition_rejects_intermediate_residency_for_fused_children() -> None
 
     with pytest.raises(vp.MaterializationError, match="visible composition child"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "compose",
                 "fused-intermediate-residency",
                 {
@@ -18451,7 +20537,7 @@ def test_composition_rejects_intermediate_residency_for_fused_children() -> None
 
 def test_composition_compile_whole_operator_requires_compile_axis() -> None:
     registry = vpx.standard_axis_registry()
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "compose",
         "bad",
         composition_settings(execution="compile_whole_composition"),
@@ -18476,14 +20562,14 @@ def test_composition_child_compile_boundary_compiles_each_child(
         return len(compiled_stack) > 0
 
     def fake_compile(
-        component: Callable[[vp.Batch, vp.TensorTree], vp.TensorTree],
+        component: Callable[[vpx.Batch, vpx.TensorTree], vpx.TensorTree],
         *,
         backend: str,
         mode: str | None,
         fullgraph: bool,
         dynamic: bool | None,
         options: Mapping[str, bool] | None,
-    ) -> Callable[[vp.Batch, vp.TensorTree], vp.TensorTree]:
+    ) -> Callable[[vpx.Batch, vpx.TensorTree], vpx.TensorTree]:
         assert backend == "inductor"
         assert mode == "default"
         assert fullgraph is False
@@ -18491,7 +20577,7 @@ def test_composition_child_compile_boundary_compiles_each_child(
         assert options is None
         events.append(("compile", compiled_active()))
 
-        def compiled(batch: vp.Batch, vector: vp.TensorTree) -> vp.TensorTree:
+        def compiled(batch: vpx.Batch, vector: vpx.TensorTree) -> vpx.TensorTree:
             compiled_stack.append(True)
             events.append(("compiled_child", compiled_active()))
 
@@ -18503,10 +20589,10 @@ def test_composition_child_compile_boundary_compiles_each_child(
         return compiled
 
     def recording_runtime_output(
-        output: vp.TensorTree,
+        output: vpx.TensorTree,
         settings: Mapping[str, object],
-        parameter_surface: vp.ParameterSurface | None = None,
-    ) -> vp.TensorTree:
+        parameter_surface: vpx.ParameterSurface | None = None,
+    ) -> vpx.TensorTree:
         events.append(("runtime_output", compiled_active()))
 
         return original_runtime_output(output, settings, parameter_surface)
@@ -18514,7 +20600,7 @@ def test_composition_child_compile_boundary_compiles_each_child(
     monkeypatch.setattr(runtime_module.torch, "compile", fake_compile)
     monkeypatch.setattr(runtime_module, "_runtime_output", recording_runtime_output)
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "compiled_children",
             aggregation="none",
@@ -18526,7 +20612,7 @@ def test_composition_child_compile_boundary_compiles_each_child(
         },
     )
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "compiled-children",
             {
@@ -18555,7 +20641,7 @@ def test_composition_child_compile_boundary_compiles_each_child(
 
 def test_composition_child_compile_boundary_rejects_fused_composition() -> None:
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "compiled_children",
             aggregation="none",
@@ -18570,7 +20656,7 @@ def test_composition_child_compile_boundary_rejects_fused_composition() -> None:
 
     with pytest.raises(vp.MaterializationError, match="child calls"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "compose",
                 "compiled-fused",
                 {
@@ -18587,19 +20673,19 @@ def test_composition_child_compile_boundary_rejects_fused_composition() -> None:
 def test_composition_fuse_adjacent_children_runs_fused_component() -> None:
     events = []
 
-    def child_component(batch: vp.Batch, vector: vp.TensorTree) -> vp.TensorTree:
+    def child_component(batch: vpx.Batch, vector: vpx.TensorTree) -> vpx.TensorTree:
         assert batch["scale"]
         events.append("child")
 
         return vector
 
-    def fused_component(batch: vp.Batch, vector: vp.TensorTree) -> vp.TensorTree:
+    def fused_component(batch: vpx.Batch, vector: vpx.TensorTree) -> vpx.TensorTree:
         events.append("fused")
 
         return fused_multiply_shift_component(batch, vector)
 
     factory = vpx.composition_operation_factory(
-        vp.composition(
+        ops.composition(
             "compose",
             "fused",
             aggregation="none",
@@ -18612,7 +20698,7 @@ def test_composition_fuse_adjacent_children_runs_fused_component() -> None:
         fused_components={("multiply", "shift"): fused_component},
     )
     result = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "fused",
             composition_settings(execution="fuse_adjacent_children"),
@@ -18631,7 +20717,7 @@ def test_composition_fuse_adjacent_children_runs_fused_component() -> None:
 
 def test_composition_fuse_adjacent_children_reference_validates_fused_output() -> None:
     check = vpx.composition_reference_check(
-        vp.composition(
+        ops.composition(
             "compose",
             "fused",
             aggregation="none",
@@ -18651,7 +20737,7 @@ def test_composition_fuse_adjacent_children_reference_validates_fused_output() -
         thresholds={"max_abs_diff": 1e-9, "max_rel_diff": 1e-9},
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "fused",
             composition_settings(execution="fuse_adjacent_children"),
@@ -18671,7 +20757,7 @@ def test_composition_fuse_adjacent_children_reference_validates_fused_output() -
 def test_composition_validate_composed_output_skips_child_anchor() -> None:
     child = vpx.CompositionChild(
         name="identity",
-        candidate=vp.Candidate(
+        candidate=vpx.Candidate(
             "child",
             "bad",
             {"operator_path": "child"},
@@ -18683,7 +20769,7 @@ def test_composition_validate_composed_output_skips_child_anchor() -> None:
         input_signature={"child": "bad"},
     )
     check = vpx.composition_reference_check(
-        vp.composition(
+        ops.composition(
             "compose",
             "composed_only",
             aggregation="none",
@@ -18695,7 +20781,7 @@ def test_composition_validate_composed_output_skips_child_anchor() -> None:
         children=(child,),
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "row",
             composition_settings(
@@ -18713,7 +20799,7 @@ def test_composition_validate_composed_output_skips_child_anchor() -> None:
 
 def test_composition_replay_requires_child_reference_rows(tmp_path: Path) -> None:
     model = OneParameterModule()
-    operator = vp.composition(
+    operator = ops.composition(
         "compose",
         "child_anchor",
         aggregation="none",
@@ -18721,7 +20807,7 @@ def test_composition_replay_requires_child_reference_rows(tmp_path: Path) -> Non
     )
     child = vpx.CompositionChild(
         name="identity",
-        candidate=vp.Candidate(
+        candidate=vpx.Candidate(
             "child",
             "identity",
             {"operator_path": "child"},
@@ -18732,7 +20818,7 @@ def test_composition_replay_requires_child_reference_rows(tmp_path: Path) -> Non
         reference_check=passed_child_reference,
         input_signature={"child": "identity"},
     )
-    parent = vp.Candidate(
+    parent = vpx.Candidate(
         "compose",
         "row",
         composition_settings(
@@ -18752,16 +20838,16 @@ def test_composition_replay_requires_child_reference_rows(tmp_path: Path) -> Non
         anchor_component_signature={"identity": "test.identity_component"},
         axis_registry=None,
     )
-    problem = vp.Problem(
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=ScaleData(),
         operator=operator,
         vectors=ParameterVectorProvider(),
         target=cpu_target(),
         runtime=runtime,
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),
@@ -18866,7 +20952,7 @@ def test_composition_replay_requires_child_reference_rows(tmp_path: Path) -> Non
 
 def test_composition_reference_check_low_precision_anchor() -> None:
     check = vpx.composition_reference_check(
-        vp.composition(
+        ops.composition(
             "compose",
             "identity",
             aggregation="none",
@@ -18879,7 +20965,7 @@ def test_composition_reference_check_low_precision_anchor() -> None:
 
     with pytest.raises(vp.ReferenceFailedError):
         check(
-            vp.Candidate(
+            vpx.Candidate(
                 "compose",
                 "float32",
                 {**composition_settings(), "dtype.output": "fp32"},
@@ -18892,7 +20978,7 @@ def test_composition_reference_check_low_precision_anchor() -> None:
 
 def test_composition_reference_check_applies_numeric_error_bound_fields() -> None:
     check = vpx.composition_reference_check(
-        vp.composition(
+        ops.composition(
             "compose",
             "identity",
             aggregation="none",
@@ -18904,7 +20990,7 @@ def test_composition_reference_check_applies_numeric_error_bound_fields() -> Non
         numeric_bound_fields=numeric_bound_fields(),
     )
     result = check(
-        vp.Candidate(
+        vpx.Candidate(
             "compose",
             "high-matmul",
             {
@@ -18928,13 +21014,13 @@ def test_standard_runtime_tunes_hvp_and_materializes_selected_operator(
     model = OneParameterModule()
     params = {"w": model.w.detach().clone()}
     candidates = (
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "reverse",
             hvp_settings("reverse_over_reverse"),
             changed_axes=("hvp.path",),
         ),
-        vp.Candidate(
+        vpx.Candidate(
             "hvp",
             "jvp-grad",
             {
@@ -18944,10 +21030,10 @@ def test_standard_runtime_tunes_hvp_and_materializes_selected_operator(
             changed_axes=("hvp.path",),
         ),
     )
-    operator = vp.hvp("hvp", "loss", aggregation="sum")
-    problem = vp.Problem(
+    operator = ops.hvp("hvp", "loss", aggregation="sum")
+    problem = vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=ScaleData(),
         operator=operator,
         vectors=ParameterVectorProvider(),
@@ -18969,7 +21055,7 @@ def test_standard_runtime_tunes_hvp_and_materializes_selected_operator(
             scalar_objectives={"loss": quadratic_scalar},
         ),
     )
-    plan = vp.tune(
+    plan = tune_problem(
         problem,
         run_dir=tmp_path,
         memory_backend=CPUMemoryBackend(),

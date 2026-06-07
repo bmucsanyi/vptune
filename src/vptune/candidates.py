@@ -1,8 +1,8 @@
 """Candidate axes, admission, and DAG helpers."""
 
 import dataclasses
+import importlib
 from collections.abc import Callable, Mapping, Sequence
-from itertools import starmap
 from typing import Any
 
 import torch
@@ -13,11 +13,7 @@ from vptune.admission import (
     admit_forward_ad,
     admit_torch_func,
 )
-from vptune.checks import (
-    NUMERIC_ERROR_BOUND_FIELDS,
-    uses_reduction_degrading_setting,
-)
-from vptune.data import Candidate, Family
+from vptune.data import PACKAGE_VERSION, Candidate, Family
 from vptune.errors import AdmissionError
 
 AdmissionRule = Callable[[Candidate], tuple[bool, str | None]]
@@ -41,20 +37,6 @@ class AxisTable:
         """
         return {axis.axis_key: axis for axis in self.axes}
 
-    def optional_owner_by_key(self) -> dict[str, "AxisDescriptor"]:
-        """Return owner axes keyed by optional setting key.
-
-        Returns:
-            Mapping from optional setting key to owning axis descriptor.
-        """
-        owners = {}
-
-        for axis in self.axes:
-            for key in axis.optional_settings_keys:
-                owners[key] = axis
-
-        return owners
-
     def signature(self) -> dict[str, Any]:
         """Return stable axis table identity.
 
@@ -69,58 +51,6 @@ class AxisTable:
             "merge_rules": self.merge_rules,
         }
 
-    def admit(
-        self,
-        candidate: Candidate,
-        *,
-        fixed_fields: Mapping[str, Any],
-    ) -> Candidate:
-        """Return candidate with axis table admission status set.
-
-        Returns:
-            Candidate with updated admission status.
-        """
-        error = self.admission_error(candidate, fixed_fields=fixed_fields)
-
-        if error is not None:
-            return dataclasses.replace(
-                candidate,
-                admission_status="failed",
-                admission_error=error,
-            )
-
-        return dataclasses.replace(candidate, admission_status="passed")
-
-    def admission_error(
-        self,
-        candidate: Candidate,
-        *,
-        fixed_fields: Mapping[str, Any],
-    ) -> str | None:
-        """Return the first axis table admission error.
-
-        Returns:
-            Failure reason, or None when admitted.
-        """
-        by_key = self.by_key()
-        optional_owner_by_key = self.optional_owner_by_key()
-
-        for key, value in candidate.settings.items():
-            axis = by_key.get(key)
-
-            if axis is None:
-                if key in optional_owner_by_key:
-                    continue
-
-                return f"candidate setting key has no axis table owner: {key}"
-
-            value_error = _axis_table_value_error(axis, value)
-
-            if value_error is not None:
-                return value_error
-
-        return _axis_table_cross_rule_error(candidate.settings, fixed_fields)
-
 
 AxisManifest = AxisTable
 
@@ -134,8 +64,13 @@ ALL_OPERATOR_FAMILIES = (
     "fisher_vp",
     "sampled_fisher_vp",
     "empirical_fisher_vp",
+    "per_example_gradient",
     "metric",
+    "sqrt_metric",
+    "inverse_sqrt_metric",
+    "metric_inner",
     "inverse_metric",
+    "inverse_metric_inner",
     "composition",
 )
 MODEL_CALL_OPERATOR_FAMILIES = (
@@ -147,6 +82,7 @@ MODEL_CALL_OPERATOR_FAMILIES = (
     "fisher_vp",
     "sampled_fisher_vp",
     "empirical_fisher_vp",
+    "per_example_gradient",
 )
 VECTOR_OPERATOR_FAMILIES = (
     "jvp",
@@ -156,7 +92,12 @@ VECTOR_OPERATOR_FAMILIES = (
     "fisher_vp",
     "sampled_fisher_vp",
     "empirical_fisher_vp",
+    "sqrt_metric",
+    "inverse_sqrt_metric",
+    "metric_inner",
     "composition",
+    "inverse_metric",
+    "inverse_metric_inner",
 )
 
 PACKED_ATTENTION_MERGE_RULE = (
@@ -176,6 +117,13 @@ FSDP_REDUCE_DTYPE_MERGE_RULE = (
 FACTORIZED_INVERSE_MERGE_RULE = (
     "factorized inverse rows merge inverse_solve with metric_storage"
 )
+DIRECT_LAYOUT_VALUES = (
+    "parameter_tree",
+    "flat_contiguous",
+    "per_layer_flat",
+    "per_block_flat",
+)
+DISTRIBUTED_LAYOUT_VALUES = ("per_shard", "dtensor")
 
 AXIS_TABLE_MERGE_RULES = (
     PACKED_ATTENTION_MERGE_RULE,
@@ -192,6 +140,7 @@ INTEGER_TUPLE_DOMAIN = ("positive_integer_tuple_domain",)
 POSITIVE_FLOAT_DOMAIN = ("positive_float_domain",)
 DECLARED_DOMAIN = ("declared",)
 REGISTERED_DOMAIN = ("registered",)
+FSDP_RESHARD_AFTER_FORWARD_DOMAIN = ("false_true_or_positive_integer_domain",)
 COMPILE_BOUNDARY_VALUES = (
     "model_forward",
     "transformer_block",
@@ -209,8 +158,13 @@ COMPILE_BOUNDARY_VALUES = (
     "fisher_score_grad",
     "sampled_fisher_score_grad",
     "empirical_fisher_example_grad",
+    "per_example_gradient",
     "metric_multiply",
+    "metric_inner_reduce",
+    "metric_sqrt_multiply",
     "inverse_metric_solve",
+    "inverse_metric_inner_reduce",
+    "bound_operator_vector_step",
     "composition_child",
     "whole_operator",
 )
@@ -218,6 +172,16 @@ BACKEND_OPTION_KEYS = (
     "compile.options.epilogue_fusion",
     "compile.options.shape_padding",
     "compile.cuda_graphs",
+)
+COMPILE_REQUIRED_ENABLED_SETTINGS = (
+    "compile.boundary",
+    "compile.backend",
+    "compile.mode",
+    "compile.fullgraph",
+    "compile.dynamic",
+    "compile.compiled_autograd",
+    *BACKEND_OPTION_KEYS,
+    "compile.cache_state",
 )
 COMPILE_DISABLED_VALUES = {
     "compile.backend": "inductor",
@@ -230,22 +194,6 @@ COMPILE_DISABLED_VALUES = {
     "compile.cuda_graphs": "false",
     "compile.cache_state": "warm_cache",
 }
-PACKED_BATCH_LAYOUTS = ("packed_with_inverse_permutation", "variable_length")
-CHECKPOINT_RECOMPUTE_VALUES = (
-    "checkpoint_non_reentrant_by_layer",
-    "checkpoint_selective",
-)
-CHECKPOINT_DISABLED_SETTINGS = {
-    "checkpoint.early_stop": "false",
-    "checkpoint.preserve_rng_state": "false",
-    "checkpoint.determinism_check": "none",
-    "checkpoint.context_fn": "none",
-}
-FORWARD_AD_PATHS_BY_KEY = {
-    "jvp.path": ("torch_func_jvp", "forward_ad_dual"),
-    "hvp.path": ("jvp_grad", "forward_ad_dual"),
-    "ggn.jvp_path": ("torch_func_jvp", "forward_ad_dual"),
-}
 MICROBATCH_OPERATOR_PATH_KEYS = (
     "gradient.path",
     "jvp.path",
@@ -256,32 +204,13 @@ MICROBATCH_OPERATOR_PATH_KEYS = (
     "sampled_fisher.accumulation",
     "empirical_fisher.grad_path",
 )
-DENSE_REPRESENTATIONS = ("dense_matrix",)
-DIAGONAL_REPRESENTATIONS = ("diagonal_tree",)
-BLOCK_REPRESENTATIONS = ("block_diagonal",)
-KFAC_REPRESENTATIONS = ("kfac_factors",)
-LOW_RANK_REPRESENTATIONS = ("low_rank_factors",)
-GGN_REPRESENTATIONS = ("ggn_derived_factors",)
-FACTOR_REPRESENTATIONS = (
-    *DIAGONAL_REPRESENTATIONS,
-    *KFAC_REPRESENTATIONS,
-    *LOW_RANK_REPRESENTATIONS,
-    *GGN_REPRESENTATIONS,
-)
-STREAMING_REPRESENTATIONS = (
-    *DIAGONAL_REPRESENTATIONS,
-    *BLOCK_REPRESENTATIONS,
-    *KFAC_REPRESENTATIONS,
-    *LOW_RANK_REPRESENTATIONS,
-    *GGN_REPRESENTATIONS,
-)
-BLOCK_OR_KFAC_REPRESENTATIONS = (*BLOCK_REPRESENTATIONS, *KFAC_REPRESENTATIONS)
-DIRECT_SOLVE_PATHS = ("dense_solve", "cholesky_solve", "eigh_solve", "svd_solve")
-ITERATIVE_SOLVE_PATHS = ("conjugate_gradient",)
-ADMISSION_BOUND_FIELDS = NUMERIC_ERROR_BOUND_FIELDS
 OWNER_EXACT = {
     "teacher_outputs": "input_schedule",
     "autocast": "numeric_backend",
+    "forward_ad_flags": "ad_lowering",
+    "torch_func_admission": "ad_lowering",
+    "attention.custom_kernel_id": "transformers_attention",
+    "attention.mask_formatter_id": "transformers_attention",
 }
 OWNER_PREFIX = {
     "gradient": "gradient",
@@ -292,8 +221,12 @@ OWNER_PREFIX = {
     "fisher": "fisher",
     "sampled_fisher": "sampled_fisher",
     "empirical_fisher": "empirical_fisher",
+    "per_example_gradient": "per_example_gradient",
     "metric": "metric",
+    "metric_inner": "metric",
+    "sqrt_metric": "metric",
     "inverse_metric": "inverse_metric",
+    "inverse_metric_inner": "inverse_metric",
     "composition": "composition",
     "vectorization": "vectorization",
     "compile": "compile",
@@ -318,6 +251,8 @@ OWNER_PREFIX = {
 CLASS_C_EXACT = {
     "teacher_outputs": "input_schedule",
     "autocast": "numeric_backend",
+    "forward_ad_flags": "ad_lowering",
+    "torch_func_admission": "ad_lowering",
     "memory.primal_outputs": "activation_memory",
     "memory.jvp_outputs": "activation_memory",
     "memory.output_cotangents": "activation_memory",
@@ -335,6 +270,7 @@ CLASS_C_PREFIX = {
     "fisher": "ad_lowering",
     "sampled_fisher": "ad_lowering",
     "empirical_fisher": "ad_lowering",
+    "per_example_gradient": "ad_lowering",
     "composition": "ad_lowering",
     "vectorization": "ad_lowering",
     "call": "ad_lowering",
@@ -358,7 +294,10 @@ CLASS_C_PREFIX = {
     "compile": "compile",
     "fusion": "fusion",
     "metric": "metric_storage",
+    "metric_inner": "metric_storage",
+    "sqrt_metric": "metric_storage",
     "inverse_metric": "inverse_solve",
+    "inverse_metric_inner": "inverse_solve",
 }
 OPERATOR_PREFIX = {
     "gradient": ("gradient",),
@@ -369,9 +308,36 @@ OPERATOR_PREFIX = {
     "fisher": ("fisher_vp",),
     "sampled_fisher": ("sampled_fisher_vp",),
     "empirical_fisher": ("empirical_fisher_vp",),
+    "per_example_gradient": ("per_example_gradient",),
     "metric": ("metric",),
+    "metric_inner": ("metric_inner",),
+    "sqrt_metric": ("sqrt_metric", "inverse_sqrt_metric"),
     "inverse_metric": ("inverse_metric",),
+    "inverse_metric_inner": ("inverse_metric_inner",),
     "composition": ("composition",),
+}
+AXIS_TABLE_DOMAIN_OVERRIDES = {
+    "vectorization.batch_size": INTEGER_DOMAIN,
+    "vectorization.vmap_chunk_size": INTEGER_DOMAIN,
+    "vectorization.in_dims": DECLARED_DOMAIN,
+    "batch.data_microbatch_size": INTEGER_DOMAIN,
+    "batch.hvp_row_batch_size": INTEGER_DOMAIN,
+    "batch.ggn_batch_size": INTEGER_DOMAIN,
+    "batch.fisher_sample_batch_size": INTEGER_DOMAIN,
+    "batch.empirical_example_batch_size": INTEGER_DOMAIN,
+    "batch.per_example_block_size": INTEGER_DOMAIN,
+    "chunk.token_block_size": INTEGER_DOMAIN,
+    "chunk.sequence_position_block_size": INTEGER_DOMAIN,
+    "chunk.class_block_size_with_exact_global_normalization": INTEGER_DOMAIN,
+    "chunk.output_cotangent_block_size": INTEGER_DOMAIN,
+    "chunk.parameter_block_size": INTEGER_DOMAIN,
+    "chunk.layer_block_size": INTEGER_DOMAIN,
+    "chunk.lm_head_weight_chunk_bytes": INTEGER_DOMAIN,
+    "attention.custom_kernel_id": REGISTERED_DOMAIN,
+    "attention.mask_formatter_id": REGISTERED_DOMAIN,
+    "compile.backend": ("inductor", "registered_backend"),
+    "inverse_metric.iteration_budget": INTEGER_DOMAIN,
+    "sqrt_metric.lanczos_iterations": INTEGER_DOMAIN,
 }
 
 
@@ -381,7 +347,7 @@ def axis_table() -> AxisTable:
     Returns:
         Complete axis table for candidate generation and admission.
     """
-    axes = tuple(starmap(_axis_table_axis, _axis_table_axis_domains()))
+    axes = _axis_table_axes()
     groups = {}
 
     for axis in axes:
@@ -390,7 +356,7 @@ def axis_table() -> AxisTable:
     class_c_groups = {name: tuple(keys) for name, keys in sorted(groups.items())}
 
     return AxisTable(
-        package_version="0.0.1",
+        package_version=PACKAGE_VERSION,
         axis_table_version="1",
         axes=axes,
         class_c_groups=class_c_groups,
@@ -407,423 +373,151 @@ def axis_manifest() -> AxisManifest:
     return axis_table()
 
 
-def _axis_table_axis(
-    axis_key: str,
-    value_domain: tuple[Any, ...],
-) -> "AxisDescriptor":
+def _axis_table_axes() -> tuple["AxisDescriptor", ...]:
+    standard_axes = tuple(
+        _axis_table_axis_from_descriptor(axis) for axis in standard_axis_descriptors()
+    )
+    adapter_axes = tuple(
+        _axis_table_axis_from_descriptor(axis)
+        for axis in _axis_table_adapter_axis_descriptors()
+    )
+    seen = set()
+    axes = []
+
+    for axis in (*standard_axes, *adapter_axes):
+        if axis.axis_key in seen:
+            message = f"axis table axis is registered twice: {axis.axis_key}"
+            raise AdmissionError(message)
+
+        seen.add(axis.axis_key)
+        axes.append(axis)
+
+    return tuple(axes)
+
+
+def _axis_table_axis_from_descriptor(axis: "AxisDescriptor") -> "AxisDescriptor":
+    axis_key = axis.axis_key
     class_c_group = _class_c_group(axis_key)
 
     return AxisDescriptor(
         name=axis_key,
-        settings_keys=(axis_key,),
-        allowed_values=value_domain,
+        settings_keys=axis.settings_keys,
+        allowed_values=_axis_table_descriptor_domain(axis),
+        optional_settings_keys=axis.optional_settings_keys,
         owner_id=_owner_id(axis_key),
+        value_owner_ids=_value_owner_ids(axis_key),
         operators=_operators_for_axis(axis_key),
         class_a=_class_a(axis_key),
         class_b=_class_b(axis_key),
         class_c_group=class_c_group,
         merge_rules=_axis_merge_rules(axis_key),
-        optional_settings_keys=_axis_table_optional_settings(axis_key),
         adapter_id=_adapter_id(axis_key),
+        adapter_version=axis.adapter_version,
+        admission_rule=axis.admission_rule,
+        identity=axis.identity,
     )
 
 
-def _axis_table_optional_settings(axis_key: str) -> tuple[str, ...]:
-    if axis_key == "numeric.loss_scaling":
-        return ("numeric.loss_scale", "numeric.loss_unscale_degree")
+def _axis_table_descriptor_domain(axis: "AxisDescriptor") -> tuple[Any, ...]:
+    override = AXIS_TABLE_DOMAIN_OVERRIDES.get(axis.axis_key)
 
-    return ()
+    if override is not None:
+        return override
+
+    if axis.admission_rule is not None:
+        return axis.allowed_values
+
+    if not axis.allowed_values:
+        message = f"axis table domain is missing for descriptor: {axis.axis_key}"
+        raise AdmissionError(message)
+
+    return axis.allowed_values
 
 
-def _axis_table_axis_domains() -> tuple[tuple[str, tuple[Any, ...]], ...]:
+def _axis_table_adapter_axis_descriptors() -> tuple["AxisDescriptor", ...]:
+    attention_module = importlib.import_module("vptune.attention")
+    distributed_module = importlib.import_module("vptune.adapters.distributed")
+
+    core_attention_axes = tuple(
+        axis
+        for axis in attention_module.core_attention_axis_descriptors()
+        if axis.axis_key
+        in {"attention.sdpa_kernel", "attention.partition", "attention.padding"}
+    )
+
     return (
-        (
-            "gradient.path",
-            (
-                "torch_autograd_grad",
-                "torch_func_grad",
-                "torch_func_grad_and_value",
-                "backward_materialized_grad",
-            ),
+        _axis_table_attention_frontend_descriptor(),
+        *_axis_table_transformers_optional_attention_descriptors(),
+        *core_attention_axes,
+        *distributed_module.distributed_manifest_axis_descriptors(),
+    )
+
+
+def _axis_table_attention_frontend_descriptor() -> "AxisDescriptor":
+    attention_module = importlib.import_module("vptune.attention")
+    transformers_module = importlib.import_module("vptune.adapters.transformers")
+
+    core_axis = attention_module.core_attention_axis()
+    transformers_axis = transformers_module.transformers_manifest_attention_axis()
+
+    return AxisDescriptor(
+        "attention.frontend",
+        ("attention.frontend",),
+        _attention_frontend_values(),
+        optional_settings_keys=tuple(
+            dict.fromkeys((
+                *core_axis.optional_settings_keys,
+                *transformers_axis.optional_settings_keys,
+            ))
         ),
-        ("gradient.value_reuse", ("gradient_only", "gradient_and_primal_value")),
-        ("gradient.graph_schedule", ("build_once", "rebuild_per_call")),
-        ("jvp.path", ("torch_func_jvp", "forward_ad_dual", "torch_func_linearize")),
-        ("jvp.linearize_reuse", ("none", "reuse_at_same_primal")),
-        (
-            "vjp.path",
-            ("torch_func_vjp", "autograd_grad_outputs", "backward_materialized_grad"),
-        ),
-        ("vjp.closure_reuse", ("none", "reuse_vjp_closure_at_same_primal")),
-        (
-            "hvp.path",
-            (
-                "reverse_over_reverse",
-                "jvp_grad",
-                "autograd_functional_hvp",
-                "autograd_functional_vhp",
-                "forward_ad_dual",
-                "linearize_grad",
-            ),
-        ),
-        (
-            "hvp.graph_schedule",
-            ("retain_graph_across_vectors", "rebuild_graph_per_vector"),
-        ),
-        ("hvp.primal_reuse", ("reuse_primal", "recompute_primal")),
-        (
-            "hvp.gradient_reuse",
-            ("reuse_gradient_closure", "recompute_gradient"),
-        ),
-        (
-            "ggn.jvp_path",
-            ("torch_func_jvp", "forward_ad_dual", "torch_func_linearize"),
-        ),
-        ("ggn.loss_hessian_path", ("closed_form_softmax_ce_kl", "autodiff_loss_hvp")),
-        (
-            "ggn.loss_hessian_kernel",
-            ("dense_global", "streaming_global", "two_pass_chunked_global"),
-        ),
-        ("ggn.vjp_path", ("torch_func_vjp", "autograd_grad_outputs")),
-        ("ggn.jvp_reuse", ("reuse_jvp", "recompute_jvp")),
-        (
-            "ggn.cotangent_reuse",
-            ("reuse_output_cotangent", "recompute_output_cotangent"),
-        ),
-        ("fisher.expectation_path", ("explicit_full_expectation_score_rows",)),
-        (
-            "fisher.score_grad_path",
-            (
-                "torch_autograd_grad_loop",
-                "torch_func_grad",
-                "vmap_grad",
-                "backward_materialized_grad",
-            ),
-        ),
-        (
-            "fisher.accumulation",
-            (
-                "streaming_dot_accumulate",
-                "materialize_score_gradients",
-                "blockwise_score_matrix",
-            ),
-        ),
-        (
-            "sampled_fisher.sample_source",
-            ("fixed_sample_table", "fixed_seed_and_count"),
-        ),
-        (
-            "sampled_fisher.score_grad_path",
-            (
-                "torch_autograd_grad_loop",
-                "torch_func_grad",
-                "vmap_grad",
-                "backward_materialized_grad",
-            ),
-        ),
-        (
-            "sampled_fisher.accumulation",
-            (
-                "streaming_dot_accumulate",
-                "materialize_score_gradients",
-                "blockwise_score_matrix",
-            ),
-        ),
-        (
-            "sampled_fisher.exact_fisher_check",
-            ("disabled", "enabled_with_sampling_bound"),
-        ),
-        (
-            "empirical_fisher.grad_path",
-            (
-                "torch_autograd_grad_loop",
-                "torch_func_grad",
-                "vmap_grad",
-                "backward_materialized_grad",
-            ),
-        ),
-        (
-            "empirical_fisher.accumulation",
-            (
-                "streaming_dot_accumulate",
-                "materialize_per_example_gradients",
-                "blockwise_gradient_matrix",
-            ),
-        ),
-        (
-            "metric.multiply_path",
-            (
-                "dense_matmul",
-                "factorized_multiply",
-                "blockwise_multiply",
-                "streaming_multiply",
-            ),
-        ),
-        ("metric.block_schedule", ("layer_blocks", "module_blocks", "custom_blocks")),
-        ("metric.accumulation", ("streaming", "materialized_blocks")),
-        (
-            "inverse_metric.solve_path",
-            (
-                "dense_solve",
-                "cholesky_solve",
-                "eigh_solve",
-                "svd_solve",
-                "conjugate_gradient",
-                "factorized_solve",
-                "blockwise_solve",
-                "woodbury_low_rank_solve",
-            ),
-        ),
-        (
-            "inverse_metric.preconditioner",
-            ("none", "diagonal", "block_diagonal", "factorized_metric"),
-        ),
-        ("inverse_metric.iteration_budget", INTEGER_DOMAIN),
-        (
-            "inverse_metric.factor_reuse",
-            ("refactor_each_rhs", "reuse_factor_across_rhs"),
-        ),
-        (
-            "inverse_metric.block_schedule",
-            ("layer_blocks", "module_blocks", "custom_blocks"),
-        ),
-        (
-            "composition.execution",
-            (
-                "materialize_each_child",
-                "stream_child_outputs",
-                "fuse_adjacent_children",
-                "compile_whole_composition",
-            ),
-        ),
-        (
-            "composition.child_evaluation",
-            ("selected_child_rows", "inline_child_lowering"),
-        ),
-        ("composition.validation", ("validate_each_child", "validate_composed_output")),
-        ("vectorization.mode", ("single_loop", "manual_batch", "vmap")),
-        ("vectorization.batch_size", INTEGER_DOMAIN),
-        ("vectorization.vmap_chunk_size", INTEGER_DOMAIN),
-        ("vectorization.in_dims", DECLARED_DOMAIN),
-        ("vectorization.randomness", ("error", "same", "different")),
-        ("call.path", ("functional_call", "stateful_module")),
-        ("call.params", ("explicit_params", "module_params")),
-        ("call.buffers", ("explicit_buffers", "module_buffers")),
-        ("call.tied_weights", ("preserve_alias_groups",)),
-        ("call.parametrizations", ("preserve_parametrizations",)),
-        ("call.buffer_mutation", ("forbidden", "declared_and_restored")),
-        ("call.grad_mode", ("grad_enabled",)),
-        (
-            "call.return_type",
-            ("raw_tensor_tree", "model_output_object_with_declared_fields"),
-        ),
-        ("attention.frontend", ATTENTION_FRONTEND_VALUES),
-        ("attention.sdpa_kernel", SDPA_KERNEL_VALUES),
-        ("attention.custom_kernel_id", REGISTERED_DOMAIN),
-        ("attention.mask_formatter_id", REGISTERED_DOMAIN),
-        (
-            "attention.partition",
-            ("full", "packed_tokens", "blockwise_queries", "segmented_forward_ad"),
-        ),
-        ("attention.padding", ("dense_padded", "unpadded_packed")),
-        ("batch.data_microbatch_size", INTEGER_DOMAIN),
-        ("batch.hvp_row_batch_size", INTEGER_DOMAIN),
-        ("batch.ggn_batch_size", INTEGER_DOMAIN),
-        ("batch.fisher_sample_batch_size", INTEGER_DOMAIN),
-        ("batch.empirical_example_batch_size", INTEGER_DOMAIN),
-        ("chunk.token_block_size", INTEGER_DOMAIN),
-        ("chunk.sequence_position_block_size", INTEGER_DOMAIN),
-        ("chunk.class_block_size_with_exact_global_normalization", INTEGER_DOMAIN),
-        ("chunk.output_cotangent_block_size", INTEGER_DOMAIN),
-        ("chunk.parameter_block_size", INTEGER_DOMAIN),
-        ("chunk.layer_block_size", INTEGER_DOMAIN),
-        ("chunk.lm_head_weight_chunk_bytes", INTEGER_DOMAIN),
-        ("schedule.per_example", ("loop", "vmap", "manual_batch")),
-        ("schedule.per_token", ("loop", "packed")),
-        ("schedule.gradient_accumulation", ("single_step", "microbatch_accumulate")),
-        (
-            "input.batch_layout",
-            ("dense_padded", "packed_with_inverse_permutation", "variable_length"),
-        ),
-        ("input.length_grouping", ("none", "exact_length_bucket")),
-        ("input.host_to_device", ("outside_measured_call", "inside_measured_call")),
-        ("input.residency", ("cpu_staged", "cpu_pinned", "gpu")),
-        (
-            "teacher_outputs",
-            (
-                "precomputed_cpu",
-                "precomputed_cpu_pinned",
-                "precomputed_gpu",
-                "recomputed_with_equality_check",
-            ),
-        ),
-        ("checkpoint.use_reentrant", ("false",)),
-        ("checkpoint.early_stop", ("false", "true")),
-        ("checkpoint.preserve_rng_state", ("false", "true")),
-        ("checkpoint.determinism_check", ("default", "none")),
-        ("checkpoint.context_fn", ("none", "declared_context_pair")),
-        ("memory.primal_outputs", ("retain", "recompute")),
-        ("memory.jvp_outputs", ("retain", "recompute")),
-        ("memory.output_cotangents", ("retain", "recompute")),
-        (
-            "activation.recompute",
-            (
-                "none",
-                "checkpoint_non_reentrant_by_layer",
-                "checkpoint_selective",
-                "manual_recompute",
-            ),
-        ),
-        (
-            "activation.offload",
-            ("none", "saved_tensor_hooks_cpu", "custom_saved_tensor_hooks"),
-        ),
-        ("memory.vector_residency", ("gpu", "cpu_pinned", "cpu_staged", "mmap_cpu")),
-        ("memory.intermediate_residency", ("gpu", "cpu_pinned", "cpu_staged")),
-        ("memory.factor_residency", ("gpu", "cpu_pinned", "cpu_staged", "mmap_cpu")),
-        ("memory.output_buffers", ("fresh_allocation", "preallocated")),
-        ("dtype.parameter_storage", ("fp32", "bf16", "fp16", "fp8_when_supported")),
-        ("dtype.model_compute", ("fp32", "bf16", "fp16", "fp8_when_supported")),
-        ("dtype.autodiff_compute", ("fp32", "bf16", "fp16")),
-        ("dtype.accumulation", ("fp32", "bf16", "fp16")),
-        ("dtype.vector", ("fp32", "bf16", "fp16")),
-        ("dtype.intermediate", ("fp32", "bf16", "fp16")),
-        ("dtype.output", ("fp32", "bf16", "fp16")),
-        ("dtype.metric_factor", ("fp32", "bf16", "fp16")),
-        ("autocast", ("off", "cuda_fp16", "cuda_bf16")),
-        ("numeric.float32_matmul_precision", MATMUL_PRECISION_VALUES),
-        ("numeric.bf16_reduced_precision_reduction", ("false", "true")),
-        ("numeric.fp16_reduced_precision_reduction", ("false", "true")),
-        ("numeric.deterministic_algorithms", ("false", "true")),
-        ("numeric.loss_scaling", ("none", "static_scale_with_exact_unscale")),
-        ("compile.enabled", ("false", "true")),
-        (
-            "compile.boundary",
-            COMPILE_BOUNDARY_VALUES,
-        ),
-        ("compile.backend", ("inductor", "registered_backend")),
-        ("compile.mode", (None, "default", "max-autotune")),
-        ("compile.fullgraph", ("false", "true")),
-        ("compile.dynamic", (None, "false", "true")),
-        ("compile.compiled_autograd", ("false", "true")),
-        ("compile.options.epilogue_fusion", ("false", "true")),
-        ("compile.options.shape_padding", ("false", "true")),
-        ("compile.cuda_graphs", ("false", "true")),
-        ("compile.cache_state", ("cold_compile", "warm_cache")),
-        ("fusion.norm", ("model_default", "fused_rmsnorm", "fused_layernorm")),
-        ("fusion.mlp", ("model_default", "fused_mlp")),
-        ("fusion.rope", ("model_default", "fused_rope")),
-        ("fusion.logits", ("model_default", "fused_logits_projection")),
-        ("fusion.loss", ("model_default", "fused_ce", "fused_kl")),
-        (
-            "layout.params",
-            (
-                "parameter_tree",
-                "flat_contiguous",
-                "per_layer_flat",
-                "per_block_flat",
-                "per_shard",
-                "dtensor",
-            ),
-        ),
-        (
-            "layout.vector",
-            (
-                "parameter_tree",
-                "flat_contiguous",
-                "per_layer_flat",
-                "per_block_flat",
-                "per_shard",
-                "dtensor",
-            ),
-        ),
-        (
-            "layout.output",
-            (
-                "parameter_tree",
-                "flat_contiguous",
-                "per_layer_flat",
-                "per_block_flat",
-                "per_shard",
-                "dtensor",
-            ),
-        ),
-        ("layout.flatten_order", ("canonical_parameter_order",)),
-        ("layout.vector_ops", ("python_loop", "foreach")),
-        ("layout.contiguity", ("contiguous", "preserve_existing_strides")),
-        ("layout.aliasing", ("preserve_tied_weight_aliases",)),
-        ("layout.parametrizations", ("preserve_active_parametrizations",)),
-        ("distributed.launch", ("single_process", "torchrun")),
-        ("distributed.process_group_backend", ("nccl", "gloo", "ucc_when_available")),
-        ("distributed.local_rank_binding", ("cuda_local_rank", "explicit_device_map")),
-        ("distributed.mesh_shape", INTEGER_TUPLE_DOMAIN),
-        ("distributed.mesh_dim_names", DECLARED_DOMAIN),
-        (
-            "distributed.strategy",
-            (
-                "single_gpu",
-                "fsdp2",
-                "hsdp",
-                "tensor_parallel",
-                "sequence_parallel",
-                "context_parallel",
-                "hybrid",
-            ),
-        ),
-        ("dtensor.params_placement", ("replicate", "shard_dim", "partial")),
-        ("dtensor.vector_placement", ("replicate", "shard_dim", "partial")),
-        ("dtensor.logits_placement", ("replicate", "shard_dim", "partial")),
-        ("dtensor.tangent_placement", ("replicate", "shard_dim", "partial")),
-        ("dtensor.cotangent_placement", ("replicate", "shard_dim", "partial")),
-        ("dtensor.output_placement", ("replicate", "shard_dim", "partial")),
-        (
-            "dtensor.redistribute_schedule",
-            (
-                "none",
-                "before_forward",
-                "before_backward",
-                "between_operator_parts",
-                "before_output",
-            ),
-        ),
-        ("fsdp.wrap_granularity", ("root", "transformer_block", "block_group")),
-        (
-            "fsdp.reshard_after_forward",
-            ("false", "true", "positive_integer_group_size"),
-        ),
-        ("fsdp.shard_placement_fn", ("none", "declared_fn")),
-        ("fsdp.mp_policy.param_dtype", ("fp32", "bf16", "fp16")),
-        ("fsdp.mp_policy.reduce_dtype", ("fp32", "bf16", "fp16")),
-        ("fsdp.mp_policy.output_dtype", ("fp32", "bf16", "fp16")),
-        ("fsdp.mp_policy.cast_forward_inputs", ("false", "true")),
-        ("fsdp.offload_policy", ("none", "cpu")),
-        ("fsdp.ignored_params", DECLARED_DOMAIN),
-        ("fsdp.dp_mesh_dims", DECLARED_DOMAIN),
-        ("tp.plan", REGISTERED_DOMAIN),
-        ("tp.qkv_projection", ("colwise", "rowwise", "replicated")),
-        ("tp.output_projection", ("rowwise", "colwise", "replicated")),
-        ("tp.mlp_up_gate", ("colwise", "rowwise", "replicated")),
-        ("tp.mlp_down", ("rowwise", "colwise", "replicated")),
-        ("tp.embedding", ("replicated", "rowwise", "colwise")),
-        ("tp.lm_head", ("replicated", "vocab_sharded")),
-        ("tp.prepare_module_input", DECLARED_DOMAIN),
-        ("tp.prepare_module_output", DECLARED_DOMAIN),
-        ("tp.loss_parallel", ("false", "true")),
-        ("sequence_parallel.enabled", ("false", "true")),
-        ("sequence_parallel.norm_modules", DECLARED_DOMAIN),
-        (
-            "sequence_parallel.output_placement_policy",
-            ("preserve_sequence_shard", "redistribute_to_declared_output"),
-        ),
-        ("context_parallel.enabled", ("false", "true")),
-        ("context_parallel.rotate_method", ("all_gather", "all_to_all")),
-        ("context_parallel.sequence_dim", DECLARED_DOMAIN),
-        (
-            "comm.overlap",
-            ("none", "all_gather_overlap", "reduce_scatter_overlap", "both"),
-        ),
-        ("comm.prefetch", ("none", "forward", "backward", "both")),
-        ("comm.collective_bucket_size", INTEGER_DOMAIN),
+        adapter_id="vptune.attention_or_adapter",
+        adapter_version=PACKAGE_VERSION,
+        admission_rule=_attention_frontend_manifest_axis(core_axis, transformers_axis),
+        identity={
+            "core": core_axis.signature(),
+            "transformers": transformers_axis.signature(),
+        },
+    )
+
+
+def _attention_frontend_manifest_axis(
+    core_axis: "AxisDescriptor",
+    transformers_axis: "AxisDescriptor",
+) -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings.get("attention.frontend")
+
+        if value in core_axis.allowed_values:
+            return core_axis.admit(candidate)
+
+        if value in transformers_axis.allowed_values:
+            return transformers_axis.admit(candidate)
+
+        return False, f"attention.frontend is unsupported: {value}"
+
+    return admit
+
+
+def _axis_table_transformers_optional_attention_descriptors() -> tuple[
+    "AxisDescriptor",
+    ...,
+]:
+    transformers_module = importlib.import_module("vptune.adapters.transformers")
+
+    transformers_axis = transformers_module.transformers_manifest_attention_axis()
+
+    return tuple(
+        AxisDescriptor(
+            key,
+            (key,),
+            REGISTERED_DOMAIN,
+            adapter_id="vptune.adapters.transformers",
+            adapter_version=transformers_axis.adapter_version,
+            admission_rule=_registered_id_axis(key),
+            identity=transformers_axis.identity,
+        )
+        for key in ("attention.custom_kernel_id", "attention.mask_formatter_id")
+        if key in transformers_axis.optional_settings_keys
     )
 
 
@@ -844,6 +538,38 @@ def _owner_id(axis_key: str) -> str:
 
     message = f"axis table axis has no owner: {axis_key}"
     raise AdmissionError(message)
+
+
+def _value_owner_ids(axis_key: str) -> Mapping[Any, str]:
+    if axis_key != "attention.frontend":
+        return {}
+
+    return {
+        value: _attention_frontend_value_owner(value)
+        for value in _attention_frontend_values()
+    }
+
+
+def _attention_frontend_value_owner(value: str) -> str:
+    if value in _core_attention_frontend_values():
+        return "attention_execution"
+
+    return "vptune.adapters.transformers"
+
+
+def _attention_frontend_values() -> tuple[str, ...]:
+    transformers_module = importlib.import_module("vptune.adapters.transformers")
+
+    return (
+        *transformers_module.TRANSFORMERS_ATTENTION_FRONTENDS,
+        *_core_attention_frontend_values(),
+    )
+
+
+def _core_attention_frontend_values() -> tuple[str, ...]:
+    attention_module = importlib.import_module("vptune.attention")
+
+    return attention_module.CORE_ATTENTION_FRONTENDS
 
 
 def _memory_owner_id(axis_key: str) -> str:
@@ -925,7 +651,11 @@ def _axis_merge_rules(axis_key: str) -> tuple[str, ...]:
     if axis_key == "fsdp.mp_policy.reduce_dtype":
         rules.append(FSDP_REDUCE_DTYPE_MERGE_RULE)
 
-    if axis_key in {"inverse_metric.solve_path", "inverse_metric.preconditioner"}:
+    if axis_key in {
+        "inverse_metric.solve_path",
+        "inverse_metric.preconditioner",
+        "inverse_metric_inner.reduction_path",
+    }:
         rules.append(FACTORIZED_INVERSE_MERGE_RULE)
 
     return tuple(rules)
@@ -933,6 +663,12 @@ def _axis_merge_rules(axis_key: str) -> tuple[str, ...]:
 
 def _adapter_id(axis_key: str) -> str:
     prefix = axis_key.split(".", 1)[0]
+
+    if axis_key in {
+        "attention.custom_kernel_id",
+        "attention.mask_formatter_id",
+    }:
+        return "vptune.adapters.transformers"
 
     if prefix in {
         "distributed",
@@ -949,28 +685,6 @@ def _adapter_id(axis_key: str) -> str:
         return "vptune.attention_or_adapter"
 
     return ""
-
-
-def _axis_table_value_error(
-    axis: "AxisDescriptor",
-    value: Any,
-) -> str | None:
-    validators = (
-        (INTEGER_DOMAIN, _positive_integer_value_error),
-        (INTEGER_TUPLE_DOMAIN, _positive_integer_tuple_value_error),
-        (POSITIVE_FLOAT_DOMAIN, _positive_float_value_error),
-        (DECLARED_DOMAIN, _declared_value_error),
-        (REGISTERED_DOMAIN, _registered_value_error),
-    )
-
-    for domain, validate in validators:
-        if axis.value_domain == domain:
-            return validate(axis.axis_key, value)
-
-    if any(value == allowed for allowed in axis.value_domain):
-        return None
-
-    return f"candidate axis value is not allowed: {axis.axis_key}"
 
 
 def _positive_integer_value_error(axis_key: str, value: Any) -> str | None:
@@ -1012,122 +726,15 @@ def _registered_value_error(axis_key: str, value: Any) -> str | None:
     return None
 
 
-def _axis_table_cross_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
+def _fsdp_reshard_after_forward_value_error(
+    axis_key: str,
+    value: Any,
 ) -> str | None:
-    checks = (
-        _sdpa_rule_error,
-        _packing_rule_error,
-        _activation_rule_error,
-        _declared_runtime_id_rule_error,
-        _compile_rule_error,
-        _reduction_bound_rule_error,
-        _sampled_fisher_rule_error,
-        _gradient_value_reuse_rule_error,
-        _jvp_linearize_reuse_rule_error,
-        _vjp_closure_reuse_rule_error,
-        _ggn_vjp_path_rule_error,
-        _fisher_rule_error,
-        _iteration_budget_rule_error,
-        _segmented_forward_ad_rule_error,
-        _metric_representation_rule_error,
-        _loss_scaling_rule_error,
-        _tp_loss_parallel_rule_error,
-    )
-
-    for check in checks:
-        error = check(settings, fixed_fields)
-
-        if error is not None:
-            return error
-
-    return None
-
-
-def _sdpa_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-) -> str | None:
-    kernel = settings.get("attention.sdpa_kernel")
-
-    if kernel is None:
+    if value in {"false", "true"}:
         return None
 
-    if fixed_fields.get("attention.calls_sdpa") is not True:
-        return "attention.sdpa_kernel requires an executable that calls PyTorch SDPA"
-
-    if kernel == "priority_list":
-        priority = fixed_fields.get("attention.sdpa_priority")
-
-        if not isinstance(priority, tuple) or not priority:
-            return "attention.sdpa_kernel=priority_list requires backend order"
-
-    if kernel == "flash_attention":
-        dtype = fixed_fields.get("attention.effective_runtime_dtype")
-
-        if dtype not in {"float16", "bfloat16"}:
-            return "flash attention requires float16 or bfloat16 runtime dtype"
-
-    return None
-
-
-def _packing_rule_error(
-    settings: Mapping[str, Any],
-    _: Mapping[str, Any],
-) -> str | None:
-    if (
-        settings.get("schedule.per_token") == "packed"
-        or settings.get("attention.partition") == "packed_tokens"
-    ) and settings.get("input.batch_layout") not in PACKED_BATCH_LAYOUTS:
-        return "packed token scheduling requires packed or variable-length layout"
-
-    return None
-
-
-def _activation_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-) -> str | None:
-    recompute = settings.get("activation.recompute")
-
-    if recompute is not None and recompute not in CHECKPOINT_RECOMPUTE_VALUES:
-        for key, value in CHECKPOINT_DISABLED_SETTINGS.items():
-            if settings.get(key) != value:
-                return f"{recompute} requires {key}={value}"
-
-    offload = settings.get("activation.offload")
-
-    if (
-        offload in {"saved_tensor_hooks_cpu", "custom_saved_tensor_hooks"}
-        and fixed_fields.get("activation.saved_tensor_hooks_path") is not True
-    ):
-        return f"{offload} requires an executable saved-tensor-hooks path"
-
-    return None
-
-
-def _declared_runtime_id_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-) -> str | None:
-    _ = fixed_fields
-
-    if settings.get("activation.offload") == "custom_saved_tensor_hooks":
-        pack_hook = settings.get("activation.pack_hook")
-        unpack_hook = settings.get("activation.unpack_hook")
-
-        if not isinstance(pack_hook, str) or not pack_hook:
-            return "activation.pack_hook must be a declared hook id"
-
-        if not isinstance(unpack_hook, str) or not unpack_hook:
-            return "activation.unpack_hook must be a declared hook id"
-
-    if settings.get("checkpoint.context_fn") == "declared_context_pair":
-        context_id = settings.get("checkpoint.context_fn_callable")
-
-        if not isinstance(context_id, str) or not context_id:
-            return "checkpoint.context_fn_callable must be a declared context id"
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return f"candidate axis must be false, true, or a positive integer: {axis_key}"
 
     return None
 
@@ -1136,7 +743,15 @@ def _compile_rule_error(
     settings: Mapping[str, Any],
     _: Mapping[str, Any],
 ) -> str | None:
+    if settings.get("compile.enabled") == "true":
+        for key in COMPILE_REQUIRED_ENABLED_SETTINGS:
+            if key not in settings:
+                return f"compile.enabled=true requires {key}"
+
     if settings.get("compile.enabled") == "false":
+        if "compile.boundary" in settings:
+            return "compile.enabled=false forbids compile.boundary"
+
         for key, disabled_value in COMPILE_DISABLED_VALUES.items():
             value = settings.get(key)
 
@@ -1157,23 +772,6 @@ def _compile_rule_error(
         and settings.get("compile.mode") is None
     ):
         return "disabled compile options forbid compile.mode=None"
-
-    return None
-
-
-def _reduction_bound_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-) -> str | None:
-    if not uses_reduction_degrading_setting(settings):
-        return None
-
-    missing = tuple(
-        field for field in ADMISSION_BOUND_FIELDS if field not in fixed_fields
-    )
-
-    if missing:
-        return f"reduction-degrading row missing bound fields: {missing}"
 
     return None
 
@@ -1236,571 +834,11 @@ def _static_loss_scaling_error(
     return None
 
 
-def _sampled_fisher_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-) -> str | None:
-    sample_source = settings.get("sampled_fisher.sample_source")
-
-    if sample_source is None:
-        return None
-
-    if "sampled_fisher.sample_count" not in fixed_fields:
-        return "sampled FisherVP requires fixed sample count"
-
-    if (
-        sample_source == "fixed_sample_table"
-        and "sampled_fisher.sample_table_id" not in fixed_fields
-    ):
-        return "fixed_sample_table requires sample table identity"
-
-    if (
-        sample_source == "fixed_seed_and_count"
-        and "sampled_fisher.sample_seed" not in fixed_fields
-    ):
-        return "fixed_seed_and_count requires sample seed"
-
-    if (
-        settings.get("sampled_fisher.exact_fisher_check")
-        == "enabled_with_sampling_bound"
-        and "sampled_fisher.sampling_bound" not in fixed_fields
-    ):
-        return "exact Fisher comparison requires sampling-bound formula"
-
-    return None
-
-
-def _gradient_value_reuse_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-) -> str | None:
-    return _path_coupled_rule_error(
-        settings,
-        fixed_fields,
-        setting_key="gradient.value_reuse",
-        required_value="gradient_and_primal_value",
-        path_key="gradient.path",
-        required_path="torch_func_grad_and_value",
-        fixed_field="gradient.runtime_returns_value_and_grad",
-        message="gradient_and_primal_value requires a value-and-gradient path",
-    )
-
-
-def _jvp_linearize_reuse_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-) -> str | None:
-    return _path_coupled_rule_error(
-        settings,
-        fixed_fields,
-        setting_key="jvp.linearize_reuse",
-        required_value="reuse_at_same_primal",
-        path_key="jvp.path",
-        required_path="torch_func_linearize",
-        fixed_field="jvp.runtime_reuses_linearize_at_same_primal",
-        message="reuse_at_same_primal requires torch_func_linearize",
-    )
-
-
-def _vjp_closure_reuse_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-) -> str | None:
-    return _path_coupled_rule_error(
-        settings,
-        fixed_fields,
-        setting_key="vjp.closure_reuse",
-        required_value="reuse_vjp_closure_at_same_primal",
-        path_key="vjp.path",
-        required_path="torch_func_vjp",
-        fixed_field="vjp.runtime_reuses_closure_at_same_primal",
-        message="reuse_vjp_closure_at_same_primal requires torch_func_vjp",
-    )
-
-
-def _path_coupled_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-    *,
-    setting_key: str,
-    required_value: str,
-    path_key: str,
-    required_path: str,
-    fixed_field: str,
-    message: str,
-) -> str | None:
-    if settings.get(setting_key) != required_value:
-        return None
-
-    if settings.get(path_key) == required_path:
-        return None
-
-    if fixed_fields.get(fixed_field) is True:
-        return None
-
-    return message
-
-
-def _ggn_vjp_path_rule_error(
-    settings: Mapping[str, Any],
-    _: Mapping[str, Any],
-) -> str | None:
-    jvp_path = settings.get("ggn.jvp_path")
-    vjp_path = settings.get("ggn.vjp_path")
-
-    if jvp_path is None:
-        return None
-
-    if vjp_path is None:
-        return "ggn.vjp_path is required for JVP-Hessian-VJP rows"
-
-    return None
-
-
-def _fisher_rule_error(
-    settings: Mapping[str, Any],
-    _: Mapping[str, Any],
-) -> str | None:
-    accumulation = settings.get("fisher.accumulation")
-    score_path = settings.get("fisher.score_grad_path")
-
-    if "fisher.expectation_path" in settings and (
-        settings["fisher.expectation_path"] != "explicit_full_expectation_score_rows"
-    ):
-        return "fisher.expectation_path is unsupported"
-
-    if accumulation is None:
-        return None
-
-    if "fisher.expectation_path" not in settings:
-        return "fisher.expectation_path is required for FisherVP rows"
-
-    if accumulation == "streaming_dot_accumulate" and score_path is None:
-        return "fisher.score_grad_path is required for streaming rows"
-
-    if (
-        accumulation
-        in {
-            "materialize_score_gradients",
-            "blockwise_score_matrix",
-        }
-        and score_path is not None
-    ):
-        return f"fisher.score_grad_path is not used with {accumulation}"
-
-    return None
-
-
-def _iteration_budget_rule_error(
-    settings: Mapping[str, Any],
-    _: Mapping[str, Any],
-) -> str | None:
-    solve_path = settings.get("inverse_metric.solve_path")
-
-    if solve_path in ITERATIVE_SOLVE_PATHS:
-        if "inverse_metric.iteration_budget" not in settings:
-            return "conjugate_gradient requires inverse_metric.iteration_budget"
-
-        if "inverse_metric.preconditioner" not in settings:
-            return "conjugate_gradient requires inverse_metric.preconditioner"
-    elif "inverse_metric.preconditioner" in settings:
-        return "inverse_metric.preconditioner applies only to iterative solves"
-
-    if "inverse_metric.iteration_budget" not in settings:
-        return None
-
-    if solve_path not in ITERATIVE_SOLVE_PATHS:
-        return "inverse_metric.iteration_budget applies only to iterative solves"
-
-    return None
-
-
-def _segmented_forward_ad_rule_error(
-    settings: Mapping[str, Any],
-    _: Mapping[str, Any],
-) -> str | None:
-    if settings.get("attention.partition") != "segmented_forward_ad":
-        return None
-
-    for path_key, values in FORWARD_AD_PATHS_BY_KEY.items():
-        if settings.get(path_key) in values:
-            return None
-
-    return "attention.partition=segmented_forward_ad requires forward AD path"
-
-
-def _metric_representation_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-) -> str | None:
-    representation = fixed_fields.get("metric.representation")
-
-    if representation is None:
-        if _uses_metric_representation(settings):
-            return "metric row requires metric.representation fixed field"
-
-        return None
-
-    return _metric_representation_value_error(settings, fixed_fields, representation)
-
-
-def _uses_metric_representation(settings: Mapping[str, Any]) -> bool:
-    return any(
-        key.startswith(("metric.", "inverse_metric."))
-        or key in {"dtype.metric_factor", "memory.factor_residency"}
-        for key in settings
-    )
-
-
-def _metric_representation_value_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-    representation: Any,
-) -> str | None:
-    multiply_error = _metric_multiply_representation_error(settings, representation)
-
-    if multiply_error is not None:
-        return multiply_error
-
-    solve_error = _metric_solve_representation_error(
-        settings,
-        fixed_fields,
-        representation,
-    )
-
-    if solve_error is not None:
-        return solve_error
-
-    return _metric_factor_setting_error(settings, representation)
-
-
-def _metric_multiply_representation_error(
-    settings: Mapping[str, Any],
-    representation: Any,
-) -> str | None:
-    multiply_path = settings.get("metric.multiply_path")
-    requirement_error = _representation_requirement_error(
-        multiply_path,
-        representation,
-        (
-            (
-                "dense_matmul",
-                DENSE_REPRESENTATIONS,
-                "metric.multiply_path=dense_matmul requires dense matrix",
-            ),
-            (
-                "factorized_multiply",
-                FACTOR_REPRESENTATIONS,
-                "metric.multiply_path=factorized_multiply requires factors",
-            ),
-            (
-                "blockwise_multiply",
-                BLOCK_REPRESENTATIONS,
-                "metric.multiply_path=blockwise_multiply requires blocks",
-            ),
-            (
-                "streaming_multiply",
-                STREAMING_REPRESENTATIONS,
-                "metric.multiply_path=streaming_multiply requires streamable fields",
-            ),
-        ),
-    )
-
-    if requirement_error is not None:
-        return requirement_error
-
-    block_schedule_error = _metric_block_schedule_error(
-        settings,
-        representation,
-        "metric.block_schedule",
-    )
-
-    if block_schedule_error is not None:
-        return block_schedule_error
-
-    if (
-        settings.get("metric.accumulation") is not None
-        and settings.get("metric.multiply_path") == "dense_matmul"
-    ):
-        return "metric.accumulation applies only to non-dense metric paths"
-
-    accumulation_error = _metric_accumulation_error(settings)
-
-    if accumulation_error is not None:
-        return accumulation_error
-
-    return None
-
-
-def _metric_accumulation_error(settings: Mapping[str, Any]) -> str | None:
-    value = settings.get("metric.accumulation")
-    path = settings.get("metric.multiply_path")
-
-    if path is None:
-        if value is not None:
-            return "metric.accumulation requires metric.multiply_path"
-
-        return None
-
-    if path == "dense_matmul":
-        return None
-
-    expected = "streaming" if path == "streaming_multiply" else "materialized_blocks"
-
-    if value is None:
-        return "metric.accumulation is required for non-dense metric paths"
-
-    if value != expected:
-        return f"metric.accumulation must be {expected} for this path"
-
-    return None
-
-
-def _representation_requirement_error(
-    path: Any,
-    representation: Any,
-    requirements: Sequence[tuple[Any, tuple[str, ...], str]],
-) -> str | None:
-    kind = _metric_representation_kind_field(representation)
-
-    for required_path, representations, message in requirements:
-        if path == required_path and kind not in representations:
-            return message
-
-    return None
-
-
-def _metric_solve_representation_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-    representation: Any,
-) -> str | None:
-    solve_path = settings.get("inverse_metric.solve_path")
-    requirement_error = _representation_requirement_error(
-        solve_path,
-        representation,
-        (
-            (
-                "dense_solve",
-                DENSE_REPRESENTATIONS,
-                "inverse_metric.solve_path=dense_solve requires dense matrix",
-            ),
-            (
-                "cholesky_solve",
-                DENSE_REPRESENTATIONS,
-                "inverse_metric.solve_path=cholesky_solve requires dense matrix",
-            ),
-            (
-                "eigh_solve",
-                DENSE_REPRESENTATIONS,
-                "inverse_metric.solve_path=eigh_solve requires dense matrix",
-            ),
-            (
-                "svd_solve",
-                DENSE_REPRESENTATIONS,
-                "inverse_metric.solve_path=svd_solve requires dense matrix",
-            ),
-            (
-                "factorized_solve",
-                FACTOR_REPRESENTATIONS,
-                "factorized_solve requires factors",
-            ),
-            (
-                "blockwise_solve",
-                BLOCK_REPRESENTATIONS,
-                "blockwise_solve requires blocks",
-            ),
-            (
-                "woodbury_low_rank_solve",
-                LOW_RANK_REPRESENTATIONS,
-                "woodbury_low_rank_solve requires low-rank factors",
-            ),
-        ),
-    )
-
-    if requirement_error is not None:
-        return requirement_error
-
-    field_error = _metric_solve_field_error(settings, fixed_fields)
-
-    if field_error is not None:
-        return field_error
-
-    preconditioner_error = _metric_preconditioner_representation_error(
-        settings,
-        representation,
-    )
-
-    if preconditioner_error is not None:
-        return preconditioner_error
-
-    block_schedule_error = _metric_block_schedule_error(
-        settings,
-        representation,
-        "inverse_metric.block_schedule",
-    )
-
-    if block_schedule_error is not None:
-        return block_schedule_error
-
-    return None
-
-
-def _metric_block_schedule_error(
-    settings: Mapping[str, Any],
-    representation: Any,
-    axis_key: str,
-) -> str | None:
-    value = settings.get(axis_key)
-
-    if value is None:
-        return None
-
-    kind = _metric_representation_kind_field(representation)
-
-    if kind not in BLOCK_OR_KFAC_REPRESENTATIONS:
-        return f"{axis_key} requires blocks or KFAC factors"
-
-    if not isinstance(representation, Mapping):
-        return f"{axis_key} requires representation.block_schedule"
-
-    schedule = representation.get("block_schedule")
-
-    if not isinstance(schedule, str):
-        return f"{axis_key} requires representation.block_schedule"
-
-    if value != schedule:
-        return f"{axis_key} must match representation.block_schedule"
-
-    return None
-
-
-def _metric_representation_kind_field(representation: Any) -> Any:
-    if isinstance(representation, Mapping):
-        return representation.get("kind")
-
-    return representation
-
-
-def _metric_solve_field_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-) -> str | None:
-    solve_path = settings.get("inverse_metric.solve_path")
-
-    if solve_path == "conjugate_gradient" and "metric.multiply_path" not in settings:
-        return "conjugate_gradient requires metric.multiply_path"
-
-    if solve_path == "cholesky_solve" and fixed_fields.get("metric.psd") is not True:
-        return "cholesky_solve requires a PSD metric"
-
-    if solve_path == "eigh_solve" and fixed_fields.get("metric.symmetric") is not True:
-        return "eigh_solve requires a symmetric metric"
-
-    return None
-
-
-def _metric_preconditioner_representation_error(
-    settings: Mapping[str, Any],
-    representation: Any,
-) -> str | None:
-    preconditioner = settings.get("inverse_metric.preconditioner")
-    kind = _metric_representation_kind_field(representation)
-
-    if preconditioner == "block_diagonal" and kind not in BLOCK_OR_KFAC_REPRESENTATIONS:
-        return "block_diagonal preconditioner requires blocks or KFAC factors"
-
-    if preconditioner == "factorized_metric" and kind not in FACTOR_REPRESENTATIONS:
-        return "factorized_metric preconditioner requires factors"
-
-    return None
-
-
-def _metric_factor_setting_error(
-    settings: Mapping[str, Any],
-    representation: Any,
-) -> str | None:
-    if "dtype.metric_factor" in settings and not _uses_metric_factors(
-        settings,
-        representation,
-    ):
-        return "dtype.metric_factor requires a factorized metric path"
-
-    if "memory.factor_residency" in settings and not _uses_metric_factors(
-        settings,
-        representation,
-    ):
-        return "memory.factor_residency requires a factorized metric path"
-
-    return None
-
-
-def _uses_metric_factors(
-    settings: Mapping[str, Any],
-    representation: Any,
-) -> bool:
-    if _metric_representation_kind_field(representation) in FACTOR_REPRESENTATIONS:
-        return True
-
-    if settings.get("metric.multiply_path") in {
-        "factorized_multiply",
-        "streaming_multiply",
-    }:
-        return True
-
-    return settings.get("inverse_metric.solve_path") in {
-        "factorized_solve",
-        "woodbury_low_rank_solve",
-    }
-
-
-def _tp_loss_parallel_rule_error(
-    settings: Mapping[str, Any],
-    fixed_fields: Mapping[str, Any],
-) -> str | None:
-    if settings.get("tp.loss_parallel") != "true":
-        return None
-
-    if fixed_fields.get("tp.exact_cross_shard_normalization") is not True:
-        return "tp.loss_parallel=true requires exact cross-shard normalization"
-
-    if fixed_fields.get("tp.multi_rank_agreement_check") is not True:
-        return "tp.loss_parallel=true requires multi-rank agreement check"
-
-    return None
-
-
-ATTENTION_FRONTEND_VALUES = (
-    "transformers_eager",
-    "transformers_sdpa",
-    "transformers_flash_attention_2",
-    "transformers_flash_attention_3",
-    "transformers_flash_attention_4",
-    "transformers_flex_attention",
-    "paged|eager",
-    "paged|sdpa",
-    "paged|flash_attention_2",
-    "paged|flash_attention_3",
-    "paged|flash_attention_4",
-    "registered_transformers_attention",
-    "pytorch_sdpa_direct",
-    "patched_eager",
-    "packed_exact",
-    "blockwise_exact",
-)
 BASELINE_ATTENTION_FRONTEND_VALUES = (
     "transformers_eager",
     "transformers_sdpa",
     "pytorch_sdpa_direct",
     "patched_eager",
-)
-SDPA_KERNEL_VALUES = (
-    "math",
-    "flash_attention",
-    "efficient_attention",
-    "cudnn_attention",
-    "overrideable",
-    "priority_list",
 )
 
 
@@ -1813,10 +851,34 @@ def attention_frontend_requires_full_size_agreement(frontend: object) -> bool:
 
 
 FORWARD_AD_TRANSFORM_PATHS = ("torch_func_jvp", "jvp_grad")
+TORCH_FUNC_AXIS_EXCLUDED_FIELDS = {
+    *FORWARD_AD_FIELDS,
+    "vectorization.randomness",
+}
 TORCH_FUNC_AXIS_FIELDS = tuple(
-    field for field in TORCH_FUNC_FIELDS if field not in FORWARD_AD_FIELDS
+    field for field in TORCH_FUNC_FIELDS if field not in TORCH_FUNC_AXIS_EXCLUDED_FIELDS
 )
 VMAP_TRANSFORM_PATHS = ("per_example_gradient_vmap",)
+TORCH_FUNC_ADMISSION_PATH_SETTINGS = (
+    ("gradient.path", "torch_func_grad"),
+    ("gradient.path", "torch_func_grad_and_value"),
+    ("jvp.path", "torch_func_jvp"),
+    ("jvp.path", "torch_func_linearize"),
+    ("vjp.path", "torch_func_vjp"),
+    ("hvp.path", "jvp_grad"),
+    ("hvp.path", "linearize_grad"),
+    ("ggn.jvp_path", "torch_func_jvp"),
+    ("ggn.jvp_path", "torch_func_linearize"),
+    ("ggn.vjp_path", "torch_func_vjp"),
+    ("fisher.score_grad_path", "torch_func_grad"),
+    ("fisher.score_grad_path", "vmap_grad"),
+    ("sampled_fisher.score_grad_path", "torch_func_grad"),
+    ("sampled_fisher.score_grad_path", "vmap_grad"),
+    ("empirical_fisher.grad_path", "torch_func_grad"),
+    ("empirical_fisher.grad_path", "vmap_grad"),
+    ("per_example_gradient.grad_path", "torch_func_grad"),
+    ("per_example_gradient.grad_path", "vmap_grad"),
+)
 VMAP_PATH_SETTINGS = (
     ("fisher.score_grad_path", "vmap_grad"),
     ("sampled_fisher.score_grad_path", "vmap_grad"),
@@ -1846,6 +908,26 @@ VJP_VECTOR_LOOP_PATHS = (
 VJP_VECTOR_VMAP_PATHS = ("torch_func_vjp",)
 GGN_VECTOR_LOOP_PATHS = ("torch_func_jvp", "forward_ad_dual", "torch_func_linearize")
 GGN_VECTOR_VMAP_PATHS = ("torch_func_jvp", "torch_func_linearize")
+INVERSE_METRIC_VECTOR_LOOP_PATHS = (
+    "dense_solve",
+    "cholesky_solve",
+    "eigh_solve",
+    "svd_solve",
+    "conjugate_gradient",
+    "factorized_solve",
+    "blockwise_solve",
+    "woodbury_low_rank_solve",
+)
+METRIC_INNER_VECTOR_LOOP_PATHS = (
+    "multiply_then_reduce",
+    "factored_gram",
+    "sqrt_apply_reduce",
+)
+INVERSE_METRIC_INNER_VECTOR_LOOP_PATHS = (
+    "solve_then_reduce",
+    "factored_gram",
+    "sqrt_apply_reduce",
+)
 FISHER_VECTOR_ACCUMULATIONS = (
     "streaming_dot_accumulate",
     "materialize_score_gradients",
@@ -1876,13 +958,14 @@ class AxisDescriptor:
     allowed_values: tuple[Any, ...]
     optional_settings_keys: tuple[str, ...] = ()
     owner_id: str = "core"
+    value_owner_ids: Mapping[Any, str] = dataclasses.field(default_factory=dict)
     operators: tuple[str, ...] = ()
     class_a: str = ""
     class_b: str = ""
     class_c_group: str = ""
     merge_rules: tuple[str, ...] = ()
     adapter_id: str = "core"
-    adapter_version: str = "0.0.1"
+    adapter_version: str = dataclasses.field(default_factory=lambda: PACKAGE_VERSION)
     admission_rule: AdmissionRule | None = None
     identity: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -1922,6 +1005,7 @@ class AxisDescriptor:
             "allowed_values": self.allowed_values,
             "value_domain": self.value_domain,
             "owner_id": self.owner_id,
+            "value_owner_ids": dict(self.value_owner_ids),
             "operators": self.operators,
             "class_a": self.class_a,
             "class_b": self.class_b,
@@ -1974,16 +1058,32 @@ class AxisRegistry:
                 message = f"setting key has multiple axis owners: {key}"
                 raise AdmissionError(message)
 
+            optional_owners = self.optional_owners.get(key)
+
+            if optional_owners is not None:
+                message = f"setting key has primary and optional axis owners: {key}"
+                raise AdmissionError(message)
+
         self.axes[axis.name] = axis
 
         for key in axis.settings_keys:
             self.owners[key] = axis.name
 
         for key in axis.optional_settings_keys:
+            owner = self.owners.get(key)
+
+            if owner is not None:
+                message = f"setting key has primary and optional axis owners: {key}"
+                raise AdmissionError(message)
+
             owners = self.optional_owners.get(key, ())
 
-            if axis.name not in owners:
-                self.optional_owners[key] = (*owners, axis.name)
+            if owners and axis.name not in owners:
+                message = f"setting key has multiple optional axis owners: {key}"
+                raise AdmissionError(message)
+
+            if not owners:
+                self.optional_owners[key] = (axis.name,)
 
     def admit(self, candidate: Candidate) -> Candidate:
         """Return candidate with admission status set.
@@ -2098,6 +1198,9 @@ def _axis_value_error(axis: AxisDescriptor, candidate: Candidate) -> str | None:
     else:
         value = {key: candidate.settings[key] for key in axis.settings_keys}
 
+    if _is_symbolic_axis_domain(axis.allowed_values):
+        return _symbolic_axis_domain_error(axis.axis_key, axis.allowed_values, value)
+
     if not axis.allowed_values or any(
         value == allowed for allowed in axis.allowed_values
     ):
@@ -2106,9 +1209,48 @@ def _axis_value_error(axis: AxisDescriptor, candidate: Candidate) -> str | None:
     return f"candidate axis value is not allowed: {axis.name}"
 
 
+def _symbolic_axis_domain_error(
+    axis_key: str,
+    domain: tuple[Any, ...],
+    value: Any,
+) -> str | None:
+    validators = {
+        INTEGER_DOMAIN: _positive_integer_value_error,
+        INTEGER_TUPLE_DOMAIN: _positive_integer_tuple_value_error,
+        POSITIVE_FLOAT_DOMAIN: _positive_float_value_error,
+        DECLARED_DOMAIN: _declared_value_error,
+        REGISTERED_DOMAIN: _registered_value_error,
+        FSDP_RESHARD_AFTER_FORWARD_DOMAIN: (_fsdp_reshard_after_forward_value_error),
+    }
+    validate = validators.get(domain)
+
+    if validate is None:
+        return None
+
+    return validate(axis_key, value)
+
+
+def _is_symbolic_axis_domain(domain: tuple[Any, ...]) -> bool:
+    return any(
+        domain == symbolic_domain
+        for symbolic_domain in (
+            INTEGER_DOMAIN,
+            INTEGER_TUPLE_DOMAIN,
+            POSITIVE_FLOAT_DOMAIN,
+            DECLARED_DOMAIN,
+            REGISTERED_DOMAIN,
+            FSDP_RESHARD_AFTER_FORWARD_DOMAIN,
+        )
+    )
+
+
 def _compile_backend_axis() -> AdmissionRule:
     def admit(candidate: Candidate) -> tuple[bool, str | None]:
         value = candidate.settings["compile.backend"]
+        compile_error = _compile_rule_error(candidate.settings, {})
+
+        if compile_error is not None:
+            return False, compile_error
 
         if not isinstance(value, str):
             return False, "compile.backend must be a string"
@@ -2124,6 +1266,360 @@ def _compile_backend_axis() -> AdmissionRule:
     return admit
 
 
+def _compile_setting_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        error = _compile_rule_error(candidate.settings, {})
+
+        return (True, None) if error is None else (False, error)
+
+    return admit
+
+
+def _compile_boundary_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        settings = candidate.settings
+        error = _compile_rule_error(settings, {})
+
+        if error is not None:
+            return False, error
+
+        if settings.get("compile.enabled") != "true":
+            return False, "compile.boundary requires compile.enabled=true"
+
+        boundary = settings["compile.boundary"]
+
+        if _adapter_compile_boundary_supported(boundary, settings):
+            return True, None
+
+        operator_kind = _compile_boundary_operator_kind(settings)
+
+        if operator_kind is None:
+            return False, "compile.boundary requires one operator path setting"
+
+        if _compile_boundary_supported(operator_kind, boundary, settings):
+            return True, None
+
+        return False, f"compile.boundary={boundary} is not lowered for {operator_kind}"
+
+    return admit
+
+
+def _adapter_compile_boundary_supported(
+    boundary: Any,
+    settings: Mapping[str, Any],
+) -> bool:
+    if boundary == "attention_module" and "attention.frontend" in settings:
+        return True
+
+    return boundary == "transformer_block" and _has_transformers_adapter_setting(
+        settings
+    )
+
+
+def _has_transformers_adapter_setting(settings: Mapping[str, Any]) -> bool:
+    frontend = settings.get("attention.frontend")
+
+    if isinstance(frontend, str) and (
+        frontend.startswith("transformers_")
+        or frontend == "registered_transformers_attention"
+    ):
+        return True
+
+    return any(
+        key in settings
+        for key in (
+            "module_mode",
+            "dropout_p",
+            "use_cache",
+            "output_attentions",
+        )
+    )
+
+
+def _memory_output_axis(key: str) -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings[key]
+
+        if value == "retain":
+            return True, None
+
+        if value == "recompute":
+            return (
+                False,
+                f"{key}=recompute requires package-owned output recompute lowering",
+            )
+
+        return False, f"{key} is unsupported: {value}"
+
+    return admit
+
+
+def _memory_intermediate_residency_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings["memory.intermediate_residency"]
+
+        if value not in {"gpu", "cpu_staged", "cpu_pinned"}:
+            return False, f"memory.intermediate_residency is unsupported: {value}"
+
+        operator_kind = _compile_boundary_operator_kind(candidate.settings)
+
+        if operator_kind == "ggnvp":
+            return True, None
+
+        if operator_kind == "composition":
+            if (
+                candidate.settings.get("composition.execution")
+                == "fuse_adjacent_children"
+            ):
+                return (
+                    False,
+                    (
+                        "memory.intermediate_residency requires visible composition "
+                        "child boundaries"
+                    ),
+                )
+
+            return True, None
+
+        return (
+            False,
+            "memory.intermediate_residency requires named intermediate boundaries",
+        )
+
+    return admit
+
+
+def _compile_boundary_operator_kind(settings: Mapping[str, Any]) -> str | None:
+    operator_checks = (
+        ("gradient", ("gradient.path",)),
+        ("jvp", ("jvp.path",)),
+        ("vjp", ("vjp.path",)),
+        ("hvp", ("hvp.path",)),
+        ("ggnvp", ("ggn.jvp_path", "ggn.loss_hessian_kernel")),
+        ("fisher_vp", ("fisher.accumulation",)),
+        ("sampled_fisher_vp", ("sampled_fisher.accumulation",)),
+        (
+            "empirical_fisher_vp",
+            ("empirical_fisher.grad_path", "empirical_fisher.accumulation"),
+        ),
+        ("per_example_gradient", ("per_example_gradient.grad_path",)),
+        ("metric_inner", ("metric_inner.reduction_path",)),
+        ("inverse_metric_inner", ("inverse_metric_inner.reduction_path",)),
+        ("sqrt_metric", ("sqrt_metric.factor_path",)),
+        ("inverse_metric", ("inverse_metric.solve_path",)),
+        ("metric", ("metric.multiply_path",)),
+        ("composition", ("composition.execution",)),
+    )
+    compound_checks = (
+        (
+            "metric_inner",
+            ("metric_inner.reduction_path",),
+            ("metric.multiply_path", "sqrt_metric.factor_path"),
+        ),
+        (
+            "inverse_metric_inner",
+            ("inverse_metric_inner.reduction_path",),
+            (
+                "inverse_metric.solve_path",
+                "metric.multiply_path",
+                "sqrt_metric.factor_path",
+            ),
+        ),
+        (
+            "inverse_metric",
+            ("inverse_metric.solve_path",),
+            ("metric.multiply_path",),
+        ),
+    )
+
+    for operator, keys, dependency_keys in compound_checks:
+        if not any(key in settings for key in keys):
+            continue
+
+        if _has_other_operator_path_setting(
+            settings,
+            operator_checks,
+            (*keys, *dependency_keys),
+        ):
+            return None
+
+        return operator
+
+    operators = tuple(
+        operator
+        for operator, keys in operator_checks
+        if any(key in settings for key in keys)
+    )
+
+    if len(operators) == 1:
+        return operators[0]
+
+    return None
+
+
+def _has_other_operator_path_setting(
+    settings: Mapping[str, Any],
+    operator_checks: Sequence[tuple[str, tuple[str, ...]]],
+    allowed_keys: tuple[str, ...],
+) -> bool:
+    for _, keys in operator_checks:
+        for key in keys:
+            if key in settings and key not in allowed_keys:
+                return True
+
+    return False
+
+
+def _compile_boundary_supported(
+    operator_kind: str,
+    boundary: str,
+    settings: Mapping[str, Any],
+) -> bool:
+    direct = _direct_compile_boundary_supported(operator_kind, boundary, settings)
+
+    if direct is not None:
+        return direct
+
+    if operator_kind == "hvp":
+        return _hvp_compile_boundary_supported(boundary, settings)
+
+    if operator_kind == "ggnvp":
+        return _ggn_compile_boundary_supported(boundary, settings)
+
+    if operator_kind in {
+        "fisher_vp",
+        "sampled_fisher_vp",
+        "empirical_fisher_vp",
+        "per_example_gradient",
+    }:
+        return _score_matrix_compile_boundary_supported(
+            operator_kind,
+            boundary,
+            settings,
+        )
+
+    boundaries = {
+        "gradient": "gradient_closure",
+        "jvp": "jvp_closure",
+        "vjp": "vjp_closure",
+        "metric": "metric_multiply",
+        "sqrt_metric": "metric_sqrt_multiply",
+        "inverse_sqrt_metric": "metric_sqrt_multiply",
+        "metric_inner": "metric_inner_reduce",
+        "inverse_metric": "inverse_metric_solve",
+        "inverse_metric_inner": "inverse_metric_inner_reduce",
+        "composition": "composition_child",
+    }
+
+    return boundaries.get(operator_kind) == boundary
+
+
+def _direct_compile_boundary_supported(
+    operator_kind: str,
+    boundary: str,
+    settings: Mapping[str, Any],
+) -> bool | None:
+    if boundary == "whole_operator":
+        return True
+
+    if boundary == "model_forward":
+        return settings.get("call.path") == "stateful_module"
+
+    if boundary == "loss_closure":
+        return operator_kind in {"gradient", "hvp"}
+
+    return None
+
+
+def _hvp_compile_boundary_supported(
+    boundary: str,
+    settings: Mapping[str, Any],
+) -> bool:
+    vectorized = settings.get("vectorization.mode") in {"single_loop", "vmap"}
+
+    if boundary == "hvp_single_vector":
+        return not vectorized
+
+    if boundary == "hvp_batched_vectors":
+        return vectorized
+
+    return False
+
+
+def _ggn_compile_boundary_supported(
+    boundary: str,
+    settings: Mapping[str, Any],
+) -> bool:
+    if boundary == "ggn_full_product":
+        return True
+
+    if settings.get("vectorization.mode") in {"single_loop", "manual_batch", "vmap"}:
+        return False
+
+    if boundary in {"ggn_jvp", "ggn_loss_hessian_product"}:
+        return settings.get("ggn.jvp_path") in {
+            "torch_func_jvp",
+            "forward_ad_dual",
+            "torch_func_linearize",
+        }
+
+    if boundary != "ggn_vjp":
+        return False
+
+    return settings.get("ggn.vjp_path") in {
+        "torch_func_vjp",
+        "autograd_grad_outputs",
+    }
+
+
+def _score_matrix_compile_boundary_supported(
+    operator_kind: str,
+    boundary: str,
+    settings: Mapping[str, Any],
+) -> bool:
+    if operator_kind == "fisher_vp":
+        return boundary == "fisher_score_grad" and settings.get(
+            "fisher.score_grad_path"
+        ) in {
+            "torch_autograd_grad_loop",
+            "torch_func_grad",
+            "vmap_grad",
+            "backward_materialized_grad",
+        }
+
+    if operator_kind == "sampled_fisher_vp":
+        return boundary == "sampled_fisher_score_grad" and settings.get(
+            "sampled_fisher.score_grad_path"
+        ) in {
+            "torch_autograd_grad_loop",
+            "torch_func_grad",
+            "vmap_grad",
+            "backward_materialized_grad",
+        }
+
+    if operator_kind == "empirical_fisher_vp":
+        return boundary == "empirical_fisher_example_grad" and settings.get(
+            "empirical_fisher.grad_path"
+        ) in {
+            "torch_autograd_grad_loop",
+            "torch_func_grad",
+            "vmap_grad",
+            "backward_materialized_grad",
+        }
+
+    return (
+        boundary == "per_example_gradient"
+        and settings.get("per_example_gradient.grad_path")
+        in {
+            "torch_autograd_grad_loop",
+            "torch_func_grad",
+            "vmap_grad",
+            "backward_materialized_grad",
+        }
+        and settings.get("per_example_gradient.accumulation") == "stacked_leading_axis"
+    )
+
+
 def _positive_int_axis(*keys: str) -> AdmissionRule:
     def admit(candidate: Candidate) -> tuple[bool, str | None]:
         for key in keys:
@@ -2131,6 +1627,35 @@ def _positive_int_axis(*keys: str) -> AdmissionRule:
 
             if error is not None:
                 return False, error
+
+        return True, None
+
+    return admit
+
+
+def _registered_id_axis(*keys: str) -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        for key in keys:
+            value = candidate.settings[key]
+
+            if not isinstance(value, str) or not value:
+                return False, f"{key} must be a registered id"
+
+        return True, None
+
+    return admit
+
+
+def _fsdp_reshard_after_forward_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        key = "fsdp.reshard_after_forward"
+        error = _fsdp_reshard_after_forward_value_error(
+            key,
+            candidate.settings[key],
+        )
+
+        if error is not None:
+            return False, error
 
         return True, None
 
@@ -2372,6 +1897,23 @@ def _empirical_fisher_grad_path_axis() -> AdmissionRule:
     return admit
 
 
+def _per_example_gradient_grad_path_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings["per_example_gradient.grad_path"]
+
+        if value == "vmap_grad":
+            return _admit_torch_func_path(
+                "per_example_gradient_vmap", candidate.settings
+            )
+
+        if value == "torch_func_grad":
+            return _admit_torch_func_path("torch_func_vjp", candidate.settings)
+
+        return True, None
+
+    return admit
+
+
 def _composition_execution_axis() -> AdmissionRule:
     def admit(candidate: Candidate) -> tuple[bool, str | None]:
         value = candidate.settings["composition.execution"]
@@ -2384,6 +1926,279 @@ def _composition_execution_axis() -> AdmissionRule:
                 False,
                 "compile_whole_composition requires compile.enabled=true",
             )
+
+        return True, None
+
+    return admit
+
+
+def _inverse_metric_multi_rhs_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        settings = candidate.settings
+        value = settings["inverse_metric.multi_rhs"]
+
+        if value == "single_column":
+            return True, None
+
+        if value != "block":
+            return False, f"inverse_metric.multi_rhs is unsupported: {value}"
+
+        if settings.get("vectorization.mode") not in {"single_loop", "manual_batch"}:
+            return False, "inverse_metric.multi_rhs=block requires stacked vectors"
+
+        return True, None
+
+    return admit
+
+
+def _inverse_metric_preconditioner_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings["inverse_metric.preconditioner"]
+
+        if value == "matrix_free":
+            return (
+                False,
+                (
+                    "inverse_metric.preconditioner=matrix_free requires named "
+                    "sibling product lowering"
+                ),
+            )
+
+        if value in {"none", "diagonal", "block_diagonal", "factorized_metric"}:
+            return True, None
+
+        return False, f"inverse_metric.preconditioner is unsupported: {value}"
+
+    return admit
+
+
+def _layout_tree_axis(key: str) -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings[key]
+
+        if value in DIRECT_LAYOUT_VALUES:
+            return True, None
+
+        if value in DISTRIBUTED_LAYOUT_VALUES:
+            if _has_distributed_adapter_setting(candidate.settings):
+                return True, None
+
+            return False, f"{key}={value} requires distributed adapter ownership"
+
+        return False, f"{key} is unsupported: {value}"
+
+    return admit
+
+
+def _has_distributed_adapter_setting(settings: Mapping[str, Any]) -> bool:
+    prefixes = (
+        "distributed.",
+        "dtensor.",
+        "fsdp.",
+        "tp.",
+        "sequence_parallel.",
+        "context_parallel.",
+        "comm.",
+    )
+
+    return any(key.startswith(prefixes) for key in settings)
+
+
+def _sqrt_metric_factor_path_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings["sqrt_metric.factor_path"]
+
+        if value != "matrix_free_lanczos":
+            if "sqrt_metric.lanczos_iterations" in candidate.settings:
+                return (
+                    False,
+                    "sqrt_metric.lanczos_iterations requires matrix_free_lanczos",
+                )
+
+            return True, None
+
+        if "sqrt_metric.lanczos_iterations" not in candidate.settings:
+            return (
+                False,
+                "matrix_free_lanczos requires sqrt_metric.lanczos_iterations",
+            )
+
+        error = _positive_int_error(
+            candidate.settings, "sqrt_metric.lanczos_iterations"
+        )
+
+        return (True, None) if error is None else (False, error)
+
+    return admit
+
+
+def _sqrt_metric_lanczos_iterations_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        if candidate.settings.get("sqrt_metric.factor_path") != "matrix_free_lanczos":
+            return (
+                False,
+                "sqrt_metric.lanczos_iterations requires matrix_free_lanczos",
+            )
+
+        error = _positive_int_error(
+            candidate.settings, "sqrt_metric.lanczos_iterations"
+        )
+
+        return (True, None) if error is None else (False, error)
+
+    return admit
+
+
+def _metric_inner_reduction_path_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        error = _metric_inner_reduction_path_error(candidate.settings)
+
+        return (True, None) if error is None else (False, error)
+
+    return admit
+
+
+def _inverse_metric_inner_reduction_path_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        error = _inverse_metric_inner_reduction_path_error(candidate.settings)
+
+        return (True, None) if error is None else (False, error)
+
+    return admit
+
+
+def _metric_inner_reduction_path_error(settings: Mapping[str, Any]) -> str | None:
+    value = settings["metric_inner.reduction_path"]
+
+    if value == "multiply_then_reduce":
+        return _path_dependency_error(
+            settings,
+            required_key="metric.multiply_path",
+            required_message="multiply_then_reduce requires metric.multiply_path",
+            forbidden_keys={
+                "sqrt_metric.factor_path": (
+                    "multiply_then_reduce does not use sqrt_metric.factor_path"
+                ),
+            },
+        )
+
+    if value == "factored_gram":
+        return _path_dependency_error(
+            settings,
+            forbidden_keys={
+                "metric.multiply_path": (
+                    "factored_gram does not use metric.multiply_path"
+                ),
+                "sqrt_metric.factor_path": (
+                    "factored_gram does not use sqrt_metric.factor_path"
+                ),
+            },
+        )
+
+    if value == "sqrt_apply_reduce":
+        return _path_dependency_error(
+            settings,
+            required_key="sqrt_metric.factor_path",
+            required_message="sqrt_apply_reduce requires sqrt_metric.factor_path",
+            forbidden_keys={
+                "metric.multiply_path": (
+                    "sqrt_apply_reduce does not use metric.multiply_path"
+                ),
+            },
+        )
+
+    return None
+
+
+def _inverse_metric_inner_reduction_path_error(
+    settings: Mapping[str, Any],
+) -> str | None:
+    value = settings["inverse_metric_inner.reduction_path"]
+
+    if value == "solve_then_reduce":
+        return _path_dependency_error(
+            settings,
+            required_key="inverse_metric.solve_path",
+            required_message="solve_then_reduce requires inverse_metric.solve_path",
+            forbidden_keys={
+                "sqrt_metric.factor_path": (
+                    "solve_then_reduce does not use sqrt_metric.factor_path"
+                ),
+            },
+        )
+
+    if value == "factored_gram":
+        return _path_dependency_error(
+            settings,
+            forbidden_keys={
+                "inverse_metric.solve_path": (
+                    "factored_gram does not use inverse_metric.solve_path"
+                ),
+                "sqrt_metric.factor_path": (
+                    "factored_gram does not use sqrt_metric.factor_path"
+                ),
+            },
+        )
+
+    if value == "sqrt_apply_reduce":
+        return _path_dependency_error(
+            settings,
+            required_key="sqrt_metric.factor_path",
+            required_message="sqrt_apply_reduce requires sqrt_metric.factor_path",
+            forbidden_keys={
+                "inverse_metric.solve_path": (
+                    "sqrt_apply_reduce does not use inverse_metric.solve_path"
+                ),
+            },
+        )
+
+    return None
+
+
+def _path_dependency_error(
+    settings: Mapping[str, Any],
+    *,
+    required_key: str | None = None,
+    required_message: str | None = None,
+    forbidden_keys: Mapping[str, str] | None = None,
+) -> str | None:
+    if required_key is not None and required_key not in settings:
+        if required_message is None:
+            return f"{required_key} is required"
+
+        return required_message
+
+    if forbidden_keys is None:
+        return None
+
+    for key, message in forbidden_keys.items():
+        if key in settings:
+            return message
+
+    return None
+
+
+def _metric_inner_multi_rhs_axis(axis_key: str) -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        value = candidate.settings[axis_key]
+
+        if value == "single_column":
+            return True, None
+
+        if value != "block":
+            return False, f"{axis_key} is unsupported: {value}"
+
+        if candidate.settings.get("vectorization.mode") not in {
+            "single_loop",
+            "manual_batch",
+            "vmap",
+        }:
+            message = (
+                f"{axis_key}=block requires vectorization.mode=single_loop, "
+                "manual_batch, or vmap"
+            )
+
+            return False, message
 
         return True, None
 
@@ -2467,6 +2282,50 @@ def _vmap_path_error(settings: Mapping[str, Any]) -> str | None:
 def _per_example_schedule_axis() -> AdmissionRule:
     def admit(candidate: Candidate) -> tuple[bool, str | None]:
         error = _per_example_schedule_error(candidate.settings)
+
+        return (True, None) if error is None else (False, error)
+
+    return admit
+
+
+def _per_example_gradient_accumulation_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        settings = candidate.settings
+        accumulation = settings["per_example_gradient.accumulation"]
+
+        if accumulation == "blockwise_stacked":
+            if "batch.per_example_block_size" not in settings:
+                return (
+                    False,
+                    "blockwise_stacked requires batch.per_example_block_size",
+                )
+
+            error = _positive_int_error(settings, "batch.per_example_block_size")
+
+            return (True, None) if error is None else (False, error)
+
+        if "batch.per_example_block_size" in settings:
+            return (
+                False,
+                "batch.per_example_block_size requires blockwise_stacked",
+            )
+
+        return True, None
+
+    return admit
+
+
+def _per_example_block_size_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        settings = candidate.settings
+
+        if settings.get("per_example_gradient.accumulation") != "blockwise_stacked":
+            return (
+                False,
+                "batch.per_example_block_size requires blockwise_stacked",
+            )
+
+        error = _positive_int_error(settings, "batch.per_example_block_size")
 
         return (True, None) if error is None else (False, error)
 
@@ -2566,6 +2425,12 @@ def _uses_vjp_vector_vmap_path(settings: Mapping[str, Any]) -> bool:
 
 
 def _uses_ggn_vector_loop_path(settings: Mapping[str, Any]) -> bool:
+    if (
+        settings.get("ggn.loss_hessian_kernel") == "dense_global"
+        and "ggn.jvp_path" not in settings
+    ):
+        return True
+
     return settings.get("ggn.jvp_path") in GGN_VECTOR_LOOP_PATHS and settings.get(
         "ggn.vjp_path"
     ) in {
@@ -2579,6 +2444,22 @@ def _uses_ggn_vector_vmap_path(settings: Mapping[str, Any]) -> bool:
         settings.get("ggn.jvp_path") in GGN_VECTOR_VMAP_PATHS
         and settings.get("ggn.vjp_path") == "torch_func_vjp"
     )
+
+
+def _uses_inverse_metric_vector_loop_path(settings: Mapping[str, Any]) -> bool:
+    return settings.get("inverse_metric.solve_path") in INVERSE_METRIC_VECTOR_LOOP_PATHS
+
+
+def _uses_metric_inner_vector_loop_path(settings: Mapping[str, Any]) -> bool:
+    return (
+        settings.get("metric_inner.reduction_path") in METRIC_INNER_VECTOR_LOOP_PATHS
+        or settings.get("inverse_metric_inner.reduction_path")
+        in INVERSE_METRIC_INNER_VECTOR_LOOP_PATHS
+    )
+
+
+def _uses_metric_inner_vector_vmap_path(settings: Mapping[str, Any]) -> bool:
+    return _uses_metric_inner_vector_loop_path(settings)
 
 
 def _uses_fisher_vector_path(settings: Mapping[str, Any]) -> bool:
@@ -2606,6 +2487,8 @@ def _uses_vector_loop_path(settings: Mapping[str, Any]) -> bool:
         or _uses_vjp_vector_loop_path(settings)
         or _uses_ggn_vector_loop_path(settings)
         or _uses_hvp_vector_loop_path(settings)
+        or _uses_inverse_metric_vector_loop_path(settings)
+        or _uses_metric_inner_vector_loop_path(settings)
         or _uses_fisher_vector_path(settings)
         or _uses_sampled_fisher_vector_path(settings)
         or _uses_empirical_fisher_vector_path(settings)
@@ -2628,6 +2511,7 @@ def _uses_vector_vmap_path(settings: Mapping[str, Any]) -> bool:
         or _uses_fisher_vector_path(settings)
         or _uses_sampled_fisher_vector_path(settings)
         or _uses_empirical_fisher_vector_path(settings)
+        or _uses_metric_inner_vector_vmap_path(settings)
         or settings.get("composition.execution")
         in {
             "materialize_each_child",
@@ -2678,6 +2562,32 @@ def _vectorization_mode_axis() -> AdmissionRule:
         return (True, None) if error is None else (False, error)
 
     return admit
+
+
+def _vectorization_randomness_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        settings = candidate.settings
+
+        if settings.get("vectorization.mode") == "vmap":
+            error = _vmap_randomness_error(settings)
+
+            return (True, None) if error is None else (False, error)
+
+        if _uses_torch_func_admission_path(settings):
+            return True, None
+
+        return (
+            False,
+            "vectorization.randomness requires vmap mode or torch.func lowering",
+        )
+
+    return admit
+
+
+def _uses_torch_func_admission_path(settings: Mapping[str, Any]) -> bool:
+    return any(
+        settings.get(key) == value for key, value in TORCH_FUNC_ADMISSION_PATH_SETTINGS
+    )
 
 
 def _vmap_chunk_size_error(settings: Mapping[str, Any]) -> str | None:
@@ -2775,17 +2685,47 @@ def _vmap_batch_in_dims_error(settings: Mapping[str, Any]) -> str | None:
 
 
 def _vmap_batch_in_dims_value_error(in_dims: Any) -> str | None:
-    if not isinstance(in_dims, Mapping) or not in_dims:
-        return "vectorization.in_dims must be a nonempty mapping"
+    error = None
+
+    if (isinstance(in_dims, int) and not isinstance(in_dims, bool)) or in_dims is None:
+        error = None
+    elif isinstance(in_dims, Mapping):
+        error = _vmap_batch_in_dims_mapping_error(in_dims)
+    elif isinstance(in_dims, tuple):
+        error = _vmap_batch_in_dims_tuple_error(in_dims)
+    else:
+        error = (
+            "vectorization.in_dims values must be integers, None, mappings, or tuples"
+        )
+
+    return error
+
+
+def _vmap_batch_in_dims_mapping_error(in_dims: Mapping[Any, Any]) -> str | None:
+    if not in_dims:
+        return "vectorization.in_dims mapping must be nonempty"
 
     for key, value in in_dims.items():
         if not isinstance(key, str) or not key:
             return "vectorization.in_dims keys must be nonempty strings"
 
-        if value is not None and (
-            not isinstance(value, int) or isinstance(value, bool)
-        ):
-            return "vectorization.in_dims values must be integers or None"
+        error = _vmap_batch_in_dims_value_error(value)
+
+        if error is not None:
+            return error
+
+    return None
+
+
+def _vmap_batch_in_dims_tuple_error(in_dims: tuple[Any, ...]) -> str | None:
+    if not in_dims:
+        return "vectorization.in_dims tuple must be nonempty"
+
+    for value in in_dims:
+        error = _vmap_batch_in_dims_value_error(value)
+
+        if error is not None:
+            return error
 
     return None
 
@@ -2879,6 +2819,7 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
                 "per_shard",
                 "dtensor",
             ),
+            admission_rule=_layout_tree_axis("layout.params"),
         ),
         AxisDescriptor(
             "layout.vector",
@@ -2891,6 +2832,7 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
                 "per_shard",
                 "dtensor",
             ),
+            admission_rule=_layout_tree_axis("layout.vector"),
         ),
         AxisDescriptor(
             "layout.output",
@@ -2903,6 +2845,7 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
                 "per_shard",
                 "dtensor",
             ),
+            admission_rule=_layout_tree_axis("layout.output"),
         ),
         AxisDescriptor(
             "layout.contiguity",
@@ -3004,7 +2947,6 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             "gradient.value_reuse",
             ("gradient.value_reuse",),
             ("gradient_only", "gradient_and_primal_value"),
-            optional_settings_keys=("gradient.path",),
             admission_rule=_gradient_value_reuse_axis(),
         ),
         AxisDescriptor(
@@ -3022,7 +2964,6 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             "jvp.linearize_reuse",
             ("jvp.linearize_reuse",),
             ("none", "reuse_at_same_primal"),
-            optional_settings_keys=("jvp.path",),
             admission_rule=_jvp_linearize_reuse_axis(),
         ),
         AxisDescriptor(
@@ -3035,7 +2976,6 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             "vjp.closure_reuse",
             ("vjp.closure_reuse",),
             ("none", "reuse_vjp_closure_at_same_primal"),
-            optional_settings_keys=("vjp.path",),
             admission_rule=_vjp_closure_reuse_axis(),
         ),
         AxisDescriptor(
@@ -3058,7 +2998,6 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             "ggn.vjp_path",
             ("ggn.vjp_path",),
             ("torch_func_vjp", "autograd_grad_outputs"),
-            optional_settings_keys=("ggn.jvp_path",),
             admission_rule=_ggn_vjp_path_axis(),
         ),
         AxisDescriptor(
@@ -3150,6 +3089,23 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ),
         ),
         AxisDescriptor(
+            "per_example_gradient.grad_path",
+            ("per_example_gradient.grad_path",),
+            (
+                "torch_autograd_grad_loop",
+                "torch_func_grad",
+                "vmap_grad",
+                "backward_materialized_grad",
+            ),
+            admission_rule=_per_example_gradient_grad_path_axis(),
+        ),
+        AxisDescriptor(
+            "per_example_gradient.accumulation",
+            ("per_example_gradient.accumulation",),
+            ("stacked_leading_axis", "blockwise_stacked"),
+            admission_rule=_per_example_gradient_accumulation_axis(),
+        ),
+        AxisDescriptor(
             "forward_ad_flags",
             FORWARD_AD_FIELDS,
             (),
@@ -3166,6 +3122,12 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("vectorization.mode",),
             ("single_loop", "manual_batch", "vmap"),
             admission_rule=_vectorization_mode_axis(),
+        ),
+        AxisDescriptor(
+            "vectorization.randomness",
+            ("vectorization.randomness",),
+            ("error", "same", "different"),
+            admission_rule=_vectorization_randomness_axis(),
         ),
         AxisDescriptor(
             "vectorization.batch_size",
@@ -3214,6 +3176,12 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             ("batch.empirical_example_batch_size",),
             (),
             admission_rule=_positive_int_axis("batch.empirical_example_batch_size"),
+        ),
+        AxisDescriptor(
+            "batch.per_example_block_size",
+            ("batch.per_example_block_size",),
+            (),
+            admission_rule=_per_example_block_size_axis(),
         ),
         AxisDescriptor(
             "schedule.per_example",
@@ -3281,6 +3249,7 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             "memory.intermediate_residency",
             ("memory.intermediate_residency",),
             ("gpu", "cpu_pinned", "cpu_staged"),
+            admission_rule=_memory_intermediate_residency_axis(),
         ),
         AxisDescriptor(
             "memory.factor_residency",
@@ -3296,16 +3265,19 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             "memory.primal_outputs",
             ("memory.primal_outputs",),
             ("retain", "recompute"),
+            admission_rule=_memory_output_axis("memory.primal_outputs"),
         ),
         AxisDescriptor(
             "memory.jvp_outputs",
             ("memory.jvp_outputs",),
             ("retain", "recompute"),
+            admission_rule=_memory_output_axis("memory.jvp_outputs"),
         ),
         AxisDescriptor(
             "memory.output_cotangents",
             ("memory.output_cotangents",),
             ("retain", "recompute"),
+            admission_rule=_memory_output_axis("memory.output_cotangents"),
         ),
         AxisDescriptor(
             "chunk.class_block_size_with_exact_global_normalization",
@@ -3339,11 +3311,17 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             (),
             admission_rule=_positive_int_axis("chunk.lm_head_weight_chunk_bytes"),
         ),
-        AxisDescriptor("compile.enabled", ("compile.enabled",), ("false", "true")),
+        AxisDescriptor(
+            "compile.enabled",
+            ("compile.enabled",),
+            ("false", "true"),
+            admission_rule=_compile_setting_axis(),
+        ),
         AxisDescriptor(
             "compile.boundary",
             ("compile.boundary",),
             COMPILE_BOUNDARY_VALUES,
+            admission_rule=_compile_boundary_axis(),
         ),
         AxisDescriptor(
             "compile.backend",
@@ -3355,37 +3333,49 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             "compile.mode",
             ("compile.mode",),
             (None, "default", "max-autotune"),
+            admission_rule=_compile_setting_axis(),
         ),
-        AxisDescriptor("compile.fullgraph", ("compile.fullgraph",), ("false", "true")),
+        AxisDescriptor(
+            "compile.fullgraph",
+            ("compile.fullgraph",),
+            ("false", "true"),
+            admission_rule=_compile_setting_axis(),
+        ),
         AxisDescriptor(
             "compile.dynamic",
             ("compile.dynamic",),
             (None, "false", "true"),
+            admission_rule=_compile_setting_axis(),
         ),
         AxisDescriptor(
             "compile.compiled_autograd",
             ("compile.compiled_autograd",),
             ("false", "true"),
+            admission_rule=_compile_setting_axis(),
         ),
         AxisDescriptor(
             "compile.options.epilogue_fusion",
             ("compile.options.epilogue_fusion",),
             ("false", "true"),
+            admission_rule=_compile_setting_axis(),
         ),
         AxisDescriptor(
             "compile.options.shape_padding",
             ("compile.options.shape_padding",),
             ("false", "true"),
+            admission_rule=_compile_setting_axis(),
         ),
         AxisDescriptor(
             "compile.cuda_graphs",
             ("compile.cuda_graphs",),
             ("false", "true"),
+            admission_rule=_compile_setting_axis(),
         ),
         AxisDescriptor(
             "compile.cache_state",
             ("compile.cache_state",),
             ("cold_compile", "warm_cache"),
+            admission_rule=_compile_setting_axis(),
         ),
         AxisDescriptor(
             "activation.recompute",
@@ -3459,12 +3449,40 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             "metric.accumulation",
             ("metric.accumulation",),
             ("streaming", "materialized_blocks"),
-            optional_settings_keys=("metric.multiply_path",),
         ),
         AxisDescriptor(
             "metric.block_schedule",
             ("metric.block_schedule",),
             ("layer_blocks", "module_blocks", "custom_blocks"),
+        ),
+        AxisDescriptor(
+            "metric_inner.reduction_path",
+            ("metric_inner.reduction_path",),
+            ("multiply_then_reduce", "factored_gram", "sqrt_apply_reduce"),
+            admission_rule=_metric_inner_reduction_path_axis(),
+        ),
+        AxisDescriptor(
+            "metric_inner.multi_rhs",
+            ("metric_inner.multi_rhs",),
+            ("single_column", "block"),
+            admission_rule=_metric_inner_multi_rhs_axis("metric_inner.multi_rhs"),
+        ),
+        AxisDescriptor(
+            "sqrt_metric.factor_path",
+            ("sqrt_metric.factor_path",),
+            (
+                "closed_form_factor_square_root",
+                "cholesky_factor",
+                "eigenbasis_factor",
+                "matrix_free_lanczos",
+            ),
+            admission_rule=_sqrt_metric_factor_path_axis(),
+        ),
+        AxisDescriptor(
+            "sqrt_metric.lanczos_iterations",
+            ("sqrt_metric.lanczos_iterations",),
+            (),
+            admission_rule=_sqrt_metric_lanczos_iterations_axis(),
         ),
         AxisDescriptor(
             "inverse_metric.solve_path",
@@ -3483,7 +3501,8 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
         AxisDescriptor(
             "inverse_metric.preconditioner",
             ("inverse_metric.preconditioner",),
-            ("none", "diagonal", "block_diagonal", "factorized_metric"),
+            ("none", "diagonal", "block_diagonal", "factorized_metric", "matrix_free"),
+            admission_rule=_inverse_metric_preconditioner_axis(),
         ),
         AxisDescriptor(
             "inverse_metric.iteration_budget",
@@ -3500,6 +3519,26 @@ def standard_axis_descriptors() -> tuple[AxisDescriptor, ...]:
             "inverse_metric.block_schedule",
             ("inverse_metric.block_schedule",),
             ("layer_blocks", "module_blocks", "custom_blocks"),
+        ),
+        AxisDescriptor(
+            "inverse_metric.multi_rhs",
+            ("inverse_metric.multi_rhs",),
+            ("single_column", "block"),
+            admission_rule=_inverse_metric_multi_rhs_axis(),
+        ),
+        AxisDescriptor(
+            "inverse_metric_inner.reduction_path",
+            ("inverse_metric_inner.reduction_path",),
+            ("solve_then_reduce", "factored_gram", "sqrt_apply_reduce"),
+            admission_rule=_inverse_metric_inner_reduction_path_axis(),
+        ),
+        AxisDescriptor(
+            "inverse_metric_inner.multi_rhs",
+            ("inverse_metric_inner.multi_rhs",),
+            ("single_column", "block"),
+            admission_rule=_metric_inner_multi_rhs_axis(
+                "inverse_metric_inner.multi_rhs"
+            ),
         ),
         AxisDescriptor(
             "composition.execution",
@@ -3595,7 +3634,7 @@ def settings_product(
     *,
     axis_registry: AxisRegistry | None = None,
     generator_id: str = "grid",
-    generator_version: str = "0.0.1",
+    generator_version: str | None = None,
 ) -> tuple[Candidate, ...]:
     """Create candidates from an ordered grid of axis values.
 
@@ -3604,6 +3643,9 @@ def settings_product(
     """
     items = tuple(axes.items())
     candidates = []
+    candidate_generator_version = (
+        PACKAGE_VERSION if generator_version is None else generator_version
+    )
 
     def build(index: int, settings: dict[str, Any], changed: tuple[str, ...]) -> None:
         if index == len(items):
@@ -3615,7 +3657,7 @@ def settings_product(
                     settings=dict(settings),
                     changed_axes=changed,
                     generator_id=generator_id,
-                    generator_version=generator_version,
+                    generator_version=candidate_generator_version,
                 )
             )
 

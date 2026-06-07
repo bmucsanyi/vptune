@@ -23,6 +23,7 @@ STANDARD_THRESHOLDS = {
     "psd_violation": 1e-12,
     "directional_abs_diff": 1e-3,
     "directional_rel_diff": 1e-2,
+    "min_probe_norm": 1e-3,
 }
 THRESHOLD_PAIRS = (
     ("max_abs_diff", "max_rel_diff"),

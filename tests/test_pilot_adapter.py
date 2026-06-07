@@ -7,15 +7,12 @@ import torch
 
 import vptune as vp
 import vptune.ext as vpx
+from vptune import operators as ops
 from vptune.adapters.pilot import (
     PilotReadiness,
-    acceptance_family_names,
-    acceptance_readiness,
     lower,
     readiness,
-    require_acceptance_families,
     selected_settings,
-    validators,
 )
 
 
@@ -54,24 +51,24 @@ class OneVectorProvider:
         return (torch.tensor([1.0]),)
 
 
-def cpu_target() -> vp.Target:
-    return vp.Target(
+def cpu_target() -> vpx.Target:
+    return vpx.Target(
         devices=("cpu",),
         accelerator="cpu",
         allowed_dtypes=("fp32",),
         allowed_attention_frontends=(),
         allowed_sdpa_kernels=(),
         allowed_sharding_modes=("single_device",),
-        timing_policy=vp.TimingPolicy(),
-        selection_policy=vp.SelectionPolicy(),
-        search_policy=vp.SearchPolicy(strategy="exhaustive"),
+        timing_policy=vpx.TimingPolicy(),
+        selection_policy=vpx.SelectionPolicy(),
+        search_policy=vpx.SearchPolicy(strategy="exhaustive"),
         determinism_policy={},
         environment_capture={"runtime": "test"},
     )
 
 
-def reference_passed() -> vp.ReferenceResult:
-    return vp.ReferenceResult(
+def reference_passed() -> vpx.ReferenceResult:
+    return vpx.ReferenceResult(
         "tree_close",
         {"max_abs_diff": 1e-6},
         {"max_abs_diff": 0.0},
@@ -79,8 +76,8 @@ def reference_passed() -> vp.ReferenceResult:
 
 
 def materialize_candidate_impl(
-    candidate: vp.Candidate,
-    record: vp.FullSizeRecord,
+    candidate: vpx.Candidate,
+    record: vpx.FullSizeRecord,
 ) -> vpx.CandidateOperation:
     assert record.candidate_id == candidate.candidate_id
 
@@ -91,13 +88,14 @@ materialize_candidate = vpx.CallableMaterializer(
     "tests.pilot.materialize_candidate",
     "1",
     {},
+    {"callback": "tests.pilot.materialize_candidate_impl"},
     materialize_candidate_impl,
 )
 
 
-def problem_for(name: str, operator: vp.OperatorSpec) -> vp.Problem:
+def problem_for(name: str, operator: vpx.OperatorSpec) -> vpx.Problem:
     model = torch.nn.Linear(1, 1)
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         name,
         f"{name}:row",
         {"axis": name},
@@ -105,10 +103,10 @@ def problem_for(name: str, operator: vp.OperatorSpec) -> vp.Problem:
     )
 
     def reference_check(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
-    ) -> vp.ReferenceResult:
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
         assert candidate.family == name
         assert batch["family"] == name
         assert isinstance(vector, torch.Tensor)
@@ -116,26 +114,41 @@ def problem_for(name: str, operator: vp.OperatorSpec) -> vp.Problem:
         return reference_passed()
 
     def operation_factory(
-        candidate: vp.Candidate,
+        candidate: vpx.Candidate,
         batch: Mapping[str, object],
-        vector: vp.TensorTree,
+        vector: vpx.TensorTree,
     ) -> vpx.CandidateOperation:
         assert candidate.family == name
         assert batch["family"] == name
 
         return vpx.constant_operation(vector)
 
-    return vp.Problem(
+    wrapped_operation_factory = vpx.CallableOperationFactory(
+        "tests.pilot.operation_factory",
+        "1",
+        {"generator": name},
+        {"callback": "tests.pilot.operation_factory"},
+        operation_factory,
+    )
+    wrapped_reference_check = vpx.CallableReferenceCheck(
+        "tests.pilot.reference_check",
+        "1",
+        {"generator": name},
+        {"callback": "tests.pilot.reference_check"},
+        reference_check,
+    )
+
+    return vpx.Problem(
         model=model,
-        params=vp.parameter_surface(model),
+        params=vpx.parameter_surface(model),
         data=OneBatchData(),
         operator=operator,
         vectors=OneVectorProvider(),
         target=cpu_target(),
         runtime=vpx.RuntimeConfig(
             (candidate,),
-            operation_factory,
-            reference_check,
+            wrapped_operation_factory,
+            wrapped_reference_check,
             materialize_candidate,
             None,
             {"generator": name},
@@ -143,8 +156,8 @@ def problem_for(name: str, operator: vp.OperatorSpec) -> vp.Problem:
     )
 
 
-def full_size_record(candidate: vp.Candidate) -> vp.FullSizeRecord:
-    sample = vp.Measurement(
+def full_size_record(candidate: vpx.Candidate) -> vpx.FullSizeRecord:
+    sample = vpx.Measurement(
         elapsed_seconds=1.0,
         peak_allocated_mib=1.0,
         peak_reserved_mib=1.0,
@@ -152,7 +165,7 @@ def full_size_record(candidate: vp.Candidate) -> vp.FullSizeRecord:
         post_reserved_mib=0.0,
     )
 
-    record = vp.FullSizeRecord(
+    record = vpx.FullSizeRecord(
         family=candidate.family,
         candidate_id=candidate.candidate_id,
         status="passed",
@@ -169,8 +182,8 @@ def full_size_record(candidate: vp.Candidate) -> vp.FullSizeRecord:
 
 
 def dependency_identity(
-    candidate: vp.Candidate,
-    record: vp.FullSizeRecord,
+    candidate: vpx.Candidate,
+    record: vpx.FullSizeRecord,
 ) -> dict[str, object]:
     return {
         "family": candidate.family,
@@ -181,18 +194,18 @@ def dependency_identity(
     }
 
 
-def refresh_check_record(record: vp.CheckRecord) -> vp.CheckRecord:
+def refresh_check_record(record: vpx.CheckRecord) -> vpx.CheckRecord:
     return record
 
 
-def plan_for(candidate: vp.Candidate) -> vp.Plan:
+def plan_for(candidate: vpx.Candidate) -> vpx.Plan:
     record = full_size_record(candidate)
 
-    return vp.Plan(
+    return vpx.Plan(
         selected={candidate.family: candidate},
         records={candidate.family: record},
         input_signature={"case": "pilot"},
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(record,),
         materializers={candidate.family: materialize_candidate},
         validation_order=(candidate.family,),
@@ -201,9 +214,9 @@ def plan_for(candidate: vp.Candidate) -> vp.Plan:
 
 def test_pilot_lower_validates_family_problem_match() -> None:
     target = cpu_target()
-    first_operator = vp.gradient("first", "loss", aggregation="sum")
-    second_operator = vp.hvp("second", "loss", aggregation="sum")
-    constraint = vp.CohortConstraint(
+    first_operator = ops.gradient("first", "loss", aggregation="sum")
+    second_operator = ops.hvp("second", "loss", aggregation="sum")
+    constraint = vpx.CohortConstraint(
         name="dtype",
         settings_keys=("dtype.model_compute",),
         assignments=({"dtype.model_compute": "fp32"},),
@@ -211,10 +224,10 @@ def test_pilot_lower_validates_family_problem_match() -> None:
     )
 
     def validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         assert candidate.family == record.family
         assert context.family in {"first", "second"}
 
@@ -223,8 +236,8 @@ def test_pilot_lower_validates_family_problem_match() -> None:
     run = lower(
         target=target,
         families=(
-            vp.Family("second", second_operator, dependencies=("first",)),
-            vp.Family("first", first_operator),
+            vpx.Family("second", second_operator, dependencies=("first",)),
+            vpx.Family("first", first_operator),
         ),
         problems=(
             problem_for("first", first_operator),
@@ -250,7 +263,7 @@ def test_pilot_lower_validates_family_problem_match() -> None:
     with pytest.raises(vp.MaterializationError):
         lower(
             target=target,
-            families=(vp.Family("first", first_operator),),
+            families=(vpx.Family("first", first_operator),),
             problems=(problem_for("second", second_operator),),
             run_id="bad",
         )
@@ -258,7 +271,7 @@ def test_pilot_lower_validates_family_problem_match() -> None:
     with pytest.raises(vp.MaterializationError, match="validator identities"):
         lower(
             target=target,
-            families=(vp.Family("first", first_operator),),
+            families=(vpx.Family("first", first_operator),),
             problems=(problem_for("first", first_operator),),
             run_id="bad-validators",
             plan_validators={"first": validator},
@@ -267,7 +280,7 @@ def test_pilot_lower_validates_family_problem_match() -> None:
 
 
 def test_pilot_readiness_and_selected_settings() -> None:
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"axis": "value"},
@@ -298,13 +311,13 @@ def test_pilot_readiness_and_selected_settings() -> None:
 def test_pilot_lowered_run_feeds_downstream_readiness_consumer(
     tmp_path: Path,
 ) -> None:
-    operator = vp.gradient("family", "loss", aggregation="sum")
+    operator = ops.gradient("family", "loss", aggregation="sum")
 
     def validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         assert candidate.family == "family"
         assert record.family == "family"
         assert context.family == "family"
@@ -313,7 +326,7 @@ def test_pilot_lowered_run_feeds_downstream_readiness_consumer(
 
     tuning = lower(
         target=cpu_target(),
-        families=(vp.Family("family", operator),),
+        families=(vpx.Family("family", operator),),
         problems=(problem_for("family", operator),),
         run_id="pilot-e2e",
         plan_validators={"family": validator},
@@ -341,7 +354,7 @@ def test_pilot_lowered_run_feeds_downstream_readiness_consumer(
 
 
 def test_pilot_readiness_rejects_stale_selected_candidate_metadata() -> None:
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"axis": "value"},
@@ -371,14 +384,14 @@ def test_pilot_readiness_rejects_stale_selected_candidate_metadata() -> None:
 
 
 def test_pilot_readiness_rejects_stale_selected_dependencies() -> None:
-    dependency = vp.Candidate(
+    dependency = vpx.Candidate(
         "dependency",
         "dependency-row",
         {"axis": "dependency"},
         admission_status="passed",
     )
     dependency_record = full_size_record(dependency)
-    dependent = vp.Candidate(
+    dependent = vpx.Candidate(
         "dependent",
         "dependent-row",
         {"axis": "dependent"},
@@ -387,7 +400,7 @@ def test_pilot_readiness_rejects_stale_selected_dependencies() -> None:
         },
         admission_status="passed",
     )
-    plan = vp.Plan(
+    plan = vpx.Plan(
         selected={
             "dependency": dependency,
             "dependent": dependent,
@@ -397,7 +410,7 @@ def test_pilot_readiness_rejects_stale_selected_dependencies() -> None:
             "dependent": full_size_record(dependent),
         },
         input_signature={"case": "pilot"},
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(dependency_record, full_size_record(dependent)),
         materializers={
             "dependency": materialize_candidate,
@@ -426,14 +439,14 @@ def test_pilot_readiness_rejects_stale_selected_dependencies() -> None:
 
 
 def test_pilot_readiness_requires_selected_dependencies() -> None:
-    dependency = vp.Candidate(
+    dependency = vpx.Candidate(
         "dependency",
         "dependency-row",
         {"axis": "dependency"},
         admission_status="passed",
     )
     dependency_record = full_size_record(dependency)
-    dependent = vp.Candidate(
+    dependent = vpx.Candidate(
         "dependent",
         "dependent-row",
         {"axis": "dependent"},
@@ -443,23 +456,23 @@ def test_pilot_readiness_requires_selected_dependencies() -> None:
         admission_status="passed",
     )
     dependent_record = full_size_record(dependent)
-    missing_dependency_plan = vp.Plan(
+    missing_dependency_plan = vpx.Plan(
         selected={"dependent": dependent},
         records={"dependent": dependent_record},
         input_signature={"case": "pilot"},
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(dependent_record,),
         materializers={"dependent": materialize_candidate},
         validation_order=("dependent",),
     )
-    ready_plan = vp.Plan(
+    ready_plan = vpx.Plan(
         selected={"dependency": dependency, "dependent": dependent},
         records={
             "dependency": dependency_record,
             "dependent": dependent_record,
         },
         input_signature={"case": "pilot"},
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(dependency_record, dependent_record),
         materializers={
             "dependency": materialize_candidate,
@@ -481,7 +494,7 @@ def test_pilot_readiness_requires_selected_dependencies() -> None:
 def test_pilot_selected_settings_require_validation_rows_when_plan_requires_them() -> (
     None
 ):
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "family",
         "row",
         {"axis": "value"},
@@ -495,10 +508,10 @@ def test_pilot_selected_settings_require_validation_rows_when_plan_requires_them
     )
 
     def validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         assert candidate.family == "family"
         assert record.family == "family"
         assert context.family == "family"
@@ -532,15 +545,45 @@ def test_pilot_selected_settings_require_validation_rows_when_plan_requires_them
         )
 
 
+def test_pilot_selected_settings_rejects_failed_plan_validator() -> None:
+    candidate = vpx.Candidate(
+        "family",
+        "row",
+        {"axis": "value"},
+        admission_status="passed",
+    )
+    plan = dataclasses.replace(
+        plan_for(candidate),
+        validation_required=True,
+        validation_order=("family",),
+        validator_identities={"family": {"validator": "test"}},
+    )
+
+    def validator(
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
+        assert candidate.family == "family"
+        assert record.family == "family"
+        assert context.selected().equal(torch.tensor([1.0]))
+
+        message = "selected implementation failed"
+        raise vp.ReferenceFailedError(message)
+
+    with pytest.raises(vp.ReferenceFailedError, match="selected implementation"):
+        vp.validate_plan(plan, {"family": validator})
+
+
 def test_pilot_selected_settings_rejects_validation_dependency_mismatch() -> None:
-    dependency = vp.Candidate(
+    dependency = vpx.Candidate(
         "dependency",
         "dependency-row",
         {"axis": "dependency"},
         admission_status="passed",
     )
     dependency_record = full_size_record(dependency)
-    dependent = vp.Candidate(
+    dependent = vpx.Candidate(
         "dependent",
         "dependent-row",
         {"axis": "dependent"},
@@ -550,14 +593,14 @@ def test_pilot_selected_settings_rejects_validation_dependency_mismatch() -> Non
         admission_status="passed",
     )
     dependent_record = full_size_record(dependent)
-    plan = vp.Plan(
+    plan = vpx.Plan(
         selected={"dependency": dependency, "dependent": dependent},
         records={
             "dependency": dependency_record,
             "dependent": dependent_record,
         },
         input_signature={"case": "pilot"},
-        policy=vp.SelectionPolicy(),
+        policy=vpx.SelectionPolicy(),
         full_size_records=(dependency_record, dependent_record),
         materializers={
             "dependency": materialize_candidate,
@@ -573,10 +616,10 @@ def test_pilot_selected_settings_rejects_validation_dependency_mismatch() -> Non
     )
 
     def validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
+        candidate: vpx.Candidate,
+        record: vpx.FullSizeRecord,
+        context: vpx.PlanValidationContext,
+    ) -> vpx.ReferenceResult:
         assert candidate.family == record.family
         assert context.family == candidate.family
 
@@ -614,51 +657,3 @@ def test_pilot_selected_settings_rejects_validation_dependency_mismatch() -> Non
             ("dependent",),
             validation_records=(validation_records[0], bad_dependent_record),
         )
-
-
-def test_pilot_acceptance_helpers_require_acceptance_family_set() -> None:
-    required = acceptance_family_names()
-    candidate = vp.Candidate(
-        required[0],
-        "row",
-        {"axis": "value"},
-        admission_status="passed",
-    )
-    plan = plan_for(candidate)
-    state = acceptance_readiness(plan)
-
-    require_acceptance_families(required)
-
-    assert required == (
-        "capability_gradient",
-        "retain_kl_backward",
-        "kfac_metric",
-        "capability_hvp",
-        "hessian_ritz",
-        "chart_retain_curvature",
-        "contact_training_step",
-    )
-    assert not state.passed()
-    assert state.missing_families == required[1:]
-
-    with pytest.raises(vp.MaterializationError):
-        require_acceptance_families(("capability_gradient",))
-
-
-def test_pilot_validators_require_exact_family_coverage() -> None:
-    def validator(
-        candidate: vp.Candidate,
-        record: vp.FullSizeRecord,
-        context: vp.PlanValidationContext,
-    ) -> vp.ReferenceResult:
-        assert candidate.family == record.family
-        assert context.family == candidate.family
-
-        return reference_passed()
-
-    accepted = validators(("family",), {"family": validator})
-
-    assert tuple(accepted) == ("family",)
-
-    with pytest.raises(vp.MaterializationError):
-        validators(("family",), {})

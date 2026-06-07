@@ -12,6 +12,7 @@ from vptune.data import (
     ReferenceCheck,
     ReferenceResult,
 )
+from vptune.errors import MaterializationError
 from vptune.tensor_tree import TensorTree
 
 
@@ -29,6 +30,10 @@ def tree_reference_check(
         batch: Batch,
         vector: TensorTree,
     ) -> ReferenceResult:
+        if anchor_candidate_id == candidate.candidate_id:
+            message = "reference anchor candidate_id must differ from candidate_id"
+            raise MaterializationError(message)
+
         anchor_candidate = dataclasses.replace(
             candidate,
             candidate_id=anchor_candidate_id,

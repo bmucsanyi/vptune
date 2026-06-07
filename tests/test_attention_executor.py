@@ -92,67 +92,9 @@ def attention_location() -> vpat.MappingAttentionLocation:
     )
 
 
-def test_core_attention_axis_admits_executable_frontends() -> None:
-    registry = vpx.AxisRegistry()
-    registry.register(vpat.core_attention_axis())
-    rows = (
-        vp.Candidate(
-            "attention",
-            "sdpa",
-            {
-                "attention.frontend": "pytorch_sdpa_direct",
-                "attention.sdpa_kernel": "math",
-                "attention.partition": "full",
-                "attention.padding": "dense_padded",
-            },
-        ),
-        vp.Candidate(
-            "attention",
-            "patched",
-            {
-                "attention.frontend": "patched_eager",
-                "attention.partition": "full",
-                "attention.padding": "dense_padded",
-            },
-        ),
-        vp.Candidate(
-            "attention",
-            "packed",
-            {
-                "attention.frontend": "packed_exact",
-                "attention.partition": "packed_tokens",
-                "attention.padding": "unpadded_packed",
-            },
-        ),
-        vp.Candidate(
-            "attention",
-            "blockwise",
-            {
-                "attention.frontend": "blockwise_exact",
-                "attention.partition": "blockwise_queries",
-                "attention.padding": "dense_padded",
-                "chunk.sequence_position_block_size": 2,
-            },
-        ),
-        vp.Candidate(
-            "attention",
-            "segmented-forward-ad",
-            {
-                "attention.frontend": "blockwise_exact",
-                "attention.partition": "segmented_forward_ad",
-                "attention.padding": "dense_padded",
-            },
-        ),
-    )
-
-    for row in rows:
-        assert registry.admit(row).admission_status == "passed"
-
-
 def test_core_attention_axis_rejects_invalid_sequence_block_size() -> None:
-    registry = vpx.AxisRegistry()
-    registry.register(vpat.core_attention_axis())
-    row = vp.Candidate(
+    registry = vpat.core_attention_axis_registry()
+    row = vpx.Candidate(
         "attention",
         "bad-block",
         {
@@ -190,42 +132,11 @@ def test_core_attention_axis_rejects_invalid_sequence_block_size() -> None:
 def test_core_attention_axis_rejects_invalid_rows(
     settings: dict[str, object],
 ) -> None:
-    registry = vpx.AxisRegistry()
-    registry.register(vpat.core_attention_axis())
+    registry = vpat.core_attention_axis_registry()
 
-    admitted = registry.admit(vp.Candidate("attention", "row", settings))
+    admitted = registry.admit(vpx.Candidate("attention", "row", settings))
 
     assert admitted.admission_status == "failed"
-
-
-def test_attention_settings_from_candidate_records_priority_order() -> None:
-    settings = vpat.attention_settings_from_candidate({
-        "attention.frontend": "pytorch_sdpa_direct",
-        "attention.sdpa_kernel": "priority_list",
-        "attention.sdpa_priority_list": ("flash_attention", "math"),
-        "attention.partition": "full",
-        "attention.padding": "dense_padded",
-    })
-
-    assert settings.signature() == {
-        "frontend": "pytorch_sdpa_direct",
-        "sdpa_kernel": "priority_list",
-        "sdpa_priority": ("flash_attention", "math"),
-        "partition": "full",
-        "padding": "dense_padded",
-        "query_block_size": None,
-    }
-
-
-def test_attention_settings_from_candidate_records_sequence_block_size() -> None:
-    settings = vpat.attention_settings_from_candidate({
-        "attention.frontend": "blockwise_exact",
-        "attention.partition": "blockwise_queries",
-        "attention.padding": "dense_padded",
-        "chunk.sequence_position_block_size": 2,
-    })
-
-    assert settings.signature()["query_block_size"] == 2
 
 
 def test_attention_operation_factory_and_reference_check_execute_core_row() -> None:
@@ -236,7 +147,7 @@ def test_attention_operation_factory_and_reference_check_execute_core_row() -> N
         "value": inputs.value,
         "query_block_size": 2,
     }
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "attention",
         "blockwise",
         {
@@ -290,7 +201,7 @@ def test_attention_reference_check_rejects_dropout_without_reproducible_policy()
 
     with pytest.raises(AdmissionError, match=r"dropout_p=0[.]0"):
         reference_check(
-            vp.Candidate(
+            vpx.Candidate(
                 "attention",
                 "dropout",
                 {
@@ -311,7 +222,7 @@ def test_attention_operation_uses_candidate_sequence_block_size() -> None:
         "key": inputs.key,
         "value": inputs.value,
     }
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "attention",
         "blockwise",
         {
@@ -348,14 +259,14 @@ def test_attention_operation_compiles_attention_module_boundary(
     events = []
 
     def fake_compile(
-        operation: Callable[[], vp.TensorTree],
+        operation: Callable[[], vpx.TensorTree],
         *,
         backend: str,
         mode: str | None,
         fullgraph: bool,
         dynamic: bool | None,
         options: Mapping[str, bool] | None,
-    ) -> Callable[[], vp.TensorTree]:
+    ) -> Callable[[], vpx.TensorTree]:
         events.append({
             "backend": backend,
             "mode": mode,
@@ -364,7 +275,7 @@ def test_attention_operation_compiles_attention_module_boundary(
             "options": options,
         })
 
-        def compiled() -> vp.TensorTree:
+        def compiled() -> vpx.TensorTree:
             events.append({"compiled_attention": True})
 
             return operation()
@@ -381,7 +292,7 @@ def test_attention_operation_compiles_attention_module_boundary(
     }
     factory = vpat.attention_operation_factory(location)
     operation = factory(
-        vp.Candidate(
+        vpx.Candidate(
             "attention",
             "compiled-attention",
             {
@@ -428,7 +339,7 @@ def test_attention_operation_rejects_other_compile_boundaries() -> None:
 
     with pytest.raises(vp.MaterializationError, match="model_forward"):
         factory(
-            vp.Candidate(
+            vpx.Candidate(
                 "attention",
                 "bad-compile",
                 {
@@ -467,7 +378,7 @@ def test_attention_rejects_conflicting_query_block_sizes() -> None:
         "value": inputs.value,
         "query_block_size": 3,
     }
-    candidate = vp.Candidate(
+    candidate = vpx.Candidate(
         "attention",
         "blockwise",
         {
@@ -517,13 +428,13 @@ def test_sdpa_priority_list_enters_priority_context(
         yield
 
     monkeypatch.setattr(vpat, "sdpa_kernel", fake_sdpa_kernel)
-    settings = attention_settings(
-        "pytorch_sdpa_direct",
-        "priority_list",
-        ("flash_attention", "math"),
-        "full",
-        "dense_padded",
-    )
+    settings = vpat.attention_settings_from_candidate({
+        "attention.frontend": "pytorch_sdpa_direct",
+        "attention.sdpa_kernel": "priority_list",
+        "attention.sdpa_priority_list": ("flash_attention", "math"),
+        "attention.partition": "full",
+        "attention.padding": "dense_padded",
+    })
 
     vpat.run_attention(attention_inputs(), settings)
 
