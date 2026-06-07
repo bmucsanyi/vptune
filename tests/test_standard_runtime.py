@@ -13070,7 +13070,7 @@ def test_standard_metric_materializer_returns_metric_object(tmp_path: Path) -> N
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
     )
-    selected = vp.materialize(plan, family="metric")
+    selected = vp.materialize(plan, name="metric")
     batch = {"metric_matrix": DenseMetricData.matrix}
     vector = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     right = {"w": torch.tensor([-1.0, 0.5], dtype=torch.float64)}
@@ -13150,7 +13150,7 @@ def materialized_standard_metric_operator(
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
     )
-    selected = vp.materialize(plan, family=family)
+    selected = vp.materialize(plan, name=family)
     assert isinstance(selected, vpx.StandardMetricOperator)
 
     return selected
@@ -13692,7 +13692,7 @@ def test_inverse_metric_materializer_calls_inverse_by_default(tmp_path: Path) ->
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
     )
-    selected = vp.materialize(plan, family="inverse_metric")
+    selected = vp.materialize(plan, name="inverse_metric")
     batch = {"metric_matrix": DenseMetricData.matrix}
     vector = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
 
@@ -13769,7 +13769,7 @@ def test_inverse_metric_materializer_preserves_conjugate_gradient_path(
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
     )
-    selected = vp.materialize(plan, family="inverse_metric")
+    selected = vp.materialize(plan, name="inverse_metric")
     batch = {"metric_matrix": DenseMetricData.matrix}
     vector = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
 
@@ -17497,7 +17497,7 @@ def test_composition_runtime_config_runs_and_materializes_selected_operator(
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 1.0)),
     )
-    selected = vp.materialize(plan, family="compose")
+    selected = vp.materialize(plan, name="compose")
     result = selected(
         {"family": "compose", "scale": 2.0},
         {"w": torch.tensor([3.0], dtype=torch.float64)},
@@ -18614,7 +18614,7 @@ def test_standard_runtime_tunes_hvp_and_materializes_selected_operator(
         memory_backend=CPUMemoryBackend(),
         clock=SequenceClock((0.0, 2.0, 2.0, 3.0)),
     )
-    selected = vp.materialize(plan, family="hvp")
+    selected = vp.materialize(plan, name="hvp")
     result = selected(
         {"family": "hvp", "scale": 2.0},
         {"w": torch.tensor([3.0], dtype=torch.float64)},

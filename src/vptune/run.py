@@ -3873,10 +3873,9 @@ def materialize(
     plan: Plan,
     *,
     name: str | None = None,
-    family: str | None = None,
 ) -> Any:
     """Return selected materialization data for a plan."""
-    return plan.materialize(family, name=name)
+    return plan.materialize(name=name)
 
 
 def load_tuned_plan(
@@ -4256,7 +4255,7 @@ def validate_plan(
             )
             raise MaterializationError(message)
 
-        selected_impl = materialize(plan, family=family)
+        selected_impl = materialize(plan, name=family)
         materialized[family] = selected_impl
         dependencies = {
             dependency: materialized[dependency] for dependency in dependency_names

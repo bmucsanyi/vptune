@@ -2315,11 +2315,13 @@ vptune/
       checks.py
       data.py
       errors.py
+      ext.py
       identities.py
       attention.py
       io.py
       measure.py
       operators.py
+      public.py
       reference.py
       runtime.py
       select.py
@@ -2336,9 +2338,13 @@ vptune/
     test_core.py
     test_attention_executor.py
     test_standard_runtime.py
+    test_public_api.py
+    test_functional_call.py
+    test_torch_func_admission.py
     test_transformers_adapter.py
     test_distributed_adapter.py
     test_pilot_adapter.py
+    vptune_test_helpers.py
 ```
 
 ## Implementation Order

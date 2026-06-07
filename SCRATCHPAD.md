@@ -1,51 +1,42 @@
 # Scratchpad
-Branch: codex-implement-spec @ 4b715a1
+Branch: codex-implement-spec @ 17003cc
 
 ## TODO
-- [x] Read SPEC.md in full after latest binding reminder: 2361 lines.
-- [x] Read FEATURES.md in full after latest binding reminder: 1293 lines.
-- [x] Read FAILURE_MODE_ANALYSIS.md in full after latest binding reminder: 93 lines.
-- [x] Read REPO_AUDIT.md in full after latest binding reminder: 151 lines.
-- [x] Update SPEC to make KFAC damping exclusively typed-operator damping and reject metric-owned declarations.
-- [x] Lower `vp.damping.per_group(...)` for dense, low-rank, GGN-derived, and matrix-free metrics using parameter-surface group names.
-- [x] Run focused per-group tests after lint cleanup.
-- [x] Run `bash -lc 'make lint-fix'`.
-- [x] Run `bash -lc 'make test'`.
-- [x] Commit and push the current verified tree for Ferranti hardware testing.
-- [x] Pull the pushed branch in `/home/hennig/hmx900/repos/vptune` on Ferranti.
-- [x] Submit the hardware-guarded tests to the `h100-ferranti` partition and record the result -- Slurm job 398414.
-- [x] Re-audit remaining blockers against live code after the goal continuation.
-- [x] Run focused manifest, FEATURES parity, acceptance-coverage, and root-surface tests.
-- [x] Run focused boundary tests for the remaining blocker cases.
-- [x] Finish sampled-Fisher run-level admission for the two named sampling-bound formulas.
-- [x] Finish matrix-free preconditioner runtime test with `inverse_metric.preconditioner_product`.
-- [x] Add inverse-sqrt matrix-free Lanczos `tol` runtime test.
-- [x] Update `BLOCKERS.md` after the three resolved implementation gaps are verified.
-- [x] Run focused tests for the current slice -- 11 passed.
-- [x] Run `bash -lc 'make lint-fix'` -- passed.
-- [x] Run `bash -lc 'make test'` -- 858 passed, 11 skipped, 38 warnings.
-- [x] Resolve the remaining loss-constructor assumption blocker by making the executable semantics explicit in SPEC.
-- [x] Clear `BLOCKERS.md` after the SPEC loss clarification.
-- [x] Run final `bash -lc 'make lint-fix'` -- passed.
-- [x] Run final `bash -lc 'make test'` -- 858 passed, 11 skipped, 38 warnings.
-- [x] Rerun Ferranti hardware tests after the final local tree is ready for full DoD -- Slurm job 398424, 9 passed.
+- [x] Read SPEC.md in full.
+- [x] Read FEATURES.md in full.
+- [x] Read FAILURE_MODE_ANALYSIS.md in full.
+- [x] Read REPO_AUDIT.md and extract mistakes to avoid.
+- [x] Inspect current package and tests before editing.
+- [x] Run local lint and tests for current source/test changes.
+- [x] Run hardware-gated tests on Ferranti.
+- [x] Audit remaining spec gaps from current evidence.
+- [x] Derive the next missing spec step and implement it vertically.
+- [x] Run lint and tests required for edited files.
 
 ## Open questions for the user
-- None.
 
 ## Uncertain / ideas to explore
-- REPO_AUDIT guard: do not add another near-identical branch or spy test. Prefer one dispatch point and parametrized behavior tests.
+- Need verify every audit finding against current files before acting on it; the audit itself says live edits superseded some findings.
+- Prefer adding rows to existing tables and parametrized tests over new per-case functions.
+- Need stop and raise any conflict where current code is better than SPEC.md or where I disagree with the spec.
 
 ## Notes to self
-- Ferranti for this goal is `ssh -i ~/.ssh/slurm_tue hmx900@134.2.168.205 -p 2221` only.
-- No `owl569` access under any circumstance in this session.
-- The latest binding read completed on 2026-06-07 before resuming implementation.
-- Current SPEC says sampled Fisher public sources accept `sampling_bound=`, with `abs_or_rel`, `matrix_bernstein`, and `hutchinson_relative_variance`.
-- Current SPEC says inverse-sqrt `tol` is admitted only for matrix-free Lanczos and sets the accepted Lanczos residual estimate.
-- Current SPEC says `inverse_metric.preconditioner=matrix_free` requires companion setting `inverse_metric.preconditioner_product`.
-- Current SPEC says KFAC damping is only through typed `vp.damping.*`; metric-owned KFAC damping declarations reject.
-- Current SPEC now spells out KL, MSE, declared-PSD, and declared-PSD matrix-free loss semantics to match the executable code and tests.
-- Existing Ferranti evidence before this final tree: Slurm job 398414 passed 12 hardware tests on `h100-ferranti`.
-- Final Ferranti evidence: Slurm job 398424 completed 0:0 on `h100-ferranti`, allocated `gres/gpu:h100=2`, and pytest reported 9 passed in 12.10s.
-- Final local evidence: `make lint-fix` passed and `make test` passed with 858 passed, 11 skipped, 38 warnings.
-- Manifest parity evidence: full `make test` passed tests covering SPEC key/value domains, FEATURES key parity, manifest value/check coverage, and SPEC acceptance coverage.
+- Existing scratchpad was explicitly ignored for this session.
+- SPEC Implementation Order starts with manifest parity, then core data/schema/replay, then runtime lowerings, anchors, measurement/selection/search, autobatch, attention, adapters, compile, memory, layout, distributed, pilot.
+- FEATURES permits per-value ownership only for attention.frontend; all other keys have exactly one owner.
+- No fallback behavior is allowed. Unsupported combinations should be explicit admission failures or explicit raises at the required layer.
+- REPO_AUDIT run 3 flags current work to verify: composition algebra lowering, missing loss constructors, manifest meta-tests, admission timing, alias normalization, with matrix_free status treated as possibly changed.
+- FAILURE_MODE_ANALYSIS warns against copying each operator/value into separate functions when one data-driven dispatch or parametrized test covers the behavior.
+- Current tree already has loss constructors, composition algebra tests, and manifest meta-tests that REPO_AUDIT listed as missing.
+- Local `make lint-fix` passed.
+- Local `make test` passed with 860 passed, 11 skipped, 38 warnings after escalation for uv cache access.
+- Ferranti hardware-gated job `398465` on `h100-ferranti` passed 8 tests in 10.89s with two H100 GPUs: CUDA SDPA backends, single-rank and two-rank NCCL, GPU vector residency, GPU input movement, and GPU teacher outputs.
+- Ferranti pinned-memory job `398466` on `h100-ferranti` passed 3 tests in 4.16s with one H100 GPU: pinned vector residency, pinned input movement, and pinned teacher outputs. All 11 local skipped hardware/backend tests now have Ferranti pass evidence.
+- Commit `17003cc` pushed to origin/codex-implement-spec for cluster testing.
+- Meta-audit command passed: 6 tests covering manifest-vs-SPEC domains, manifest-vs-FEATURES keys, manifest value/check coverage, acceptance-test coverage, descriptor identity fields, and root import boundary.
+- `BLOCKERS.md` currently contains `None`.
+- User approved editing SPEC.md to add missing `src/vptune/ext.py` to Package Layout because the public API already requires `vptune.ext`.
+- User approved keeping `public.py`; SPEC Package Layout now lists `public.py` and the real test files.
+- Root `vp.materialize` now matches SPEC with only `name=`, and tests/internal calls use `name=` instead of `family=`.
+- Verification after edits: `make lint-fix` passed; focused materialize/layout tests passed 3; full `make test` passed with 860 passed, 11 skipped, 38 warnings.
+- Current-tree verification before final Ferranti run: `make lint-fix` passed; focused manifest/acceptance/API tests passed 7; full `make test` passed with 860 passed, 11 skipped, 38 warnings.

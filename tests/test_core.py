@@ -4338,6 +4338,11 @@ def test_plan_materialize_accepts_public_name_selector() -> None:
     with pytest.raises(vp.MaterializationError, match="selectors differ"):
         plan.materialize("family", name="other")
 
+    public_materialize = vars(vp)["materialize"]
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'family'"):
+        public_materialize(plan, family="family")
+
 
 def test_validate_plan_materializes_in_validation_order() -> None:
     input_signature = {"case": "validation-materialization-order"}
@@ -7725,7 +7730,7 @@ def test_tune_uses_explicit_candidates_and_reference_checks(tmp_path: Path) -> N
     assert len(plan.check_records) == 3
     assert plan.check_records[0].status == "passed"
     assert plan.check_records[1].status == "failed"
-    selected_operator = vp.materialize(plan, family="family")
+    selected_operator = vp.materialize(plan, name="family")
 
     assert torch.equal(selected_operator(), torch.tensor([2.0]))
 
@@ -8205,7 +8210,7 @@ def test_tune_writes_records_and_produced_rows_are_current(tmp_path: Path) -> No
         },
         run_dir=tmp_path,
     )
-    replayed_operator = vp.materialize(replayed, family="family")
+    replayed_operator = vp.materialize(replayed, name="family")
 
     assert torch.equal(replayed_operator(), torch.tensor([1.0]))
 
