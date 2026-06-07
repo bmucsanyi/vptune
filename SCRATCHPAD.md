@@ -1,5 +1,5 @@
 # Scratchpad
-Branch: codex-implement-spec @ d2d3d99
+Branch: codex-implement-spec @ 4b715a1
 
 ## TODO
 - [x] Read SPEC.md in full after latest binding reminder: 2361 lines.
@@ -28,7 +28,7 @@ Branch: codex-implement-spec @ d2d3d99
 - [x] Clear `BLOCKERS.md` after the SPEC loss clarification.
 - [x] Run final `bash -lc 'make lint-fix'` -- passed.
 - [x] Run final `bash -lc 'make test'` -- 858 passed, 11 skipped, 38 warnings.
-- [ ] Rerun Ferranti hardware tests after the final local tree is ready for full DoD.
+- [x] Rerun Ferranti hardware tests after the final local tree is ready for full DoD -- Slurm job 398424, 9 passed.
 
 ## Open questions for the user
 - None.
@@ -46,3 +46,6 @@ Branch: codex-implement-spec @ d2d3d99
 - Current SPEC says KFAC damping is only through typed `vp.damping.*`; metric-owned KFAC damping declarations reject.
 - Current SPEC now spells out KL, MSE, declared-PSD, and declared-PSD matrix-free loss semantics to match the executable code and tests.
 - Existing Ferranti evidence before this final tree: Slurm job 398414 passed 12 hardware tests on `h100-ferranti`.
+- Final Ferranti evidence: Slurm job 398424 completed 0:0 on `h100-ferranti`, allocated `gres/gpu:h100=2`, and pytest reported 9 passed in 12.10s.
+- Final local evidence: `make lint-fix` passed and `make test` passed with 858 passed, 11 skipped, 38 warnings.
+- Manifest parity evidence: full `make test` passed tests covering SPEC key/value domains, FEATURES key parity, manifest value/check coverage, and SPEC acceptance coverage.
