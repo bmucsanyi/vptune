@@ -160,6 +160,10 @@ def validate_selection_policy(policy: SelectionPolicy) -> None:
     Raises:
         RuntimeError: If the policy requests an unsupported field.
     """
+    if policy.near_fastest_multiplier < 1.0:
+        message = "near_fastest_multiplier must be at least 1.0"
+        raise RuntimeError(message)
+
     if policy.speed_statistic != "median_elapsed_seconds":
         message = f"unsupported speed statistic: {policy.speed_statistic}"
         raise RuntimeError(message)

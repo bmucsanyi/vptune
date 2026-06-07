@@ -162,6 +162,10 @@ class DeterminismPolicy:
 
     fields: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Validate deterministic-execution policy fields."""
+        _validate_identity_fields(self.fields, "determinism policy")
+
     def signature(self) -> Mapping[str, Any]:
         """Return stable deterministic-execution policy fields."""
         return dict(self.fields)
@@ -172,6 +176,10 @@ class EnvironmentPolicy:
     """Typed target environment-capture policy."""
 
     fields: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate target environment-capture fields."""
+        _validate_identity_fields(self.fields, "environment policy")
 
     def signature(self) -> Mapping[str, Any]:
         """Return stable target environment-capture fields."""
@@ -969,6 +977,18 @@ class Target:
     selection_policy: SelectionPolicy
     determinism_policy: DeterminismPolicy
     environment_policy: EnvironmentPolicy
+
+    def __post_init__(self) -> None:
+        """Validate public target identity fields."""
+        _validate_string_tuple(self.devices, "target devices", require_nonempty=True)
+        _require_nonempty_string(self.accelerator, "accelerator")
+        _validate_string_tuple(self.allowed_dtypes, "allowed_dtypes")
+        _validate_string_tuple(
+            self.allowed_attention_frontends,
+            "allowed_attention_frontends",
+        )
+        _validate_string_tuple(self.allowed_sdpa_kernels, "allowed_sdpa_kernels")
+        _validate_string_tuple(self.allowed_sharding_modes, "allowed_sharding_modes")
 
     def lower(self, search: SearchStrategy) -> _LowerTarget:
         """Return the lower-layer target used by the tuning engine."""
@@ -6516,6 +6536,43 @@ def _require_nonempty_string(value: Any, name: str) -> None:
 
     message = f"{name} must be a nonempty string"
     raise MaterializationError(message)
+
+
+def _validate_identity_fields(fields: Mapping[str, Any], name: str) -> None:
+    if not isinstance(fields, Mapping):
+        message = f"{name} fields must be a mapping"
+        raise MaterializationError(message)
+
+    for key in fields:
+        _require_nonempty_string(key, f"{name} key")
+
+    try:
+        to_json_value(fields)
+    except TypeError as error:
+        message = f"{name} fields must be JSON-compatible"
+        raise MaterializationError(message) from error
+
+
+def _validate_string_tuple(
+    values: tuple[str, ...],
+    name: str,
+    *,
+    require_nonempty: bool = False,
+) -> None:
+    if not isinstance(values, tuple):
+        message = f"{name} must be a tuple"
+        raise MaterializationError(message)
+
+    if require_nonempty and not values:
+        message = f"{name} must be nonempty"
+        raise MaterializationError(message)
+
+    for value in values:
+        _require_nonempty_string(value, name)
+
+    if len(set(values)) != len(values):
+        message = f"{name} must be unique"
+        raise MaterializationError(message)
 
 
 def _require_loss_reduction(reduction: str) -> None:

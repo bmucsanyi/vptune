@@ -2,6 +2,7 @@
 
 import dataclasses
 import itertools
+import math
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -704,6 +705,53 @@ class TimingPolicy:
     long_warmups: int = 0
     long_measured_calls: int = 1
 
+    def __post_init__(self) -> None:
+        """Validate timing policy fields.
+
+        Raises:
+            RuntimeError: If thresholds or call counts are invalid.
+        """
+        thresholds = (
+            ("short_seconds", self.short_seconds),
+            ("medium_seconds", self.medium_seconds),
+        )
+
+        for name, value in thresholds:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                message = f"{name} must be finite and nonnegative"
+                raise RuntimeError(message)
+
+        if self.medium_seconds < self.short_seconds:
+            message = "medium_seconds must be at least short_seconds"
+            raise RuntimeError(message)
+
+        warmups = (
+            ("short_warmups", self.short_warmups),
+            ("medium_warmups", self.medium_warmups),
+            ("long_warmups", self.long_warmups),
+        )
+
+        for name, value in warmups:
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                message = f"{name} must be a nonnegative integer"
+                raise RuntimeError(message)
+
+        measured_calls = (
+            ("short_measured_calls", self.short_measured_calls),
+            ("medium_measured_calls", self.medium_measured_calls),
+            ("long_measured_calls", self.long_measured_calls),
+        )
+
+        for name, value in measured_calls:
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                message = f"{name} must be a positive integer"
+                raise RuntimeError(message)
+
     def plan(self, elapsed_seconds: float) -> tuple[int, int]:
         """Return warmup and measured-call counts."""
         if elapsed_seconds < self.short_seconds:
@@ -734,9 +782,22 @@ class SelectionPolicy:
         """Validate policy fields.
 
         Raises:
-            RuntimeError: If the compile call horizon is invalid.
+            RuntimeError: If numeric policy fields are invalid.
         """
-        if self.compile_call_horizon <= 0:
+        if (
+            isinstance(self.near_fastest_multiplier, bool)
+            or not isinstance(self.near_fastest_multiplier, int | float)
+            or not math.isfinite(self.near_fastest_multiplier)
+            or self.near_fastest_multiplier < 1.0
+        ):
+            message = "near_fastest_multiplier must be finite and at least 1.0"
+            raise RuntimeError(message)
+
+        if (
+            not isinstance(self.compile_call_horizon, int)
+            or isinstance(self.compile_call_horizon, bool)
+            or self.compile_call_horizon <= 0
+        ):
             message = "compile_call_horizon must be positive"
             raise RuntimeError(message)
 
@@ -767,7 +828,11 @@ class SearchPolicy:
             message = f"unsupported search strategy: {self.strategy}"
             raise RuntimeError(message)
 
-        if self.retained_top_count is not None and self.retained_top_count <= 0:
+        if self.retained_top_count is not None and (
+            not isinstance(self.retained_top_count, int)
+            or isinstance(self.retained_top_count, bool)
+            or self.retained_top_count <= 0
+        ):
             message = "retained_top_count must be positive"
             raise RuntimeError(message)
 
@@ -778,7 +843,10 @@ class SearchPolicy:
             message = f"{self.strategy} search requires retained_top_count"
             raise RuntimeError(message)
 
-        if any(horizon <= 0 for horizon in self.compile_call_horizons):
+        if any(
+            not isinstance(horizon, int) or isinstance(horizon, bool) or horizon <= 0
+            for horizon in self.compile_call_horizons
+        ):
             message = "compile_call_horizons must be positive"
             raise RuntimeError(message)
 
@@ -786,9 +854,10 @@ class SearchPolicy:
             message = "thorough search requires compile_call_horizons"
             raise RuntimeError(message)
 
-        if (
-            self.variance_repeat_count is not None
-            and self.variance_repeat_count < MIN_VARIANCE_REPEAT_COUNT
+        if self.variance_repeat_count is not None and (
+            not isinstance(self.variance_repeat_count, int)
+            or isinstance(self.variance_repeat_count, bool)
+            or self.variance_repeat_count < MIN_VARIANCE_REPEAT_COUNT
         ):
             message = (
                 f"variance_repeat_count must be at least {MIN_VARIANCE_REPEAT_COUNT}"

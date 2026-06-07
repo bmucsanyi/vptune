@@ -1,109 +1,51 @@
 # Scratchpad
-Branch: codex-implement-spec @ b3f5851
+Branch: codex-implement-spec @ b112e52 + uncommitted validation audit fixes
 
 ## TODO
 - [x] Read SPEC.md in full.
 - [x] Read FEATURES.md in full.
 - [x] Read FAILURE_MODE_ANALYSIS.md in full.
 - [x] Read REPO_AUDIT.md and extract mistakes to avoid.
-- [x] Inspect current package and tests before editing.
-- [x] Run local lint and tests for current source/test changes.
-- [x] Run hardware-gated tests on Ferranti.
-- [x] Audit remaining spec gaps from current evidence.
-- [x] Derive the next missing spec step and implement it vertically.
-- [x] Run lint and tests required for edited files.
-- [x] Review current production-readiness guidance and map it to this repo.
-- [x] Complete code review for API stability, failure modes, and maintainability.
-- [x] Fix production-readiness gaps found by review.
-- [x] Run real user workflows against the public API.
-- [x] Check README examples against the final API.
-- [x] Verify build/install from a fresh environment.
-- [x] Review test warnings and decide whether they require code changes.
-- [x] Decide handling for untracked audit docs and scratchpad state.
-- [x] Rerun lint, tests, and any required hardware checks after changes.
-- [x] Build a 2026 source-backed engineering checklist for this specific package.
-- [ ] Poll final Ferranti job `398529` until it completes.
-- [ ] Audit public API, data normalization, and replay path with file/line findings.
-- [ ] Audit admission, lowering, measurement, and selection for hidden behavior.
-- [ ] Audit packaging, dependency, warning, and release behavior beyond build success.
-- [x] Patch confirmed defects with focused tests.
-- [ ] Rerun local lint/test gates and required Ferranti gates after final code edit.
-- [ ] Rebuild final wheel/sdist and run `twine check`.
-- [ ] Fresh-install final wheel/sdist and run import/workflow checks.
+- [x] Build a source-backed engineering checklist from current primary sources.
+- [x] Patch package metadata, security files, dependency bounds, and sdist contents.
+- [x] Patch candidate generation to reject empty extension-axis value lists.
+- [x] Patch fresh-install PyTorch NumPy warning by adding explicit NumPy runtime dependency.
+- [x] Patch timing policy validation.
+- [x] Patch public target and policy identity validation.
+- [x] Patch selection/search policy integer validation.
+- [x] Run `make lint-fix`.
+- [x] Run `make lint`.
+- [x] Run full local `make test`: 889 passed, 11 skipped.
+- [x] Run `git diff --check`.
+- [x] Build current wheel/sdist at `/private/tmp/vptune-audit-final-dist-5`.
+- [x] Run `twine check` on current wheel/sdist.
+- [x] Fresh-install current wheel/sdist into Python 3.14 envs.
+- [x] Run warning-as-error imports from both fresh installs.
+- [x] Run warning-as-error README-style CPU tuning workflow from both fresh installs.
+- [x] Run `uv pip check` in both fresh installs.
+- [x] Run `pip-audit` on final wheel env by path.
+- [x] Cancel stale Ferranti job `398531`.
+- [ ] Commit and push final validation audit fixes.
+- [ ] Pull final commit on Ferranti.
+- [ ] Submit current-code hardware tests to `h100-ferranti`.
+- [ ] Poll current-code Ferranti job and read output.
 
 ## Open questions for the user
 
 ## Uncertain / ideas to explore
-- Need verify every audit finding against current files before acting on it; the audit itself says live edits superseded some findings.
-- Prefer adding rows to existing tables and parametrized tests over new per-case functions.
-- Need stop and raise any conflict where current code is better than SPEC.md or where I disagree with the spec.
-- Metadata was moved to version 1.0.0 and `Development Status :: 5 - Production/Stable`; `PACKAGE_VERSION` and `uv.lock` were updated with it.
-- README now has a root public API quickstart that tunes built-in softmax-cross-entropy gradient on CPU.
-- Audit docs stay untracked local review inputs and are excluded from package output. `SCRATCHPAD.md` stays the tracked live scratchpad required by repo instructions and is also excluded from package output.
-- Best-practice mapping used NIST SSDF, PyPA packaging/build docs, Hatch sdist file selection docs, and OpenSSF Scorecard checks.
-- Direct git runtime dependency on `autobatch` is verified for repo/wheel/sdist install, but PyPA says public indexes should not allow direct references in uploaded distributions. Do not claim PyPI-upload readiness until `autobatch` has a normal index release or the dependency model changes.
+- Direct git dependency on `autobatch` works for local, wheel, and sdist installs, but public advisory tooling skips it because it is not a PyPI package.
+- `pyproject.toml` declares `import-names = ["vptune"]`, but emitted wheel metadata stays at Core Metadata 2.4 because current Twine rejects Core Metadata 2.5.
+- Remaining pytest warning filters are exact PyTorch internal warning filters for `torch.jit` and `torch.fx` paths required by the test suite. Fresh install imports and README workflow pass with `-W error`.
 
 ## Notes to self
-- Existing scratchpad was explicitly ignored for this session.
-- SPEC Implementation Order starts with manifest parity, then core data/schema/replay, then runtime lowerings, anchors, measurement/selection/search, autobatch, attention, adapters, compile, memory, layout, distributed, pilot.
-- FEATURES permits per-value ownership only for attention.frontend; all other keys have exactly one owner.
-- No fallback behavior is allowed. Unsupported combinations should be explicit admission failures or explicit raises at the required layer.
-- REPO_AUDIT run 3 flags current work to verify: composition algebra lowering, missing loss constructors, manifest meta-tests, admission timing, alias normalization, with matrix_free status treated as possibly changed.
-- FAILURE_MODE_ANALYSIS warns against copying each operator/value into separate functions when one data-driven dispatch or parametrized test covers the behavior.
-- Current tree already has loss constructors, composition algebra tests, and manifest meta-tests that REPO_AUDIT listed as missing.
-- Local `make lint-fix` passed.
-- Local `make test` passed with 860 passed, 11 skipped, 38 warnings after escalation for uv cache access.
-- Ferranti hardware-gated job `398465` on `h100-ferranti` passed 8 tests in 10.89s with two H100 GPUs: CUDA SDPA backends, single-rank and two-rank NCCL, GPU vector residency, GPU input movement, and GPU teacher outputs.
-- Ferranti pinned-memory job `398466` on `h100-ferranti` passed 3 tests in 4.16s with one H100 GPU: pinned vector residency, pinned input movement, and pinned teacher outputs. All 11 local skipped hardware/backend tests now have Ferranti pass evidence.
-- Commit `17003cc` pushed to origin/codex-implement-spec for cluster testing.
-- Meta-audit command passed: 6 tests covering manifest-vs-SPEC domains, manifest-vs-FEATURES keys, manifest value/check coverage, acceptance-test coverage, descriptor identity fields, and root import boundary.
 - `BLOCKERS.md` currently contains `None`.
-- User approved editing SPEC.md to add missing `src/vptune/ext.py` to Package Layout because the public API already requires `vptune.ext`.
-- User approved keeping `public.py`; SPEC Package Layout now lists `public.py` and the real test files.
-- Root `vp.materialize` now matches SPEC with only `name=`, and tests/internal calls use `name=` instead of `family=`.
-- Verification after edits: `make lint-fix` passed; focused materialize/layout tests passed 3; full `make test` passed with 860 passed, 11 skipped, 38 warnings.
-- Current-tree verification before final Ferranti run: `make lint-fix` passed; focused manifest/acceptance/API tests passed 7; full `make test` passed with 860 passed, 11 skipped, 38 warnings.
-- Final commit for code/spec/test verification is `38d7f77`.
-- Ferranti final pinned-memory job `398473` on `h100-ferranti` passed 3 tests in 4.90s with one H100 GPU.
-- Ferranti final hardware-gated job `398472` on `h100-ferranti` passed 8 tests in 10.96s with two H100 GPUs: CUDA SDPA backends, single-rank and two-rank NCCL, GPU vector residency, GPU input movement, and GPU teacher outputs.
-- Production-readiness pass started after acceptance completion. Current concrete gaps: README only has title and one sentence; `pyproject.toml` still declares `Development Status :: 3 - Alpha`; fresh install and public workflow examples still need this-pass verification.
-- A CE gradient tuning example with an all-ones reference vector failed because the directional reference denominator was zero, producing nonfinite `directional_rel_diff`; a nondegenerate vector fixes the example and the code path passes.
-- Added `tests/test_public_api.py::test_public_tune_builtin_softmax_cross_entropy_gradient`.
-- Added `tests/test_core.py::test_package_version_matches_project_metadata`.
-- Verification after README/version edits: `make lint-fix` passed; focused metadata and public CE-gradient workflow tests passed 2; README workflow command passed and printed the expected gradient tensor.
-- First package build succeeded but sdist included `.uv-cache`, `SCRATCHPAD.md`, `FAILURE_MODE_ANALYSIS.md`, and `REPO_AUDIT.md`. Added explicit Hatch sdist include list.
-- Rebuilt package at `/private/tmp/vptune-prod-dist-20260607-2`: wheel contains only installable `vptune` package and dist-info; sdist contains source, tests, design docs, README/LICENSE/pyproject/Makefile/uv.lock, and omits cache, scratchpad, and audit docs.
-- Fresh wheel install into `/private/tmp/vptune-prod-venv-20260607-2` succeeded with `vptune==1.0.0`, `torch==2.12.0`, and pinned `autobatch` commit `a0663ac586c61c4593e9b9c6031f43f464f61139`.
-- Fresh installed README workflow passed and printed package version `1.0.0` plus the expected gradient tensor.
-- `uv pip check` passed in the fresh environment; `python -m pip check` is unavailable because the uv-created venv has no `pip` module.
-- `twine check` passed for final `vptune-1.0.0` wheel and sdist.
-- Fresh sdist install into `/private/tmp/vptune-prod-sdist-venv-20260607` passed; the installed workflow, metadata check, and `uv pip check` all passed.
-- Fresh sdist install imports passed for `vptune`, `vptune.ext`, `vptune.adapters`, `vptune.adapters.transformers`, `vptune.adapters.distributed`, and `vptune.adapters.pilot` without installing the optional `transformers` extra.
-- `pip-audit` over the fresh site-packages found no known vulnerabilities in PyPI packages. It skipped `autobatch` and `vptune` because direct/local packages are not in PyPI advisory matching.
-- Warning review: full local test suite has 38 warnings, all from PyTorch internals: 18 `torch.jit.script` deprecations in attention tests, 14 `torch.jit.script_method` deprecations in standard runtime tests, and 6 `torch.fx` const-fold UserWarnings. Fresh install also shows PyTorch's no-NumPy warning when NumPy is absent. No package code calls `torch.jit.script` or `script_method`; adding NumPy solely to silence PyTorch would add an unused dependency.
-- `pytest -W error tests/test_public_api.py` fails in 9 JVP/GGN-related public tests because PyTorch emits the same `torch.jit.script` deprecation while loading forward-AD decompositions inside `torch.func.jvp`. Focused README/public gradient workflow passes with `-W error`.
-- Added exact pytest filters for known PyTorch internal warnings. Normal required `make test` now reports `862 passed, 11 skipped` with no warnings summary.
-- Final local lint gate after package edits: `make lint-fix` passed and `git diff --check` passed.
-- Commit `4fc34c1` pushed to origin/codex-implement-spec for final Ferranti verification.
-- Ferranti checkout `/home/hennig/hmx900/repos/vptune` fast-forwarded to `4fc34c1`.
-- Ferranti pinned-memory job `398527` on `h100-ferranti` passed 3 tests in 4.24s; Slurm state COMPLETED 0:0.
-- Ferranti 2-GPU hardware job `398526` on `h100-ferranti` is still pending by priority and must finish before production-ready certification.
-- Commit `b3f5851` adds exact PyTorch warning filters and was pushed to origin/codex-implement-spec. Ferranti checkout fast-forwarded to `b3f5851`.
-- Replaced pending 2-GPU job `398526` with final job `398529`, which prints `git rev-parse --short HEAD` before running hardware tests.
-- Final `b3f5851` package build passed: `twine check` passed for wheel and sdist, sdist excludes cache/scratchpad/audit docs, and wheel contains only package plus dist-info.
-- Fresh final wheel and sdist installs passed into `/private/tmp/vptune-prod-wheel-venv-b3f5851` and `/private/tmp/vptune-prod-sdist-venv-b3f5851`; both installed workflows printed `1.0.0` and expected gradient; both `uv pip check` commands passed.
-- Final wheel environment import check passed for root, extension, and adapter modules. Final wheel environment `pip-audit` found no known vulnerabilities in PyPI packages; it skipped local/direct packages `vptune` and `autobatch`.
-- User rejected the earlier audit as too shallow. Corrective move: source-backed engineering checklist, module-by-module review, concrete file/line findings, patches for real defects.
-- External source basis now includes NIST SSDF, PyPA packaging specs, SLSA, OpenSSF Scorecard, pytest warning docs, Python warning docs, Ruff docs, mypy docs, and pip-audit docs.
-- Final Ferranti job `398529` is still pending by priority as of the latest poll.
-- Confirmed packaging metadata defect: legacy license table plus missing `import-names` left wheel/sdist below current PyPA metadata fields. Patched `pyproject.toml` and `tests/test_core.py`.
-- Build backend is now pinned as `hatchling==1.30.1`, and both wheel and sdist metadata are forced to Core Metadata 2.5 so `Import-Name` is emitted.
-- Added `SECURITY.md`, `.github/CODEOWNERS`, and `.github/dependabot.yml`; `pyproject.toml` now ships them in the sdist.
-- Focused repo/package tests passed: `test_package_metadata_matches_current_pypa_fields` and `test_repository_security_files_are_declared`.
-- Rebuilt `/private/tmp/vptune-audit-metadata-build-5`; sdist includes `SECURITY.md`, `.github/CODEOWNERS`, and `.github/dependabot.yml`.
-- Confirmed candidate helper bug: `settings_product` with an empty extension axis reached an unbound local. Patched it to raise `AdmissionError` and added `test_settings_product_rejects_empty_axis_values`.
-- Confirmed dependency metadata gap: spec is grounded in PyTorch 2.12 but package declared plain `torch`. Patched dependency to `torch>=2.12,<2.13`, updated README and `uv.lock`, and verified wheel metadata emits `Requires-Dist: torch<2.13,>=2.12`.
-- Aligned `make lint` with `make lint-fix` by adding `ty check src tests` to the non-mutating lint gate.
-- Twine 6.2.0 rewrites `packaging.metadata._VALID_METADATA_VERSIONS` at import time and rejects Core Metadata 2.5 even when the installed `packaging` accepts it. Final emitted metadata must stay at 2.4 until Twine accepts 2.5.
-- `pyproject.toml` still declares `import-names = ["vptune"]`, but the wheel cannot emit `Import-Name` while `twine check` requires Core Metadata 2.4.
-- Final current-code local gates still need rerun after lowering emitted metadata to 2.4.
+- `make test` final local count after validation fixes: 889 passed, 11 skipped, coverage 82%.
+- Current wheel metadata includes SPDX license, license file, NumPy, PyTorch `>=2.12,<2.13`, and no legacy license classifier.
+- Current sdist includes `.github/CODEOWNERS`, `.github/dependabot.yml`, `SECURITY.md`, SPEC/FEATURES/BLOCKERS, tests, source, README, LICENSE, Makefile, pyproject, and uv.lock.
+- `settings_product` now raises `AdmissionError` for an empty axis value list instead of leaking an unbound local.
+- `TimingPolicy` now rejects invalid thresholds, negative warmups, and nonpositive measured-call counts.
+- Public `Target` now rejects empty/duplicate devices, empty accelerator, duplicate allowed values, non-tuple allowed values, and empty allowed entries.
+- `DeterminismPolicy` and `EnvironmentPolicy` now require string keys and JSON-compatible values.
+- `SelectionPolicy` now rejects invalid `near_fastest_multiplier` and non-integer or nonpositive `compile_call_horizon`.
+- `SearchPolicy` now rejects bool/non-integer retained counts, compile horizons, and variance repeat counts.
+- Stale Ferranti job `398531` was canceled because it targeted commit `b112e52` before the validation fixes.

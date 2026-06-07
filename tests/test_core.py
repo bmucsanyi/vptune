@@ -994,6 +994,15 @@ def test_search_policy_requires_balanced_top_count() -> None:
     with pytest.raises(RuntimeError, match="retained_top_count"):
         vpx.SearchPolicy(strategy="balanced")
 
+    with pytest.raises(RuntimeError, match="retained_top_count"):
+        vpx.SearchPolicy(strategy="balanced", retained_top_count=True)
+
+    with pytest.raises(RuntimeError, match="retained_top_count"):
+        vpx.SearchPolicy(
+            strategy="balanced",
+            retained_top_count=unchecked_timing_policy_value(1.5),
+        )
+
 
 def test_search_policy_requires_thorough_fields() -> None:
     with pytest.raises(RuntimeError, match="compile_call_horizons"):
@@ -1005,6 +1014,69 @@ def test_search_policy_requires_thorough_fields() -> None:
             retained_top_count=1,
             compile_call_horizons=(1,),
         )
+
+    with pytest.raises(RuntimeError, match="compile_call_horizons"):
+        vpx.SearchPolicy(
+            strategy="thorough",
+            retained_top_count=1,
+            compile_call_horizons=(True,),
+            variance_repeat_count=2,
+        )
+
+    with pytest.raises(RuntimeError, match="variance_repeat_count"):
+        vpx.SearchPolicy(
+            strategy="thorough",
+            retained_top_count=1,
+            compile_call_horizons=(1,),
+            variance_repeat_count=True,
+        )
+
+
+def unchecked_timing_policy_value(value: Any) -> Any:
+    return value
+
+
+@pytest.mark.parametrize(
+    ("factory", "message"),
+    [
+        (lambda: vpx.TimingPolicy(short_seconds=-1.0), "short_seconds"),
+        (lambda: vpx.TimingPolicy(short_seconds=float("inf")), "short_seconds"),
+        (lambda: vpx.TimingPolicy(short_seconds=True), "short_seconds"),
+        (
+            lambda: vpx.TimingPolicy(short_seconds=2.0, medium_seconds=1.0),
+            "medium_seconds",
+        ),
+        (lambda: vpx.TimingPolicy(short_warmups=-1), "short_warmups"),
+        (lambda: vpx.TimingPolicy(medium_warmups=True), "medium_warmups"),
+        (
+            lambda: vpx.TimingPolicy(long_warmups=unchecked_timing_policy_value(1.5)),
+            "long_warmups",
+        ),
+        (lambda: vpx.TimingPolicy(short_measured_calls=0), "short_measured_calls"),
+        (
+            lambda: vpx.TimingPolicy(medium_measured_calls=False),
+            "medium_measured_calls",
+        ),
+        (lambda: vpx.TimingPolicy(long_measured_calls=-1), "long_measured_calls"),
+    ],
+)
+def test_timing_policy_rejects_invalid_counts_and_thresholds(
+    factory: Callable[[], vpx.TimingPolicy],
+    message: str,
+) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        factory()
+
+
+def test_timing_policy_allows_zero_thresholds_for_long_tier() -> None:
+    policy = vpx.TimingPolicy(
+        short_seconds=0.0,
+        medium_seconds=0.0,
+        long_warmups=0,
+        long_measured_calls=1,
+    )
+
+    assert policy.plan(0.1) == (0, 1)
 
 
 def test_tune_rejects_thorough_horizon_mismatch_before_probe() -> None:
@@ -4891,6 +4963,20 @@ def test_cohort_selection_sums_compiled_row_scores() -> None:
 
     assert cohort["a"][0] == compiled_a
     assert cohort["b"][0] == compiled_b
+
+
+@pytest.mark.parametrize("value", [0.0, 0.99, float("nan"), True])
+def test_selection_policy_rejects_invalid_near_fastest_multiplier(
+    value: float | bool,
+) -> None:
+    with pytest.raises(RuntimeError, match="near_fastest_multiplier"):
+        vpx.SelectionPolicy(near_fastest_multiplier=value)
+
+
+@pytest.mark.parametrize("value", [0, True, unchecked_timing_policy_value(1.5)])
+def test_selection_policy_rejects_invalid_compile_call_horizon(value: Any) -> None:
+    with pytest.raises(RuntimeError, match="compile_call_horizon"):
+        vpx.SelectionPolicy(compile_call_horizon=value)
 
 
 def test_selection_rejects_unsupported_policy_fields() -> None:

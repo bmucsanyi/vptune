@@ -15,6 +15,10 @@ import vptune.runtime as runtime_module
 from vptune.tensor_tree import tree_leaves
 
 
+def unchecked_public_value(value: Any) -> Any:
+    return value
+
+
 def test_root_import_surface_exposes_front_door_and_hides_extensions() -> None:
     for name in public_module.__all__:
         assert getattr(vp, name) is getattr(public_module, name)
@@ -2516,6 +2520,40 @@ def test_public_search_builders_lower_to_engine_policies() -> None:
             compile_horizons=(1,),
             variance_repeats=1,
         )
+
+
+def public_target_with_overrides(**overrides: Any) -> vp.Target:
+    return dataclasses.replace(public_cpu_target(), **overrides)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"devices": ()}, "target devices"),
+        ({"devices": ("cpu", "cpu")}, "target devices"),
+        ({"accelerator": ""}, "accelerator"),
+        ({"allowed_dtypes": ("fp32", "fp32")}, "allowed_dtypes"),
+        (
+            {"allowed_sdpa_kernels": unchecked_public_value(["math"])},
+            "allowed_sdpa_kernels",
+        ),
+        ({"allowed_sharding_modes": ("",)}, "allowed_sharding_modes"),
+    ],
+)
+def test_public_target_rejects_invalid_identity_fields(
+    overrides: Mapping[str, Any],
+    message: str,
+) -> None:
+    with pytest.raises(vp.MaterializationError, match=message):
+        public_target_with_overrides(**overrides)
+
+
+def test_public_policy_identity_fields_must_be_json_compatible() -> None:
+    with pytest.raises(vp.MaterializationError, match="determinism policy key"):
+        vp.DeterminismPolicy(unchecked_public_value({1: "enabled"}))
+
+    with pytest.raises(vp.MaterializationError, match="environment policy fields"):
+        vp.EnvironmentPolicy({"bad": object()})
 
 
 def test_public_cuda_target_lowers_to_engine_target() -> None:
