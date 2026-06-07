@@ -2021,7 +2021,7 @@ def _semantic_measurements(
             return {}
 
         matrix = _metric_dense_matrix(operator, batch, vector)
-        inverse_matrix = _inverse_metric_matrix(operator, matrix, batch)
+        inverse_matrix = _inverse_metric_matrix(operator, matrix, batch, vector)
         vector_tensor = _flatten_vector(vector)
         output_tensor = _flatten_vector(output)
         measurements = {
@@ -2034,7 +2034,7 @@ def _semantic_measurements(
             ),
             "condition_number_max": _matrix_condition_number(inverse_matrix),
         }
-        damping = _inverse_metric_damping(operator)
+        damping = _inverse_metric_min_damping(operator)
 
         if damping > 0.0:
             measurements["damping_min"] = damping
@@ -2057,7 +2057,7 @@ def _matrix_free_inverse_reference_measurements(
     if _metric_representation_kind(operator) != "matrix_free":
         return {}
 
-    damping = _inverse_metric_damping(operator)
+    damping = _inverse_metric_damping_payload(operator)
     flat_output = _flatten_vector(output)
     applied = _metric_apply_flat(
         operator,
@@ -2078,7 +2078,7 @@ def _matrix_free_inverse_reference_measurements(
 
     return {
         "inverse_residual": inverse_residual,
-        "damping_min": damping,
+        "damping_min": _minimum_inverse_metric_damping(damping),
     }
 
 
@@ -2124,7 +2124,7 @@ def _inverse_metric_inner_reference_measurements(
             solution_matrix,
         )
     }
-    damping = _inverse_metric_damping(operator)
+    damping = _inverse_metric_min_damping(operator)
 
     if damping > 0.0:
         measurements["damping_min"] = damping
@@ -2134,6 +2134,7 @@ def _inverse_metric_inner_reference_measurements(
             operator,
             _metric_dense_matrix(operator, batch, params),
             batch,
+            params,
         )
         measurements["condition_number_max"] = _matrix_condition_number(inverse_matrix)
 
@@ -2216,7 +2217,7 @@ def _inverse_metric_inner_residual(
     right_matrix: torch.Tensor,
     solution_matrix: torch.Tensor,
 ) -> float:
-    damping = _inverse_metric_damping(operator)
+    damping = _inverse_metric_damping_payload(operator)
 
     if _metric_representation_kind(operator) == "matrix_free":
         metric_path = _metric_runtime_path_from_settings(candidate.settings)
@@ -2234,6 +2235,7 @@ def _inverse_metric_inner_residual(
             operator,
             _metric_dense_matrix(operator, batch, params),
             batch,
+            params,
         )
         applied = _matmul_runtime(
             candidate.settings,
@@ -2505,9 +2507,10 @@ def _inverse_metric_matrix(
     operator: OperatorSpec,
     matrix: torch.Tensor,
     batch: Batch,
+    template: TensorTree | None = None,
 ) -> torch.Tensor:
     if _inverse_metric_damping_kind(operator) == "per_group":
-        return _per_group_damped_metric_matrix(operator, matrix, batch)
+        return _per_group_damped_metric_matrix(operator, matrix, batch, template)
 
     return _damped_metric_matrix(matrix, _inverse_metric_damping(operator))
 
@@ -2516,6 +2519,7 @@ def _per_group_damped_metric_matrix(
     operator: OperatorSpec,
     matrix: torch.Tensor,
     batch: Batch,
+    template: TensorTree | None,
 ) -> torch.Tensor:
     kind = _metric_representation_kind(operator)
 
@@ -2536,17 +2540,21 @@ def _per_group_damped_metric_matrix(
             )
         )
     elif kind == "kfac_factors":
-        factor_batch = _kfac_factor_batch(batch)
-        damped_blocks = []
-
-        for block in _kfac_blocks(operator):
-            left = _kfac_factor(factor_batch, block.left_factor_key)
-            right = _kfac_factor(factor_batch, block.right_factor_key)
-            dense_block = torch.kron(left, right)
-            damping = _inverse_metric_group_damping(operator, block.parameter_name)
-            damped_blocks.append(_damped_metric_matrix(dense_block, damping))
-
-        damped = torch.block_diag(*damped_blocks)
+        damped = _kfac_per_group_damped_metric_matrix(operator, batch)
+    elif kind == "ekfac_factors":
+        damped = _ekfac_per_group_damped_metric_matrix(operator, batch, template)
+    elif kind in {
+        "dense_matrix",
+        "low_rank_factors",
+        "ggn_derived_factors",
+    }:
+        damping = _per_group_damping_vector(
+            operator,
+            matrix.shape[0],
+            dtype=matrix.dtype,
+            device=matrix.device,
+        )
+        damped = matrix + torch.diag(damping)
     else:
         message = f"per_group damping is not lowered for metric kind: {kind}"
         raise MaterializationError(message)
@@ -2558,6 +2566,45 @@ def _per_group_damped_metric_matrix(
     _require_finite_tensor(damped, "per-group damped metric matrix")
 
     return damped
+
+
+def _kfac_per_group_damped_metric_matrix(
+    operator: OperatorSpec,
+    batch: Batch,
+) -> torch.Tensor:
+    factor_batch = _kfac_factor_batch(batch)
+    damped_blocks = []
+
+    for block in _kfac_blocks(operator):
+        left = _kfac_factor(factor_batch, block.left_factor_key)
+        right = _kfac_factor(factor_batch, block.right_factor_key)
+        dense_block = torch.kron(left, right)
+        damping = _inverse_metric_group_damping(operator, block.parameter_name)
+        damped_blocks.append(_damped_metric_matrix(dense_block, damping))
+
+    return torch.block_diag(*damped_blocks)
+
+
+def _ekfac_per_group_damped_metric_matrix(
+    operator: OperatorSpec,
+    batch: Batch,
+    template: TensorTree | None,
+) -> torch.Tensor:
+    if template is None:
+        message = "EKFAC per_group damping requires a vector template"
+        raise MaterializationError(message)
+
+    damped_blocks = []
+
+    for key, value in _ekfac_vector_map(template).items():
+        eigvecs_a, eigvecs_g, eigenvalues = _ekfac_factors(batch, key, value)
+        basis = torch.kron(eigvecs_a, eigvecs_g)
+        damping = _inverse_metric_group_damping(operator, key)
+        spectrum = eigenvalues.reshape(-1) + damping
+        block = basis @ torch.diag(spectrum) @ basis.T
+        damped_blocks.append(block)
+
+    return torch.block_diag(*damped_blocks)
 
 
 def _metric_reference_output(
@@ -2574,7 +2621,7 @@ def _metric_reference_output(
         result = dense_metric_multiply(matrix, flat_vector)
     elif operator.kind == "inverse_metric":
         result = dense_metric_inverse_multiply(
-            _inverse_metric_matrix(operator, matrix, batch),
+            _inverse_metric_matrix(operator, matrix, batch, vector),
             flat_vector,
         )
     else:
@@ -2988,7 +3035,23 @@ def _low_rank_inverse_metric_flat_batch(
     vector_batch: torch.Tensor,
 ) -> torch.Tensor:
     basis, diagonal = _low_rank_factors(batch, template)
-    base_diagonal = diagonal + _inverse_metric_damping(operator)
+    base_diagonal = _damped_diagonal_vector(operator, template, diagonal)
+
+    return _low_rank_plus_diagonal_inverse_flat_batch(
+        basis,
+        base_diagonal,
+        vector_batch,
+        "low-rank inverse metric",
+    )
+
+
+def _low_rank_plus_diagonal_inverse_flat_batch(
+    basis: torch.Tensor,
+    base_diagonal: torch.Tensor,
+    vector_batch: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    _require_positive_spectrum(base_diagonal, f"{name} base diagonal")
     inverse_base_vectors = vector_batch / base_diagonal
     inverse_base_basis = basis / base_diagonal.unsqueeze(1)
     inner = (
@@ -3003,7 +3066,7 @@ def _low_rank_inverse_metric_flat_batch(
         inverse_base_basis @ torch.linalg.solve(inner, basis.T @ inverse_base_vectors.T)
     ).T
     result = inverse_base_vectors - correction
-    _require_finite_tensor(result, "batched low-rank inverse metric result")
+    _require_finite_tensor(result, f"batched {name} result")
 
     return result
 
@@ -3311,7 +3374,8 @@ def _ekfac_inverse_metric_multiply(
         {},
         inverse=True,
         square_root=False,
-        damping=_inverse_metric_damping(operator),
+        damping=_inverse_metric_damping_payload(operator),
+        damping_kind=_inverse_metric_damping_kind(operator),
     )
 
 
@@ -3319,7 +3383,12 @@ def _ekfac_inverse_metric_multiply_batch(execution: "StandardExecution") -> Tens
     vector_batch = _flat_inverse_metric_vector_batch(execution)
     matrix = _ekfac_dense_matrix(execution.batch, execution.params)
     result = torch.linalg.solve(
-        _damped_metric_matrix(matrix, _inverse_metric_damping(execution.operator)),
+        _inverse_metric_matrix(
+            execution.operator,
+            matrix,
+            execution.batch,
+            execution.params,
+        ),
         vector_batch.T,
     ).T
     _require_finite_tensor(result, "batched inverse EKFAC metric result")
@@ -3338,7 +3407,12 @@ def _ekfac_square_root_apply(
         execution.candidate.settings,
         inverse=inverse,
         square_root=True,
-        damping=_inverse_metric_damping(execution.operator) if inverse else 0.0,
+        damping=(
+            _inverse_metric_damping_payload(execution.operator) if inverse else 0.0
+        ),
+        damping_kind=(
+            _inverse_metric_damping_kind(execution.operator) if inverse else "scalar"
+        ),
     )
 
 
@@ -3349,12 +3423,16 @@ def _ekfac_apply(
     *,
     inverse: bool,
     square_root: bool,
-    damping: float = 0.0,
+    damping: float | Mapping[str, float] = 0.0,
+    damping_kind: str = "scalar",
 ) -> TensorTree:
     result = {}
 
     for key, value in _ekfac_vector_map(vector).items():
         eigvecs_a, eigvecs_g, eigenvalues = _ekfac_factors(batch, key, value)
+        leaf_damping = (
+            _resolved_group_damping(damping, damping_kind, key) if inverse else 0.0
+        )
         result[key] = _ekfac_apply_leaf(
             eigvecs_a,
             eigvecs_g,
@@ -3363,7 +3441,7 @@ def _ekfac_apply(
             settings,
             inverse=inverse,
             square_root=square_root,
-            damping=damping,
+            damping=leaf_damping,
         )
 
     return result
@@ -3593,12 +3671,6 @@ def _ggn_derived_inverse_metric_flat_rhs(
     loss_hessian: torch.Tensor,
     rhs: torch.Tensor,
 ) -> torch.Tensor:
-    damping = _inverse_metric_damping(operator)
-
-    if damping <= 0.0:
-        message = "GGN-derived factorized inverse requires positive damping"
-        raise MaterializationError(message)
-
     if rhs.ndim != MATRIX_DIMS or rhs.shape[0] != jacobian.shape[1]:
         message = "GGN-derived inverse RHS shape must match parameter width"
         raise MaterializationError(message)
@@ -3609,16 +3681,18 @@ def _ggn_derived_inverse_metric_flat_rhs(
         eigenvectors @ torch.diag(torch.sqrt(eigenvalues)) @ eigenvectors.T
     )
     factor = sqrt_loss_hessian @ jacobian
-    capacitance = (
-        torch.eye(
-            factor.shape[0],
-            dtype=factor.dtype,
-            device=factor.device,
-        )
-        + (factor @ factor.T) / damping
+    base_diagonal = _inverse_metric_damping_vector(
+        operator,
+        jacobian.shape[1],
+        dtype=jacobian.dtype,
+        device=jacobian.device,
     )
-    correction = factor.T @ torch.linalg.solve(capacitance, factor @ rhs)
-    result = rhs / damping - correction / (damping * damping)
+    result = _low_rank_plus_diagonal_inverse_flat_batch(
+        factor.T,
+        base_diagonal,
+        rhs.T,
+        "GGN-derived inverse metric",
+    ).T
     _require_finite_tensor(result, "GGN-derived inverse metric flat result")
 
     return result
@@ -3649,6 +3723,115 @@ def _inverse_metric_damping(operator: OperatorSpec) -> float:
         raise MaterializationError(message)
 
     return value
+
+
+def _damped_diagonal_vector(
+    operator: OperatorSpec,
+    template: TensorTree,
+    diagonal: torch.Tensor,
+) -> torch.Tensor:
+    damping = _inverse_metric_damping_vector(
+        operator,
+        diagonal.numel(),
+        dtype=diagonal.dtype,
+        device=diagonal.device,
+    )
+
+    if damping.numel() != _flatten_vector(template).numel():
+        message = "per_group damping width does not match vector width"
+        raise MaterializationError(message)
+
+    return diagonal + damping
+
+
+def _inverse_metric_damping_vector(
+    operator: OperatorSpec,
+    width: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if _inverse_metric_damping_kind(operator) == "per_group":
+        return _per_group_damping_vector(operator, width, dtype=dtype, device=device)
+
+    damping = _inverse_metric_damping(operator)
+
+    return torch.full((width,), damping, dtype=dtype, device=device)
+
+
+def _per_group_damping_vector(
+    operator: OperatorSpec,
+    width: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    groups = _inverse_metric_damping_groups(operator)
+    values = _inverse_metric_damping_values(operator)
+    result = torch.empty((width,), dtype=dtype, device=device)
+    expected_start = 0
+
+    for group in groups:
+        name = group["name"]
+        start = group["start"]
+        stop = group["stop"]
+
+        if start != expected_start or stop <= start or stop > width:
+            message = "per_group damping groups must partition the vector"
+            raise MaterializationError(message)
+
+        result[start:stop] = values[name]
+        expected_start = stop
+
+    if expected_start != width:
+        message = "per_group damping groups must cover the vector"
+        raise MaterializationError(message)
+
+    return result
+
+
+def _inverse_metric_damping_groups(
+    operator: OperatorSpec,
+) -> tuple[Mapping[str, Any], ...]:
+    value = operator.semantics.get("damping_groups")
+
+    if not isinstance(value, tuple) or not value:
+        message = "per_group damping requires parameter-surface group identity"
+        raise MaterializationError(message)
+
+    groups = []
+
+    for item in value:
+        if not isinstance(item, Mapping):
+            message = "per_group damping group identity must be a mapping"
+            raise MaterializationError(message)
+
+        name = item.get("name")
+        start = item.get("start")
+        stop = item.get("stop")
+
+        if not isinstance(name, str) or not name:
+            message = "per_group damping group name must be a string"
+            raise MaterializationError(message)
+
+        if (
+            not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(stop, int)
+            or isinstance(stop, bool)
+        ):
+            message = "per_group damping group bounds must be integers"
+            raise MaterializationError(message)
+
+        groups.append({"name": name, "start": start, "stop": stop})
+
+    if {group["name"] for group in groups} != set(
+        _inverse_metric_damping_values(operator)
+    ):
+        message = "per_group damping group names must match damping values"
+        raise MaterializationError(message)
+
+    return tuple(groups)
 
 
 def _inverse_metric_damping_values(operator: OperatorSpec) -> Mapping[str, float]:
@@ -3705,6 +3888,31 @@ def _inverse_metric_damping_payload(
     return _inverse_metric_damping(operator)
 
 
+def _minimum_inverse_metric_damping(damping: float | Mapping[str, float]) -> float:
+    if isinstance(damping, Mapping):
+        return min(_required_group_damping_mapping(damping).values())
+
+    return damping
+
+
+def _inverse_metric_damping_product(
+    operator: OperatorSpec,
+    flat_vector: torch.Tensor,
+    damping: float | Mapping[str, float],
+) -> torch.Tensor:
+    if isinstance(damping, Mapping):
+        values = _per_group_damping_vector(
+            operator,
+            flat_vector.numel(),
+            dtype=flat_vector.dtype,
+            device=flat_vector.device,
+        )
+
+        return values * flat_vector
+
+    return damping * flat_vector
+
+
 def _resolved_group_damping(
     damping: float | Mapping[str, float],
     damping_kind: str,
@@ -3741,8 +3949,8 @@ def _required_group_damping_mapping(
             message = "per_group damping keys must be strings"
             raise MaterializationError(message)
 
-        if not isinstance(value, float | int) or isinstance(value, bool):
-            message = "per_group damping values must be numeric"
+        if not isinstance(value, float | int) or isinstance(value, bool) or value < 0.0:
+            message = "per_group damping values must be nonnegative"
             raise MaterializationError(message)
 
         result[key] = float(value)
@@ -11267,7 +11475,11 @@ def _low_rank_square_root_apply(
     basis, diagonal = _low_rank_factors(execution.batch, execution.params)
 
     if inverse:
-        base_diagonal = diagonal + _inverse_metric_damping(execution.operator)
+        base_diagonal = _damped_diagonal_vector(
+            execution.operator,
+            execution.params,
+            diagonal,
+        )
         flat_result = _low_rank_plus_diagonal_inverse_square_root_flat_apply(
             basis,
             base_diagonal,
@@ -11370,16 +11582,10 @@ def _ggn_derived_square_root_apply(
     loss_root = _psd_square_root(loss_hessian, "GGN-derived loss Hessian")
 
     if inverse:
-        damping = _inverse_metric_damping(execution.operator)
-
-        if damping <= 0.0:
-            message = "GGN-derived inverse square root requires positive damping"
-            raise MaterializationError(message)
-
         factor_basis = (loss_root @ jacobian).T
-        diagonal = torch.full(
-            (jacobian.shape[1],),
-            damping,
+        diagonal = _inverse_metric_damping_vector(
+            execution.operator,
+            jacobian.shape[1],
             dtype=jacobian.dtype,
             device=jacobian.device,
         )
@@ -11424,7 +11630,12 @@ def _metric_square_root_factor_matrix(
 ) -> torch.Tensor:
     if inverse:
         factor_matrix = torch.linalg.inv(
-            _inverse_metric_matrix(execution.operator, matrix, execution.batch)
+            _inverse_metric_matrix(
+                execution.operator,
+                matrix,
+                execution.batch,
+                execution.vector,
+            )
         )
     else:
         factor_matrix = matrix
@@ -11463,6 +11674,7 @@ def _lanczos_matrix_free_metric_square_root_product(
     inverse: bool,
 ) -> torch.Tensor:
     iterations, transform = _lanczos_sqrt_transform(execution, inverse=inverse)
+    damping = _inverse_metric_damping_payload(execution.operator) if inverse else 0.0
 
     def apply(flat_vector: torch.Tensor) -> torch.Tensor:
         return _metric_apply_flat(
@@ -11470,7 +11682,7 @@ def _lanczos_matrix_free_metric_square_root_product(
             execution.batch,
             execution.vector,
             flat_vector,
-            0.0,
+            damping,
             METRIC_STREAMING_PATH,
             execution.candidate.settings,
         )
@@ -11489,19 +11701,16 @@ def _lanczos_sqrt_transform(
     inverse: bool,
 ) -> tuple[int, Callable[[torch.Tensor], torch.Tensor]]:
     iterations = _sqrt_metric_lanczos_iterations(execution.candidate.settings)
-    damping = _inverse_metric_damping(execution.operator) if inverse else 0.0
 
     def transform(values: torch.Tensor) -> torch.Tensor:
-        shifted = values + damping
-
         if inverse:
-            _require_positive_spectrum(shifted, "Lanczos square-root spectrum")
+            _require_positive_spectrum(values, "Lanczos square-root spectrum")
 
-            return torch.rsqrt(shifted)
+            return torch.rsqrt(values)
 
-        _require_nonnegative_spectrum(shifted, "Lanczos square-root spectrum")
+        _require_nonnegative_spectrum(values, "Lanczos square-root spectrum")
 
-        return torch.sqrt(shifted)
+        return torch.sqrt(values)
 
     return iterations, transform
 
@@ -12033,6 +12242,7 @@ def _run_inverse_metric_reused_dense_factor_batch(
         execution.operator,
         _metric_dense_matrix(execution.operator, execution.batch, execution.vector),
         execution.batch,
+        execution.vector,
     )
     vector_batch = _flat_inverse_metric_vector_batch(execution)
     _require_finite_tensor(inverse_matrix, "metric matrix")
@@ -12092,6 +12302,7 @@ def _inverse_metric_solve_by_path(execution: StandardExecution) -> TensorTree:
         execution.operator,
         _metric_dense_matrix(execution.operator, execution.batch, execution.vector),
         execution.batch,
+        execution.vector,
     )
     vector_tensor = _flatten_vector(execution.vector)
     _require_finite_tensor(inverse_matrix, "metric matrix")
@@ -12113,7 +12324,7 @@ def _conjugate_gradient_inverse_metric_multiply(
     preconditioner = _inverse_metric_preconditioner(execution.candidate.settings)
     metric_path = _metric_runtime_path_from_settings(execution.candidate.settings)
     _require_metric_accumulation_settings(metric_path, execution.candidate.settings)
-    damping = _inverse_metric_damping(execution.operator)
+    damping = _inverse_metric_damping_payload(execution.operator)
     _require_positive_matrix_free_damping(execution.operator, damping)
     tolerance = _inverse_metric_tolerance(execution.operator)
     solution = _conjugate_gradient_inverse_metric_batch_solve(
@@ -12146,12 +12357,12 @@ def _zero_numerator_divide(
 
 def _require_positive_matrix_free_damping(
     operator: OperatorSpec,
-    damping: float,
+    damping: float | Mapping[str, float],
 ) -> None:
     if _metric_representation_kind(operator) != "matrix_free":
         return
 
-    if damping > 0.0:
+    if _minimum_inverse_metric_damping(damping) > 0.0:
         return
 
     message = "matrix_free conjugate_gradient requires positive damping"
@@ -12165,7 +12376,7 @@ def _conjugate_gradient_inverse_metric_multiply_batch(
     preconditioner = _inverse_metric_preconditioner(execution.candidate.settings)
     metric_path = _metric_runtime_path_from_settings(execution.candidate.settings)
     _require_metric_accumulation_settings(metric_path, execution.candidate.settings)
-    damping = _inverse_metric_damping(execution.operator)
+    damping = _inverse_metric_damping_payload(execution.operator)
     _require_positive_matrix_free_damping(execution.operator, damping)
     tolerance = _inverse_metric_tolerance(execution.operator)
     vector_batch = _flat_inverse_metric_vector_batch(execution)
@@ -12191,7 +12402,7 @@ def _conjugate_gradient_inverse_metric_batch_solve(
     budget: int,
     preconditioner: str,
     metric_path: str,
-    damping: float,
+    damping: float | Mapping[str, float],
     tolerance: float | None,
 ) -> torch.Tensor:
     solution = torch.zeros_like(vectors)
@@ -12311,13 +12522,17 @@ def _metric_apply_flat(
     batch: Batch,
     template: TensorTree,
     flat_vector: torch.Tensor,
-    damping: float,
+    damping: float | Mapping[str, float],
     metric_path: str,
     settings: Mapping[str, Any],
 ) -> torch.Tensor:
     vector = _wrap_flat_vector(template, flat_vector)
     result = _metric_multiply_by_path(operator, batch, vector, metric_path, settings)
-    flat_result = _flatten_vector(result) + damping * flat_vector
+    flat_result = _flatten_vector(result) + _inverse_metric_damping_product(
+        operator,
+        flat_vector,
+        damping,
+    )
     _require_finite_tensor(flat_result, "metric apply result")
 
     return flat_result
@@ -12328,7 +12543,7 @@ def _metric_apply_flat_batch(
     batch: Batch,
     template: TensorTree,
     flat_batch: torch.Tensor,
-    damping: float,
+    damping: float | Mapping[str, float],
     metric_path: str,
     settings: Mapping[str, Any],
 ) -> torch.Tensor:
@@ -12369,6 +12584,7 @@ def _apply_inverse_metric_preconditioner(
                 operator,
                 _metric_dense_matrix(operator, batch, template),
                 batch,
+                template,
             )
         )
         result = residual / diagonal
@@ -12634,7 +12850,12 @@ class StandardMetricOperator:
         else:
             _require_metric_representation(inverse_operator, ("dense_matrix",))
             matrix = self._dense_matrix(batch, vector)
-            inverse_matrix = _inverse_metric_matrix(inverse_operator, matrix, batch)
+            inverse_matrix = _inverse_metric_matrix(
+                inverse_operator,
+                matrix,
+                batch,
+                vector,
+            )
             flat_result = _dense_inverse_metric_solve(
                 inverse_matrix,
                 _flatten_vector(vector),
@@ -12700,15 +12921,17 @@ class StandardMetricOperator:
     def _operator_for_inverse(self) -> OperatorSpec:
         damping_kind = _inverse_metric_damping_kind(self.operator)
         damping_value = _inverse_metric_damping_payload(self.operator)
+        semantics = {
+            "damping": damping_value,
+            "damping_kind": damping_kind,
+            "damping_value": damping_value,
+        }
+        damping_groups = self.operator.semantics.get("damping_groups")
 
-        return self._operator_spec(
-            "inverse_metric",
-            {
-                "damping": damping_value,
-                "damping_kind": damping_kind,
-                "damping_value": damping_value,
-            },
-        )
+        if damping_groups is not None:
+            semantics["damping_groups"] = damping_groups
+
+        return self._operator_spec("inverse_metric", semantics)
 
     def _operator_spec(
         self,
@@ -13606,7 +13829,7 @@ def _require_supported_standard_settings(
     )
     _require_memory_recompute_settings(operator, candidate.settings)
     _require_output_buffer_settings(candidate.settings)
-    _require_fusion_settings(candidate.settings, fusion_rewriter)
+    _require_fusion_settings(operator, candidate.settings, fusion_rewriter)
     _require_call_runtime_settings(candidate.settings)
     _require_stateful_module_path_settings(operator, path, candidate.settings)
     _require_gradient_graph_schedule_settings(operator, candidate.settings)
@@ -14765,6 +14988,7 @@ def _require_output_buffer_settings(settings: Mapping[str, Any]) -> None:
 
 
 def _require_fusion_settings(
+    operator: OperatorSpec,
     settings: Mapping[str, Any],
     fusion_rewriter: Callable[[torch.nn.Module, Candidate], torch.nn.Module] | None,
 ) -> None:
@@ -14775,6 +14999,9 @@ def _require_fusion_settings(
             continue
 
         if value in fused_values:
+            if key == "fusion.loss":
+                _require_fused_loss_identity(operator, value)
+
             if fusion_rewriter is None:
                 message = f"{key}={value} requires a registered fused implementation"
                 raise MaterializationError(message)
@@ -14793,6 +15020,48 @@ def _fusion_value_domains() -> Mapping[str, set[str]]:
         "fusion.logits": {"fused_logits_projection"},
         "fusion.loss": {"fused_ce", "fused_kl"},
     }
+
+
+def _require_fused_loss_identity(
+    operator: OperatorSpec,
+    fused_loss: Any,
+) -> None:
+    expected_loss_kind = {
+        "fused_ce": "softmax_cross_entropy",
+        "fused_kl": "kl",
+    }.get(fused_loss)
+
+    if expected_loss_kind is None:
+        return
+
+    loss = operator.semantics.get("loss")
+
+    if not isinstance(loss, Mapping):
+        message = (
+            f"fusion.loss={fused_loss} requires typed "
+            f"{expected_loss_kind} loss identity"
+        )
+        raise MaterializationError(message)
+
+    if loss.get("kind") != expected_loss_kind:
+        message = (
+            f"fusion.loss={fused_loss} requires typed "
+            f"{expected_loss_kind} loss identity"
+        )
+        raise MaterializationError(message)
+
+    identity = loss.get("identity")
+
+    if not isinstance(identity, Mapping):
+        message = f"fusion.loss={fused_loss} requires exact global normalization fields"
+        raise MaterializationError(message)
+
+    reduction = identity.get("reduction")
+    denominator = identity.get("denominator")
+
+    if not isinstance(reduction, str) or not isinstance(denominator, str):
+        message = f"fusion.loss={fused_loss} requires exact global normalization fields"
+        raise MaterializationError(message)
 
 
 def _runtime_fusion_module(
@@ -18271,6 +18540,9 @@ def _require_sampled_fisher_semantics(execution: StandardExecution) -> None:
     if exact_check not in {"disabled", "enabled_with_sampling_bound"}:
         message = f"sampled_fisher.exact_fisher_check is unsupported: {exact_check}"
         raise MaterializationError(message)
+
+    if exact_check == "enabled_with_sampling_bound":
+        _sampled_fisher_sampling_bound(operator)
 
     score_reduction = _operator_semantic(operator, "score_reduction")
 

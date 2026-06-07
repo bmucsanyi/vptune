@@ -496,7 +496,9 @@ def _fusion_binding_error(
     }
 
     for key, values in fused_values.items():
-        if settings.get(key) not in values:
+        value = settings.get(key)
+
+        if value not in values:
             continue
 
         if not _runtime_callback_present(runtime_signature, "fusion_rewriter"):
@@ -504,6 +506,78 @@ def _fusion_binding_error(
 
         if runtime_signature.get("module") is not True:
             return "fused rows require a module"
+
+        if key == "fusion.loss":
+            error = _fused_loss_identity_error(value, runtime_signature)
+
+            if error is not None:
+                return error
+
+    return None
+
+
+def _fused_loss_identity_error(
+    fused_loss: Any,
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    expected_loss_kind = {
+        "fused_ce": "softmax_cross_entropy",
+        "fused_kl": "kl",
+    }.get(fused_loss)
+
+    if expected_loss_kind is None:
+        return None
+
+    operator = runtime_signature.get("operator")
+    semantics = operator.get("semantics") if isinstance(operator, Mapping) else None
+    loss = semantics.get("loss") if isinstance(semantics, Mapping) else None
+
+    if not isinstance(loss, Mapping):
+        return (
+            f"fusion.loss={fused_loss} requires typed "
+            f"{expected_loss_kind} loss identity"
+        )
+
+    if loss.get("kind") != expected_loss_kind:
+        return (
+            f"fusion.loss={fused_loss} requires typed "
+            f"{expected_loss_kind} loss identity"
+        )
+
+    identity = loss.get("identity")
+
+    if not isinstance(identity, Mapping):
+        return f"fusion.loss={fused_loss} requires exact global normalization fields"
+
+    reduction = identity.get("reduction")
+    denominator = identity.get("denominator")
+
+    if not isinstance(reduction, str) or not isinstance(denominator, str):
+        return f"fusion.loss={fused_loss} requires exact global normalization fields"
+
+    return None
+
+
+def _sampled_fisher_binding_error(
+    settings: Mapping[str, Any],
+    runtime_signature: Mapping[str, Any],
+) -> str | None:
+    if settings.get("sampled_fisher.exact_fisher_check") != (
+        "enabled_with_sampling_bound"
+    ):
+        return None
+
+    operator = runtime_signature.get("operator")
+    semantics = operator.get("semantics") if isinstance(operator, Mapping) else None
+    sampling_bound = (
+        semantics.get("sampling_bound") if isinstance(semantics, Mapping) else None
+    )
+
+    if not isinstance(sampling_bound, Mapping):
+        return "sampled_fisher exact-Fisher check requires declared sampling_bound"
+
+    if sampling_bound.get("kind") != "abs_or_rel":
+        return "sampled_fisher exact-Fisher check requires declared sampling_bound"
 
     return None
 
@@ -880,6 +954,7 @@ def _sqrt_metric_path_binding_error(
 
 _RUNTIME_BINDING_RULES = (
     _fusion_binding_error,
+    _sampled_fisher_binding_error,
     _batch_layout_binding_error,
     _parameter_surface_binding_error,
     _lm_head_binding_error,

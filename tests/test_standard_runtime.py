@@ -8251,8 +8251,6 @@ def test_standard_runtime_accepts_model_default_fusion_settings() -> None:
         ("fusion.mlp", "fused_mlp"),
         ("fusion.rope", "fused_rope"),
         ("fusion.logits", "fused_logits_projection"),
-        ("fusion.loss", "fused_ce"),
-        ("fusion.loss", "fused_kl"),
     ],
 )
 def test_standard_runtime_rejects_fused_rows_without_registered_implementation(
@@ -8283,8 +8281,6 @@ def test_standard_runtime_rejects_fused_rows_without_registered_implementation(
         ("fusion.mlp", "fused_mlp"),
         ("fusion.rope", "fused_rope"),
         ("fusion.logits", "fused_logits_projection"),
-        ("fusion.loss", "fused_ce"),
-        ("fusion.loss", "fused_kl"),
     ],
 )
 def test_standard_runtime_executes_fused_row_with_registered_rewriter(
@@ -8359,7 +8355,10 @@ def test_standard_runtime_executes_fused_row_with_registered_rewriter(
         (
             ops.hvp("hvp", "loss", aggregation="sum"),
             "hvp",
-            {**hvp_settings("reverse_over_reverse"), "fusion.loss": "fused_ce"},
+            {
+                **hvp_settings("reverse_over_reverse"),
+                "fusion.logits": "fused_logits_projection",
+            },
             {"scale": torch.tensor([2.0], dtype=torch.float64)},
             {"w": torch.tensor([3.0], dtype=torch.float64)},
             {"loss": quadratic_scalar},
@@ -8369,7 +8368,10 @@ def test_standard_runtime_executes_fused_row_with_registered_rewriter(
         (
             ops.ggnvp("ggn", "model_output", aggregation="sum"),
             "ggn",
-            {**ggn_dense_kernel_settings(), "fusion.loss": "fused_ce"},
+            {
+                **ggn_dense_kernel_settings(),
+                "fusion.logits": "fused_logits_projection",
+            },
             {
                 "scale": 1.0,
                 "loss_hessian": torch.tensor([[5.0]], dtype=torch.float64),
@@ -8384,7 +8386,7 @@ def test_standard_runtime_executes_fused_row_with_registered_rewriter(
             "fisher",
             {
                 **fisher_settings("materialize_score_gradients"),
-                "fusion.loss": "fused_ce",
+                "fusion.logits": "fused_logits_projection",
             },
             {
                 "score_gradients": torch.tensor([[2.0], [4.0]], dtype=torch.float64),
@@ -8400,7 +8402,7 @@ def test_standard_runtime_executes_fused_row_with_registered_rewriter(
             "sampled",
             {
                 **sampled_fisher_settings("materialize_score_gradients"),
-                "fusion.loss": "fused_ce",
+                "fusion.logits": "fused_logits_projection",
             },
             {
                 "sampled_score_gradients": torch.tensor(
@@ -8416,7 +8418,10 @@ def test_standard_runtime_executes_fused_row_with_registered_rewriter(
         (
             empirical_fisher_sum("empirical", "scores"),
             "empirical",
-            {**empirical_dense_settings(), "fusion.loss": "fused_ce"},
+            {
+                **empirical_dense_settings(),
+                "fusion.logits": "fused_logits_projection",
+            },
             {
                 "per_example_gradients": torch.tensor(
                     [[2.0], [4.0]], dtype=torch.float64
@@ -8445,7 +8450,7 @@ def test_standard_runtime_executes_fused_rows_for_higher_order_families(
         module: torch.nn.Module,
         candidate: vpx.Candidate,
     ) -> torch.nn.Module:
-        events.append((candidate.family, candidate.settings["fusion.loss"]))
+        events.append((candidate.family, candidate.settings["fusion.logits"]))
 
         return module
 
@@ -8467,8 +8472,125 @@ def test_standard_runtime_executes_fused_rows_for_higher_order_families(
         vector,
     )
 
-    assert events == [(family, "fused_ce")]
+    assert events == [(family, "fused_logits_projection")]
     torch.testing.assert_close(tree_leaves(result)[0], expected)
+
+
+def test_standard_runtime_rejects_fused_loss_without_loss_identity() -> None:
+    def fusion_rewriter(
+        module: torch.nn.Module,
+        candidate: vpx.Candidate,
+    ) -> torch.nn.Module:
+        _ = candidate
+
+        return module
+
+    factory = vpx.standard_operation_factory(
+        ops.hvp("hvp", "loss", aggregation="sum"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+        module=OneParameterModule(),
+        fusion_rewriter=fusion_rewriter,
+    )
+
+    with pytest.raises(vp.MaterializationError, match="typed softmax_cross_entropy"):
+        run_passed_candidate(
+            factory,
+            "hvp",
+            "fused-loss",
+            {**hvp_settings("reverse_over_reverse"), "fusion.loss": "fused_ce"},
+            {"scale": torch.tensor([2.0], dtype=torch.float64)},
+            {"w": torch.tensor([3.0], dtype=torch.float64)},
+        )
+
+
+def test_standard_runtime_rejects_fused_loss_kind_mismatch() -> None:
+    def fusion_rewriter(
+        module: torch.nn.Module,
+        candidate: vpx.Candidate,
+    ) -> torch.nn.Module:
+        _ = candidate
+
+        return module
+
+    operator = dataclasses.replace(
+        ops.hvp("hvp", "loss", aggregation="sum"),
+        semantics={
+            "loss": {
+                "kind": "softmax_cross_entropy",
+                "identity": {
+                    "reduction": "token_mean",
+                    "denominator": "num_tokens",
+                },
+            }
+        },
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+        module=OneParameterModule(),
+        fusion_rewriter=fusion_rewriter,
+    )
+
+    with pytest.raises(vp.MaterializationError, match="typed kl"):
+        run_passed_candidate(
+            factory,
+            "hvp",
+            "fused-loss",
+            {**hvp_settings("reverse_over_reverse"), "fusion.loss": "fused_kl"},
+            {"scale": torch.tensor([2.0], dtype=torch.float64)},
+            {"w": torch.tensor([3.0], dtype=torch.float64)},
+        )
+
+
+def test_standard_runtime_accepts_fused_loss_with_normalization_identity() -> None:
+    events = []
+
+    def fusion_rewriter(
+        module: torch.nn.Module,
+        candidate: vpx.Candidate,
+    ) -> torch.nn.Module:
+        events.append(candidate.settings["fusion.loss"])
+
+        return module
+
+    operator = dataclasses.replace(
+        ops.hvp("hvp", "loss", aggregation="sum"),
+        semantics={
+            "loss": {
+                "kind": "softmax_cross_entropy",
+                "identity": {
+                    "reduction": "token_mean",
+                    "denominator": "num_tokens",
+                },
+            }
+        },
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        buffers={},
+        scalar_objectives={"loss": quadratic_scalar},
+        module=OneParameterModule(),
+        fusion_rewriter=fusion_rewriter,
+    )
+    result = run_passed_candidate(
+        factory,
+        "hvp",
+        "fused-loss",
+        {**hvp_settings("reverse_over_reverse"), "fusion.loss": "fused_ce"},
+        {"scale": torch.tensor([2.0], dtype=torch.float64)},
+        {"w": torch.tensor([3.0], dtype=torch.float64)},
+    )
+
+    assert events == ["fused_ce"]
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        torch.tensor([12.0], dtype=torch.float64),
+    )
 
 
 def test_standard_runtime_executes_layout_contiguity_axis() -> None:
@@ -10752,6 +10874,65 @@ def test_ekfac_inverse_metric_factorized_solve_matches_dense_reference() -> None
     torch.testing.assert_close(flatten_tree(output), expected)
     assert reference_result.measurements["max_abs_diff"] == pytest.approx(0.0)
     assert reference_result.measurements["inverse_residual"] == pytest.approx(0.0)
+
+
+def test_ekfac_inverse_metric_per_group_damping_matches_dense_reference() -> None:
+    params = {"w": torch.zeros((2, 2), dtype=torch.float64)}
+    factors = EKFACMetricData.factors()
+    vector = {"w": torch.tensor([[0.25, -0.75], [0.5, 1.25]], dtype=torch.float64)}
+    damping = {"w": 0.25}
+    operator = dataclasses.replace(
+        ops.inverse_metric(
+            "inverse",
+            "ekfac",
+            aggregation="sum",
+            representation=ekfac_metric_representation(),
+            damping=0.0,
+        ),
+        semantics={
+            "damping": damping,
+            "damping_kind": "per_group",
+            "damping_value": damping,
+            "representation": ekfac_metric_representation(),
+        },
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+    check = vpx.standard_reference_check(
+        operator,
+        params=params,
+        buffers={},
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "symmetry_max_abs_diff": 1e-12,
+            "psd_violation": 1e-12,
+            "inverse_residual": 1e-12,
+            "damping_min": 0.1,
+            "condition_number_max": 20.0,
+        },
+    )
+    dense_matrix = ekfac_dense_matrix(factors)
+    expected = torch.linalg.solve(
+        dense_matrix + 0.25 * torch.eye(4, dtype=torch.float64),
+        vector["w"].reshape(-1),
+    )
+    candidate = vpx.Candidate(
+        "inverse",
+        "factorized",
+        inverse_metric_settings("factorized_solve"),
+        admission_status="passed",
+    )
+    output = factory(candidate, factors, vector)()
+    reference_result = check(candidate, factors, vector)
+
+    torch.testing.assert_close(flatten_tree(output), expected)
+    assert reference_result.measurements["max_abs_diff"] == pytest.approx(0.0)
+    assert reference_result.measurements["inverse_residual"] == pytest.approx(0.0)
+    assert reference_result.measurements["damping_min"] == pytest.approx(0.25)
 
 
 def test_ekfac_closed_form_square_root_paths_match_reference() -> None:
@@ -14704,6 +14885,47 @@ def test_sampled_fisher_vp_rejects_inconsistent_rows() -> None:
             vpx.Candidate(
                 "sampled",
                 "exact-check",
+                sampled_fisher_settings(
+                    "materialize_score_gradients",
+                    exact_check="enabled_with_sampling_bound",
+                ),
+                admission_status="passed",
+            ),
+            batch,
+            vector,
+        )()
+
+
+def test_sampled_fisher_exact_check_requires_declared_sampling_bound() -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64)}
+    vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
+    batch = {
+        "sampled_score_gradients": torch.ones((4, 1), dtype=torch.float64),
+        "num_examples": 2,
+    }
+    operator = ops.sampled_fisher_vp(
+        "sampled",
+        "sampled_scores",
+        aggregation="mean_per_example",
+        distribution="explicit_score_gradients",
+        label_policy="sampled_labels",
+        sample_count=2,
+        sample_source="fixed_seed_and_count",
+        sampling_bound={"kind": "disabled"},
+        score_reduction="none",
+        denominator="num_examples",
+    )
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+    )
+
+    with pytest.raises(vp.MaterializationError, match=r"sampling_bound\.kind"):
+        factory(
+            vpx.Candidate(
+                "sampled",
+                "exact-check-without-bound",
                 sampled_fisher_settings(
                     "materialize_score_gradients",
                     exact_check="enabled_with_sampling_bound",

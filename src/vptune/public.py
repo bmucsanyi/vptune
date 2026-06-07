@@ -3474,6 +3474,7 @@ def gradient(model: Model, loss: Loss, name: str | None = None) -> Operator:
         "typed_loss",
         aggregation="sum",
     )
+    spec = _operator_with_loss_identity(spec, loss)
 
     return Operator(
         model=model,
@@ -3496,6 +3497,7 @@ def hvp(model: Model, loss: Loss, name: str | None = None) -> Operator:
         "typed_loss",
         aggregation="sum",
     )
+    spec = _operator_with_loss_identity(spec, loss)
 
     return Operator(
         model=model,
@@ -3518,6 +3520,7 @@ def ggnvp(model: Model, loss: Loss, name: str | None = None) -> Operator:
         loss.output,
         aggregation="sum",
     )
+    spec = _operator_with_loss_identity(spec, loss)
 
     return Operator(
         model=model,
@@ -3573,6 +3576,7 @@ def fisher_vp(
         score_reduction="none",
         denominator=_likelihood_string_field(likelihood, "denominator"),
     )
+    spec = _operator_with_likelihood_identity(spec, likelihood)
 
     return Operator(
         model=model,
@@ -3673,6 +3677,7 @@ def jvp(model: Model, output: Output, name: str | None = None) -> Operator:
         output.field,
         aggregation="sum",
     )
+    spec = _operator_with_output_identity(spec, output)
 
     return _typed_model_field_operator(
         model=model,
@@ -3696,6 +3701,7 @@ def vjp(model: Model, output: Output, name: str | None = None) -> Operator:
         output.field,
         aggregation="sum",
     )
+    spec = _operator_with_output_identity(spec, output)
 
     return _typed_model_field_operator(
         model=model,
@@ -3724,6 +3730,7 @@ def per_example_gradient(
         aggregation="sum",
         example_loss_reduction="per_example",
     )
+    spec = _operator_with_loss_identity(spec, loss)
 
     return Operator(
         model=model,
@@ -3761,6 +3768,7 @@ def empirical_fisher_vp(
         example_loss_reduction="per_example",
         denominator="num_examples",
     )
+    spec = _operator_with_loss_identity(spec, loss)
 
     return Operator(
         model=model,
@@ -4439,13 +4447,112 @@ def _require_declared_psd_matrix_free_certificate(loss_hessian: torch.Tensor) ->
         message = "loss.declared_psd_matrix_free matvec must be symmetric"
         raise MaterializationError(message)
 
-    eigenvalues = torch.linalg.eigvalsh(loss_hessian)
-    smallest_ritz = eigenvalues[0]
-    residual_norm = loss_hessian.new_tensor(0.0)
+    smallest_ritz, residual_norm = _lanczos_smallest_ritz_bound(
+        loss_hessian,
+        loss_hessian.shape[0],
+    )
+    tolerance = loss_hessian.new_tensor(STANDARD_THRESHOLDS["psd_violation"])
 
-    if bool((smallest_ritz - residual_norm) < 0.0):
+    if bool((smallest_ritz - residual_norm) < -tolerance):
         message = "GGN requires a PSD output-space metric"
         raise MaterializationError(message)
+
+
+def _lanczos_smallest_ritz_bound(
+    matrix: torch.Tensor,
+    iterations: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if matrix.ndim != SQUARE_MATRIX_DIMS or matrix.shape[0] != matrix.shape[1]:
+        message = "Lanczos PSD certificate requires a square matrix"
+        raise MaterializationError(message)
+
+    if iterations < 1 or iterations > matrix.shape[0]:
+        message = "Lanczos PSD certificate iteration count is invalid"
+        raise MaterializationError(message)
+
+    start = _lanczos_basis_start(matrix, 0)
+    best_ritz, best_residual = _lanczos_smallest_ritz_bound_from_start(
+        matrix,
+        iterations,
+        start,
+    )
+    best_bound = best_ritz - best_residual
+
+    for start_index in range(1, matrix.shape[0]):
+        start = _lanczos_basis_start(matrix, start_index)
+        current_ritz, current_residual = _lanczos_smallest_ritz_bound_from_start(
+            matrix,
+            iterations,
+            start,
+        )
+        current_bound = current_ritz - current_residual
+
+        if bool(current_bound < best_bound):
+            best_ritz = current_ritz
+            best_residual = current_residual
+            best_bound = current_bound
+
+    return best_ritz, best_residual
+
+
+def _lanczos_basis_start(matrix: torch.Tensor, start_index: int) -> torch.Tensor:
+    start = torch.zeros(matrix.shape[0], dtype=matrix.dtype, device=matrix.device)
+    start[start_index] = 1.0
+
+    return start
+
+
+def _lanczos_smallest_ritz_bound_from_start(
+    matrix: torch.Tensor,
+    iterations: int,
+    start: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    current = start / start.norm()
+    previous = torch.zeros_like(current)
+    beta = matrix.new_tensor(0.0)
+    alphas = []
+    betas = []
+    final_beta = matrix.new_tensor(0.0)
+
+    for iteration in range(iterations):
+        residual = matrix @ current
+        alpha = current @ residual
+        residual = residual - alpha * current - beta * previous
+        beta = residual.norm()
+        alphas.append(alpha)
+        final_beta = beta
+
+        if torch.equal(beta, torch.zeros_like(beta)):
+            break
+
+        if iteration == iterations - 1:
+            break
+
+        betas.append(beta)
+        previous = current
+        current = residual / beta
+
+    tridiagonal = _lanczos_tridiagonal(alphas, betas)
+    eigenvalues, eigenvectors = torch.linalg.eigh(tridiagonal)
+    index = int(torch.argmin(eigenvalues).item())
+    smallest_ritz = eigenvalues[index]
+    residual_norm = final_beta * eigenvectors[-1, index].abs()
+
+    return smallest_ritz, residual_norm
+
+
+def _lanczos_tridiagonal(
+    alphas: Sequence[torch.Tensor],
+    betas: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    tridiagonal = torch.diag(torch.stack(tuple(alphas)))
+
+    if betas:
+        off_diagonal = torch.stack(tuple(betas))
+        tridiagonal = tridiagonal + torch.diag(off_diagonal, diagonal=1)
+        tridiagonal = tridiagonal + torch.diag(off_diagonal, diagonal=-1)
+
+    return tridiagonal
 
 
 def _softmax_cross_entropy_loss_hessian_scale(
@@ -4801,18 +4908,20 @@ def inverse_metric_vp(
         Inverse metric-vector operator.
     """
     tolerance = _typed_inverse_tol(metric, tol)
-    damping_value = _damping_value(metric, damping)
-    _require_matrix_free_positive_damping(metric, damping_value)
+    damping_payload = _damping_value(model, metric, damping)
+    _require_matrix_free_positive_damping(metric, damping_payload)
     family = _operator_family(name, "inverse_metric")
     spec = _operator_builders.inverse_metric(
         family,
         "typed_metric",
         aggregation="sum",
         representation=metric.representation,
-        damping=damping_value,
+        damping=_builder_damping_value(damping_payload),
         tol=tolerance,
     )
-    spec = _operator_with_damping_identity(spec, metric, damping)
+    spec = _operator_with_damping_identity(
+        spec, model, metric, damping, damping_payload
+    )
 
     return _typed_metric_operator(
         model,
@@ -4837,17 +4946,19 @@ def inverse_sqrt_metric_vp(
         Inverse metric square-root operator.
     """
     _reject_inverse_sqrt_tol(tol)
-    damping_value = _damping_value(metric, damping)
-    _require_matrix_free_positive_damping(metric, damping_value)
+    damping_payload = _damping_value(model, metric, damping)
+    _require_matrix_free_positive_damping(metric, damping_payload)
     family = _operator_family(name, "inverse_sqrt_metric")
     spec = _operator_builders.inverse_sqrt_metric(
         family,
         "typed_metric",
         aggregation="sum",
         representation=metric.representation,
-        damping=damping_value,
+        damping=_builder_damping_value(damping_payload),
     )
-    spec = _operator_with_damping_identity(spec, metric, damping)
+    spec = _operator_with_damping_identity(
+        spec, model, metric, damping, damping_payload
+    )
 
     return _typed_metric_operator(
         model,
@@ -4903,19 +5014,21 @@ def inverse_metric_inner_vp(
         Inverse metric inner-product operator.
     """
     tolerance = _typed_inverse_tol(metric, tol)
-    damping_value = _damping_value(metric, damping)
-    _require_matrix_free_positive_damping(metric, damping_value)
+    damping_payload = _damping_value(model, metric, damping)
+    _require_matrix_free_positive_damping(metric, damping_payload)
     family = _operator_family(name, "inverse_metric_inner")
     spec = _operator_builders.inverse_metric_inner(
         family,
         "typed_metric",
         aggregation="sum",
         representation=metric.representation,
-        damping=damping_value,
+        damping=_builder_damping_value(damping_payload),
         as_norm=as_norm,
         tol=tolerance,
     )
-    spec = _operator_with_damping_identity(spec, metric, damping)
+    spec = _operator_with_damping_identity(
+        spec, model, metric, damping, damping_payload
+    )
 
     return _typed_metric_operator(
         model,
@@ -5503,6 +5616,8 @@ def _operator_thresholds(operator: Operator) -> Mapping[str, float]:
 
         if isinstance(damping, float | int) and damping > 0.0:
             thresholds["damping_min"] = float(damping)
+        elif isinstance(damping, Mapping):
+            thresholds["damping_min"] = _minimum_damping_value(damping)
 
     return thresholds
 
@@ -5902,25 +6017,30 @@ def _active_parameter_count(model: Model) -> int:
     return count
 
 
-def _require_matrix_free_positive_damping(metric: Metric, damping: float) -> None:
+def _require_matrix_free_positive_damping(
+    metric: Metric,
+    damping: float | Mapping[str, float],
+) -> None:
     if metric.kind != "matrix_free":
         return
 
-    if damping > 0.0:
+    if _minimum_damping_value(damping) > 0.0:
         return
 
     message = "matrix_free inverse metric requires positive damping"
     raise MaterializationError(message)
 
 
-def _damping_value(metric: Metric, damping: Damping) -> float:
+def _damping_value(
+    model: Model,
+    metric: Metric,
+    damping: Damping,
+) -> float | Mapping[str, float]:
     if damping.kind == "scalar":
         return _float_damping(damping.value, "scalar damping")
 
     if damping.kind == "per_group":
-        _per_group_damping_values(metric, damping)
-
-        return 0.0
+        return _per_group_damping_values(model, metric, damping)
 
     if damping.kind == "eigenvalue_floor":
         if metric.kind != "ekfac_factors":
@@ -5940,19 +6060,28 @@ def _damping_value(metric: Metric, damping: Damping) -> float:
     raise MaterializationError(message)
 
 
+def _builder_damping_value(damping: float | Mapping[str, float]) -> float:
+    if isinstance(damping, Mapping):
+        return 0.0
+
+    return damping
+
+
+def _minimum_damping_value(damping: float | Mapping[str, float]) -> float:
+    if isinstance(damping, Mapping):
+        return min(damping.values())
+
+    return damping
+
+
 def _per_group_damping_values(
+    model: Model,
     metric: Metric,
     damping: Damping,
 ) -> dict[str, float]:
-    if metric.kind not in {"diagonal_tree", "block_diagonal", "kfac_factors"}:
-        message = (
-            "per_group damping requires a diagonal, block-diagonal, or KFAC metric"
-        )
-        raise MaterializationError(message)
-
     values = _per_group_damping_mapping(damping.value)
 
-    expected = _per_group_metric_names(metric)
+    expected = _per_group_metric_names(model, metric)
     actual = tuple(values)
 
     if set(actual) != set(expected):
@@ -5994,36 +6123,86 @@ def _per_group_damping_mapping(
     return result
 
 
-def _per_group_metric_names(metric: Metric) -> tuple[str, ...]:
+def _per_group_metric_names(model: Model, metric: Metric) -> tuple[str, ...]:
     if metric.kind == "diagonal_tree":
-        value = metric.batch.get("metric_diagonal")
-
-        if not isinstance(value, Mapping) or not value:
-            message = "diagonal metric requires named leaves for per_group damping"
-            raise MaterializationError(message)
-
-        for key, item in value.items():
-            if not isinstance(key, str) or not isinstance(item, torch.Tensor):
-                message = "diagonal metric leaves must be named tensors"
-                raise MaterializationError(message)
-
-        return tuple(value)
+        return _diagonal_per_group_metric_names(metric)
 
     if metric.kind == "block_diagonal":
-        value = metric.representation.get("block_names")
+        return _block_per_group_metric_names(metric)
 
-        if (
-            not isinstance(value, tuple)
-            or not value
-            or any(not isinstance(item, str) for item in value)
-        ):
-            message = (
-                "block-diagonal metric requires named blocks for per_group damping"
-            )
+    if metric.kind == "ekfac_factors":
+        return _ekfac_per_group_metric_names(metric)
+
+    if metric.kind == "kfac_factors":
+        return _kfac_per_group_metric_names(metric)
+
+    if metric.kind in {
+        "dense_matrix",
+        "low_rank_factors",
+        "ggn_derived_factors",
+        "matrix_free",
+    }:
+        return _parameter_surface_per_group_metric_names(model)
+
+    message = f"per_group damping is not lowered for metric kind: {metric.kind}"
+    raise MaterializationError(message)
+
+
+def _parameter_surface_per_group_metric_names(model: Model) -> tuple[str, ...]:
+    names = model.parameters.names
+
+    if not names:
+        message = "per_group damping requires named parameter-surface blocks"
+        raise MaterializationError(message)
+
+    return names
+
+
+def _diagonal_per_group_metric_names(metric: Metric) -> tuple[str, ...]:
+    value = metric.batch.get("metric_diagonal")
+
+    if not isinstance(value, Mapping) or not value:
+        message = "diagonal metric requires named leaves for per_group damping"
+        raise MaterializationError(message)
+
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, torch.Tensor):
+            message = "diagonal metric leaves must be named tensors"
             raise MaterializationError(message)
 
-        return value
+    return tuple(value)
 
+
+def _block_per_group_metric_names(metric: Metric) -> tuple[str, ...]:
+    value = metric.representation.get("block_names")
+
+    if (
+        not isinstance(value, tuple)
+        or not value
+        or any(not isinstance(item, str) for item in value)
+    ):
+        message = "block-diagonal metric requires named blocks for per_group damping"
+        raise MaterializationError(message)
+
+    return value
+
+
+def _ekfac_per_group_metric_names(metric: Metric) -> tuple[str, ...]:
+    value = metric.batch.get("ekfac_corrected_eigenvalues")
+
+    if not isinstance(value, Mapping) or not value:
+        message = "EKFAC metric requires named blocks for per_group damping"
+        raise MaterializationError(message)
+
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, torch.Tensor):
+            message = "EKFAC metric blocks must be named tensors"
+            raise MaterializationError(message)
+
+    return tuple(value)
+
+
+def _kfac_per_group_metric_names(metric: Metric) -> tuple[str, ...]:
     blocks = metric.representation.get("blocks")
 
     if not isinstance(blocks, tuple) or not blocks:
@@ -6050,23 +6229,93 @@ def _per_group_metric_names(metric: Metric) -> tuple[str, ...]:
 
 def _operator_with_damping_identity(
     spec: OperatorSpec,
+    model: Model,
     metric: Metric,
     damping: Damping,
+    damping_payload: float | Mapping[str, float],
 ) -> OperatorSpec:
-    if damping.kind == "per_group":
-        damping_value = _per_group_damping_values(metric, damping)
-    else:
-        damping_value = damping.value
-
     semantics = {
         **dict(spec.semantics),
         "damping_kind": damping.kind,
-        "damping_value": damping_value,
-        "damping": damping_value,
+        "damping_value": damping_payload,
+        "damping": damping_payload,
     }
 
     if damping.policy is not None:
         semantics["damping_policy"] = damping.policy
+
+    groups = _damping_group_identity(model, metric, damping)
+
+    if groups:
+        semantics["damping_groups"] = groups
+
+    return dataclasses.replace(spec, semantics=semantics)
+
+
+def _damping_group_identity(
+    model: Model,
+    metric: Metric,
+    damping: Damping,
+) -> tuple[Mapping[str, Any], ...]:
+    if damping.kind != "per_group":
+        return ()
+
+    if metric.kind not in {
+        "dense_matrix",
+        "low_rank_factors",
+        "ggn_derived_factors",
+        "matrix_free",
+    }:
+        return ()
+
+    offset = 0
+    groups = []
+
+    for name, shape in zip(
+        model.parameters.names,
+        model.parameters.shapes,
+        strict=True,
+    ):
+        width = math.prod(shape)
+        groups.append({"name": name, "start": offset, "stop": offset + width})
+        offset += width
+
+    if not groups:
+        message = "per_group damping requires named parameter-surface blocks"
+        raise MaterializationError(message)
+
+    return tuple(groups)
+
+
+def _operator_with_loss_identity(spec: OperatorSpec, typed_loss: Loss) -> OperatorSpec:
+    semantics = {
+        **dict(spec.semantics),
+        "loss": typed_loss.signature(),
+    }
+
+    return dataclasses.replace(spec, semantics=semantics)
+
+
+def _operator_with_output_identity(
+    spec: OperatorSpec,
+    typed_output: Output,
+) -> OperatorSpec:
+    semantics = {
+        **dict(spec.semantics),
+        "output": typed_output.signature(),
+    }
+
+    return dataclasses.replace(spec, semantics=semantics)
+
+
+def _operator_with_likelihood_identity(
+    spec: OperatorSpec,
+    typed_likelihood: Likelihood,
+) -> OperatorSpec:
+    semantics = {
+        **dict(spec.semantics),
+        "likelihood": typed_likelihood.signature(),
+    }
 
     return dataclasses.replace(spec, semantics=semantics)
 

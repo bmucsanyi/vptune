@@ -12,6 +12,7 @@ import vptune.ext as vpx
 import vptune.public as public_module
 import vptune.run as run_module
 import vptune.runtime as runtime_module
+from vptune.tensor_tree import tree_leaves
 
 
 def test_root_import_surface_exposes_front_door_and_hides_extensions() -> None:
@@ -56,8 +57,31 @@ class PublicMetricModule(torch.nn.Module):
         return {"logits": x @ self.weight.T}
 
 
+class PublicTwoParameterMetricModule(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.left = torch.nn.Parameter(torch.tensor([1.0, -2.0], dtype=torch.float64))
+        self.right = torch.nn.Parameter(torch.tensor([0.5], dtype=torch.float64))
+
+    def forward(self, x: torch.Tensor) -> Mapping[str, torch.Tensor]:
+        logit_zero = x[:, 0] * self.left[0] + x[:, 1] * self.right[0]
+        logit_one = x[:, 0] * self.left[1]
+
+        return {"logits": torch.stack((logit_zero, logit_one), dim=1)}
+
+
 def typed_metric_model() -> vp.Model:
     module = PublicMetricModule()
+
+    return vp.torch_model(
+        module,
+        parameters=vp.parameters(module),
+        call=vp.module_call(args=("x",), kwargs={}, output="logits"),
+    )
+
+
+def typed_two_parameter_metric_model() -> vp.Model:
+    module = PublicTwoParameterMetricModule()
 
     return vp.torch_model(
         module,
@@ -86,6 +110,13 @@ def typed_vector() -> dict[str, torch.Tensor]:
             [[0.5, -1.0], [2.0, 3.0]],
             dtype=torch.float64,
         )
+    }
+
+
+def typed_two_parameter_vector() -> dict[str, torch.Tensor]:
+    return {
+        "left": torch.tensor([0.5, -1.0], dtype=torch.float64),
+        "right": torch.tensor([2.0], dtype=torch.float64),
     }
 
 
@@ -231,6 +262,39 @@ def flat_weight(tree: vpx.TensorTree) -> torch.Tensor:
     return tensor_mapping(tree)["weight"].reshape(-1)
 
 
+def flat_tree(tree: vpx.TensorTree) -> torch.Tensor:
+    return torch.cat(tuple(leaf.reshape(-1) for leaf in tree_leaves(tree)))
+
+
+def tree_basis_vector(
+    template: vpx.TensorTree,
+    index: int,
+) -> vpx.TensorTree:
+    leaves = tree_leaves(template)
+    output_leaves = []
+    offset = 0
+
+    for leaf in leaves:
+        flat = torch.zeros_like(leaf).reshape(-1)
+        next_offset = offset + flat.numel()
+
+        if offset <= index < next_offset:
+            flat[index - offset] = 1.0
+
+        output_leaves.append(flat.reshape_as(leaf))
+        offset = next_offset
+
+    assert offset > index
+
+    if isinstance(template, dict):
+        return dict(zip(template, output_leaves, strict=True))
+
+    if isinstance(template, tuple):
+        return tuple(output_leaves)
+
+    return output_leaves[0]
+
+
 def weight_basis_vector(
     template: vpx.TensorTree,
     index: int,
@@ -250,6 +314,43 @@ def dense_weight_operator_matrix(
     columns = tuple(
         flat_weight(operator(batch, weight_basis_vector(template, index)))
         for index in range(flat_weight(template).numel())
+    )
+
+    return torch.stack(columns, dim=1)
+
+
+def dense_tree_operator_matrix(
+    operator: vp.Operator,
+    batch: vpx.Batch,
+    template: vpx.TensorTree,
+) -> torch.Tensor:
+    columns = tuple(
+        flat_tree(operator(batch, tree_basis_vector(template, index)))
+        for index in range(flat_tree(template).numel())
+    )
+
+    return torch.stack(columns, dim=1)
+
+
+def dense_weight_unary_operator_matrix(
+    operator: vp.Operator,
+    template: vpx.TensorTree,
+) -> torch.Tensor:
+    columns = tuple(
+        flat_weight(operator(weight_basis_vector(template, index)))
+        for index in range(flat_weight(template).numel())
+    )
+
+    return torch.stack(columns, dim=1)
+
+
+def dense_tree_unary_operator_matrix(
+    operator: vp.Operator,
+    template: vpx.TensorTree,
+) -> torch.Tensor:
+    columns = tuple(
+        flat_tree(operator(tree_basis_vector(template, index)))
+        for index in range(flat_tree(template).numel())
     )
 
     return torch.stack(columns, dim=1)
@@ -624,6 +725,51 @@ def test_typed_low_rank_metric_products_execute_against_reference() -> None:
     torch.testing.assert_close(inverse_inner, flat_left @ expected_inverse)
 
 
+def test_typed_low_rank_metric_square_root_accepts_declared_latent_width() -> None:
+    model = typed_metric_model()
+    factor = torch.tensor(
+        [[1.0], [2.0], [-1.0], [0.5]],
+        dtype=torch.float64,
+    )
+    diagonal = torch.tensor([4.0, 5.0, 6.0, 7.0], dtype=torch.float64)
+    metric = vp.metric.low_rank(factor=factor, diagonal=diagonal)
+    latent = torch.tensor([0.25, -1.0, 0.5, 2.0, -0.75], dtype=torch.float64)
+    rank = factor.shape[1]
+    expected = factor @ latent[:rank] + torch.sqrt(diagonal) * latent[rank:]
+
+    square_root_product = vp.sqrt_metric_vp(model, metric)(latent)
+
+    torch.testing.assert_close(flat_weight(square_root_product), expected)
+
+
+def test_typed_low_rank_inverse_square_root_is_declared_factor() -> None:
+    model = typed_metric_model()
+    factor = torch.tensor(
+        [[1.0], [2.0], [-1.0], [0.5]],
+        dtype=torch.float64,
+    )
+    diagonal = torch.tensor([4.0, 5.0, 6.0, 7.0], dtype=torch.float64)
+    metric = vp.metric.low_rank(factor=factor, diagonal=diagonal)
+    vector = typed_vector()
+    damping = 0.25
+    damped_matrix = factor @ factor.T + torch.diag(diagonal)
+    damped_matrix = damped_matrix + damping * torch.eye(4, dtype=torch.float64)
+    operator = vp.inverse_sqrt_metric_vp(
+        model,
+        metric,
+        damping=vp.damping.scalar(damping),
+    )
+
+    factor_matrix = dense_weight_unary_operator_matrix(operator, vector)
+
+    torch.testing.assert_close(
+        factor_matrix @ factor_matrix.T,
+        torch.linalg.inv(damped_matrix),
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
 def test_typed_kfac_metric_products_execute_against_reference() -> None:
     model = typed_metric_model()
     left_factor = torch.tensor([[3.0, 0.5], [0.5, 2.0]], dtype=torch.float64)
@@ -784,6 +930,41 @@ def test_typed_kfac_pi_damping_uses_factored_shift() -> None:
     assert not torch.allclose(flat_weight(inverse_product), scalar_exact)
 
 
+def test_typed_ekfac_metric_per_group_damping_executes_by_block() -> None:
+    model = typed_metric_model()
+    metric = typed_ekfac_metric()
+    damping = vp.damping.per_group({"weight": 0.25})
+    vector = typed_vector()
+    left = typed_left_vector()
+    flat_vector = flat_weight(vector)
+    flat_left = flat_weight(left)
+    damped_spectrum = typed_ekfac_spectrum().reshape(-1) + 0.25
+
+    inverse_operator = vp.inverse_metric_vp(model, metric, damping=damping)
+    inverse_product = inverse_operator(vector)
+    inverse_inner = vp.inverse_metric_inner_vp(model, metric, damping=damping)(
+        left,
+        vector,
+    )
+    inverse_sqrt_product = vp.inverse_sqrt_metric_vp(
+        model,
+        metric,
+        damping=damping,
+    )(vector)
+
+    expected_inverse = flat_vector / damped_spectrum
+    expected_inverse_square_root = flat_vector / torch.sqrt(damped_spectrum)
+
+    assert inverse_operator.spec.semantics["damping_kind"] == "per_group"
+    assert inverse_operator.spec.semantics["damping_value"] == {"weight": 0.25}
+    torch.testing.assert_close(flat_weight(inverse_product), expected_inverse)
+    torch.testing.assert_close(inverse_inner, flat_left @ expected_inverse)
+    torch.testing.assert_close(
+        flat_weight(inverse_sqrt_product),
+        expected_inverse_square_root,
+    )
+
+
 def test_typed_ggn_derived_metric_products_execute_against_reference() -> None:
     model = typed_metric_model()
     jacobian = torch.tensor(
@@ -825,6 +1006,227 @@ def test_typed_ggn_derived_metric_products_execute_against_reference() -> None:
     torch.testing.assert_close(inverse_inner, flat_left @ expected_inverse)
 
 
+def test_typed_ggn_derived_metric_square_root_accepts_output_latent_width() -> None:
+    model = typed_metric_model()
+    jacobian = torch.tensor(
+        [
+            [1.0, 0.0, 2.0, -1.0],
+            [0.5, 1.0, -0.5, 0.25],
+            [0.0, -1.0, 1.5, 2.0],
+        ],
+        dtype=torch.float64,
+    )
+    loss_hessian = torch.diag(torch.tensor([2.0, 3.0, 5.0], dtype=torch.float64))
+    metric = vp.metric.ggn_derived(
+        factors={"jacobian": jacobian, "loss_hessian": loss_hessian}
+    )
+    latent = torch.tensor([0.25, -1.0, 0.5], dtype=torch.float64)
+    loss_root = torch.diag(torch.sqrt(torch.diag(loss_hessian)))
+    expected = jacobian.T @ (loss_root @ latent)
+
+    square_root_product = vp.sqrt_metric_vp(model, metric)(latent)
+
+    torch.testing.assert_close(flat_weight(square_root_product), expected)
+
+
+def test_typed_ggn_derived_inverse_square_root_is_declared_factor() -> None:
+    model = typed_metric_model()
+    jacobian = torch.tensor(
+        [
+            [1.0, 0.0, 2.0, -1.0],
+            [0.5, 1.0, -0.5, 0.25],
+            [0.0, -1.0, 1.5, 2.0],
+        ],
+        dtype=torch.float64,
+    )
+    loss_hessian = torch.diag(torch.tensor([2.0, 3.0, 5.0], dtype=torch.float64))
+    metric = vp.metric.ggn_derived(
+        factors={"jacobian": jacobian, "loss_hessian": loss_hessian}
+    )
+    vector = typed_vector()
+    damping = 0.25
+    damped_matrix = jacobian.T @ loss_hessian @ jacobian
+    damped_matrix = damped_matrix + damping * torch.eye(4, dtype=torch.float64)
+    operator = vp.inverse_sqrt_metric_vp(
+        model,
+        metric,
+        damping=vp.damping.scalar(damping),
+    )
+
+    factor_matrix = dense_weight_unary_operator_matrix(operator, vector)
+
+    torch.testing.assert_close(
+        factor_matrix @ factor_matrix.T,
+        torch.linalg.inv(damped_matrix),
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
+def test_typed_parameter_surface_per_group_damping_executes() -> None:
+    model = typed_two_parameter_metric_model()
+    vector = typed_two_parameter_vector()
+    left = {
+        "left": torch.tensor([-1.5, 0.75], dtype=torch.float64),
+        "right": torch.tensor([0.25], dtype=torch.float64),
+    }
+    flat_vector = flat_tree(vector)
+    flat_left = flat_tree(left)
+    damping = vp.damping.per_group({"left": 0.25, "right": 0.75})
+    damping_diagonal = torch.tensor([0.25, 0.25, 0.75], dtype=torch.float64)
+    dense_matrix = torch.tensor(
+        [
+            [4.0, 0.25, -0.5],
+            [0.25, 3.0, 0.75],
+            [-0.5, 0.75, 2.5],
+        ],
+        dtype=torch.float64,
+    )
+    low_rank_factor = torch.tensor([[1.0], [-0.5], [0.25]], dtype=torch.float64)
+    low_rank_diagonal = torch.tensor([3.0, 4.0, 5.0], dtype=torch.float64)
+    low_rank_matrix = low_rank_factor @ low_rank_factor.T
+    low_rank_matrix = low_rank_matrix + torch.diag(low_rank_diagonal)
+    jacobian = torch.tensor(
+        [
+            [1.0, 0.0, 0.5],
+            [0.25, 1.0, -0.5],
+            [0.5, -0.25, 1.0],
+        ],
+        dtype=torch.float64,
+    )
+    loss_hessian = torch.diag(torch.tensor([2.0, 3.0, 4.0], dtype=torch.float64))
+    ggn_matrix = jacobian.T @ loss_hessian @ jacobian
+    cases = (
+        ("dense", vp.metric.dense(matrix=dense_matrix), dense_matrix),
+        (
+            "low_rank",
+            vp.metric.low_rank(factor=low_rank_factor, diagonal=low_rank_diagonal),
+            low_rank_matrix,
+        ),
+        (
+            "ggn",
+            vp.metric.ggn_derived(
+                factors={"jacobian": jacobian, "loss_hessian": loss_hessian}
+            ),
+            ggn_matrix,
+        ),
+    )
+
+    for _, metric, matrix in cases:
+        damped = matrix + torch.diag(damping_diagonal)
+        inverse_operator = vp.inverse_metric_vp(model, metric, damping=damping)
+        inverse_inner_operator = vp.inverse_metric_inner_vp(
+            model,
+            metric,
+            damping=damping,
+        )
+        inverse_sqrt_operator = vp.inverse_sqrt_metric_vp(
+            model,
+            metric,
+            damping=damping,
+        )
+        inverse_product = inverse_operator(vector)
+        inverse_inner = inverse_inner_operator(left, vector)
+        factor_matrix = dense_tree_unary_operator_matrix(
+            inverse_sqrt_operator,
+            vector,
+        )
+        expected_inverse = torch.linalg.solve(damped, flat_vector)
+
+        torch.testing.assert_close(
+            flat_tree(inverse_product),
+            expected_inverse,
+            atol=1e-10,
+            rtol=1e-10,
+        )
+        torch.testing.assert_close(
+            inverse_inner,
+            flat_left @ expected_inverse,
+            atol=1e-10,
+            rtol=1e-10,
+        )
+        torch.testing.assert_close(
+            factor_matrix @ factor_matrix.T,
+            torch.linalg.inv(damped),
+            atol=1e-10,
+            rtol=1e-10,
+        )
+        assert inverse_operator.spec.semantics["damping_kind"] == "per_group"
+        assert inverse_operator.spec.semantics["damping_groups"] == (
+            {"name": "left", "start": 0, "stop": 2},
+            {"name": "right", "start": 2, "stop": 3},
+        )
+
+
+def test_typed_matrix_free_metric_per_group_damping_uses_parameter_surface(
+    tmp_path: Path,
+) -> None:
+    model = typed_two_parameter_metric_model()
+    batch = {
+        "x": torch.tensor(
+            [[1.0, -0.5], [0.25, 2.0], [-1.5, 0.75]],
+            dtype=torch.float64,
+        ),
+        "labels": torch.tensor([0, 1, 0], dtype=torch.long),
+        "symmetry_vector": typed_two_parameter_vector(),
+    }
+    vector = typed_two_parameter_vector()
+    loss = vp.loss.softmax_cross_entropy(output="logits", labels="labels")
+    curvature = vp.ggnvp(model, loss, name="two_parameter_curvature")
+    metric = vp.metric.matrix_free(operator=curvature)
+    damping = vp.damping.per_group({"left": 0.25, "right": 0.75})
+    inverse_product = vp.inverse_metric_vp(
+        model,
+        metric,
+        name="two_parameter_inverse",
+        damping=damping,
+    )
+    inverse_inner = vp.inverse_metric_inner_vp(
+        model,
+        metric,
+        name="two_parameter_inverse_inner",
+        damping=damping,
+    )
+    run = vp.tune(
+        products=(curvature, inverse_product, inverse_inner),
+        model=model,
+        data={
+            "two_parameter_curvature": (batch,),
+            "two_parameter_inverse": (batch,),
+            "two_parameter_inverse_inner": (batch,),
+        },
+        vectors={
+            "two_parameter_curvature": (vector,),
+            "two_parameter_inverse": (vector,),
+            "two_parameter_inverse_inner": ((batch["symmetry_vector"], vector),),
+        },
+        target=public_cpu_target(),
+        space=vp.space.standard(),
+        search=vp.search.exhaustive(),
+        run_dir=tmp_path,
+    )
+    dense_matrix = dense_tree_operator_matrix(curvature, batch, vector)
+    damping_diagonal = torch.tensor([0.25, 0.25, 0.75], dtype=torch.float64)
+    expected = torch.linalg.solve(
+        dense_matrix + torch.diag(damping_diagonal),
+        flat_tree(vector),
+    )
+    output = run["two_parameter_inverse"](batch, vector)
+    inner_output = run["two_parameter_inverse_inner"](
+        batch,
+        batch["symmetry_vector"],
+        vector,
+    )
+    flat_left = flat_tree(batch["symmetry_vector"])
+
+    torch.testing.assert_close(flat_tree(output), expected, atol=1e-8, rtol=1e-8)
+    torch.testing.assert_close(inner_output, flat_left @ expected, atol=1e-8, rtol=1e-8)
+    assert inverse_product.spec.semantics["damping_groups"] == (
+        {"name": "left", "start": 0, "stop": 2},
+        {"name": "right", "start": 2, "stop": 3},
+    )
+
+
 def test_eigenvalue_floor_damping_requires_ekfac_metric() -> None:
     model = typed_metric_model()
     matrix = torch.eye(4, dtype=torch.float64)
@@ -850,11 +1252,11 @@ def test_per_group_damping_requires_named_block_metric_groups() -> None:
         }
     )
 
-    with pytest.raises(vp.MaterializationError, match="diagonal, block-diagonal"):
+    with pytest.raises(vp.MaterializationError, match="keys must match"):
         vp.inverse_metric_vp(
             model,
             dense_metric,
-            damping=vp.damping.per_group({"weight": 0.1}),
+            damping=vp.damping.per_group({"other": 0.1}),
         )
 
     with pytest.raises(vp.MaterializationError, match="keys must match"):
@@ -1241,6 +1643,33 @@ def test_typed_softmax_cross_entropy_gradient_and_hvp_match_reference() -> None:
     )
 
 
+def test_typed_public_operators_record_typed_object_identities() -> None:
+    model = typed_metric_model()
+    loss = vp.loss.softmax_cross_entropy(output="logits", labels="labels")
+    output = vp.output("logits")
+    likelihood = vp.likelihood.gaussian(
+        output="logits",
+        target="target",
+        noise=0.5,
+    )
+
+    assert vp.gradient(model, loss).spec.semantics["loss"] == loss.signature()
+    assert vp.hvp(model, loss).spec.semantics["loss"] == loss.signature()
+    assert vp.ggnvp(model, loss).spec.semantics["loss"] == loss.signature()
+    assert (
+        vp.per_example_gradient(model, loss).spec.semantics["loss"] == loss.signature()
+    )
+    assert (
+        vp.empirical_fisher_vp(model, loss).spec.semantics["loss"] == loss.signature()
+    )
+    assert vp.jvp(model, output).spec.semantics["output"] == output.signature()
+    assert vp.vjp(model, output).spec.semantics["output"] == output.signature()
+    assert (
+        vp.fisher_vp(model, likelihood).spec.semantics["likelihood"]
+        == likelihood.signature()
+    )
+
+
 def test_typed_softmax_cross_entropy_ggn_matches_masked_reference() -> None:
     model = typed_metric_model()
     batch = {
@@ -1438,6 +1867,46 @@ def test_typed_declared_psd_matrix_free_rejects_indefinite_matvec() -> None:
 
     with pytest.raises(vp.MaterializationError, match="PSD output-space metric"):
         vp.ggnvp(model, loss)(batch, vector)
+
+
+def test_declared_psd_matrix_free_rejects_orthogonal_indefinite_matvec() -> None:
+    model = typed_metric_model()
+    batch = {
+        "x": torch.tensor(
+            [[1.0, -0.5], [0.25, 2.0]],
+            dtype=torch.float64,
+        ),
+    }
+    vector = typed_vector()
+
+    def indefinite_matvec(output: torch.Tensor, tangent: torch.Tensor) -> torch.Tensor:
+        _ = output
+        matrix = torch.eye(tangent.numel(), dtype=tangent.dtype, device=tangent.device)
+        matrix[0, 0] = 0.0
+        matrix[0, 1] = 1.0
+        matrix[1, 0] = 1.0
+        matrix[1, 1] = 0.0
+
+        return (matrix @ tangent.reshape(-1)).reshape_as(tangent)
+
+    loss = vp.loss.declared_psd_matrix_free(
+        output="logits",
+        matvec=indefinite_matvec,
+        version="v1",
+    )
+
+    with pytest.raises(vp.MaterializationError, match="PSD output-space metric"):
+        vp.ggnvp(model, loss)(batch, vector)
+
+
+def test_declared_psd_matrix_free_certificate_uses_lanczos_residual_bound() -> None:
+    matrix = torch.diag(torch.tensor([1.0, -1.0, 1.0, 1.0], dtype=torch.float64))
+    smallest_ritz, residual_norm = public_module._lanczos_smallest_ritz_bound(
+        matrix,
+        matrix.shape[0],
+    )
+
+    assert smallest_ritz - residual_norm < 0.0
 
 
 def test_public_matrix_free_metric_tunes_selected_curvature_product(

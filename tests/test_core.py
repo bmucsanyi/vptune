@@ -3824,6 +3824,73 @@ def test_candidate_rows_reject_fusion_without_module() -> None:
     assert rows[0].admission_error == "fused rows require a module"
 
 
+def test_candidate_rows_reject_fused_loss_without_loss_identity() -> None:
+    runtime = runtime_config(
+        (
+            vpx.Candidate(
+                "family",
+                "fused",
+                {"fusion.loss": "fused_ce"},
+                admission_status="passed",
+            ),
+        ),
+        constant_operation_factory,
+        passing_reference_check,
+        materialize_candidate,
+        None,
+        {
+            "runtime": "standard",
+            "fusion_rewriter": True,
+            "module": True,
+            "operator": ops.hvp("family", "loss", aggregation="sum").signature(),
+        },
+    )
+    rows = tuple(run_module._candidate_rows(runtime))
+
+    assert rows[0].admission_status == "failed"
+    assert rows[0].admission_error == (
+        "fusion.loss=fused_ce requires typed softmax_cross_entropy loss identity"
+    )
+
+
+def test_candidate_rows_reject_sampled_fisher_exact_check_without_bound() -> None:
+    runtime = runtime_config(
+        (
+            vpx.Candidate(
+                "sampled",
+                "exact-check",
+                {"sampled_fisher.exact_fisher_check": ("enabled_with_sampling_bound")},
+                admission_status="passed",
+            ),
+        ),
+        constant_operation_factory,
+        passing_reference_check,
+        materialize_candidate,
+        None,
+        {
+            "runtime": "standard",
+            "operator": ops.sampled_fisher_vp(
+                "sampled",
+                "scores",
+                aggregation="mean_per_example",
+                distribution="explicit_score_gradients",
+                label_policy="sampled_labels",
+                sample_count=2,
+                sample_source="fixed_seed_and_count",
+                sampling_bound={"kind": "disabled"},
+                score_reduction="none",
+                denominator="num_examples",
+            ).signature(),
+        },
+    )
+    rows = tuple(run_module._candidate_rows(runtime))
+
+    assert rows[0].admission_status == "failed"
+    assert rows[0].admission_error == (
+        "sampled_fisher exact-Fisher check requires declared sampling_bound"
+    )
+
+
 def test_candidate_rows_reject_stateful_module_without_module() -> None:
     runtime = runtime_config(
         (
