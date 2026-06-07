@@ -394,23 +394,11 @@ class Precision:
     def axes_for(self, operator: "Operator") -> Mapping[str, Sequence[Any]]:
         """Return precision axes."""
         _ = operator
-        axes = {}
 
-        if self.model:
-            axes["dtype.model_compute"] = _axis_values_for_domain(
-                "dtype.model_compute",
-                self.model,
-                "Precision model",
-            )
-
-        if self.accumulation:
-            axes["dtype.accumulation"] = _axis_values_for_domain(
-                "dtype.accumulation",
-                self.accumulation,
-                "Precision accumulation",
-            )
-
-        return axes
+        return _component_axes(
+            ("dtype.model_compute", self.model, "Precision model"),
+            ("dtype.accumulation", self.accumulation, "Precision accumulation"),
+        )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -430,30 +418,12 @@ class Layout:
     def axes_for(self, operator: "Operator") -> Mapping[str, Sequence[Any]]:
         """Return layout axes."""
         _ = operator
-        axes = {}
 
-        if self.params:
-            axes["layout.params"] = _axis_values_for_domain(
-                "layout.params",
-                self.params,
-                "Layout params",
-            )
-
-        if self.vector:
-            axes["layout.vector"] = _axis_values_for_domain(
-                "layout.vector",
-                self.vector,
-                "Layout vector",
-            )
-
-        if self.output:
-            axes["layout.output"] = _axis_values_for_domain(
-                "layout.output",
-                self.output,
-                "Layout output",
-            )
-
-        return axes
+        return _component_axes(
+            ("layout.params", self.params, "Layout params"),
+            ("layout.vector", self.vector, "Layout vector"),
+            ("layout.output", self.output, "Layout output"),
+        )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -574,23 +544,14 @@ class Compile:
                 self.boundaries,
                 "Compile boundaries",
             ),
-            "compile.backend": (self.backend,),
-            "compile.mode": (self.mode,),
-            "compile.fullgraph": (_bool_setting(self.fullgraph),),
-            "compile.dynamic": (
-                None if self.dynamic is None else _bool_setting(self.dynamic),
-            ),
-            "compile.compiled_autograd": (_bool_setting(self.compiled_autograd),),
-            "compile.options.epilogue_fusion": (_bool_setting(self.epilogue_fusion),),
-            "compile.options.shape_padding": (_bool_setting(self.shape_padding),),
-            "compile.cuda_graphs": (_bool_setting(self.cuda_graphs),),
-            "compile.cache_state": (self.cache_state,),
+            **{key: (value,) for key, value in self._enabled_fixed_settings().items()},
         }
 
     def setting_rows_for(self, operator: "Operator") -> tuple[Mapping[str, Any], ...]:
         """Return row-conditioned compile settings."""
         _ = operator
         rows = []
+        fixed_settings = self._enabled_fixed_settings()
 
         for enabled in self.enabled:
             if not enabled:
@@ -601,19 +562,7 @@ class Compile:
                 {
                     "compile.enabled": "true",
                     "compile.boundary": boundary,
-                    "compile.backend": self.backend,
-                    "compile.mode": self.mode,
-                    "compile.fullgraph": _bool_setting(self.fullgraph),
-                    "compile.dynamic": (
-                        None if self.dynamic is None else _bool_setting(self.dynamic)
-                    ),
-                    "compile.compiled_autograd": _bool_setting(self.compiled_autograd),
-                    "compile.options.epilogue_fusion": _bool_setting(
-                        self.epilogue_fusion
-                    ),
-                    "compile.options.shape_padding": _bool_setting(self.shape_padding),
-                    "compile.cuda_graphs": _bool_setting(self.cuda_graphs),
-                    "compile.cache_state": self.cache_state,
+                    **fixed_settings,
                 }
                 for boundary in _axis_values_for_domain(
                     "compile.boundary",
@@ -623,6 +572,21 @@ class Compile:
             )
 
         return tuple(rows)
+
+    def _enabled_fixed_settings(self) -> Mapping[str, Any]:
+        return {
+            "compile.backend": self.backend,
+            "compile.mode": self.mode,
+            "compile.fullgraph": _bool_setting(self.fullgraph),
+            "compile.dynamic": (
+                None if self.dynamic is None else _bool_setting(self.dynamic)
+            ),
+            "compile.compiled_autograd": _bool_setting(self.compiled_autograd),
+            "compile.options.epilogue_fusion": _bool_setting(self.epilogue_fusion),
+            "compile.options.shape_padding": _bool_setting(self.shape_padding),
+            "compile.cuda_graphs": _bool_setting(self.cuda_graphs),
+            "compile.cache_state": self.cache_state,
+        }
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -642,16 +606,11 @@ class Memory:
         """Return memory axes."""
         _ = operator
 
-        if not self.vector_residency:
-            return {}
-
-        return {
-            "memory.vector_residency": _axis_values_for_domain(
-                "memory.vector_residency",
-                self.vector_residency,
-                "Memory vector_residency",
-            )
-        }
+        return _component_axes((
+            "memory.vector_residency",
+            self.vector_residency,
+            "Memory vector_residency",
+        ))
 
 
 _AD_AXIS_BY_OPERATOR_KIND = {
@@ -972,6 +931,16 @@ def _axis_values_for_domain(
     return normalized
 
 
+def _component_axes(
+    *rows: tuple[str, Sequence[Any], str],
+) -> Mapping[str, Sequence[Any]]:
+    return {
+        axis_key: _axis_values_for_domain(axis_key, values, field)
+        for axis_key, values, field in rows
+        if values
+    }
+
+
 def _axis_descriptor(axis_key: str) -> Any:
     descriptor = axis_manifest().by_key().get(axis_key)
 
@@ -1214,20 +1183,16 @@ class _LossObjective:
                 message = f"loss kind has no per-example lowering: {self.kind}"
                 raise MaterializationError(message)
 
-            return self._softmax_cross_entropy_per_example(
-                params,
-                buffers,
-                batch,
-            )
+            return self.softmax_cross_entropy_per_example(params, buffers, batch)
 
         if self.kind == "softmax_cross_entropy":
-            return self._softmax_cross_entropy(params, buffers, batch)
+            return self.softmax_cross_entropy(params, buffers, batch)
 
         if self.kind == "kl":
-            return self._kl(params, buffers, batch)
+            return self.kl(params, buffers, batch)
 
         if self.kind == "mse":
-            return self._mse(params, buffers, batch)
+            return self.mse(params, buffers, batch)
 
         message = f"loss kind is not lowered: {self.kind}"
         raise MaterializationError(message)
@@ -1238,20 +1203,21 @@ class _LossObjective:
 
         return f"loss.{self.kind}"
 
-    def _softmax_cross_entropy(
+    def softmax_cross_entropy(
         self,
         params: ParameterTree,
         buffers: BufferTree,
         batch: Batch,
     ) -> torch.Tensor:
-        logits = _model_output_tensor(self.model, params, buffers, batch, self.output)
-        labels = _batch_long_tensor(batch, self.target)
-        losses = _softmax_cross_entropy_losses(logits, labels)
-        mask = _loss_mask(batch, self.mask, labels.shape)
-
-        if mask is not None:
-            mask = mask.to(device=losses.device, dtype=losses.dtype)
-            losses = losses * mask
+        losses, mask = _softmax_cross_entropy_loss_terms(
+            self.model,
+            params,
+            buffers,
+            batch,
+            self.output,
+            self.target,
+            self.mask,
+        )
 
         return _reduce_losses(
             losses,
@@ -1260,16 +1226,21 @@ class _LossObjective:
             denominator=self.denominator,
         )
 
-    def _softmax_cross_entropy_per_example(
+    def softmax_cross_entropy_per_example(
         self,
         params: ParameterTree,
         buffers: BufferTree,
         batch: Batch,
     ) -> torch.Tensor:
-        logits = _model_output_tensor(self.model, params, buffers, batch, self.output)
-        labels = _batch_long_tensor(batch, self.target)
-        losses = _softmax_cross_entropy_losses(logits, labels)
-        mask = _loss_mask(batch, self.mask, labels.shape)
+        losses, mask = _softmax_cross_entropy_loss_terms(
+            self.model,
+            params,
+            buffers,
+            batch,
+            self.output,
+            self.target,
+            self.mask,
+        )
 
         return _per_example_reduce_losses(
             losses,
@@ -1278,20 +1249,21 @@ class _LossObjective:
             denominator=self.denominator,
         )
 
-    def _kl(
+    def kl(
         self,
         params: ParameterTree,
         buffers: BufferTree,
         batch: Batch,
     ) -> torch.Tensor:
-        logits = _model_output_tensor(self.model, params, buffers, batch, self.output)
-        target = _batch_tensor(batch, self.target)
-        losses = _kl_token_losses(logits, target)
-        mask = _loss_mask(batch, self.mask, losses.shape)
-
-        if mask is not None:
-            mask = mask.to(device=losses.device, dtype=losses.dtype)
-            losses = losses * mask
+        losses, mask = _kl_loss_terms(
+            self.model,
+            params,
+            buffers,
+            batch,
+            self.output,
+            self.target,
+            self.mask,
+        )
 
         return _reduce_losses(
             losses,
@@ -1300,18 +1272,21 @@ class _LossObjective:
             denominator=self.denominator,
         )
 
-    def _mse(
+    def mse(
         self,
         params: ParameterTree,
         buffers: BufferTree,
         batch: Batch,
     ) -> torch.Tensor:
-        prediction = _model_output_tensor(
-            self.model, params, buffers, batch, self.output
+        losses, mask, prediction = _mse_loss_terms(
+            self.model,
+            params,
+            buffers,
+            batch,
+            self.output,
+            self.target,
+            self.mask,
         )
-        target = _batch_tensor(batch, self.target)
-        losses = _mse_element_losses(prediction, target)
-        mask = _mse_mask(batch, self.mask, prediction.shape)
 
         if mask is not None:
             losses = losses * _mse_element_mask(mask, prediction)
@@ -1537,18 +1512,18 @@ class _LossHessianBatch:
 
     def __call__(self, batch: Batch) -> Batch:
         if self.kind == "softmax_cross_entropy":
-            loss_hessian = self._softmax_cross_entropy(batch)
+            loss_hessian = self.softmax_cross_entropy(batch)
         elif self.kind == "kl":
-            loss_hessian = self._kl(batch)
+            loss_hessian = self.kl(batch)
         elif self.kind == "mse":
-            loss_hessian = self._mse(batch)
+            loss_hessian = self.mse(batch)
         else:
             message = f"loss kind has no output-Hessian lowering: {self.kind}"
             raise MaterializationError(message)
 
         return {**batch, "loss_hessian": loss_hessian}
 
-    def _softmax_cross_entropy(self, batch: Batch) -> torch.Tensor:
+    def softmax_cross_entropy(self, batch: Batch) -> torch.Tensor:
         logits = _current_model_output_tensor(
             self.model,
             batch,
@@ -1565,7 +1540,7 @@ class _LossHessianBatch:
             denominator=self.denominator,
         )
 
-    def _kl(self, batch: Batch) -> torch.Tensor:
+    def kl(self, batch: Batch) -> torch.Tensor:
         logits = _current_model_output_tensor(
             self.model,
             batch,
@@ -1583,7 +1558,7 @@ class _LossHessianBatch:
             denominator=self.denominator,
         )
 
-    def _mse(self, batch: Batch) -> torch.Tensor:
+    def mse(self, batch: Batch) -> torch.Tensor:
         prediction = _current_model_output_tensor(
             self.model,
             batch,
@@ -1745,6 +1720,7 @@ class Operator:
         Raises:
             MaterializationError: If tuning does not select a row.
         """
+        _reject_composition_entrypoint(self.spec.kind, "operator.tune")
         tuning_problem = _operator_problem(
             self,
             data=data,
@@ -2143,8 +2119,16 @@ def _require_softmax_cross_entropy_denominator(
     _: str,
     denominator: str,
 ) -> None:
-    if denominator != "num_tokens":
-        message = f"softmax_cross_entropy denominator is unsupported: {denominator}"
+    _require_supported_value(
+        denominator,
+        "num_tokens",
+        "softmax_cross_entropy denominator",
+    )
+
+
+def _require_supported_value(value: Any, expected: Any, name: str) -> None:
+    if value != expected:
+        message = f"{name} is unsupported: {value}"
         raise MaterializationError(message)
 
 
@@ -2341,9 +2325,8 @@ class _MetricNamespace:
         """
         _require_tensor(matrix, "metric.dense matrix")
 
-        return Metric(
-            kind="dense_matrix",
-            representation={"kind": "dense_matrix"},
+        return _metric_declaration(
+            "dense_matrix",
             batch={"metric_matrix": matrix},
             identity_fields={"metric_matrix": tensor_signature(matrix)},
         )
@@ -2355,9 +2338,8 @@ class _MetricNamespace:
         Returns:
             Diagonal metric declaration.
         """
-        return Metric(
-            kind="diagonal_tree",
-            representation={"kind": "diagonal_tree"},
+        return _metric_declaration(
+            "diagonal_tree",
             batch={"metric_diagonal": diag},
             identity_fields={"metric_diagonal": _tree_signature(diag)},
         )
@@ -2377,9 +2359,8 @@ class _MetricNamespace:
         _require_same_keys(eigvecs_a, eigvecs_g, "ekfac eigvec keys")
         _require_same_keys(eigvecs_a, corrected_eigenvalues, "ekfac eigenvalue keys")
 
-        return Metric(
-            kind="ekfac_factors",
-            representation={"kind": "ekfac_factors"},
+        return _metric_declaration(
+            "ekfac_factors",
             batch={
                 "ekfac_eigvecs_a": dict(eigvecs_a),
                 "ekfac_eigvecs_g": dict(eigvecs_g),
@@ -2403,9 +2384,8 @@ class _MetricNamespace:
         Returns:
             Low-rank metric declaration.
         """
-        return Metric(
-            kind="low_rank_factors",
-            representation={"kind": "low_rank_factors"},
+        return _metric_declaration(
+            "low_rank_factors",
             batch={"low_rank_factors": {"basis": factor, "diagonal": diagonal}},
             identity_fields={
                 "factor": _tree_signature(factor),
@@ -2431,12 +2411,9 @@ class _MetricNamespace:
             _require_nonempty_string(key, "metric.block_diagonal block key")
             _require_tensor(block, f"metric.block_diagonal block {key}")
 
-        return Metric(
-            kind="block_diagonal",
-            representation={
-                "kind": "block_diagonal",
-                "block_names": tuple(blocks),
-            },
+        return _metric_declaration(
+            "block_diagonal",
+            representation_fields={"block_names": tuple(blocks)},
             batch={"metric_blocks": tuple(blocks.values())},
             identity_fields={"metric_blocks": _tree_signature(blocks)},
         )
@@ -2479,9 +2456,9 @@ class _MetricNamespace:
                 "right_factor": right_key,
             })
 
-        return Metric(
-            kind="kfac_factors",
-            representation={"kind": "kfac_factors", "blocks": tuple(blocks)},
+        return _metric_declaration(
+            "kfac_factors",
+            representation_fields={"blocks": tuple(blocks)},
             batch={"kfac_factors": factor_batch},
             identity_fields={"kfac_factors": _tree_signature(factors)},
         )
@@ -2493,9 +2470,8 @@ class _MetricNamespace:
         Returns:
             GGN-derived metric declaration.
         """
-        return Metric(
-            kind="ggn_derived_factors",
-            representation={"kind": "ggn_derived_factors"},
+        return _metric_declaration(
+            "ggn_derived_factors",
             batch={"ggn_factors": dict(factors)},
             identity_fields={"ggn_factors": _tree_signature(factors)},
         )
@@ -2523,26 +2499,51 @@ class _MetricNamespace:
             message = "matrix_free metric requires a GGN or Fisher operator"
             raise MaterializationError(message)
 
-        return Metric(
-            kind="matrix_free",
-            representation={"kind": "matrix_free", "operator": operator.spec.family},
+        return _metric_declaration(
+            "matrix_free",
+            representation_fields={"operator": operator.spec.family},
             batch={},
             identity_fields={"operator": operator.spec.family},
             product_name=operator.spec.family,
         )
 
 
+def _metric_declaration(
+    kind: str,
+    *,
+    batch: Mapping[str, Any],
+    identity_fields: Mapping[str, Any],
+    representation_fields: Mapping[str, Any] | None = None,
+    product_name: str | None = None,
+) -> Metric:
+    return Metric(
+        kind,
+        {"kind": kind, **(representation_fields or {})},
+        batch,
+        identity_fields,
+        product_name,
+    )
+
+
+def _float_damping_declaration(
+    kind: str,
+    value: float,
+    name: str,
+    *,
+    policy: str | None = None,
+) -> Damping:
+    return Damping(kind, _float_damping(value, name), policy=policy)
+
+
+def _fixed_float_damping(kind: str, name: str) -> Callable[[float], Damping]:
+    def build(lam: float) -> Damping:
+        return _float_damping_declaration(kind, lam, name)
+
+    return build
+
+
 class _DampingNamespace:
-    @staticmethod
-    def scalar(lam: float) -> Damping:
-        """Build scalar damping.
-
-        Returns:
-            Scalar damping declaration.
-        """
-        _require_nonnegative_float(lam, "scalar damping")
-
-        return Damping("scalar", float(lam))
+    scalar = staticmethod(_fixed_float_damping("scalar", "scalar damping"))
 
     @staticmethod
     def per_group(values: Mapping[str, float]) -> Damping:
@@ -2580,24 +2581,22 @@ class _DampingNamespace:
         Raises:
             MaterializationError: If the damping or policy is invalid.
         """
-        _require_nonnegative_float(lam, "kfac_pi damping")
+        damping = _float_damping_declaration(
+            "kfac_pi",
+            lam,
+            "kfac_pi damping",
+            policy=policy,
+        )
 
         if policy not in {"trace_norm", "equal"}:
             message = f"kfac_pi policy is unsupported: {policy}"
             raise MaterializationError(message)
 
-        return Damping("kfac_pi", float(lam), policy=policy)
+        return damping
 
-    @staticmethod
-    def eigenvalue_floor(lam: float) -> Damping:
-        """Build EKFAC eigenvalue-floor damping.
-
-        Returns:
-            EKFAC eigenvalue-floor damping declaration.
-        """
-        _require_nonnegative_float(lam, "eigenvalue_floor damping")
-
-        return Damping("eigenvalue_floor", float(lam))
+    eigenvalue_floor = staticmethod(
+        _fixed_float_damping("eigenvalue_floor", "eigenvalue_floor damping")
+    )
 
 
 loss = _LossNamespace()
@@ -2617,24 +2616,13 @@ class _LikelihoodNamespace:
 
         Returns:
             Categorical likelihood declaration.
-
-        Raises:
-            MaterializationError: If a closed-set field is invalid.
         """
         _require_nonempty_string(output, "likelihood output")
         _require_nonempty_string(labels, "likelihood labels")
 
-        if sample_space != "terms":
-            message = f"categorical sample_space is unsupported: {sample_space}"
-            raise MaterializationError(message)
-
-        if denominator != "num_tokens":
-            message = f"categorical denominator is unsupported: {denominator}"
-            raise MaterializationError(message)
-
-        if label_policy != "explicit":
-            message = f"categorical label_policy is unsupported: {label_policy}"
-            raise MaterializationError(message)
+        _require_supported_value(sample_space, "terms", "categorical sample_space")
+        _require_supported_value(denominator, "num_tokens", "categorical denominator")
+        _require_supported_value(label_policy, "explicit", "categorical label_policy")
 
         return Likelihood(
             kind="categorical",
@@ -2660,21 +2648,13 @@ class _LikelihoodNamespace:
 
         Returns:
             Gaussian likelihood declaration.
-
-        Raises:
-            MaterializationError: If a closed-set field is invalid.
         """
         _require_nonempty_string(output, "likelihood output")
         _require_nonempty_string(target, "likelihood target")
         _require_positive_float(noise, "gaussian noise")
 
-        if sample_space != "terms":
-            message = f"gaussian sample_space is unsupported: {sample_space}"
-            raise MaterializationError(message)
-
-        if denominator != "num_examples":
-            message = f"gaussian denominator is unsupported: {denominator}"
-            raise MaterializationError(message)
+        _require_supported_value(sample_space, "terms", "gaussian sample_space")
+        _require_supported_value(denominator, "num_examples", "gaussian denominator")
 
         return Likelihood(
             kind="gaussian",
@@ -3079,33 +3059,17 @@ def _combine_signature(term: Combine | str) -> Mapping[str, Any]:
     raise MaterializationError(message)
 
 
+def _fixed_search_strategy(name: str) -> Callable[[], SearchStrategy]:
+    def build() -> SearchStrategy:
+        return _search_strategy(name)
+
+    return build
+
+
 class _SearchNamespace:
-    @staticmethod
-    def admission() -> SearchStrategy:
-        """Build an admission-only search strategy.
-
-        Returns:
-            Admission-only search strategy.
-        """
-        return _search_strategy("admission")
-
-    @staticmethod
-    def smoke() -> SearchStrategy:
-        """Build a smoke search strategy.
-
-        Returns:
-            Smoke search strategy.
-        """
-        return _search_strategy("smoke")
-
-    @staticmethod
-    def fast() -> SearchStrategy:
-        """Build a fast search strategy.
-
-        Returns:
-            Fast search strategy.
-        """
-        return _search_strategy("fast")
+    admission = staticmethod(_fixed_search_strategy("admission"))
+    smoke = staticmethod(_fixed_search_strategy("smoke"))
+    fast = staticmethod(_fixed_search_strategy("fast"))
 
     @staticmethod
     def balanced(
@@ -3143,14 +3107,7 @@ class _SearchNamespace:
             variance_repeat_count=variance_repeats,
         )
 
-    @staticmethod
-    def exhaustive() -> SearchStrategy:
-        """Build an exhaustive search strategy.
-
-        Returns:
-            Exhaustive search strategy.
-        """
-        return _search_strategy("exhaustive")
+    exhaustive = staticmethod(_fixed_search_strategy("exhaustive"))
 
 
 search = _SearchNamespace()
@@ -3255,6 +3212,8 @@ def problem(
     Returns:
         Lower-layer tuning problem for the typed product.
     """
+    _reject_composition_entrypoint(product.spec.kind, "vp.problem")
+
     return _operator_problem(
         product,
         data=data,
@@ -3279,6 +3238,8 @@ def autotune(
     Returns:
         Selected plan.
     """
+    _reject_composition_entrypoint(problem.operator.kind, "vp.autotune")
+
     return _tune_problem(
         problem,
         run_dir=run_dir,
@@ -3967,6 +3928,13 @@ def _composition_call_inputs(combine: Combine | str) -> tuple[str, ...]:
     return ("batch", "vector")
 
 
+_FIELD_LOSS_TARGET_FIELDS = {
+    "softmax_cross_entropy": "labels",
+    "kl": "target",
+    "mse": "target",
+}
+
+
 def _loss_scalar_objective(model: Model, typed_loss: Loss) -> ScalarObjective:
     if typed_loss.kind == "from_scalar":
         if typed_loss.objective is None:
@@ -3975,26 +3943,33 @@ def _loss_scalar_objective(model: Model, typed_loss: Loss) -> ScalarObjective:
 
         return typed_loss.objective
 
-    if typed_loss.kind == "softmax_cross_entropy":
-        return _LossObjective(
-            mode="scalar",
-            **_loss_lowering_fields(model, typed_loss, "labels"),
-        )
+    return _loss_objective(
+        model,
+        typed_loss,
+        mode="scalar",
+        target_fields=_FIELD_LOSS_TARGET_FIELDS,
+        unsupported_message="loss kind is not lowered",
+    )
 
-    if typed_loss.kind == "kl":
-        return _LossObjective(
-            mode="scalar",
-            **_loss_lowering_fields(model, typed_loss, "target"),
-        )
 
-    if typed_loss.kind == "mse":
-        return _LossObjective(
-            mode="scalar",
-            **_loss_lowering_fields(model, typed_loss, "target"),
-        )
+def _loss_objective(
+    model: Model,
+    typed_loss: Loss,
+    *,
+    mode: str,
+    target_fields: Mapping[str, str],
+    unsupported_message: str,
+) -> _LossObjective:
+    target_field = target_fields.get(typed_loss.kind)
 
-    message = f"loss kind is not lowered: {typed_loss.kind}"
-    raise MaterializationError(message)
+    if target_field is None:
+        message = f"{unsupported_message}: {typed_loss.kind}"
+        raise MaterializationError(message)
+
+    return _LossObjective(
+        mode=mode,
+        **_loss_lowering_fields(model, typed_loss, target_field),
+    )
 
 
 def _loss_lowering_fields(
@@ -4018,28 +3993,25 @@ def _loss_per_example_objective(
     model: Model,
     typed_loss: Loss,
 ) -> FunctionObjective:
-    if typed_loss.kind == "softmax_cross_entropy":
-        return _LossObjective(
-            mode="per_example",
-            **_loss_lowering_fields(model, typed_loss, "labels"),
-        )
-
-    message = f"loss kind has no per-example lowering: {typed_loss.kind}"
-    raise MaterializationError(message)
+    return _loss_objective(
+        model,
+        typed_loss,
+        mode="per_example",
+        target_fields={"softmax_cross_entropy": "labels"},
+        unsupported_message="loss kind has no per-example lowering",
+    )
 
 
 def _loss_hessian_batch_transform(
     model: Model,
     typed_loss: Loss,
 ) -> Callable[[Batch], Batch]:
-    if typed_loss.kind == "softmax_cross_entropy":
-        return _LossHessianBatch(**_loss_lowering_fields(model, typed_loss, "labels"))
+    target_field = _FIELD_LOSS_TARGET_FIELDS.get(typed_loss.kind)
 
-    if typed_loss.kind == "kl":
-        return _LossHessianBatch(**_loss_lowering_fields(model, typed_loss, "target"))
-
-    if typed_loss.kind == "mse":
-        return _LossHessianBatch(**_loss_lowering_fields(model, typed_loss, "target"))
+    if target_field is not None:
+        return _LossHessianBatch(
+            **_loss_lowering_fields(model, typed_loss, target_field)
+        )
 
     if typed_loss.kind == "declared_psd":
         if typed_loss.hessian_factor is None:
@@ -4085,20 +4057,19 @@ def _likelihood_score_gradient_batch_transform(
 
 def _sampled_fisher_denominator(typed_likelihood: Likelihood) -> str:
     denominator = _likelihood_string_field(typed_likelihood, "denominator")
+    expected = {
+        "categorical": "num_tokens",
+        "gaussian": "num_examples",
+    }.get(typed_likelihood.kind)
 
-    if typed_likelihood.kind == "categorical":
-        if denominator != "num_tokens":
-            message = f"categorical denominator is unsupported: {denominator}"
-            raise MaterializationError(message)
+    if expected is not None:
+        _require_supported_value(
+            denominator,
+            expected,
+            f"{typed_likelihood.kind} denominator",
+        )
 
-        return "num_tokens"
-
-    if typed_likelihood.kind == "gaussian":
-        if denominator != "num_examples":
-            message = f"gaussian denominator is unsupported: {denominator}"
-            raise MaterializationError(message)
-
-        return "num_examples"
+        return expected
 
     message = (
         f"likelihood kind has no sampled-Fisher denominator: {typed_likelihood.kind}"
@@ -4319,6 +4290,54 @@ def _loss_optional_string_field(typed_loss: Loss, field: str) -> str | None:
     return value
 
 
+def _softmax_cross_entropy_loss_terms(
+    model: Model,
+    params: ParameterTree,
+    buffers: BufferTree,
+    batch: Batch,
+    output: str,
+    target: str,
+    mask_key: str | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    logits = _model_output_tensor(model, params, buffers, batch, output)
+    labels = _batch_long_tensor(batch, target)
+    losses = _softmax_cross_entropy_losses(logits, labels)
+
+    return losses, _loss_mask(batch, mask_key, labels.shape)
+
+
+def _kl_loss_terms(
+    model: Model,
+    params: ParameterTree,
+    buffers: BufferTree,
+    batch: Batch,
+    output: str,
+    target: str,
+    mask_key: str | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    logits = _model_output_tensor(model, params, buffers, batch, output)
+    target_tensor = _batch_tensor(batch, target)
+    losses = _kl_token_losses(logits, target_tensor)
+
+    return losses, _loss_mask(batch, mask_key, losses.shape)
+
+
+def _mse_loss_terms(
+    model: Model,
+    params: ParameterTree,
+    buffers: BufferTree,
+    batch: Batch,
+    output: str,
+    target: str,
+    mask_key: str | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    prediction = _model_output_tensor(model, params, buffers, batch, output)
+    target_tensor = _batch_tensor(batch, target)
+    losses = _mse_element_losses(prediction, target_tensor)
+
+    return losses, _mse_mask(batch, mask_key, prediction.shape), prediction
+
+
 def _softmax_cross_entropy_losses(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -4355,30 +4374,12 @@ def _softmax_cross_entropy_loss_hessian(
     reduction: str,
     denominator: str,
 ) -> torch.Tensor:
-    class_count = logits.shape[-1]
-    probabilities = torch.softmax(logits, dim=-1)
-    blocks = torch.diag_embed(probabilities) - (
-        probabilities[..., :, None] * probabilities[..., None, :]
-    )
-
-    if mask is not None:
-        blocks = (
-            blocks
-            * mask.to(
-                device=logits.device,
-                dtype=logits.dtype,
-            )[..., None, None]
-        )
-
-    scale = _softmax_cross_entropy_loss_hessian_scale(
+    return _softmax_logit_loss_hessian(
         logits,
         mask=mask,
         reduction=reduction,
         denominator=denominator,
     )
-    flat_blocks = (blocks * scale).reshape(-1, class_count, class_count)
-
-    return torch.block_diag(*tuple(flat_blocks))
 
 
 def _kl_token_losses(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -4411,20 +4412,36 @@ def _kl_loss_hessian(
     denominator: str,
 ) -> torch.Tensor:
     _kl_token_losses(logits, target)
+
+    return _softmax_logit_loss_hessian(
+        logits,
+        target_mass=target.sum(dim=-1),
+        mask=mask,
+        reduction=reduction,
+        denominator=denominator,
+    )
+
+
+def _softmax_logit_loss_hessian(
+    logits: torch.Tensor,
+    *,
+    target_mass: torch.Tensor | None = None,
+    mask: torch.Tensor | None,
+    reduction: str,
+    denominator: str,
+) -> torch.Tensor:
+    class_count = logits.shape[-1]
     probabilities = torch.softmax(logits, dim=-1)
     blocks = torch.diag_embed(probabilities) - (
         probabilities[..., :, None] * probabilities[..., None, :]
     )
-    target_mass = target.sum(dim=-1)
-    blocks = blocks * target_mass[..., None, None]
+
+    if target_mass is not None:
+        blocks = blocks * target_mass[..., None, None]
 
     if mask is not None:
         blocks = (
-            blocks
-            * mask.to(
-                device=logits.device,
-                dtype=logits.dtype,
-            )[..., None, None]
+            blocks * mask.to(device=logits.device, dtype=logits.dtype)[..., None, None]
         )
 
     scale = _softmax_cross_entropy_loss_hessian_scale(
@@ -4433,7 +4450,6 @@ def _kl_loss_hessian(
         reduction=reduction,
         denominator=denominator,
     )
-    class_count = logits.shape[-1]
     flat_blocks = (blocks * scale).reshape(-1, class_count, class_count)
 
     return torch.block_diag(*tuple(flat_blocks))
@@ -4680,6 +4696,9 @@ def _reduce_losses(
     reduction: str,
     denominator: str,
 ) -> torch.Tensor:
+    if mask is not None:
+        losses = losses * mask.to(device=losses.device, dtype=losses.dtype)
+
     if reduction == "sum":
         return losses.sum()
 
@@ -4997,20 +5016,15 @@ def inverse_metric_vp(
     Returns:
         Inverse metric-vector operator.
     """
-    tolerance = _typed_inverse_tol(metric, tol)
-    damping_payload = _damping_value(model, metric, damping)
-    _require_matrix_free_positive_damping(metric, damping_payload)
-    family = _operator_family(name, "inverse_metric")
-    spec = _operator_builders.inverse_metric(
-        family,
-        "typed_metric",
-        aggregation="sum",
-        representation=metric.representation,
-        damping=_builder_damping_value(damping_payload),
-        tol=tolerance,
-    )
-    spec = _operator_with_damping_identity(
-        spec, model, metric, damping, damping_payload
+    spec = _inverse_metric_product_spec(
+        model,
+        metric,
+        damping,
+        tol,
+        name=name,
+        family_default="inverse_metric",
+        builder=_operator_builders.inverse_metric,
+        tolerance_for=_typed_inverse_tol,
     )
 
     return _typed_metric_operator(
@@ -5035,20 +5049,15 @@ def inverse_sqrt_metric_vp(
     Returns:
         Inverse metric square-root operator.
     """
-    tolerance = _typed_inverse_sqrt_tol(metric, tol)
-    damping_payload = _damping_value(model, metric, damping)
-    _require_matrix_free_positive_damping(metric, damping_payload)
-    family = _operator_family(name, "inverse_sqrt_metric")
-    spec = _operator_builders.inverse_sqrt_metric(
-        family,
-        "typed_metric",
-        aggregation="sum",
-        representation=metric.representation,
-        damping=_builder_damping_value(damping_payload),
-        tol=tolerance,
-    )
-    spec = _operator_with_damping_identity(
-        spec, model, metric, damping, damping_payload
+    spec = _inverse_metric_product_spec(
+        model,
+        metric,
+        damping,
+        tol,
+        name=name,
+        family_default="inverse_sqrt_metric",
+        builder=_operator_builders.inverse_sqrt_metric,
+        tolerance_for=_typed_inverse_sqrt_tol,
     )
 
     return _typed_metric_operator(
@@ -5104,21 +5113,16 @@ def inverse_metric_inner_vp(
     Returns:
         Inverse metric inner-product operator.
     """
-    tolerance = _typed_inverse_tol(metric, tol)
-    damping_payload = _damping_value(model, metric, damping)
-    _require_matrix_free_positive_damping(metric, damping_payload)
-    family = _operator_family(name, "inverse_metric_inner")
-    spec = _operator_builders.inverse_metric_inner(
-        family,
-        "typed_metric",
-        aggregation="sum",
-        representation=metric.representation,
-        damping=_builder_damping_value(damping_payload),
-        as_norm=as_norm,
-        tol=tolerance,
-    )
-    spec = _operator_with_damping_identity(
-        spec, model, metric, damping, damping_payload
+    spec = _inverse_metric_product_spec(
+        model,
+        metric,
+        damping,
+        tol,
+        name=name,
+        family_default="inverse_metric_inner",
+        builder=_operator_builders.inverse_metric_inner,
+        tolerance_for=_typed_inverse_tol,
+        extra_fields={"as_norm": as_norm},
     )
 
     return _typed_metric_operator(
@@ -5127,6 +5131,39 @@ def inverse_metric_inner_vp(
         spec=spec,
         call_inputs=_metric_inner_call_inputs(metric),
         default_settings=_inverse_metric_inner_default_settings(model, metric, as_norm),
+    )
+
+
+def _inverse_metric_product_spec(
+    model: Model,
+    metric: Metric,
+    damping: Damping,
+    tol: float | None,
+    *,
+    name: str | None,
+    family_default: str,
+    builder: Callable[..., OperatorSpec],
+    tolerance_for: Callable[[Metric, float | None], float | None],
+    extra_fields: Mapping[str, Any] | None = None,
+) -> OperatorSpec:
+    tolerance = tolerance_for(metric, tol)
+    damping_payload = _damping_value(model, metric, damping)
+    _require_matrix_free_positive_damping(metric, damping_payload)
+    family = _operator_family(name, family_default)
+    builder_fields = {
+        "aggregation": "sum",
+        "representation": metric.representation,
+        "damping": _builder_damping_value(damping_payload),
+        "tol": tolerance,
+    }
+
+    if extra_fields is not None:
+        builder_fields.update(extra_fields)
+
+    spec = builder(family, "typed_metric", **builder_fields)
+
+    return _operator_with_damping_identity(
+        spec, model, metric, damping, damping_payload
     )
 
 
@@ -5370,6 +5407,15 @@ def _operator_family(name: str | None, default: str) -> str:
         return name
 
     return default
+
+
+def _reject_composition_entrypoint(kind: str, entrypoint: str) -> None:
+    if kind == "composition":
+        message = (
+            f"{entrypoint} rejects composition products; use vp.tune(...) "
+            "with the composition and dependency products"
+        )
+        raise MaterializationError(message)
 
 
 def _operator_problem(

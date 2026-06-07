@@ -160,7 +160,7 @@ class CandidateOperation(Protocol):
 
 
 class OperationFactoryCallback(Protocol):
-    """Callable wrapped by an identity-bearing operation factory."""
+    """Callable payload for an identity-bearing operation factory."""
 
     def __call__(
         self,
@@ -191,7 +191,7 @@ class RuntimeOperationFactory(OperationFactory, Protocol):
 
 
 class ReferenceCheckCallback(Protocol):
-    """Callable wrapped by an identity-bearing reference check."""
+    """Callable payload for an identity-bearing reference check."""
 
     def __call__(
         self,
@@ -223,7 +223,7 @@ class RuntimeReferenceCheck(ReferenceCheck, Protocol):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class CallableOperationFactory:
-    """Identity-bearing wrapper for operation factory callbacks."""
+    """Identity-bearing operation factory for callback payloads."""
 
     factory_id: str
     factory_version: str
@@ -252,7 +252,7 @@ class CallableOperationFactory:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class CallableReferenceCheck:
-    """Identity-bearing wrapper for reference check callbacks."""
+    """Identity-bearing reference check for callback payloads."""
 
     check_id: str
     check_version: str
@@ -320,7 +320,7 @@ class Materializer(Protocol):
 
 
 class MaterializerCallback(Protocol):
-    """Callable wrapped by an identity-bearing materializer."""
+    """Callable payload for an identity-bearing materializer."""
 
     def __call__(
         self,
@@ -332,7 +332,7 @@ class MaterializerCallback(Protocol):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class CallableMaterializer:
-    """Identity-bearing wrapper for selected implementation builders."""
+    """Identity-bearing materializer for callback payloads."""
 
     materializer_id: str
     materializer_version: str

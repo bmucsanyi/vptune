@@ -95,10 +95,10 @@ MANIFEST_SYMBOLIC_VALUE_TEST_COVERAGE = {
         "test_gradient_reference_check_records_directional_agreement",
     ),
     ("vectorization.batch_size", candidates_module.INTEGER_DOMAIN[0]): (
-        "test_jvp_and_vjp_manual_batch_vectorization_validate_batch_size",
+        "test_vectorization_manual_batch_settings_are_validated",
     ),
     ("vectorization.vmap_chunk_size", candidates_module.INTEGER_DOMAIN[0]): (
-        "test_hvp_vmap_vectorization_runs_linearized_batched_vectors",
+        "test_hvp_vectorization_runs_batched_vectors",
     ),
     ("batch.data_microbatch_size", candidates_module.INTEGER_DOMAIN[0]): (
         "test_standard_runtime_accepts_direct_input_schedule_settings",
@@ -310,7 +310,7 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_standard_runtime_executes_metric_factor_residency_axis",
     ),
     "`vp.problem(...)` and `vp.autotune(...)` reject composition": (
-        "test_standard_problem_rejects_composition_without_tuning_run",
+        "test_public_single_product_entrypoints_reject_composition",
     ),
     "Operator constructors validate the closed-set fields": (
         "test_typed_softmax_cross_entropy_rejects_invalid_fields",
@@ -2820,14 +2820,14 @@ def test_runtime_config_requires_identity_bearing_callbacks() -> None:
 
         return reference_passed()
 
-    wrapped_operation_factory = vpx.CallableOperationFactory(
+    operation_factory_with_identity = vpx.CallableOperationFactory(
         "tests.operation_factory",
         "1",
         {},
         {"callback": "tests.operation_factory"},
         operation_factory,
     )
-    wrapped_reference_check = vpx.CallableReferenceCheck(
+    reference_check_with_identity = vpx.CallableReferenceCheck(
         "tests.reference_check",
         "1",
         {},
@@ -2842,7 +2842,7 @@ def test_runtime_config_requires_identity_bearing_callbacks() -> None:
         vpx.RuntimeConfig(
             (candidate,),
             untyped(operation_factory),
-            wrapped_reference_check,
+            reference_check_with_identity,
             materialize_candidate,
             None,
             {"runtime": "test.raw-callback"},
@@ -2851,7 +2851,7 @@ def test_runtime_config_requires_identity_bearing_callbacks() -> None:
     with pytest.raises(vp.MaterializationError, match="reference_check"):
         vpx.RuntimeConfig(
             (candidate,),
-            wrapped_operation_factory,
+            operation_factory_with_identity,
             untyped(reference_check),
             materialize_candidate,
             None,

@@ -61,57 +61,6 @@ from vptune.runtime import (
 )
 from vptune.tensor_tree import tree_signature
 
-EAGER_ATTENTION_FRONTENDS = (
-    "transformers_eager",
-    "paged|eager",
-)
-SDPA_ATTENTION_FRONTENDS = (
-    "transformers_sdpa",
-    "paged|sdpa",
-)
-FLASH_ATTENTION_FRONTENDS = (
-    "transformers_flash_attention_2",
-    "transformers_flash_attention_3",
-    "transformers_flash_attention_4",
-    "paged|flash_attention_2",
-    "paged|flash_attention_3",
-    "paged|flash_attention_4",
-)
-CUSTOM_ATTENTION_FRONTENDS = (
-    "transformers_flex_attention",
-    "registered_transformers_attention",
-)
-TRANSFORMERS_ATTENTION_FRONTENDS = (
-    "transformers_eager",
-    "transformers_sdpa",
-    "transformers_flash_attention_2",
-    "transformers_flash_attention_3",
-    "transformers_flash_attention_4",
-    "transformers_flex_attention",
-    "paged|eager",
-    "paged|sdpa",
-    "paged|flash_attention_2",
-    "paged|flash_attention_3",
-    "paged|flash_attention_4",
-    "registered_transformers_attention",
-)
-PUBLIC_ATTENTION_FRONTEND_ALIASES = {
-    "eager": "transformers_eager",
-    "sdpa": "transformers_sdpa",
-    "flash_attention_2": "transformers_flash_attention_2",
-    "flash_attention_3": "transformers_flash_attention_3",
-    "flash_attention_4": "transformers_flash_attention_4",
-    "flex_attention": "transformers_flex_attention",
-}
-SDPA_KERNELS = (
-    "math",
-    "flash_attention",
-    "efficient_attention",
-    "cudnn_attention",
-    "overrideable",
-    "priority_list",
-)
-NON_MATH_SDPA_KERNELS = tuple(kernel for kernel in SDPA_KERNELS if kernel != "math")
 SDPA_KERNEL_BACKENDS = {
     "math": SDPBackend.MATH,
     "flash_attention": SDPBackend.FLASH_ATTENTION,
@@ -119,19 +68,69 @@ SDPA_KERNEL_BACKENDS = {
     "cudnn_attention": SDPBackend.CUDNN_ATTENTION,
     "overrideable": SDPBackend.OVERRIDEABLE,
 }
+SDPA_KERNELS = (*SDPA_KERNEL_BACKENDS, "priority_list")
+NON_MATH_SDPA_KERNELS = tuple(kernel for kernel in SDPA_KERNELS if kernel != "math")
 FLASH_ATTENTION_DTYPES = ("fp16", "bf16")
+TRANSFORMERS_ATTENTION_FRONTEND_ROWS = (
+    ("transformers_eager", "eager", "eager", "eager"),
+    ("transformers_sdpa", "sdpa", "sdpa", "sdpa"),
+    (
+        "transformers_flash_attention_2",
+        "flash",
+        "flash_attention_2",
+        "flash_attention_2",
+    ),
+    (
+        "transformers_flash_attention_3",
+        "flash",
+        "flash_attention_3",
+        "flash_attention_3",
+    ),
+    (
+        "transformers_flash_attention_4",
+        "flash",
+        "flash_attention_4",
+        "flash_attention_4",
+    ),
+    (
+        "transformers_flex_attention",
+        "custom",
+        "flex_attention",
+        "flex_attention",
+    ),
+    ("paged|eager", "eager", "paged|eager", None),
+    ("paged|sdpa", "sdpa", "paged|sdpa", None),
+    (
+        "paged|flash_attention_2",
+        "flash",
+        "paged|flash_attention_2",
+        None,
+    ),
+    (
+        "paged|flash_attention_3",
+        "flash",
+        "paged|flash_attention_3",
+        None,
+    ),
+    (
+        "paged|flash_attention_4",
+        "flash",
+        "paged|flash_attention_4",
+        None,
+    ),
+    ("registered_transformers_attention", "registered", None, None),
+)
+TRANSFORMERS_ATTENTION_FRONTENDS = tuple(
+    row[0] for row in TRANSFORMERS_ATTENTION_FRONTEND_ROWS
+)
+ATTENTION_FRONTEND_KIND_BY_NAME = {
+    row[0]: row[1] for row in TRANSFORMERS_ATTENTION_FRONTEND_ROWS
+}
 LOAD_TIME_ATTENTION_FRONTENDS = {
-    "transformers_eager": "eager",
-    "transformers_sdpa": "sdpa",
-    "transformers_flash_attention_2": "flash_attention_2",
-    "transformers_flash_attention_3": "flash_attention_3",
-    "transformers_flash_attention_4": "flash_attention_4",
-    "transformers_flex_attention": "flex_attention",
-    "paged|eager": "paged|eager",
-    "paged|sdpa": "paged|sdpa",
-    "paged|flash_attention_2": "paged|flash_attention_2",
-    "paged|flash_attention_3": "paged|flash_attention_3",
-    "paged|flash_attention_4": "paged|flash_attention_4",
+    row[0]: row[2] for row in TRANSFORMERS_ATTENTION_FRONTEND_ROWS if row[2] is not None
+}
+PUBLIC_ATTENTION_FRONTEND_ALIASES = {
+    row[3]: row[0] for row in TRANSFORMERS_ATTENTION_FRONTEND_ROWS if row[3] is not None
 }
 TRANSFORMERS_RUNTIME_SETTINGS = (
     "attention.frontend",
@@ -617,9 +616,7 @@ def transformers_reference_check(
             candidate,
             attention_custom_kernel_id=attention_custom_kernel_id,
         )
-
         standard_candidate = _standard_candidate(candidate)
-
         forward_patches = _transformers_forward_patches(
             model,
             candidate.settings,
@@ -926,15 +923,15 @@ def _configure_transformers_runtime(
     attention_frontend = candidate.settings.get("attention.frontend")
 
     if isinstance(attention_frontend, str):
+        backend_id, mask_formatter_id = _runtime_attention_ids(
+            candidate.settings,
+            attention_custom_kernel_id,
+        )
         set_transformers_attention_implementation(
             model,
             attention_frontend=attention_frontend,
-            attention_custom_kernel_id=_runtime_attention_custom_kernel_id(
-                candidate.settings,
-                attention_custom_kernel_id,
-            ),
+            attention_custom_kernel_id=backend_id,
         )
-        mask_formatter_id = _runtime_attention_mask_formatter_id(candidate.settings)
 
         if mask_formatter_id is not None:
             _set_transformers_attention_mask_formatter(model, mask_formatter_id)
@@ -968,10 +965,10 @@ def _require_transformers_runtime_row_settings(settings: Mapping[str, Any]) -> N
         raise AdmissionError(message)
 
 
-def _runtime_attention_custom_kernel_id(
+def _runtime_attention_ids(
     settings: Mapping[str, Any],
     configured_id: str | None,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     row_id = settings.get("attention.custom_kernel_id")
     mask_id = settings.get("attention.mask_formatter_id")
 
@@ -983,7 +980,7 @@ def _runtime_attention_custom_kernel_id(
             )
             raise AdmissionError(message)
 
-        return configured_id
+        return configured_id, None
 
     error = _registered_attention_ids_error(settings)
 
@@ -996,27 +993,10 @@ def _runtime_attention_custom_kernel_id(
         )
         raise AdmissionError(message)
 
-    return row_id
-
-
-def _runtime_attention_mask_formatter_id(
-    settings: Mapping[str, Any],
-) -> str | None:
-    if settings.get("attention.frontend") != "registered_transformers_attention":
-        return None
-
-    error = _registered_attention_ids_error(settings)
-
-    if error is not None:
-        raise AdmissionError(error)
-
-    value = settings["attention.mask_formatter_id"]
-
-    if not isinstance(value, str):
-        message = "attention.mask_formatter_id must be a string"
-        raise AdmissionError(message)
-
-    return value
+    return (
+        settings["attention.custom_kernel_id"],
+        settings["attention.mask_formatter_id"],
+    )
 
 
 def _set_transformers_attention_mask_formatter(
@@ -1038,7 +1018,7 @@ def _set_transformers_attention_mask_formatter(
 def _transformers_sdpa_kernel_context(
     settings: Mapping[str, Any],
 ) -> Iterator[None]:
-    if settings.get("attention.frontend") not in SDPA_ATTENTION_FRONTENDS:
+    if _attention_frontend_kind(settings.get("attention.frontend")) != "sdpa":
         yield
 
         return
@@ -1451,7 +1431,9 @@ def _attention_axis_values(
         {
             "attention.frontend": frontend,
             "attention.sdpa_kernel": (
-                space.sdpa_kernel if frontend in SDPA_ATTENTION_FRONTENDS else None
+                space.sdpa_kernel
+                if _attention_frontend_kind(frontend) == "sdpa"
+                else None
             ),
         }
         for frontend in space.frontends
@@ -1485,6 +1467,13 @@ def _normalize_public_attention_frontends(
         normalized.append(value)
 
     return tuple(normalized)
+
+
+def _attention_frontend_kind(attention_frontend: object) -> str | None:
+    if not isinstance(attention_frontend, str):
+        return None
+
+    return ATTENTION_FRONTEND_KIND_BY_NAME.get(attention_frontend)
 
 
 def _require_sdpa_priority_list(priority_list: Sequence[str]) -> None:
@@ -1564,18 +1553,19 @@ def _attention_error(
     policy: TransformersAttentionPolicy,
     attention_frontend: str,
 ) -> str | None:
+    frontend_kind = _attention_frontend_kind(attention_frontend)
     error = _core_attention_setting_error(candidate.settings)
 
     if error is None:
         error = _sdpa_kernel_error(candidate.settings, policy, attention_frontend)
 
-    if error is None and attention_frontend in FLASH_ATTENTION_FRONTENDS:
+    if error is None and frontend_kind == "flash":
         error = _flash_attention_frontend_error(candidate, policy, attention_frontend)
 
     if (
         error is None
         and candidate.settings.get("output_attentions") is True
-        and attention_frontend not in EAGER_ATTENTION_FRONTENDS
+        and frontend_kind != "eager"
     ):
         error = "output_attentions requires eager attention"
 
@@ -1627,7 +1617,7 @@ def _sdpa_kernel_error(
     policy: TransformersAttentionPolicy,
     attention_frontend: str,
 ) -> str | None:
-    if attention_frontend not in SDPA_ATTENTION_FRONTENDS:
+    if _attention_frontend_kind(attention_frontend) != "sdpa":
         return _unexpected_sdpa_kernel_error(settings)
 
     value_error = _sdpa_kernel_value_error(settings)

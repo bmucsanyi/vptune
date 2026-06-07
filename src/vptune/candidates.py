@@ -897,7 +897,7 @@ def _axis_admission_settings_keys(
 
 
 def _positive_integer_value_error(axis_key: str, value: Any) -> str | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if not _positive_int_value(value):
         return f"candidate axis must be a positive integer: {axis_key}"
 
     return None
@@ -908,10 +908,14 @@ def _positive_integer_tuple_value_error(axis_key: str, value: Any) -> str | None
         return f"candidate axis must be a positive integer tuple: {axis_key}"
 
     for item in value:
-        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+        if not _positive_int_value(item):
             return f"candidate axis must be a positive integer tuple: {axis_key}"
 
     return None
+
+
+def _positive_int_value(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _positive_float_value_error(axis_key: str, value: Any) -> str | None:
@@ -942,7 +946,7 @@ def _fsdp_reshard_after_forward_value_error(
     if value in {"false", "true"}:
         return None
 
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if not _positive_int_value(value):
         return f"candidate axis must be false, true, or a positive integer: {axis_key}"
 
     return None
@@ -1068,30 +1072,63 @@ TORCH_FUNC_AXIS_FIELDS = tuple(
     field for field in TORCH_FUNC_FIELDS if field not in TORCH_FUNC_AXIS_EXCLUDED_FIELDS
 )
 VMAP_TRANSFORM_PATHS = ("per_example_gradient_vmap",)
-TORCH_FUNC_ADMISSION_PATH_SETTINGS = (
-    ("gradient.path", "torch_func_grad"),
-    ("gradient.path", "torch_func_grad_and_value"),
-    ("jvp.path", "torch_func_jvp"),
-    ("jvp.path", "torch_func_linearize"),
-    ("vjp.path", "torch_func_vjp"),
-    ("hvp.path", "jvp_grad"),
-    ("hvp.path", "linearize_grad"),
-    ("ggn.jvp_path", "torch_func_jvp"),
-    ("ggn.jvp_path", "torch_func_linearize"),
-    ("ggn.vjp_path", "torch_func_vjp"),
-    ("fisher.score_grad_path", "torch_func_grad"),
-    ("fisher.score_grad_path", "vmap_grad"),
-    ("sampled_fisher.score_grad_path", "torch_func_grad"),
-    ("sampled_fisher.score_grad_path", "vmap_grad"),
-    ("empirical_fisher.grad_path", "torch_func_grad"),
-    ("empirical_fisher.grad_path", "vmap_grad"),
-    ("per_example_gradient.grad_path", "torch_func_grad"),
-    ("per_example_gradient.grad_path", "vmap_grad"),
+TORCH_FUNC_PATH_ADMISSION = {
+    "gradient.path": {
+        "torch_func_grad": "torch_func_vjp",
+        "torch_func_grad_and_value": "torch_func_vjp",
+    },
+    "jvp.path": {
+        "torch_func_jvp": "torch_func_jvp",
+        "torch_func_linearize": "torch_func_jvp",
+    },
+    "vjp.path": {"torch_func_vjp": "torch_func_vjp"},
+    "hvp.path": {
+        "jvp_grad": "jvp_grad",
+        "linearize_grad": "jvp_grad",
+    },
+    "ggn.jvp_path": {
+        "torch_func_jvp": "torch_func_jvp",
+        "torch_func_linearize": "torch_func_jvp",
+    },
+    "ggn.vjp_path": {"torch_func_vjp": "torch_func_vjp"},
+    "fisher.score_grad_path": {
+        "torch_func_grad": "torch_func_vjp",
+        "vmap_grad": "per_example_gradient_vmap",
+    },
+    "sampled_fisher.score_grad_path": {
+        "torch_func_grad": "torch_func_vjp",
+        "vmap_grad": "per_example_gradient_vmap",
+    },
+    "empirical_fisher.grad_path": {
+        "torch_func_grad": "torch_func_vjp",
+        "vmap_grad": "per_example_gradient_vmap",
+    },
+    "per_example_gradient.grad_path": {
+        "torch_func_grad": "torch_func_vjp",
+        "vmap_grad": "per_example_gradient_vmap",
+    },
+}
+FORWARD_AD_PATH_ADMISSION = {
+    "jvp.path": ("forward_ad_dual",),
+    "hvp.path": ("forward_ad_dual",),
+    "ggn.jvp_path": ("forward_ad_dual",),
+}
+TORCH_FUNC_ADMISSION_PATH_SETTINGS = tuple(
+    (key, value)
+    for key, value_map in TORCH_FUNC_PATH_ADMISSION.items()
+    for value in value_map
 )
-VMAP_PATH_SETTINGS = (
-    ("fisher.score_grad_path", "vmap_grad"),
-    ("sampled_fisher.score_grad_path", "vmap_grad"),
-    ("empirical_fisher.grad_path", "vmap_grad"),
+PER_EXAMPLE_SCORE_PATH_KEYS = (
+    "fisher.score_grad_path",
+    "sampled_fisher.score_grad_path",
+    "empirical_fisher.grad_path",
+)
+MANUAL_PER_EXAMPLE_BATCH_SIZE_KEYS = (
+    (("empirical_fisher.grad_path",), "batch.empirical_example_batch_size"),
+    (
+        ("fisher.score_grad_path", "sampled_fisher.score_grad_path"),
+        "batch.fisher_sample_batch_size",
+    ),
 )
 PER_EXAMPLE_LOOP_PATHS = (
     "torch_autograd_grad_loop",
@@ -1152,6 +1189,37 @@ EMPIRICAL_FISHER_VECTOR_GRAD_PATHS = (
 EMPIRICAL_FISHER_VECTOR_ACCUMULATIONS = (
     "materialize_per_example_gradients",
     "blockwise_gradient_matrix",
+)
+COMPOSITION_VECTOR_EXECUTIONS = (
+    "materialize_each_child",
+    "stream_child_outputs",
+    "fuse_adjacent_children",
+    "compile_whole_composition",
+)
+METRIC_INNER_VECTOR_PATH_SETTINGS = (
+    ("metric_inner.reduction_path", METRIC_INNER_VECTOR_LOOP_PATHS),
+    ("inverse_metric_inner.reduction_path", INVERSE_METRIC_INNER_VECTOR_LOOP_PATHS),
+)
+FISHER_FAMILY_VECTOR_PATH_SETTINGS = (
+    ("fisher.accumulation", FISHER_VECTOR_ACCUMULATIONS),
+    ("sampled_fisher.accumulation", SAMPLED_FISHER_VECTOR_ACCUMULATIONS),
+    ("empirical_fisher.grad_path", EMPIRICAL_FISHER_VECTOR_GRAD_PATHS),
+    ("empirical_fisher.accumulation", EMPIRICAL_FISHER_VECTOR_ACCUMULATIONS),
+)
+VECTOR_LOOP_PATH_SETTINGS = (
+    ("hvp.path", HVP_VECTOR_LOOP_PATHS),
+    ("jvp.path", JVP_VECTOR_LOOP_PATHS),
+    ("vjp.path", VJP_VECTOR_LOOP_PATHS),
+    ("inverse_metric.solve_path", INVERSE_METRIC_VECTOR_LOOP_PATHS),
+    *METRIC_INNER_VECTOR_PATH_SETTINGS,
+    *FISHER_FAMILY_VECTOR_PATH_SETTINGS,
+)
+VECTOR_VMAP_PATH_SETTINGS = (
+    ("hvp.path", HVP_VECTOR_VMAP_PATHS),
+    ("jvp.path", JVP_VECTOR_VMAP_PATHS),
+    ("vjp.path", VJP_VECTOR_VMAP_PATHS),
+    *METRIC_INNER_VECTOR_PATH_SETTINGS,
+    *FISHER_FAMILY_VECTOR_PATH_SETTINGS,
 )
 MATMUL_PRECISION_VALUES = ("highest", "high", "medium")
 SPEC_DTYPE_VALUES = ("fp32", "bf16", "fp16")
@@ -1910,7 +1978,7 @@ def _fsdp_reshard_after_forward_axis() -> AdmissionRule:
 def _positive_int_error(settings: Mapping[str, Any], key: str) -> str | None:
     value = settings[key]
 
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+    if not _positive_int_value(value):
         return f"candidate axis must be a positive integer: {key}"
 
     return None
@@ -1955,18 +2023,6 @@ def _checkpoint_context_axis() -> AdmissionRule:
 
         if not isinstance(context_id, str) or not context_id:
             return False, "checkpoint.context_fn_callable must be a declared context id"
-
-        return True, None
-
-    return admit
-
-
-def _gradient_path_axis() -> AdmissionRule:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings["gradient.path"]
-
-        if value in {"torch_func_grad", "torch_func_grad_and_value"}:
-            return _admit_torch_func_path("torch_func_vjp", candidate.settings)
 
         return True, None
 
@@ -2021,72 +2077,16 @@ def _vjp_closure_reuse_axis() -> AdmissionRule:
     return admit
 
 
-def _jvp_path_axis() -> AdmissionRule:
+def _path_admission_axis(key: str) -> AdmissionRule:
     def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings["jvp.path"]
+        value = candidate.settings[key]
+        torch_func_path = TORCH_FUNC_PATH_ADMISSION.get(key, {}).get(value)
 
-        if value == "forward_ad_dual":
+        if torch_func_path is not None:
+            return _admit_torch_func_path(torch_func_path, candidate.settings)
+
+        if value in FORWARD_AD_PATH_ADMISSION.get(key, ()):
             return _admit_forward_ad_path(candidate.settings)
-
-        return _admit_torch_func_path("torch_func_jvp", candidate.settings)
-
-    return admit
-
-
-def _vjp_path_axis() -> AdmissionRule:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings["vjp.path"]
-
-        if value == "torch_func_vjp":
-            return _admit_torch_func_path(value, candidate.settings)
-
-        return True, None
-
-    return admit
-
-
-def _hvp_path_axis() -> AdmissionRule:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings["hvp.path"]
-
-        if value == "forward_ad_dual":
-            return _admit_forward_ad_path(candidate.settings)
-
-        if value == "jvp_grad":
-            return _admit_torch_func_path(value, candidate.settings)
-
-        if value == "linearize_grad":
-            return _admit_torch_func_path("jvp_grad", candidate.settings)
-
-        return True, None
-
-    return admit
-
-
-def _ggn_jvp_path_axis() -> AdmissionRule:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings["ggn.jvp_path"]
-
-        if value == "torch_func_jvp":
-            return _admit_torch_func_path(value, candidate.settings)
-
-        if value == "torch_func_linearize":
-            return _admit_torch_func_path("torch_func_jvp", candidate.settings)
-
-        if value == "forward_ad_dual":
-            return _admit_forward_ad_path(candidate.settings)
-
-        return True, None
-
-    return admit
-
-
-def _ggn_vjp_path_axis() -> AdmissionRule:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings["ggn.vjp_path"]
-
-        if value == "torch_func_vjp":
-            return _admit_torch_func_path(value, candidate.settings)
 
         return True, None
 
@@ -2104,23 +2104,6 @@ def _storage_compute_dtype_axis(key: str) -> AdmissionRule:
             return True, None
 
         return False, f"{key}=fp8_when_supported requires PyTorch FP8 dtype support"
-
-    return admit
-
-
-def _score_grad_path_axis(key: str) -> AdmissionRule:
-    def admit(candidate: Candidate) -> tuple[bool, str | None]:
-        value = candidate.settings[key]
-
-        if value == "torch_func_grad":
-            return _admit_torch_func_path("torch_func_vjp", candidate.settings)
-
-        if value == "vmap_grad":
-            return _admit_torch_func_path(
-                "per_example_gradient_vmap", candidate.settings
-            )
-
-        return True, None
 
     return admit
 
@@ -2540,27 +2523,17 @@ def _per_example_schedule_error(settings: Mapping[str, Any]) -> str | None:
 
 
 def _per_example_score_path(settings: Mapping[str, Any]) -> str | None:
-    if "fisher.score_grad_path" in settings:
-        return settings["fisher.score_grad_path"]
-
-    if "sampled_fisher.score_grad_path" in settings:
-        return settings["sampled_fisher.score_grad_path"]
-
-    if "empirical_fisher.grad_path" in settings:
-        return settings["empirical_fisher.grad_path"]
+    for key in PER_EXAMPLE_SCORE_PATH_KEYS:
+        if key in settings:
+            return settings[key]
 
     return None
 
 
 def _manual_per_example_batch_size_error(settings: Mapping[str, Any]) -> str | None:
-    if "empirical_fisher.grad_path" in settings:
-        key = "batch.empirical_example_batch_size"
-    elif (
-        "fisher.score_grad_path" in settings
-        or "sampled_fisher.score_grad_path" in settings
-    ):
-        key = "batch.fisher_sample_batch_size"
-    else:
+    key = _manual_per_example_batch_size_key(settings)
+
+    if key is None:
         return "schedule.per_example=manual_batch requires a Fisher-family path"
 
     if key not in settings:
@@ -2568,38 +2541,18 @@ def _manual_per_example_batch_size_error(settings: Mapping[str, Any]) -> str | N
 
     value = settings[key]
 
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+    if not _positive_int_value(value):
         return f"{key} must be a positive integer"
 
     return None
 
 
-def _uses_vmap_path(settings: Mapping[str, Any]) -> bool:
-    return any(settings.get(key) == value for key, value in VMAP_PATH_SETTINGS)
+def _manual_per_example_batch_size_key(settings: Mapping[str, Any]) -> str | None:
+    for path_keys, batch_key in MANUAL_PER_EXAMPLE_BATCH_SIZE_KEYS:
+        if any(path_key in settings for path_key in path_keys):
+            return batch_key
 
-
-def _uses_hvp_vector_loop_path(settings: Mapping[str, Any]) -> bool:
-    return settings.get("hvp.path") in HVP_VECTOR_LOOP_PATHS
-
-
-def _uses_hvp_vector_vmap_path(settings: Mapping[str, Any]) -> bool:
-    return settings.get("hvp.path") in HVP_VECTOR_VMAP_PATHS
-
-
-def _uses_jvp_vector_loop_path(settings: Mapping[str, Any]) -> bool:
-    return settings.get("jvp.path") in JVP_VECTOR_LOOP_PATHS
-
-
-def _uses_jvp_vector_vmap_path(settings: Mapping[str, Any]) -> bool:
-    return settings.get("jvp.path") in JVP_VECTOR_VMAP_PATHS
-
-
-def _uses_vjp_vector_loop_path(settings: Mapping[str, Any]) -> bool:
-    return settings.get("vjp.path") in VJP_VECTOR_LOOP_PATHS
-
-
-def _uses_vjp_vector_vmap_path(settings: Mapping[str, Any]) -> bool:
-    return settings.get("vjp.path") in VJP_VECTOR_VMAP_PATHS
+    return None
 
 
 def _uses_ggn_vector_loop_path(settings: Mapping[str, Any]) -> bool:
@@ -2624,79 +2577,30 @@ def _uses_ggn_vector_vmap_path(settings: Mapping[str, Any]) -> bool:
     )
 
 
-def _uses_inverse_metric_vector_loop_path(settings: Mapping[str, Any]) -> bool:
-    return settings.get("inverse_metric.solve_path") in INVERSE_METRIC_VECTOR_LOOP_PATHS
+def _uses_setting_path(
+    settings: Mapping[str, Any],
+    rows: Sequence[tuple[str, tuple[str, ...]]],
+) -> bool:
+    return any(settings.get(key) in values for key, values in rows)
 
 
-def _uses_metric_inner_vector_loop_path(settings: Mapping[str, Any]) -> bool:
-    return (
-        settings.get("metric_inner.reduction_path") in METRIC_INNER_VECTOR_LOOP_PATHS
-        or settings.get("inverse_metric_inner.reduction_path")
-        in INVERSE_METRIC_INNER_VECTOR_LOOP_PATHS
-    )
-
-
-def _uses_metric_inner_vector_vmap_path(settings: Mapping[str, Any]) -> bool:
-    return _uses_metric_inner_vector_loop_path(settings)
-
-
-def _uses_fisher_vector_path(settings: Mapping[str, Any]) -> bool:
-    return settings.get("fisher.accumulation") in FISHER_VECTOR_ACCUMULATIONS
-
-
-def _uses_sampled_fisher_vector_path(settings: Mapping[str, Any]) -> bool:
-    return (
-        settings.get("sampled_fisher.accumulation")
-        in SAMPLED_FISHER_VECTOR_ACCUMULATIONS
-    )
-
-
-def _uses_empirical_fisher_vector_path(settings: Mapping[str, Any]) -> bool:
-    return (
-        settings.get("empirical_fisher.grad_path") in EMPIRICAL_FISHER_VECTOR_GRAD_PATHS
-        or settings.get("empirical_fisher.accumulation")
-        in EMPIRICAL_FISHER_VECTOR_ACCUMULATIONS
-    )
+def _uses_composition_vector_execution(settings: Mapping[str, Any]) -> bool:
+    return settings.get("composition.execution") in COMPOSITION_VECTOR_EXECUTIONS
 
 
 def _uses_vector_loop_path(settings: Mapping[str, Any]) -> bool:
     return (
-        _uses_jvp_vector_loop_path(settings)
-        or _uses_vjp_vector_loop_path(settings)
+        _uses_setting_path(settings, VECTOR_LOOP_PATH_SETTINGS)
         or _uses_ggn_vector_loop_path(settings)
-        or _uses_hvp_vector_loop_path(settings)
-        or _uses_inverse_metric_vector_loop_path(settings)
-        or _uses_metric_inner_vector_loop_path(settings)
-        or _uses_fisher_vector_path(settings)
-        or _uses_sampled_fisher_vector_path(settings)
-        or _uses_empirical_fisher_vector_path(settings)
-        or settings.get("composition.execution")
-        in {
-            "materialize_each_child",
-            "stream_child_outputs",
-            "fuse_adjacent_children",
-            "compile_whole_composition",
-        }
+        or _uses_composition_vector_execution(settings)
     )
 
 
 def _uses_vector_vmap_path(settings: Mapping[str, Any]) -> bool:
     return (
-        _uses_jvp_vector_vmap_path(settings)
-        or _uses_vjp_vector_vmap_path(settings)
+        _uses_setting_path(settings, VECTOR_VMAP_PATH_SETTINGS)
         or _uses_ggn_vector_vmap_path(settings)
-        or _uses_hvp_vector_vmap_path(settings)
-        or _uses_fisher_vector_path(settings)
-        or _uses_sampled_fisher_vector_path(settings)
-        or _uses_empirical_fisher_vector_path(settings)
-        or _uses_metric_inner_vector_vmap_path(settings)
-        or settings.get("composition.execution")
-        in {
-            "materialize_each_child",
-            "stream_child_outputs",
-            "fuse_adjacent_children",
-            "compile_whole_composition",
-        }
+        or _uses_composition_vector_execution(settings)
     )
 
 
@@ -2776,11 +2680,7 @@ def _vmap_chunk_size_error(settings: Mapping[str, Any]) -> str | None:
 
     chunk_size = settings[key]
 
-    if (
-        not isinstance(chunk_size, int)
-        or isinstance(chunk_size, bool)
-        or chunk_size < 1
-    ):
+    if not _positive_int_value(chunk_size):
         return "vectorization.vmap_chunk_size must be a positive integer"
 
     return None
@@ -2794,11 +2694,7 @@ def _manual_batch_size_error(settings: Mapping[str, Any]) -> str | None:
 
     batch_size = settings[key]
 
-    if (
-        not isinstance(batch_size, int)
-        or isinstance(batch_size, bool)
-        or batch_size < 1
-    ):
+    if not _positive_int_value(batch_size):
         return "vectorization.batch_size must be a positive integer"
 
     return None
@@ -3081,7 +2977,7 @@ STORAGE_COMPUTE_DTYPE_RULE = _single_setting_axis_rule(_storage_compute_dtype_ax
 LAYOUT_TREE_RULE = _single_setting_axis_rule(_layout_tree_axis)
 MEMORY_OUTPUT_RULE = _single_setting_axis_rule(_memory_output_axis)
 METRIC_INNER_MULTI_RHS_RULE = _single_setting_axis_rule(_metric_inner_multi_rhs_axis)
-SCORE_GRAD_PATH_RULE = _single_setting_axis_rule(_score_grad_path_axis)
+PATH_ADMISSION_RULE = _single_setting_axis_rule(_path_admission_axis)
 
 STANDARD_AXIS_ROWS = (
     *_single_axis_rows(
@@ -3124,7 +3020,7 @@ STANDARD_AXIS_ROWS = (
         "call.return_type",
         ("raw_tensor_tree", "model_output_object_with_declared_fields"),
     ),
-    _single_axis_row("hvp.path", HVP_PATH_VALUES, _fixed_axis_rule(_hvp_path_axis)),
+    _single_axis_row("hvp.path", HVP_PATH_VALUES, PATH_ADMISSION_RULE),
     _single_axis_row(
         "hvp.graph_schedule",
         ("retain_graph_across_vectors", "rebuild_graph_per_vector"),
@@ -3142,7 +3038,7 @@ STANDARD_AXIS_ROWS = (
             "torch_func_grad_and_value",
             "backward_materialized_grad",
         ),
-        _fixed_axis_rule(_gradient_path_axis),
+        PATH_ADMISSION_RULE,
     ),
     _single_axis_row(
         "gradient.value_reuse",
@@ -3150,17 +3046,13 @@ STANDARD_AXIS_ROWS = (
         _fixed_axis_rule(_gradient_value_reuse_axis),
     ),
     _single_axis_row("gradient.graph_schedule", ("build_once", "rebuild_per_call")),
-    _single_axis_row(
-        "jvp.path", JVP_VECTOR_LOOP_PATHS, _fixed_axis_rule(_jvp_path_axis)
-    ),
+    _single_axis_row("jvp.path", JVP_VECTOR_LOOP_PATHS, PATH_ADMISSION_RULE),
     _single_axis_row(
         "jvp.linearize_reuse",
         ("none", "reuse_at_same_primal"),
         _fixed_axis_rule(_jvp_linearize_reuse_axis),
     ),
-    _single_axis_row(
-        "vjp.path", VJP_VECTOR_LOOP_PATHS, _fixed_axis_rule(_vjp_path_axis)
-    ),
+    _single_axis_row("vjp.path", VJP_VECTOR_LOOP_PATHS, PATH_ADMISSION_RULE),
     _single_axis_row(
         "vjp.closure_reuse",
         ("none", "reuse_vjp_closure_at_same_primal"),
@@ -3169,7 +3061,7 @@ STANDARD_AXIS_ROWS = (
     _single_axis_row(
         "ggn.jvp_path",
         JVP_VECTOR_LOOP_PATHS,
-        _fixed_axis_rule(_ggn_jvp_path_axis),
+        PATH_ADMISSION_RULE,
     ),
     _single_axis_row(
         "ggn.loss_hessian_path",
@@ -3182,7 +3074,7 @@ STANDARD_AXIS_ROWS = (
     _single_axis_row(
         "ggn.vjp_path",
         ("torch_func_vjp", "autograd_grad_outputs"),
-        _fixed_axis_rule(_ggn_vjp_path_axis),
+        PATH_ADMISSION_RULE,
     ),
     _single_axis_row("ggn.jvp_reuse", ("reuse_jvp", "recompute_jvp")),
     _single_axis_row(
@@ -3197,7 +3089,7 @@ STANDARD_AXIS_ROWS = (
     _single_axis_row(
         "fisher.score_grad_path",
         SCORE_GRAD_PATH_VALUES,
-        SCORE_GRAD_PATH_RULE,
+        PATH_ADMISSION_RULE,
     ),
     _single_axis_row("sampled_fisher.accumulation", FISHER_VECTOR_ACCUMULATIONS),
     _single_axis_row(
@@ -3207,7 +3099,7 @@ STANDARD_AXIS_ROWS = (
     _single_axis_row(
         "sampled_fisher.score_grad_path",
         SCORE_GRAD_PATH_VALUES,
-        SCORE_GRAD_PATH_RULE,
+        PATH_ADMISSION_RULE,
     ),
     _single_axis_row(
         "sampled_fisher.exact_fisher_check",
@@ -3216,7 +3108,7 @@ STANDARD_AXIS_ROWS = (
     _single_axis_row(
         "empirical_fisher.grad_path",
         SCORE_GRAD_PATH_VALUES,
-        SCORE_GRAD_PATH_RULE,
+        PATH_ADMISSION_RULE,
     ),
     _single_axis_row(
         "empirical_fisher.accumulation",
@@ -3229,7 +3121,7 @@ STANDARD_AXIS_ROWS = (
     _single_axis_row(
         "per_example_gradient.grad_path",
         SCORE_GRAD_PATH_VALUES,
-        SCORE_GRAD_PATH_RULE,
+        PATH_ADMISSION_RULE,
     ),
     _single_axis_row(
         "per_example_gradient.accumulation",

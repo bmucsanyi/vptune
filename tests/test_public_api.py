@@ -356,6 +356,44 @@ def dense_tree_unary_operator_matrix(
     return torch.stack(columns, dim=1)
 
 
+def assert_dense_weight_metric_products(
+    model: vp.Model,
+    metric: vp.Metric,
+    matrix: torch.Tensor,
+    *,
+    damping: float,
+) -> None:
+    vector = typed_vector()
+    left = typed_left_vector()
+    flat_vector = flat_weight(vector)
+    flat_left = flat_weight(left)
+    damped = matrix + damping * torch.eye(
+        matrix.shape[0],
+        dtype=matrix.dtype,
+        device=matrix.device,
+    )
+    expected_metric = matrix @ flat_vector
+    expected_inverse = torch.linalg.solve(damped, flat_vector)
+
+    metric_product = vp.metric_vp(model, metric)(vector)
+    inverse_product = vp.inverse_metric_vp(
+        model,
+        metric,
+        damping=vp.damping.scalar(damping),
+    )(vector)
+    metric_inner = vp.metric_inner_vp(model, metric)(left, vector)
+    inverse_inner = vp.inverse_metric_inner_vp(
+        model,
+        metric,
+        damping=vp.damping.scalar(damping),
+    )(left, vector)
+
+    torch.testing.assert_close(flat_weight(metric_product), expected_metric)
+    torch.testing.assert_close(flat_weight(inverse_product), expected_inverse)
+    torch.testing.assert_close(metric_inner, flat_left @ expected_metric)
+    torch.testing.assert_close(inverse_inner, flat_left @ expected_inverse)
+
+
 def is_tensor_mapping(tree: vpx.TensorTree) -> TypeGuard[dict[str, torch.Tensor]]:
     if not isinstance(tree, dict):
         return False
@@ -476,35 +514,8 @@ def test_typed_dense_metric_products_execute_against_reference() -> None:
     model = typed_metric_model()
     matrix = torch.diag(torch.tensor([2.0, 3.0, 5.0, 7.0], dtype=torch.float64))
     metric = vp.metric.dense(matrix=matrix)
-    vector = typed_vector()
-    left = typed_left_vector()
-    flat_vector = vector["weight"].reshape(-1)
-    flat_left = left["weight"].reshape(-1)
-    lam = 0.25
 
-    metric_product = vp.metric_vp(model, metric)(vector)
-    inverse_product = vp.inverse_metric_vp(
-        model,
-        metric,
-        damping=vp.damping.scalar(lam),
-    )(vector)
-    metric_inner = vp.metric_inner_vp(model, metric)(left, vector)
-    inverse_inner = vp.inverse_metric_inner_vp(
-        model,
-        metric,
-        damping=vp.damping.scalar(lam),
-    )(left, vector)
-
-    expected_metric = matrix @ flat_vector
-    expected_inverse = torch.linalg.solve(
-        matrix + lam * torch.eye(4, dtype=torch.float64),
-        flat_vector,
-    )
-
-    torch.testing.assert_close(flat_weight(metric_product), expected_metric)
-    torch.testing.assert_close(flat_weight(inverse_product), expected_inverse)
-    torch.testing.assert_close(metric_inner, flat_left @ expected_metric)
-    torch.testing.assert_close(inverse_inner, flat_left @ expected_inverse)
+    assert_dense_weight_metric_products(model, metric, matrix, damping=0.25)
 
 
 def test_typed_diagonal_metric_products_execute_against_reference() -> None:
@@ -516,39 +527,9 @@ def test_typed_diagonal_metric_products_execute_against_reference() -> None:
         )
     }
     metric = vp.metric.diagonal(diag=diagonal)
-    vector = typed_vector()
-    left = typed_left_vector()
-    lam = 0.25
+    matrix = torch.diag(diagonal["weight"].reshape(-1))
 
-    metric_product = vp.metric_vp(model, metric)(vector)
-    inverse_product = vp.inverse_metric_vp(
-        model,
-        metric,
-        damping=vp.damping.scalar(lam),
-    )(vector)
-    metric_inner = vp.metric_inner_vp(model, metric)(left, vector)
-    inverse_inner = vp.inverse_metric_inner_vp(
-        model,
-        metric,
-        damping=vp.damping.scalar(lam),
-    )(left, vector)
-
-    torch.testing.assert_close(
-        metric_product["weight"],
-        diagonal["weight"] * vector["weight"],
-    )
-    torch.testing.assert_close(
-        inverse_product["weight"],
-        vector["weight"] / (diagonal["weight"] + lam),
-    )
-    torch.testing.assert_close(
-        metric_inner,
-        (left["weight"] * diagonal["weight"] * vector["weight"]).sum(),
-    )
-    torch.testing.assert_close(
-        inverse_inner,
-        (left["weight"] * vector["weight"] / (diagonal["weight"] + lam)).sum(),
-    )
+    assert_dense_weight_metric_products(model, metric, matrix, damping=0.25)
 
 
 def test_typed_diagonal_metric_per_group_damping_executes_by_parameter() -> None:
@@ -605,35 +586,8 @@ def test_typed_block_metric_products_execute_against_reference() -> None:
     }
     matrix = torch.block_diag(blocks["first"], blocks["second"])
     metric = vp.metric.block_diagonal(blocks=blocks)
-    vector = typed_vector()
-    left = typed_left_vector()
-    flat_vector = vector["weight"].reshape(-1)
-    flat_left = left["weight"].reshape(-1)
-    lam = 0.25
 
-    metric_product = vp.metric_vp(model, metric)(vector)
-    inverse_product = vp.inverse_metric_vp(
-        model,
-        metric,
-        damping=vp.damping.scalar(lam),
-    )(vector)
-    metric_inner = vp.metric_inner_vp(model, metric)(left, vector)
-    inverse_inner = vp.inverse_metric_inner_vp(
-        model,
-        metric,
-        damping=vp.damping.scalar(lam),
-    )(left, vector)
-
-    expected_metric = matrix @ flat_vector
-    expected_inverse = torch.linalg.solve(
-        matrix + lam * torch.eye(4, dtype=torch.float64),
-        flat_vector,
-    )
-
-    torch.testing.assert_close(flat_weight(metric_product), expected_metric)
-    torch.testing.assert_close(flat_weight(inverse_product), expected_inverse)
-    torch.testing.assert_close(metric_inner, flat_left @ expected_metric)
-    torch.testing.assert_close(inverse_inner, flat_left @ expected_inverse)
+    assert_dense_weight_metric_products(model, metric, matrix, damping=0.25)
 
 
 def test_typed_block_metric_per_group_damping_executes_by_block() -> None:
@@ -694,35 +648,8 @@ def test_typed_low_rank_metric_products_execute_against_reference() -> None:
     diagonal = torch.tensor([4.0, 5.0, 6.0, 7.0], dtype=torch.float64)
     matrix = factor @ factor.T + torch.diag(diagonal)
     metric = vp.metric.low_rank(factor=factor, diagonal=diagonal)
-    vector = typed_vector()
-    left = typed_left_vector()
-    flat_vector = vector["weight"].reshape(-1)
-    flat_left = left["weight"].reshape(-1)
-    lam = 0.25
 
-    metric_product = vp.metric_vp(model, metric)(vector)
-    inverse_product = vp.inverse_metric_vp(
-        model,
-        metric,
-        damping=vp.damping.scalar(lam),
-    )(vector)
-    metric_inner = vp.metric_inner_vp(model, metric)(left, vector)
-    inverse_inner = vp.inverse_metric_inner_vp(
-        model,
-        metric,
-        damping=vp.damping.scalar(lam),
-    )(left, vector)
-
-    expected_metric = matrix @ flat_vector
-    expected_inverse = torch.linalg.solve(
-        matrix + lam * torch.eye(4, dtype=torch.float64),
-        flat_vector,
-    )
-
-    torch.testing.assert_close(flat_weight(metric_product), expected_metric)
-    torch.testing.assert_close(flat_weight(inverse_product), expected_inverse)
-    torch.testing.assert_close(metric_inner, flat_left @ expected_metric)
-    torch.testing.assert_close(inverse_inner, flat_left @ expected_inverse)
+    assert_dense_weight_metric_products(model, metric, matrix, damping=0.25)
 
 
 def test_typed_low_rank_metric_square_root_accepts_declared_latent_width() -> None:
@@ -980,30 +907,8 @@ def test_typed_ggn_derived_metric_products_execute_against_reference() -> None:
     metric = vp.metric.ggn_derived(
         factors={"jacobian": jacobian, "loss_hessian": loss_hessian}
     )
-    vector = typed_vector()
-    left = typed_left_vector()
-    damping = vp.damping.scalar(0.25)
-    flat_vector = vector["weight"].reshape(-1)
-    flat_left = left["weight"].reshape(-1)
 
-    metric_product = vp.metric_vp(model, metric)(vector)
-    metric_inner = vp.metric_inner_vp(model, metric)(left, vector)
-    inverse_product = vp.inverse_metric_vp(model, metric, damping=damping)(vector)
-    inverse_inner = vp.inverse_metric_inner_vp(model, metric, damping=damping)(
-        left,
-        vector,
-    )
-
-    expected_metric = matrix @ flat_vector
-    expected_inverse = torch.linalg.solve(
-        matrix + 0.25 * torch.eye(4, dtype=torch.float64),
-        flat_vector,
-    )
-
-    torch.testing.assert_close(flat_weight(metric_product), expected_metric)
-    torch.testing.assert_close(metric_inner, flat_left @ expected_metric)
-    torch.testing.assert_close(flat_weight(inverse_product), expected_inverse)
-    torch.testing.assert_close(inverse_inner, flat_left @ expected_inverse)
+    assert_dense_weight_metric_products(model, metric, matrix, damping=0.25)
 
 
 def test_typed_ggn_derived_metric_square_root_accepts_output_latent_width() -> None:
@@ -1394,6 +1299,66 @@ def test_typed_composition_records_sequential_combine_and_runtime_order() -> Non
             {"x": torch.zeros(1, 2, dtype=torch.float64)},
             typed_vector(),
         )
+
+
+def test_public_single_product_entrypoints_reject_composition(
+    tmp_path: Path,
+) -> None:
+    model = typed_metric_model()
+    operator = vp.composition(
+        model,
+        name="preconditioned_curvature",
+        children=("curvature", "preconditioner"),
+        combine=vp.compose("preconditioner", "curvature"),
+    )
+    batch = {}
+    vector = typed_vector()
+    target = public_cpu_target()
+    space = vp.space.standard()
+    search = vp.search.exhaustive()
+
+    with pytest.raises(
+        vp.MaterializationError,
+        match=r"operator[.]tune rejects composition",
+    ):
+        operator.tune(
+            data=(batch,),
+            vectors=(vector,),
+            target=target,
+            space=space,
+            search=search,
+            run_dir=tmp_path / "operator",
+        )
+
+    with pytest.raises(
+        vp.MaterializationError,
+        match=r"vp[.]problem rejects composition",
+    ):
+        vp.problem(
+            operator,
+            data=(batch,),
+            vectors=(vector,),
+            target=target,
+            space=space,
+            search=search,
+        )
+
+    lower_problem = public_module._composition_problem(
+        operator,
+        data=(batch,),
+        vectors=(vector,),
+        target=target,
+        space=space,
+        search=search,
+        reference=None,
+        probes=None,
+    )
+
+    with pytest.raises(
+        vp.MaterializationError,
+        match=r"vp[.]autotune rejects composition",
+    ):
+        vp.autotune(lower_problem, run_dir=tmp_path / "problem")
 
 
 def test_typed_composition_validates_combine_children_and_source_positions() -> None:

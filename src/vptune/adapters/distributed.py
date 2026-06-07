@@ -1681,9 +1681,7 @@ def _strategy_applier_and_loss_parallel(
 
 
 def _required_string_setting(settings: Mapping[str, Any], key: str) -> str:
-    value = settings.get(key)
-
-    return _required_string_value(value, key)
+    return _required_string_value(settings.get(key), key)
 
 
 def _required_declared_setting(settings: Mapping[str, Any], key: str) -> Any:
@@ -1695,33 +1693,30 @@ def _required_declared_setting(settings: Mapping[str, Any], key: str) -> Any:
 
 
 def _required_int_setting(settings: Mapping[str, Any], key: str) -> int:
-    value = settings.get(key)
-
-    if not _positive_int_value(value):
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _required_checked_value(
+        settings.get(key),
+        key,
+        _positive_int_value,
+        "a positive integer",
+    )
 
 
 def _tuple_of_ints(settings: Mapping[str, Any], key: str) -> tuple[int, ...]:
-    value = settings.get(key)
-
-    if not _positive_int_tuple_value(value):
-        message = f"{key} must be a non-empty tuple of positive integers"
-        raise MaterializationError(message)
-
-    return value
+    return _required_checked_value(
+        settings.get(key),
+        key,
+        _positive_int_tuple_value,
+        "a non-empty tuple of positive integers",
+    )
 
 
 def _tuple_of_strings(settings: Mapping[str, Any], key: str) -> tuple[str, ...]:
-    value = settings.get(key)
-
-    if not _string_tuple_value(value):
-        message = f"{key} must be a tuple of strings"
-        raise MaterializationError(message)
-
-    return value
+    return _required_checked_value(
+        settings.get(key),
+        key,
+        _string_tuple_value,
+        "a tuple of strings",
+    )
 
 
 def _required_binding(value: Any, name: str) -> Any:
@@ -1746,46 +1741,44 @@ def _required_mapping(
 
 
 def _required_mapping_value(value: Any, name: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        message = f"{name} must be a mapping"
-        raise MaterializationError(message)
-
-    return value
+    return _required_checked_value(value, name, _mapping_value, "a mapping")
 
 
 def _required_string_value(value: Any, name: str) -> str:
-    if not _non_empty_string_value(value):
-        message = f"{name} must be a non-empty string"
-        raise MaterializationError(message)
-
-    return value
+    return _required_checked_value(
+        value,
+        name,
+        _non_empty_string_value,
+        "a non-empty string",
+    )
 
 
 def _required_bool_value(value: Any, name: str) -> bool:
-    if not isinstance(value, bool):
-        message = f"{name} must be a bool"
-        raise MaterializationError(message)
-
-    return value
+    return _required_checked_value(value, name, _bool_value, "a bool")
 
 
 def _optional_int(value: Any, name: str) -> int | None:
     if value is None:
         return None
 
-    if not isinstance(value, int):
-        message = f"{name} must be an integer"
-        raise MaterializationError(message)
-
-    return value
+    return _required_checked_value(value, name, _int_value, "an integer")
 
 
 def _optional_string(value: Any, name: str) -> str | None:
     if value is None:
         return None
 
-    if not _non_empty_string_value(value):
-        message = f"{name} must be a non-empty string"
+    return _required_string_value(value, name)
+
+
+def _required_checked_value(
+    value: Any,
+    name: str,
+    validate: Callable[[Any], bool],
+    value_message: str,
+) -> Any:
+    if not validate(value):
+        message = f"{name} must be {value_message}"
         raise MaterializationError(message)
 
     return value
@@ -2439,12 +2432,7 @@ def _required_string_domain_error(
     key: str,
     values: tuple[str, ...],
 ) -> str | None:
-    value = settings.get(key)
-
-    if value not in values:
-        return f"{key} is unsupported: {value}"
-
-    return None
+    return _string_domain_value_error(settings.get(key), key, values)
 
 
 def _mesh_dim_names_error(settings: Mapping[str, Any]) -> str | None:
@@ -2487,8 +2475,14 @@ def _optional_string_domain_error(
     if key not in settings:
         return None
 
-    value = settings.get(key)
+    return _string_domain_value_error(settings.get(key), key, values)
 
+
+def _string_domain_value_error(
+    value: Any,
+    key: str,
+    values: Sequence[str],
+) -> str | None:
     if not isinstance(value, str) or value not in values:
         return f"{key} is unsupported: {value}"
 
@@ -2637,6 +2631,14 @@ def _layout_mode_error(
         )
 
     return f"unsupported layout distributed strategy: {strategy}"
+
+
+def _int_value(value: Any) -> bool:
+    return isinstance(value, int)
+
+
+def _mapping_value(value: Any) -> bool:
+    return isinstance(value, Mapping)
 
 
 def _false_value(value: Any) -> bool:

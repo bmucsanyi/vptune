@@ -35,7 +35,6 @@ from vptune.anchors import (
     jvp_anchor,
     vjp_dot_identity_error,
 )
-from vptune.candidates import standard_axis_registry
 from vptune.checks import (
     STANDARD_THRESHOLDS,
     numeric_error_bound_measurements,
@@ -53,7 +52,6 @@ from vptune.data import (
     Candidate,
     CandidateAdmitter,
     CandidateOperation,
-    DataProvider,
     FullSizeRecord,
     FunctionObjective,
     Materializer,
@@ -63,7 +61,6 @@ from vptune.data import (
     OperatorSpec,
     ParameterSurface,
     ParameterTree,
-    Problem,
     ReferenceCheck,
     ReferenceChildResult,
     ReferenceResult,
@@ -71,8 +68,6 @@ from vptune.data import (
     RuntimeOperationFactory,
     RuntimeReferenceCheck,
     ScalarObjective,
-    Target,
-    VectorProvider,
 )
 from vptune.errors import AdmissionError, MaterializationError, ReferenceFailedError
 from vptune.identities import stable_hash, tensor_signature, to_json_value
@@ -172,6 +167,30 @@ PER_EXAMPLE_GRADIENT_LOOP_PATH = "stacked_per_example_gradient_loop"
 PER_EXAMPLE_GRADIENT_TORCH_FUNC_PATH = "stacked_per_example_torch_func_grad_loop"
 PER_EXAMPLE_GRADIENT_BACKWARD_PATH = "stacked_per_example_backward_materialized"
 PER_EXAMPLE_GRADIENT_VMAP_PATH = "stacked_per_example_gradient_vmap"
+FISHER_SCORE_GRADIENT_PATHS = (
+    FISHER_SCORE_GRADIENT_LOOP_PATH,
+    FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+    FISHER_SCORE_GRADIENT_VMAP_PATH,
+    FISHER_BACKWARD_MATERIALIZED_PATH,
+)
+SAMPLED_FISHER_SCORE_GRADIENT_PATHS = (
+    SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+    SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+    SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+    SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
+)
+EMPIRICAL_FISHER_GRADIENT_PATHS = (
+    EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+    EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+    EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
+    EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+)
+PER_EXAMPLE_GRADIENT_PATHS = (
+    PER_EXAMPLE_GRADIENT_LOOP_PATH,
+    PER_EXAMPLE_GRADIENT_TORCH_FUNC_PATH,
+    PER_EXAMPLE_GRADIENT_BACKWARD_PATH,
+    PER_EXAMPLE_GRADIENT_VMAP_PATH,
+)
 METRIC_DENSE_PATH = "dense_metric"
 METRIC_FACTORIZED_PATH = "factorized_metric"
 METRIC_BLOCKWISE_PATH = "blockwise_metric"
@@ -489,38 +508,99 @@ STANDARD_ANCHOR_PATHS = {
     "inverse_metric": INVERSE_METRIC_DENSE_PATH,
     "inverse_metric_inner": INVERSE_METRIC_INNER_SOLVE_REDUCE_PATH,
 }
-VMAP_RUNTIME_PATHS = (
-    FISHER_SCORE_GRADIENT_VMAP_PATH,
-    SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
-    EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+FISHER_VECTOR_PATH_ROWS = (
+    (
+        "fisher_vp",
+        FISHER_DENSE_PATH,
+        FISHER_SCORE_GRADIENT_LOOP_PATH,
+        FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        FISHER_SCORE_GRADIENT_VMAP_PATH,
+        FISHER_BACKWARD_MATERIALIZED_PATH,
+        FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
+    ),
+    (
+        "sampled_fisher_vp",
+        SAMPLED_FISHER_DENSE_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+        SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+        SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
+        SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
+    ),
+    (
+        "empirical_fisher_vp",
+        EMPIRICAL_FISHER_DENSE_PATH,
+        EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+        EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+        EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+        EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
+        EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH,
+    ),
 )
-FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS = (
-    FISHER_SCORE_GRADIENT_LOOP_PATH,
-    FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
-    FISHER_BACKWARD_MATERIALIZED_PATH,
-)
-FISHER_SCORE_GRADIENT_PRODUCT_PATHS = (
-    *FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
-    FISHER_SCORE_GRADIENT_VMAP_PATH,
-)
-SAMPLED_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS = (
-    SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
-    SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
-    SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
-)
-SAMPLED_FISHER_SCORE_GRADIENT_PRODUCT_PATHS = (
-    *SAMPLED_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
-    SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
-)
-EMPIRICAL_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS = (
-    EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
-    EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
-    EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
-)
-EMPIRICAL_FISHER_GRADIENT_PRODUCT_PATHS = (
-    *EMPIRICAL_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
-    EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
-)
+FISHER_MANUAL_BATCH_PATHS_BY_KIND = {
+    family: (loop, torch_func, backward)
+    for family, _, loop, torch_func, _, backward, _ in FISHER_VECTOR_PATH_ROWS
+}
+FISHER_STREAMING_PRODUCT_PATHS_BY_KIND = {
+    family: (*FISHER_MANUAL_BATCH_PATHS_BY_KIND[family], vmap)
+    for family, _, _, _, vmap, _, _ in FISHER_VECTOR_PATH_ROWS
+}
+FISHER_VECTOR_VMAP_PATHS_BY_KIND = {
+    family: (dense, *FISHER_STREAMING_PRODUCT_PATHS_BY_KIND[family], blockwise)
+    for family, dense, _, _, _, _, blockwise in FISHER_VECTOR_PATH_ROWS
+}
+FISHER_DENSE_PATH_BY_KIND = {
+    family: dense for family, dense, _, _, _, _, _ in FISHER_VECTOR_PATH_ROWS
+}
+FISHER_BLOCKWISE_PATH_BY_KIND = {
+    family: blockwise for family, _, _, _, _, _, blockwise in FISHER_VECTOR_PATH_ROWS
+}
+FISHER_VECTOR_LOOP_PATHS_BY_KIND = {
+    family: (dense, loop, torch_func, vmap, backward, blockwise)
+    for family, dense, loop, torch_func, vmap, backward, blockwise in (
+        FISHER_VECTOR_PATH_ROWS
+    )
+}
+FISHER_MANUAL_PER_EXAMPLE_PATHS = {
+    path for paths in FISHER_MANUAL_BATCH_PATHS_BY_KIND.values() for path in paths
+}
+FISHER_SAMPLE_MANUAL_PER_EXAMPLE_PATHS = {
+    path
+    for family in ("fisher_vp", "sampled_fisher_vp")
+    for path in FISHER_MANUAL_BATCH_PATHS_BY_KIND[family]
+}
+FISHER_SAMPLE_VMAP_PATHS = {
+    vmap
+    for family, _, _, _, vmap, _, _ in FISHER_VECTOR_PATH_ROWS
+    if family in {"fisher_vp", "sampled_fisher_vp"}
+}
+VMAP_RUNTIME_PATHS = tuple(vmap for _, _, _, _, vmap, _, _ in FISHER_VECTOR_PATH_ROWS)
+FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS = FISHER_MANUAL_BATCH_PATHS_BY_KIND["fisher_vp"]
+FISHER_SCORE_GRADIENT_PRODUCT_PATHS = FISHER_STREAMING_PRODUCT_PATHS_BY_KIND[
+    "fisher_vp"
+]
+SAMPLED_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS = FISHER_MANUAL_BATCH_PATHS_BY_KIND[
+    "sampled_fisher_vp"
+]
+SAMPLED_FISHER_SCORE_GRADIENT_PRODUCT_PATHS = FISHER_STREAMING_PRODUCT_PATHS_BY_KIND[
+    "sampled_fisher_vp"
+]
+EMPIRICAL_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS = FISHER_MANUAL_BATCH_PATHS_BY_KIND[
+    "empirical_fisher_vp"
+]
+EMPIRICAL_FISHER_GRADIENT_PRODUCT_PATHS = FISHER_STREAMING_PRODUCT_PATHS_BY_KIND[
+    "empirical_fisher_vp"
+]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ScoreMatrixCompileRow:
+    boundary: str
+    path_key: str
+    paths: tuple[str, ...]
+    message: str
+
+
 SCORE_MATRIX_COMPILE_PATH_VALUES = (
     "torch_autograd_grad_loop",
     "torch_func_grad",
@@ -528,18 +608,31 @@ SCORE_MATRIX_COMPILE_PATH_VALUES = (
     "backward_materialized_grad",
 )
 SCORE_MATRIX_COMPILE_ROWS = {
-    "fisher_vp": ("fisher_score_grad", "fisher.score_grad_path"),
-    "sampled_fisher_vp": (
-        "sampled_fisher_score_grad",
-        "sampled_fisher.score_grad_path",
+    "fisher_vp": _ScoreMatrixCompileRow(
+        boundary="fisher_score_grad",
+        path_key="fisher.score_grad_path",
+        paths=FISHER_SCORE_GRADIENT_PATHS,
+        message="fisher score-gradient boundary requires a score-gradient path",
     ),
-    "empirical_fisher_vp": (
-        "empirical_fisher_example_grad",
-        "empirical_fisher.grad_path",
+    "sampled_fisher_vp": _ScoreMatrixCompileRow(
+        boundary="sampled_fisher_score_grad",
+        path_key="sampled_fisher.score_grad_path",
+        paths=SAMPLED_FISHER_SCORE_GRADIENT_PATHS,
+        message=(
+            "sampled Fisher score-gradient boundary requires a score-gradient path"
+        ),
     ),
-    "per_example_gradient": (
-        "per_example_gradient",
-        "per_example_gradient.grad_path",
+    "empirical_fisher_vp": _ScoreMatrixCompileRow(
+        boundary="empirical_fisher_example_grad",
+        path_key="empirical_fisher.grad_path",
+        paths=EMPIRICAL_FISHER_GRADIENT_PATHS,
+        message=("empirical Fisher example-gradient boundary requires a gradient path"),
+    ),
+    "per_example_gradient": _ScoreMatrixCompileRow(
+        boundary="per_example_gradient",
+        path_key="per_example_gradient.grad_path",
+        paths=PER_EXAMPLE_GRADIENT_PATHS,
+        message="per-example gradient boundary requires a gradient path",
     ),
 }
 HVP_VECTOR_LOOP_PATHS = (
@@ -557,42 +650,23 @@ INVERSE_METRIC_DIRECT_SOLVE_PATHS = (
     INVERSE_METRIC_EIGH_PATH,
     INVERSE_METRIC_SVD_PATH,
 )
-INVERSE_METRIC_FACTOR_REUSE_PATHS = (
-    *INVERSE_METRIC_DIRECT_SOLVE_PATHS,
-    INVERSE_METRIC_CG_PATH,
-    INVERSE_METRIC_FACTORIZED_PATH,
-    INVERSE_METRIC_BLOCKWISE_PATH,
-    INVERSE_METRIC_WOODBURY_PATH,
-)
 JVP_VECTOR_VMAP_PATHS = (JVP_PATH, JVP_LINEARIZE_PATH)
 VJP_VECTOR_VMAP_PATHS = (VJP_PATH,)
 GGN_VECTOR_VMAP_PATHS = (
     GGN_JVP_HESSIAN_VJP_PATH,
     GGN_LINEARIZE_HESSIAN_VJP_PATH,
 )
-FISHER_VECTOR_VMAP_PATHS = (
-    FISHER_DENSE_PATH,
-    *FISHER_SCORE_GRADIENT_PRODUCT_PATHS,
-    FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
-)
-SAMPLED_FISHER_VECTOR_VMAP_PATHS = (
-    SAMPLED_FISHER_DENSE_PATH,
-    *SAMPLED_FISHER_SCORE_GRADIENT_PRODUCT_PATHS,
-    SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
-)
-EMPIRICAL_FISHER_VECTOR_VMAP_PATHS = (
-    EMPIRICAL_FISHER_DENSE_PATH,
-    *EMPIRICAL_FISHER_GRADIENT_PRODUCT_PATHS,
-    EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH,
-)
+FISHER_VECTOR_VMAP_PATHS = FISHER_VECTOR_VMAP_PATHS_BY_KIND["fisher_vp"]
+SAMPLED_FISHER_VECTOR_VMAP_PATHS = FISHER_VECTOR_VMAP_PATHS_BY_KIND["sampled_fisher_vp"]
+EMPIRICAL_FISHER_VECTOR_VMAP_PATHS = FISHER_VECTOR_VMAP_PATHS_BY_KIND[
+    "empirical_fisher_vp"
+]
 VECTOR_VMAP_RUNTIME_PATHS = {
     "jvp": JVP_VECTOR_VMAP_PATHS,
     "vjp": VJP_VECTOR_VMAP_PATHS,
     "hvp": HVP_VECTOR_VMAP_PATHS,
     "ggnvp": GGN_VECTOR_VMAP_PATHS,
-    "fisher_vp": FISHER_VECTOR_VMAP_PATHS,
-    "sampled_fisher_vp": SAMPLED_FISHER_VECTOR_VMAP_PATHS,
-    "empirical_fisher_vp": EMPIRICAL_FISHER_VECTOR_VMAP_PATHS,
+    **FISHER_VECTOR_VMAP_PATHS_BY_KIND,
     "metric_inner": (
         METRIC_INNER_MULTIPLY_REDUCE_PATH,
         METRIC_INNER_FACTORED_GRAM_PATH,
@@ -619,30 +693,7 @@ VECTOR_LOOP_RUNTIME_PATHS = {
         GGN_FORWARD_AD_HESSIAN_VJP_PATH,
         GGN_LINEARIZE_HESSIAN_VJP_PATH,
     ),
-    "fisher_vp": (
-        FISHER_DENSE_PATH,
-        FISHER_SCORE_GRADIENT_LOOP_PATH,
-        FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
-        FISHER_SCORE_GRADIENT_VMAP_PATH,
-        FISHER_BACKWARD_MATERIALIZED_PATH,
-        FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
-    ),
-    "sampled_fisher_vp": (
-        SAMPLED_FISHER_DENSE_PATH,
-        SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
-        SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
-        SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
-        SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
-        SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
-    ),
-    "empirical_fisher_vp": (
-        EMPIRICAL_FISHER_DENSE_PATH,
-        EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
-        EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
-        EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
-        EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
-        EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH,
-    ),
+    **FISHER_VECTOR_LOOP_PATHS_BY_KIND,
     "inverse_metric": (
         INVERSE_METRIC_DENSE_PATH,
         INVERSE_METRIC_CG_PATH,
@@ -4566,47 +4617,12 @@ def _prepare_enabled_compile_boundary_execution(
             "inverse_metric_inner_reduce",
         ): lambda: _run_inverse_metric_inner(execution),
     }
-    score_builders = {
-        ("fisher_vp", "fisher_score_grad"): lambda: (
-            _score_gradient_matrix_from_builders(
-                execution,
-                "fisher_score_grad",
-                FISHER_SCORE_GRADIENT_BUILDERS,
-                "fisher score-gradient boundary requires a score-gradient path",
-                use_compiled=False,
-            )
-        ),
-        (
-            "sampled_fisher_vp",
-            "sampled_fisher_score_grad",
-        ): lambda: _score_gradient_matrix_from_builders(
-            execution,
-            "sampled_fisher_score_grad",
-            SAMPLED_FISHER_SCORE_GRADIENT_BUILDERS,
-            "sampled Fisher score-gradient boundary requires a score-gradient path",
-            use_compiled=False,
-        ),
-        (
-            "empirical_fisher_vp",
-            "empirical_fisher_example_grad",
-        ): lambda: _score_gradient_matrix_from_builders(
-            execution,
-            "empirical_fisher_example_grad",
-            EMPIRICAL_FISHER_GRADIENT_BUILDERS,
-            "empirical Fisher example-gradient boundary requires a gradient path",
-            use_compiled=False,
-        ),
-        (
-            "per_example_gradient",
-            "per_example_gradient",
-        ): lambda: _per_example_gradient_matrix_without_manual_batch(execution),
-    }
     builder = inner_builders.get((execution.operator.kind, boundary))
 
     if builder is not None:
         return _prepare_inner_compile_boundary(execution, settings, builder)
 
-    score_builder = score_builders.get((execution.operator.kind, boundary))
+    score_builder = _score_matrix_compile_boundary_builder(execution, boundary)
 
     if score_builder is not None:
         return _prepare_score_matrix_compile_boundary(
@@ -4783,6 +4799,34 @@ def _prepare_score_matrix_compile_boundary(
         execution,
         compiled_score_matrix=compiled_score_matrix,
     )
+
+
+def _score_matrix_compile_boundary_builder(
+    execution: StandardExecution,
+    boundary: str,
+) -> Callable[[], torch.Tensor] | None:
+    row = _score_matrix_compile_row(execution.operator.kind, boundary)
+
+    if row is None:
+        return None
+
+    return lambda: _score_gradient_matrix_from_row(
+        execution,
+        row,
+        use_compiled=False,
+    )
+
+
+def _score_matrix_compile_row(
+    operator_kind: str,
+    boundary: object,
+) -> _ScoreMatrixCompileRow | None:
+    row = SCORE_MATRIX_COMPILE_ROWS.get(operator_kind)
+
+    if row is None or boundary != row.boundary:
+        return None
+
+    return row
 
 
 def _prepare_ggn_loss_product_compile_boundary(
@@ -5085,6 +5129,12 @@ def _compile_boundary_runs_inside_operator(
     }:
         return True
 
+    if operator_kind in SCORE_MATRIX_COMPILE_ROWS:
+        return (
+            settings.get("compile.boundary")
+            == SCORE_MATRIX_COMPILE_ROWS[operator_kind].boundary
+        )
+
     return (operator_kind, settings.get("compile.boundary")) in {
         ("gradient", "loss_closure"),
         ("gradient", "gradient_closure"),
@@ -5097,10 +5147,6 @@ def _compile_boundary_runs_inside_operator(
         ("ggnvp", "ggn_jvp"),
         ("ggnvp", "ggn_loss_hessian_product"),
         ("ggnvp", "ggn_vjp"),
-        ("fisher_vp", "fisher_score_grad"),
-        ("sampled_fisher_vp", "sampled_fisher_score_grad"),
-        ("empirical_fisher_vp", "empirical_fisher_example_grad"),
-        ("per_example_gradient", "per_example_gradient"),
         ("metric", "metric_multiply"),
         ("sqrt_metric", "metric_sqrt_multiply"),
         ("inverse_sqrt_metric", "metric_sqrt_multiply"),
@@ -5473,9 +5519,8 @@ def _score_matrix_compile_boundary_supported(
     settings: Mapping[str, Any],
 ) -> bool:
     row = SCORE_MATRIX_COMPILE_ROWS[operator_kind]
-    expected_boundary, path_key = row
 
-    if boundary != expected_boundary:
+    if boundary != row.boundary:
         return False
 
     if (
@@ -5484,7 +5529,7 @@ def _score_matrix_compile_boundary_supported(
     ):
         return False
 
-    return settings.get(path_key) in SCORE_MATRIX_COMPILE_PATH_VALUES
+    return settings.get(row.path_key) in SCORE_MATRIX_COMPILE_PATH_VALUES
 
 
 def _compiled_autograd_patch() -> Any:
@@ -6320,82 +6365,6 @@ def standard_runtime_config(
         axis_registry=axis_registry,
         reference_check_name="standard_anchor",
         signature=runtime_signature,
-    )
-
-
-def standard_problem(
-    *,
-    model: torch.nn.Module,
-    parameter_surface: ParameterSurface,
-    parameter_values: ParameterTree,
-    buffers: BufferTree,
-    data: DataProvider,
-    operator: OperatorSpec,
-    vectors: VectorProvider,
-    target: Target,
-    candidates: Mapping[str, Mapping[str, Any]],
-    thresholds: Mapping[str, float],
-    objective_signature: Mapping[str, Any],
-    scalar_objectives: Mapping[str, ScalarObjective] | None = None,
-    function_objectives: Mapping[str, FunctionObjective] | None = None,
-    module_call: ModuleCallSpec | None = None,
-    batch_layout: Callable[[Candidate, Batch], Batch] | None = None,
-) -> Problem:
-    """Return a standard PyTorch tuning problem from explicit settings.
-
-    Raises:
-        MaterializationError: If candidate settings are empty.
-    """
-    if operator.kind == "composition":
-        message = "standard_problem requires TuningRun for composition operators"
-        raise MaterializationError(message)
-
-    if not candidates:
-        message = "problem candidate_settings are required"
-        raise MaterializationError(message)
-
-    axis_registry = standard_axis_registry()
-    candidate_rows = tuple(
-        Candidate(
-            family=operator.family,
-            candidate_id=candidate_id,
-            settings=dict(settings),
-            changed_axes=_standard_changed_axes(settings, axis_registry),
-            generator_id="vptune.problem",
-            generator_version=PACKAGE_VERSION,
-        )
-        for candidate_id, settings in candidates.items()
-    )
-    runtime = standard_runtime_config(
-        operator,
-        params=parameter_values,
-        buffers=buffers,
-        candidates=candidate_rows,
-        thresholds=thresholds,
-        objective_signature=objective_signature,
-        axis_registry=axis_registry,
-        parameter_surface=parameter_surface,
-        scalar_objectives=scalar_objectives,
-        function_objectives=function_objectives,
-        module=model,
-        module_call=module_call,
-        batch_layout=batch_layout,
-    )
-
-    return Problem(
-        model=model,
-        params=parameter_surface,
-        data=data,
-        operator=operator,
-        vectors=vectors,
-        target=target,
-        runtime=runtime,
-        anchor_policy={},
-        replay_policy={},
-        adapter_identity={
-            "adapter_id": "vptune.core",
-            "adapter_version": PACKAGE_VERSION,
-        },
     )
 
 
@@ -8419,13 +8388,12 @@ def _class_block_size_with_exact_global_normalization(
     settings: Mapping[str, Any],
 ) -> int:
     key = "chunk.class_block_size_with_exact_global_normalization"
-    value = settings.get(key)
 
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _required_positive_int_setting(
+        settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _run_ggnvp_vjp(
@@ -8735,28 +8703,10 @@ def _skip_score_fisher_requirement(execution: StandardExecution) -> None:
     _ = execution
 
 
-def _fisher_score_gradients(execution: StandardExecution) -> torch.Tensor:
-    return _score_gradient_matrix_from_builders(
-        execution,
-        "fisher_score_grad",
-        FISHER_SCORE_GRADIENT_BUILDERS,
-        "fisher score-gradient boundary requires a score-gradient path",
-    )
-
-
 def _run_sampled_fisher_vp(execution: StandardExecution) -> TensorTree:
     return _run_fisher_family_vp(
         execution,
         FISHER_FAMILY_RUNTIME_ROWS["sampled_fisher_vp"],
-    )
-
-
-def _sampled_fisher_score_gradients(execution: StandardExecution) -> torch.Tensor:
-    return _score_gradient_matrix_from_builders(
-        execution,
-        "sampled_fisher_score_grad",
-        SAMPLED_FISHER_SCORE_GRADIENT_BUILDERS,
-        "sampled Fisher score-gradient boundary requires a score-gradient path",
     )
 
 
@@ -8776,19 +8726,10 @@ def _run_empirical_fisher_vp(execution: StandardExecution) -> TensorTree:
     )
 
 
-def _empirical_fisher_gradients(execution: StandardExecution) -> torch.Tensor:
-    return _score_gradient_matrix_from_builders(
-        execution,
-        "empirical_fisher_example_grad",
-        EMPIRICAL_FISHER_GRADIENT_BUILDERS,
-        "empirical Fisher example-gradient boundary requires a gradient path",
-    )
-
-
 def _score_gradient_matrix_from_builders(
     execution: StandardExecution,
     compile_boundary: str,
-    builders: Mapping[str, Callable[[StandardExecution], torch.Tensor]],
+    paths: tuple[str, ...],
     error_message: str,
     *,
     use_compiled: bool = True,
@@ -8803,10 +8744,40 @@ def _score_gradient_matrix_from_builders(
     if _uses_manual_per_example_schedule(execution):
         return _per_example_gradient_matrix_manual_batches(execution)
 
+    if execution.path not in paths:
+        raise MaterializationError(error_message)
+
     return _per_example_gradient_matrix_from_builders(
         execution,
-        builders,
+        PER_EXAMPLE_GRADIENT_WITHOUT_MANUAL_BUILDERS,
         error_message,
+    )
+
+
+def _score_gradient_matrix_from_operator_row(
+    execution: StandardExecution,
+) -> torch.Tensor:
+    row = SCORE_MATRIX_COMPILE_ROWS.get(execution.operator.kind)
+
+    if row is None:
+        message = f"score-gradient matrix is not lowered for {execution.operator.kind}"
+        raise MaterializationError(message)
+
+    return _score_gradient_matrix_from_row(execution, row)
+
+
+def _score_gradient_matrix_from_row(
+    execution: StandardExecution,
+    row: _ScoreMatrixCompileRow,
+    *,
+    use_compiled: bool = True,
+) -> torch.Tensor:
+    return _score_gradient_matrix_from_builders(
+        execution,
+        row.boundary,
+        row.paths,
+        row.message,
+        use_compiled=use_compiled,
     )
 
 
@@ -8840,24 +8811,12 @@ def _run_per_example_gradient(execution: StandardExecution) -> TensorTree:
     _require_path(
         execution.operator.kind,
         execution.path,
-        (
-            PER_EXAMPLE_GRADIENT_LOOP_PATH,
-            PER_EXAMPLE_GRADIENT_TORCH_FUNC_PATH,
-            PER_EXAMPLE_GRADIENT_BACKWARD_PATH,
-            PER_EXAMPLE_GRADIENT_VMAP_PATH,
-        ),
+        PER_EXAMPLE_GRADIENT_PATHS,
     )
     accumulation = execution.candidate.settings.get("per_example_gradient.accumulation")
 
     if accumulation == "stacked_leading_axis":
-        if (
-            execution.compiled_score_matrix is not None
-            and execution.candidate.settings.get("compile.boundary")
-            == "per_example_gradient"
-        ):
-            matrix = execution.compiled_score_matrix()
-        else:
-            matrix = _per_example_gradient_matrix_without_manual_batch(execution)
+        matrix = _score_gradient_matrix_from_operator_row(execution)
     elif accumulation == "blockwise_stacked":
         matrix = _per_example_gradient_matrix_blockwise(execution)
     else:
@@ -9273,22 +9232,13 @@ def _streaming_score_gradient_product_manual_batches(
     execution: StandardExecution,
     vector_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    batch, batch_in_dims = _per_example_batch_in_dims(
-        execution.batch,
-        "per-example manual batching",
-    )
-    example_count = _per_example_batch_size(
-        batch,
-        batch_in_dims,
-        "per-example manual batching",
-    )
-    batch_size = _per_example_manual_batch_size(execution)
     result = torch.zeros_like(vector_tensor)
 
-    for start in range(0, example_count, batch_size):
-        stop = min(start + batch_size, example_count)
-        subbatch = _per_example_batch_slice(batch, batch_in_dims, start, stop)
-        subexecution = dataclasses.replace(execution, batch=subbatch)
+    for subexecution in _per_example_sliced_executions(
+        execution,
+        "per-example manual batching",
+        _per_example_manual_batch_size(execution),
+    ):
         result = result + _streaming_score_gradient_product_without_manual_batch(
             subexecution,
             vector_tensor,
@@ -9318,21 +9268,11 @@ def _streaming_gradient_rows(
     execution: StandardExecution,
 ) -> Iterator[torch.Tensor]:
     if _uses_manual_per_example_schedule(execution):
-        batch, batch_in_dims = _per_example_batch_in_dims(
-            execution.batch,
+        for subexecution in _per_example_sliced_executions(
+            execution,
             "per-example manual batching",
-        )
-        example_count = _per_example_batch_size(
-            batch,
-            batch_in_dims,
-            "per-example manual batching",
-        )
-        batch_size = _per_example_manual_batch_size(execution)
-
-        for start in range(0, example_count, batch_size):
-            stop = min(start + batch_size, example_count)
-            subbatch = _per_example_batch_slice(batch, batch_in_dims, start, stop)
-            subexecution = dataclasses.replace(execution, batch=subbatch)
+            _per_example_manual_batch_size(execution),
+        ):
             yield from _streaming_gradient_rows_without_manual_batch(subexecution)
 
         return
@@ -9350,40 +9290,10 @@ def _streaming_gradient_rows_without_manual_batch(
 
         return
 
-    if execution.path in {
-        FISHER_SCORE_GRADIENT_LOOP_PATH,
-        SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
-        EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
-    }:
-        yield from _streaming_gradient_rows_loop(execution)
+    builder = STREAMING_GRADIENT_ROW_BUILDERS.get(execution.path)
 
-        return
-
-    if execution.path in {
-        FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
-        SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
-        EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
-    }:
-        yield from _streaming_gradient_rows_torch_func(execution)
-
-        return
-
-    if execution.path in {
-        FISHER_BACKWARD_MATERIALIZED_PATH,
-        SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
-        EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
-    }:
-        yield from _streaming_gradient_rows_backward(execution)
-
-        return
-
-    if execution.path in {
-        FISHER_SCORE_GRADIENT_VMAP_PATH,
-        SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
-        EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
-    }:
-        yield from _streaming_gradient_rows_vmap(execution)
-
+    if builder is not None:
+        yield from builder(execution)
         return
 
     message = "streaming score-gradient product requires a score-gradient path"
@@ -9398,12 +9308,7 @@ def _compiled_streaming_gradient_rows(
 
     boundary = execution.candidate.settings.get("compile.boundary")
 
-    if (execution.operator.kind, boundary) not in {
-        ("fisher_vp", "fisher_score_grad"),
-        ("sampled_fisher_vp", "sampled_fisher_score_grad"),
-        ("empirical_fisher_vp", "empirical_fisher_example_grad"),
-        ("per_example_gradient", "per_example_gradient"),
-    }:
+    if _score_matrix_compile_row(execution.operator.kind, boundary) is None:
         return None
 
     score_gradients = execution.compiled_score_matrix()
@@ -9526,6 +9431,61 @@ def _streaming_gradient_rows_vmap(
 
     for index in range(row_count):
         yield torch.cat(tuple(piece[index] for piece in pieces))
+
+
+def _path_builder_map(
+    rows: Sequence[tuple[tuple[str, ...], Callable[[StandardExecution], Any]]],
+) -> dict[str, Callable[[StandardExecution], Any]]:
+    result = {}
+
+    for paths, builder in rows:
+        for path in paths:
+            result[path] = builder
+
+    return result
+
+
+STREAMING_GRADIENT_LOOP_PATHS = (
+    FISHER_SCORE_GRADIENT_LOOP_PATH,
+    SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
+    EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
+)
+STREAMING_GRADIENT_TORCH_FUNC_PATHS = (
+    FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+    SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
+    EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
+)
+STREAMING_GRADIENT_BACKWARD_PATHS = (
+    FISHER_BACKWARD_MATERIALIZED_PATH,
+    SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
+    EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
+)
+STREAMING_GRADIENT_VMAP_PATHS = (
+    FISHER_SCORE_GRADIENT_VMAP_PATH,
+    SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
+    EMPIRICAL_FISHER_GRADIENT_VMAP_PATH,
+)
+PER_EXAMPLE_GRADIENT_LOOP_PATHS = (
+    *STREAMING_GRADIENT_LOOP_PATHS,
+    PER_EXAMPLE_GRADIENT_LOOP_PATH,
+)
+PER_EXAMPLE_GRADIENT_TORCH_FUNC_PATHS = (
+    *STREAMING_GRADIENT_TORCH_FUNC_PATHS,
+    PER_EXAMPLE_GRADIENT_TORCH_FUNC_PATH,
+)
+PER_EXAMPLE_GRADIENT_BACKWARD_PATHS = (
+    *STREAMING_GRADIENT_BACKWARD_PATHS,
+    PER_EXAMPLE_GRADIENT_BACKWARD_PATH,
+)
+PER_EXAMPLE_GRADIENT_VMAP_PATHS = (PER_EXAMPLE_GRADIENT_VMAP_PATH,)
+
+
+STREAMING_GRADIENT_ROW_BUILDERS = _path_builder_map((
+    (STREAMING_GRADIENT_LOOP_PATHS, _streaming_gradient_rows_loop),
+    (STREAMING_GRADIENT_TORCH_FUNC_PATHS, _streaming_gradient_rows_torch_func),
+    (STREAMING_GRADIENT_BACKWARD_PATHS, _streaming_gradient_rows_backward),
+    (STREAMING_GRADIENT_VMAP_PATHS, _streaming_gradient_rows_vmap),
+))
 
 
 def _accumulate_streaming_gradient_row_batch(
@@ -9739,57 +9699,59 @@ def _uses_manual_per_example_schedule(execution: StandardExecution) -> bool:
     if execution.candidate.settings.get("schedule.per_example") != "manual_batch":
         return False
 
-    return execution.path in {
-        *FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
-        *SAMPLED_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
-        *EMPIRICAL_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
-    }
+    return execution.path in FISHER_MANUAL_PER_EXAMPLE_PATHS
+
+
+def _per_example_sliced_executions(
+    execution: StandardExecution,
+    label: str,
+    batch_size: int,
+) -> Iterator[StandardExecution]:
+    batch, batch_in_dims = _per_example_batch_in_dims(
+        execution.batch,
+        label,
+    )
+    example_count = _per_example_batch_size(
+        batch,
+        batch_in_dims,
+        label,
+    )
+
+    for start in range(0, example_count, batch_size):
+        stop = min(start + batch_size, example_count)
+        subbatch = _per_example_batch_slice(batch, batch_in_dims, start, stop)
+        yield dataclasses.replace(execution, batch=subbatch)
 
 
 def _per_example_gradient_matrix_manual_batches(
     execution: StandardExecution,
 ) -> torch.Tensor:
-    batch, batch_in_dims = _per_example_batch_in_dims(
-        execution.batch,
+    return _per_example_gradient_matrix_batched(
+        execution,
         "per-example manual batching",
+        _per_example_manual_batch_size(execution),
     )
-    example_count = _per_example_batch_size(
-        batch,
-        batch_in_dims,
-        "per-example manual batching",
-    )
-    batch_size = _per_example_manual_batch_size(execution)
-    rows = []
-
-    for start in range(0, example_count, batch_size):
-        stop = min(start + batch_size, example_count)
-        subbatch = _per_example_batch_slice(batch, batch_in_dims, start, stop)
-        subexecution = dataclasses.replace(execution, batch=subbatch)
-        rows.append(_per_example_gradient_matrix_without_manual_batch(subexecution))
-
-    return torch.cat(tuple(rows), dim=0)
 
 
 def _per_example_gradient_matrix_blockwise(
     execution: StandardExecution,
 ) -> torch.Tensor:
-    batch, batch_in_dims = _per_example_batch_in_dims(
-        execution.batch,
+    return _per_example_gradient_matrix_batched(
+        execution,
         "per-example gradient blockwise stacking",
+        _per_example_block_size(execution),
     )
-    example_count = _per_example_batch_size(
-        batch,
-        batch_in_dims,
-        "per-example gradient blockwise stacking",
-    )
-    block_size = _per_example_block_size(execution)
-    rows = []
 
-    for start in range(0, example_count, block_size):
-        stop = min(start + block_size, example_count)
-        subbatch = _per_example_batch_slice(batch, batch_in_dims, start, stop)
-        subexecution = dataclasses.replace(execution, batch=subbatch)
-        rows.append(_per_example_gradient_matrix_without_manual_batch(subexecution))
+
+def _per_example_gradient_matrix_batched(
+    execution: StandardExecution,
+    label: str,
+    batch_size: int,
+) -> torch.Tensor:
+    rows = [
+        _per_example_gradient_matrix_without_manual_batch(subexecution)
+        for subexecution in _per_example_sliced_executions(execution, label, batch_size)
+    ]
 
     return torch.cat(tuple(rows), dim=0)
 
@@ -9816,24 +9778,21 @@ def _per_example_manual_batch_size(execution: StandardExecution) -> int:
         message = "per-example manual batching requires a Fisher-family operator"
         raise MaterializationError(message)
 
-    value = execution.candidate.settings.get(key)
-
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _required_positive_int_setting(
+        execution.candidate.settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _per_example_block_size(execution: StandardExecution) -> int:
     key = "batch.per_example_block_size"
-    value = execution.candidate.settings.get(key)
 
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _required_positive_int_setting(
+        execution.candidate.settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _per_example_gradient_matrix(execution: StandardExecution) -> torch.Tensor:
@@ -10016,43 +9975,15 @@ def _per_example_gradient_matrix_from_builders(
     return builder(execution)
 
 
-FISHER_SCORE_GRADIENT_BUILDERS = {
-    FISHER_SCORE_GRADIENT_LOOP_PATH: _per_example_gradient_matrix,
-    FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH: _per_example_gradient_matrix_torch_func,
-    FISHER_SCORE_GRADIENT_VMAP_PATH: _per_example_gradient_matrix_vmap,
-    FISHER_BACKWARD_MATERIALIZED_PATH: _per_example_gradient_matrix_backward,
-}
-SAMPLED_FISHER_SCORE_GRADIENT_BUILDERS = {
-    SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH: _per_example_gradient_matrix,
-    SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH: (
-        _per_example_gradient_matrix_torch_func
+PER_EXAMPLE_GRADIENT_WITHOUT_MANUAL_BUILDERS = _path_builder_map((
+    (PER_EXAMPLE_GRADIENT_LOOP_PATHS, _per_example_gradient_matrix),
+    (
+        PER_EXAMPLE_GRADIENT_TORCH_FUNC_PATHS,
+        _per_example_gradient_matrix_torch_func,
     ),
-    SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH: _per_example_gradient_matrix_vmap,
-    SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH: _per_example_gradient_matrix_backward,
-}
-EMPIRICAL_FISHER_GRADIENT_BUILDERS = {
-    EMPIRICAL_FISHER_GRADIENT_LOOP_PATH: _per_example_gradient_matrix,
-    EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH: _per_example_gradient_matrix_torch_func,
-    EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH: _per_example_gradient_matrix_backward,
-    EMPIRICAL_FISHER_GRADIENT_VMAP_PATH: _per_example_gradient_matrix_vmap,
-}
-PER_EXAMPLE_GRADIENT_WITHOUT_MANUAL_BUILDERS = {
-    FISHER_SCORE_GRADIENT_LOOP_PATH: _per_example_gradient_matrix,
-    SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH: _per_example_gradient_matrix,
-    EMPIRICAL_FISHER_GRADIENT_LOOP_PATH: _per_example_gradient_matrix,
-    PER_EXAMPLE_GRADIENT_LOOP_PATH: _per_example_gradient_matrix,
-    FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH: _per_example_gradient_matrix_torch_func,
-    SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH: (
-        _per_example_gradient_matrix_torch_func
-    ),
-    EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH: _per_example_gradient_matrix_torch_func,
-    PER_EXAMPLE_GRADIENT_TORCH_FUNC_PATH: _per_example_gradient_matrix_torch_func,
-    FISHER_BACKWARD_MATERIALIZED_PATH: _per_example_gradient_matrix_backward,
-    SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH: _per_example_gradient_matrix_backward,
-    EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH: _per_example_gradient_matrix_backward,
-    PER_EXAMPLE_GRADIENT_BACKWARD_PATH: _per_example_gradient_matrix_backward,
-    PER_EXAMPLE_GRADIENT_VMAP_PATH: _per_example_gradient_matrix_vmap,
-}
+    (PER_EXAMPLE_GRADIENT_BACKWARD_PATHS, _per_example_gradient_matrix_backward),
+    (PER_EXAMPLE_GRADIENT_VMAP_PATHS, _per_example_gradient_matrix_vmap),
+))
 
 
 def _per_example_gradient_tree_vmap(
@@ -10196,20 +10127,11 @@ def _per_example_vmap_chunk_size(execution: StandardExecution) -> int | None:
         message = "per-example vmap chunk size requires a Fisher-family operator"
         raise MaterializationError(message)
 
-    chunk_size = execution.candidate.settings.get(key)
-
-    if chunk_size is None:
-        return None
-
-    if (
-        not isinstance(chunk_size, int)
-        or isinstance(chunk_size, bool)
-        or chunk_size < 1
-    ):
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return chunk_size
+    return _optional_positive_int_setting(
+        execution.candidate.settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _vmap_batch_size(
@@ -10229,38 +10151,60 @@ def _vmap_batch_size(
     raise MaterializationError(message)
 
 
-def _vmap_chunk_size(settings: Mapping[str, Any]) -> int | None:
-    chunk_size = settings.get("vectorization.vmap_chunk_size")
+def _vmap_chunk_size(settings: Mapping[str, Any]) -> int:
+    key = "vectorization.vmap_chunk_size"
 
-    if chunk_size is None:
-        message = "vectorization.mode=vmap requires vectorization.vmap_chunk_size"
-        raise MaterializationError(message)
-
-    if (
-        not isinstance(chunk_size, int)
-        or isinstance(chunk_size, bool)
-        or chunk_size < 1
-    ):
-        message = "vectorization.vmap_chunk_size must be a positive integer"
-        raise MaterializationError(message)
-
-    return chunk_size
+    return _required_positive_int_setting(
+        settings,
+        key,
+        "vectorization.vmap_chunk_size must be a positive integer",
+        missing_message=(
+            "vectorization.mode=vmap requires vectorization.vmap_chunk_size"
+        ),
+    )
 
 
 def _manual_vector_batch_size(settings: Mapping[str, Any]) -> int:
-    batch_size = settings.get("vectorization.batch_size")
+    key = "vectorization.batch_size"
 
-    if (
-        not isinstance(batch_size, int)
-        or isinstance(batch_size, bool)
-        or batch_size < 1
-    ):
-        message = (
-            "vectorization.mode=manual_batch requires positive vectorization.batch_size"
+    return _required_positive_int_setting(
+        settings,
+        key,
+        "vectorization.mode=manual_batch requires positive vectorization.batch_size",
+    )
+
+
+def _optional_positive_int_setting(
+    settings: Mapping[str, Any],
+    key: str,
+    invalid_message: str,
+) -> int | None:
+    value = settings.get(key)
+
+    if value is None:
+        return None
+
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise MaterializationError(invalid_message)
+
+    return value
+
+
+def _required_positive_int_setting(
+    settings: Mapping[str, Any],
+    key: str,
+    invalid_message: str,
+    *,
+    missing_message: str | None = None,
+) -> int:
+    value = _optional_positive_int_setting(settings, key, invalid_message)
+
+    if value is None:
+        raise MaterializationError(
+            invalid_message if missing_message is None else missing_message
         )
-        raise MaterializationError(message)
 
-    return batch_size
+    return value
 
 
 def _vector_tree_in_dims(
@@ -11845,13 +11789,11 @@ def _lanczos_tridiagonal(
 
 
 def _sqrt_metric_lanczos_iterations(settings: Mapping[str, Any]) -> int:
-    value = settings.get("sqrt_metric.lanczos_iterations")
-
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        message = "sqrt_metric.lanczos_iterations must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _required_positive_int_setting(
+        settings,
+        "sqrt_metric.lanczos_iterations",
+        "sqrt_metric.lanczos_iterations must be a positive integer",
+    )
 
 
 def _require_positive_spectrum(values: torch.Tensor, label: str) -> None:
@@ -12004,37 +11946,6 @@ def _streaming_metric_multiply(
     )
 
 
-def _streaming_diagonal_metric_multiply(
-    operator: OperatorSpec,
-    batch: Batch,
-    vector: TensorTree,
-    settings: Mapping[str, Any],
-) -> TensorTree:
-    _ = operator
-    diagonal = _metric_diagonal_tree(batch, vector)
-    result = _tree_elementwise_mul_runtime(settings, diagonal, vector)
-    _require_finite_tree(result, "streaming diagonal metric result")
-
-    return result
-
-
-def _streaming_block_diagonal_metric_multiply(
-    operator: OperatorSpec,
-    batch: Batch,
-    vector: TensorTree,
-    settings: Mapping[str, Any],
-) -> TensorTree:
-    _ = operator
-    result = _block_diagonal_apply(
-        _metric_blocks(batch),
-        _flatten_vector(vector),
-        settings,
-        "streaming block metric result",
-    )
-
-    return _wrap_flat_vector(vector, result)
-
-
 def _streaming_low_rank_metric_multiply(
     operator: OperatorSpec,
     batch: Batch,
@@ -12065,24 +11976,23 @@ def _streaming_kfac_metric_multiply(
     vector: TensorTree,
     settings: Mapping[str, Any],
 ) -> TensorTree:
-    factor_batch = _kfac_factor_batch(batch)
-    vector_map = _kfac_vector_map(vector)
-    result = {}
-
-    for block in _kfac_blocks(operator):
-        left = _kfac_factor(factor_batch, block.left_factor_key)
-        right = _kfac_factor(factor_batch, block.right_factor_key)
-        value = _kfac_vector_leaf(vector_map, block)
-        _require_kfac_shapes(block, left, right, value)
+    def product(
+        _: KFACMetricBlock,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
         left_product = _matmul_runtime(settings, left, value)
-        product = _matmul_runtime(settings, left_product, right.T)
-        _require_finite_tensor(
-            product,
-            f"streaming KFAC metric result {block.parameter_name}",
-        )
-        result[block.parameter_name] = product
 
-    return result
+        return _matmul_runtime(settings, left_product, right.T)
+
+    return _kfac_block_results(
+        _kfac_blocks(operator),
+        _kfac_factor_batch(batch),
+        vector,
+        product,
+        "streaming KFAC metric result",
+    )
 
 
 def _streaming_ggn_metric_multiply(
@@ -12199,8 +12109,8 @@ FACTORIZED_INVERSE_METRIC_BATCH_BY_KIND = {
     "ggn_derived_factors": _ggn_derived_inverse_metric_multiply_batch,
 }
 STREAMING_METRIC_MULTIPLY_BY_KIND = {
-    "diagonal_tree": _streaming_diagonal_metric_multiply,
-    "block_diagonal": _streaming_block_diagonal_metric_multiply,
+    "diagonal_tree": _diagonal_metric_multiply,
+    "block_diagonal": _block_diagonal_metric_multiply,
     "low_rank_factors": _streaming_low_rank_metric_multiply,
     "kfac_factors": _streaming_kfac_metric_multiply,
     "ekfac_factors": _ekfac_metric_multiply,
@@ -12235,18 +12145,28 @@ def _run_inverse_metric(execution: StandardExecution) -> TensorTree:
 
 
 def _run_inverse_metric_by_mode(execution: StandardExecution) -> TensorTree:
-    mode = execution.candidate.settings.get("vectorization.mode")
+    return _run_by_vectorization_mode(
+        execution,
+        single_vector=_inverse_metric_solve_by_path,
+        single_loop=_run_inverse_metric_vector_single_loop,
+        manual_batch=_run_inverse_metric_vector_manual_batch,
+        vmap=_reject_inverse_metric_vector_vmap,
+    )
 
-    if mode == "single_loop":
-        return _run_inverse_metric_vector_single_loop(execution)
 
-    if mode == "manual_batch":
-        return _run_vector_manual_batches(
-            execution,
-            _run_inverse_metric_vector_single_loop,
-        )
+def _run_inverse_metric_vector_manual_batch(
+    execution: StandardExecution,
+) -> TensorTree:
+    return _run_vector_manual_batches(
+        execution,
+        _run_inverse_metric_vector_single_loop,
+    )
 
-    return _inverse_metric_solve_by_path(execution)
+
+def _reject_inverse_metric_vector_vmap(execution: StandardExecution) -> TensorTree:
+    _ = execution
+    message = "inverse_metric does not lower vectorization.mode=vmap"
+    raise MaterializationError(message)
 
 
 def _run_inverse_metric_vector_single_loop(
@@ -12266,27 +12186,18 @@ def _run_inverse_metric_vector_single_loop(
 def _run_inverse_metric_rhs_batch(
     execution: StandardExecution,
 ) -> TensorTree:
-    if execution.path not in INVERSE_METRIC_FACTOR_REUSE_PATHS:
+    row = INVERSE_METRIC_BATCH_BY_PATH.get(execution.path)
+
+    if row is None:
         message = "block inverse metric RHS requires a batched solve path"
         raise MaterializationError(message)
 
-    if execution.path in INVERSE_METRIC_DIRECT_SOLVE_PATHS:
-        return _run_inverse_metric_reused_dense_factor_batch(execution)
+    runner, representations = row
 
-    if execution.path == INVERSE_METRIC_CG_PATH:
-        return _conjugate_gradient_inverse_metric_multiply_batch(execution)
+    if representations is not None:
+        _require_metric_representation(execution.operator, representations)
 
-    if execution.path == INVERSE_METRIC_FACTORIZED_PATH:
-        return _factorized_inverse_metric_multiply_batch(execution)
-
-    if execution.path == INVERSE_METRIC_BLOCKWISE_PATH:
-        _require_metric_representation(execution.operator, ("block_diagonal",))
-
-        return _block_diagonal_inverse_metric_multiply_batch(execution)
-
-    _require_metric_representation(execution.operator, ("low_rank_factors",))
-
-    return _low_rank_inverse_metric_multiply_batch(execution)
+    return runner(execution)
 
 
 def _run_inverse_metric_reused_dense_factor_batch(
@@ -12450,6 +12361,25 @@ def _conjugate_gradient_inverse_metric_multiply_batch(
     return _wrap_flat_vector_batch(execution.params, solution)
 
 
+INVERSE_METRIC_BATCH_BY_PATH = {
+    **dict.fromkeys(
+        INVERSE_METRIC_DIRECT_SOLVE_PATHS,
+        (_run_inverse_metric_reused_dense_factor_batch, None),
+    ),
+    INVERSE_METRIC_CG_PATH: (_conjugate_gradient_inverse_metric_multiply_batch, None),
+    INVERSE_METRIC_FACTORIZED_PATH: (_factorized_inverse_metric_multiply_batch, None),
+    INVERSE_METRIC_BLOCKWISE_PATH: (
+        _block_diagonal_inverse_metric_multiply_batch,
+        ("block_diagonal",),
+    ),
+    INVERSE_METRIC_WOODBURY_PATH: (
+        _low_rank_inverse_metric_multiply_batch,
+        ("low_rank_factors",),
+    ),
+}
+INVERSE_METRIC_FACTOR_REUSE_PATHS = tuple(INVERSE_METRIC_BATCH_BY_PATH)
+
+
 def _conjugate_gradient_inverse_metric_batch_solve(
     execution: StandardExecution,
     template: TensorTree,
@@ -12604,8 +12534,8 @@ def _metric_apply_flat_batch(
     metric_path: str,
     settings: Mapping[str, Any],
 ) -> torch.Tensor:
-    parts = [
-        _metric_apply_flat(
+    def runner(flat_vector: torch.Tensor) -> torch.Tensor:
+        return _metric_apply_flat(
             operator,
             batch,
             template,
@@ -12614,13 +12544,8 @@ def _metric_apply_flat_batch(
             metric_path,
             settings,
         )
-        for flat_vector in flat_batch
-    ]
 
-    result = torch.stack(tuple(parts), dim=0)
-    _require_finite_tensor(result, "batched metric apply result")
-
-    return result
+    return _map_flat_batch(flat_batch, runner, "batched metric apply result")
 
 
 def _apply_inverse_metric_preconditioner(
@@ -12683,8 +12608,8 @@ def _apply_inverse_metric_preconditioner_batch(
     matrix_free_operators: Mapping[str, Callable[[Batch, TensorTree], TensorTree]]
     | None,
 ) -> torch.Tensor:
-    parts = [
-        _apply_inverse_metric_preconditioner(
+    def runner(residual: torch.Tensor) -> torch.Tensor:
+        return _apply_inverse_metric_preconditioner(
             operator,
             batch,
             template,
@@ -12693,11 +12618,24 @@ def _apply_inverse_metric_preconditioner_batch(
             settings,
             matrix_free_operators,
         )
-        for residual in residual_batch
-    ]
 
-    result = torch.stack(tuple(parts), dim=0)
-    _require_finite_tensor(result, "batched inverse metric preconditioner result")
+    return _map_flat_batch(
+        residual_batch,
+        runner,
+        "batched inverse metric preconditioner result",
+    )
+
+
+def _map_flat_batch(
+    flat_batch: torch.Tensor,
+    runner: Callable[[torch.Tensor], torch.Tensor],
+    label: str,
+) -> torch.Tensor:
+    result = torch.stack(
+        tuple(runner(flat_vector) for flat_vector in flat_batch),
+        dim=0,
+    )
+    _require_finite_tensor(result, label)
 
     return result
 
@@ -12758,13 +12696,11 @@ def _matrix_free_preconditioner(
 
 
 def _inverse_metric_iteration_budget(settings: Mapping[str, Any]) -> int:
-    value = settings.get("inverse_metric.iteration_budget")
-
-    if not isinstance(value, int) or value < 1:
-        message = "inverse_metric.iteration_budget must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _required_positive_int_setting(
+        settings,
+        "inverse_metric.iteration_budget",
+        "inverse_metric.iteration_budget must be a positive integer",
+    )
 
 
 def _inverse_metric_preconditioner(settings: Mapping[str, Any]) -> str:
@@ -13088,42 +13024,43 @@ class KFACMetricOperator:
 
     def multiply(self, batch: Batch, vector: TensorTree) -> TensorTree:
         """Return KFAC metric-vector product."""
-        vector_map = _kfac_vector_map(vector)
-        result = {}
 
-        for block in self.blocks:
-            left = _kfac_factor(batch, block.left_factor_key)
-            right = _kfac_factor(batch, block.right_factor_key)
-            value = _kfac_vector_leaf(vector_map, block)
-            _require_kfac_shapes(block, left, right, value)
-            product = _matmul_runtime(
+        def product(
+            _: KFACMetricBlock,
+            left: torch.Tensor,
+            right: torch.Tensor,
+            value: torch.Tensor,
+        ) -> torch.Tensor:
+            return _matmul_runtime(
                 self.settings,
                 _matmul_runtime(self.settings, left, value),
                 right.T,
             )
-            _require_finite_tensor(
-                product, f"KFAC metric result {block.parameter_name}"
-            )
-            result[block.parameter_name] = product
 
-        return result
+        return _kfac_block_results(
+            self.blocks,
+            batch,
+            vector,
+            product,
+            "KFAC metric result",
+        )
 
     def inverse_multiply(self, batch: Batch, vector: TensorTree) -> TensorTree:
         """Return inverse KFAC metric-vector product."""
-        vector_map = _kfac_vector_map(vector)
-        result = {}
 
-        for block in self.blocks:
-            left = _kfac_factor(batch, block.left_factor_key)
-            right = _kfac_factor(batch, block.right_factor_key)
-            value = _kfac_vector_leaf(vector_map, block)
-            _require_kfac_shapes(block, left, right, value)
+        def product(
+            block: KFACMetricBlock,
+            left: torch.Tensor,
+            right: torch.Tensor,
+            value: torch.Tensor,
+        ) -> torch.Tensor:
             damping = _resolved_group_damping(
                 self.damping,
                 self.damping_kind,
                 block.parameter_name,
             )
-            product = _kfac_inverse_product(
+
+            return _kfac_inverse_product(
                 left,
                 right,
                 value,
@@ -13131,13 +13068,14 @@ class KFACMetricOperator:
                 _resolved_group_damping_kind(self.damping_kind),
                 self.damping_policy,
             )
-            _require_finite_tensor(
-                product,
-                f"inverse KFAC metric result {block.parameter_name}",
-            )
-            result[block.parameter_name] = product
 
-        return result
+        return _kfac_block_results(
+            self.blocks,
+            batch,
+            vector,
+            product,
+            "inverse KFAC metric result",
+        )
 
     def inner(
         self,
@@ -13147,6 +13085,31 @@ class KFACMetricOperator:
     ) -> torch.Tensor:
         """Return KFAC metric inner product."""
         return _tree_dot_runtime(self.settings, left, self.multiply(batch, right))
+
+
+def _kfac_block_results(
+    blocks: Sequence[KFACMetricBlock],
+    batch: Batch,
+    vector: TensorTree,
+    product: Callable[
+        [KFACMetricBlock, torch.Tensor, torch.Tensor, torch.Tensor],
+        torch.Tensor,
+    ],
+    label_prefix: str,
+) -> dict[str, torch.Tensor]:
+    vector_map = _kfac_vector_map(vector)
+    result = {}
+
+    for block in blocks:
+        left = _kfac_factor(batch, block.left_factor_key)
+        right = _kfac_factor(batch, block.right_factor_key)
+        value = _kfac_vector_leaf(vector_map, block)
+        _require_kfac_shapes(block, left, right, value)
+        block_result = product(block, left, right, value)
+        _require_finite_tensor(block_result, f"{label_prefix} {block.parameter_name}")
+        result[block.parameter_name] = block_result
+
+    return result
 
 
 def _kfac_vector_map(vector: TensorTree) -> dict[str, TensorTree]:
@@ -14699,13 +14662,12 @@ def _require_batch_data_axis(operator: OperatorSpec, label: str) -> None:
 
 def _data_microbatch_size(settings: Mapping[str, Any]) -> int:
     key = "batch.data_microbatch_size"
-    value = settings.get(key)
 
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _required_positive_int_setting(
+        settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _require_per_token_schedule(
@@ -14749,16 +14711,11 @@ def _require_per_token_schedule(
 
 def _token_block_size(settings: Mapping[str, Any]) -> int | None:
     key = "chunk.token_block_size"
-    value = settings.get(key)
-
-    if value is None:
-        return None
-
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _optional_positive_int_setting(
+        settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _require_token_block_runtime(
@@ -14780,14 +14737,14 @@ def _require_lm_head_chunking_settings(
     lm_head_chunker: Callable[[Candidate, Batch], Batch] | None,
 ) -> None:
     key = "chunk.lm_head_weight_chunk_bytes"
-    value = settings.get(key)
+    value = _optional_positive_int_setting(
+        settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
     if value is None:
         return
-
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
 
     if lm_head_chunker is None:
         message = f"{key} requires LM-head weight binding"
@@ -14795,20 +14752,8 @@ def _require_lm_head_chunking_settings(
 
 
 def _require_per_example_schedule(path: str | None, value: Any) -> None:
-    loop_paths = {
-        FISHER_SCORE_GRADIENT_LOOP_PATH,
-        FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
-        FISHER_BACKWARD_MATERIALIZED_PATH,
-        SAMPLED_FISHER_SCORE_GRADIENT_LOOP_PATH,
-        SAMPLED_FISHER_SCORE_GRADIENT_TORCH_FUNC_PATH,
-        SAMPLED_FISHER_BACKWARD_MATERIALIZED_PATH,
-        EMPIRICAL_FISHER_GRADIENT_LOOP_PATH,
-        EMPIRICAL_FISHER_TORCH_FUNC_GRAD_PATH,
-        EMPIRICAL_FISHER_BACKWARD_MATERIALIZED_PATH,
-    }
-
     if value == "loop":
-        if path in loop_paths:
+        if path in FISHER_MANUAL_PER_EXAMPLE_PATHS:
             return
 
         message = f"schedule.per_example=loop is incompatible with path: {path}"
@@ -14822,11 +14767,7 @@ def _require_per_example_schedule(path: str | None, value: Any) -> None:
         raise MaterializationError(message)
 
     if value == "manual_batch":
-        if path in {
-            *FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
-            *SAMPLED_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
-            *EMPIRICAL_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
-        }:
+        if path in FISHER_MANUAL_PER_EXAMPLE_PATHS:
             return
 
         message = f"schedule.per_example=manual_batch is incompatible with path: {path}"
@@ -14844,14 +14785,8 @@ def _require_per_example_batch_size_settings(
         path,
         settings,
         "batch.fisher_sample_batch_size",
-        {
-            FISHER_SCORE_GRADIENT_VMAP_PATH,
-            SAMPLED_FISHER_SCORE_GRADIENT_VMAP_PATH,
-        },
-        {
-            *FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
-            *SAMPLED_FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS,
-        },
+        FISHER_SAMPLE_VMAP_PATHS,
+        FISHER_SAMPLE_MANUAL_PER_EXAMPLE_PATHS,
     )
     _require_per_example_batch_size_setting(
         path,
@@ -14889,11 +14824,11 @@ def _require_per_example_batch_size_setting(
         )
         raise MaterializationError(message)
 
-    value = settings[key]
-
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
+    _required_positive_int_setting(
+        settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _require_per_example_gradient_block_size_setting(
@@ -14902,29 +14837,23 @@ def _require_per_example_gradient_block_size_setting(
 ) -> None:
     key = "batch.per_example_block_size"
     accumulation = settings.get("per_example_gradient.accumulation")
-    per_example_paths = {
-        PER_EXAMPLE_GRADIENT_LOOP_PATH,
-        PER_EXAMPLE_GRADIENT_TORCH_FUNC_PATH,
-        PER_EXAMPLE_GRADIENT_BACKWARD_PATH,
-        PER_EXAMPLE_GRADIENT_VMAP_PATH,
-    }
 
     if key not in settings:
-        if accumulation == "blockwise_stacked" and path in per_example_paths:
+        if accumulation == "blockwise_stacked" and path in PER_EXAMPLE_GRADIENT_PATHS:
             message = f"{key} is required for blockwise_stacked"
             raise MaterializationError(message)
 
         return
 
-    if accumulation != "blockwise_stacked" or path not in per_example_paths:
+    if accumulation != "blockwise_stacked" or path not in PER_EXAMPLE_GRADIENT_PATHS:
         message = f"{key} requires per_example_gradient.accumulation=blockwise_stacked"
         raise MaterializationError(message)
 
-    value = settings[key]
-
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
+    _required_positive_int_setting(
+        settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _require_input_residency_settings(settings: Mapping[str, Any]) -> None:
@@ -16159,30 +16088,20 @@ def _require_ggn_batch_size_settings(
 
 def _ggn_batch_size(settings: Mapping[str, Any]) -> int | None:
     key = "batch.ggn_batch_size"
-    value = settings.get(key)
-
-    if value is None:
-        return None
-
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _optional_positive_int_setting(
+        settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _hvp_row_batch_size(settings: Mapping[str, Any]) -> int | None:
     key = "batch.hvp_row_batch_size"
-    value = settings.get(key)
-
-    if value is None:
-        return None
-
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _optional_positive_int_setting(
+        settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _require_hvp_row_batch_size_settings(
@@ -16339,44 +16258,29 @@ def _require_output_cotangent_block_settings(
 
 def _output_cotangent_block_size(settings: Mapping[str, Any]) -> int | None:
     key = "chunk.output_cotangent_block_size"
-    value = settings.get(key)
-
-    if value is None:
-        return None
-
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _optional_positive_int_setting(
+        settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _parameter_block_size(settings: Mapping[str, Any]) -> int | None:
     key = "chunk.parameter_block_size"
-    value = settings.get(key)
-
-    if value is None:
-        return None
-
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _optional_positive_int_setting(
+        settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _layer_block_size(settings: Mapping[str, Any]) -> int | None:
     key = "chunk.layer_block_size"
-    value = settings.get(key)
-
-    if value is None:
-        return None
-
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        message = f"{key} must be a positive integer"
-        raise MaterializationError(message)
-
-    return value
+    return _optional_positive_int_setting(
+        settings,
+        key,
+        f"{key} must be a positive integer",
+    )
 
 
 def _require_parameter_block_size_settings(
@@ -18689,7 +18593,7 @@ def _sampled_fisher_score_matrix_for_bound(
     if "sampled_score_gradients" in execution.batch:
         matrix = _batch_tensor(execution.batch, "sampled_score_gradients")
     else:
-        matrix = _sampled_fisher_score_gradients(execution)
+        matrix = _score_gradient_matrix_from_operator_row(execution)
 
     return _loss_scaled_score_matrix(execution, matrix)
 
@@ -18840,13 +18744,13 @@ def _require_explicit_score_fisher_semantics(operator: OperatorSpec) -> None:
 
 FISHER_FAMILY_RUNTIME_ROWS = {
     "fisher_vp": {
-        "paths": FISHER_VECTOR_VMAP_PATHS,
-        "streaming_paths": FISHER_SCORE_GRADIENT_PRODUCT_PATHS,
-        "blockwise_path": FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
-        "dense_path": FISHER_DENSE_PATH,
+        "paths": FISHER_VECTOR_VMAP_PATHS_BY_KIND["fisher_vp"],
+        "streaming_paths": FISHER_STREAMING_PRODUCT_PATHS_BY_KIND["fisher_vp"],
+        "blockwise_path": FISHER_BLOCKWISE_PATH_BY_KIND["fisher_vp"],
+        "dense_path": FISHER_DENSE_PATH_BY_KIND["fisher_vp"],
         "block_batch_key": "score_gradient_blocks",
         "matrix_batch_key": "score_gradients",
-        "streaming_matrix": _fisher_score_gradients,
+        "streaming_matrix": _score_gradient_matrix_from_operator_row,
         "streaming_normalization": _fisher_normalization,
         "blockwise_normalization": _fisher_normalization,
         "matrix_normalization": _fisher_score_matrix_normalization,
@@ -18863,13 +18767,13 @@ FISHER_FAMILY_RUNTIME_ROWS = {
         "precheck": _skip_score_fisher_requirement,
     },
     "sampled_fisher_vp": {
-        "paths": SAMPLED_FISHER_VECTOR_VMAP_PATHS,
-        "streaming_paths": SAMPLED_FISHER_SCORE_GRADIENT_PRODUCT_PATHS,
-        "blockwise_path": SAMPLED_FISHER_BLOCKWISE_SCORE_MATRIX_PATH,
-        "dense_path": SAMPLED_FISHER_DENSE_PATH,
+        "paths": FISHER_VECTOR_VMAP_PATHS_BY_KIND["sampled_fisher_vp"],
+        "streaming_paths": FISHER_STREAMING_PRODUCT_PATHS_BY_KIND["sampled_fisher_vp"],
+        "blockwise_path": FISHER_BLOCKWISE_PATH_BY_KIND["sampled_fisher_vp"],
+        "dense_path": FISHER_DENSE_PATH_BY_KIND["sampled_fisher_vp"],
         "block_batch_key": "sampled_score_gradient_blocks",
         "matrix_batch_key": "sampled_score_gradients",
-        "streaming_matrix": _sampled_fisher_score_gradients,
+        "streaming_matrix": _score_gradient_matrix_from_operator_row,
         "streaming_normalization": _sampled_fisher_normalization,
         "blockwise_normalization": _sampled_fisher_normalization,
         "matrix_normalization": _sampled_fisher_score_matrix_normalization,
@@ -18886,13 +18790,15 @@ FISHER_FAMILY_RUNTIME_ROWS = {
         "precheck": _require_sampled_fisher_semantics,
     },
     "empirical_fisher_vp": {
-        "paths": EMPIRICAL_FISHER_VECTOR_VMAP_PATHS,
-        "streaming_paths": EMPIRICAL_FISHER_GRADIENT_PRODUCT_PATHS,
-        "blockwise_path": EMPIRICAL_FISHER_BLOCKWISE_GRADIENT_MATRIX_PATH,
-        "dense_path": EMPIRICAL_FISHER_DENSE_PATH,
+        "paths": FISHER_VECTOR_VMAP_PATHS_BY_KIND["empirical_fisher_vp"],
+        "streaming_paths": FISHER_STREAMING_PRODUCT_PATHS_BY_KIND[
+            "empirical_fisher_vp"
+        ],
+        "blockwise_path": FISHER_BLOCKWISE_PATH_BY_KIND["empirical_fisher_vp"],
+        "dense_path": FISHER_DENSE_PATH_BY_KIND["empirical_fisher_vp"],
         "block_batch_key": "per_example_gradient_blocks",
         "matrix_batch_key": "per_example_gradients",
-        "streaming_matrix": _empirical_fisher_gradients,
+        "streaming_matrix": _score_gradient_matrix_from_operator_row,
         "streaming_normalization": _empirical_fisher_streaming_normalization,
         "blockwise_normalization": _empirical_fisher_blockwise_normalization,
         "matrix_normalization": _empirical_fisher_score_matrix_normalization,

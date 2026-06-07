@@ -123,14 +123,14 @@ def problem_for(name: str, operator: vpx.OperatorSpec) -> vpx.Problem:
 
         return vpx.constant_operation(vector)
 
-    wrapped_operation_factory = vpx.CallableOperationFactory(
+    operation_factory_with_identity = vpx.CallableOperationFactory(
         "tests.pilot.operation_factory",
         "1",
         {"generator": name},
         {"callback": "tests.pilot.operation_factory"},
         operation_factory,
     )
-    wrapped_reference_check = vpx.CallableReferenceCheck(
+    reference_check_with_identity = vpx.CallableReferenceCheck(
         "tests.pilot.reference_check",
         "1",
         {"generator": name},
@@ -147,8 +147,8 @@ def problem_for(name: str, operator: vpx.OperatorSpec) -> vpx.Problem:
         target=cpu_target(),
         runtime=vpx.RuntimeConfig(
             (candidate,),
-            wrapped_operation_factory,
-            wrapped_reference_check,
+            operation_factory_with_identity,
+            reference_check_with_identity,
             materialize_candidate,
             None,
             {"generator": name},
