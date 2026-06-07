@@ -32,6 +32,7 @@ Branch: codex-implement-spec @ 38d7f77
 - README now has a root public API quickstart that tunes built-in softmax-cross-entropy gradient on CPU.
 - Audit docs stay untracked local review inputs and are excluded from package output. `SCRATCHPAD.md` stays the tracked live scratchpad required by repo instructions and is also excluded from package output.
 - Best-practice mapping used NIST SSDF, PyPA packaging/build docs, Hatch sdist file selection docs, and OpenSSF Scorecard checks.
+- Direct git runtime dependency on `autobatch` is verified for repo/wheel/sdist install, but PyPA says public indexes should not allow direct references in uploaded distributions. Do not claim PyPI-upload readiness until `autobatch` has a normal index release or the dependency model changes.
 
 ## Notes to self
 - Existing scratchpad was explicitly ignored for this session.
@@ -66,6 +67,15 @@ Branch: codex-implement-spec @ 38d7f77
 - Fresh wheel install into `/private/tmp/vptune-prod-venv-20260607-2` succeeded with `vptune==1.0.0`, `torch==2.12.0`, and pinned `autobatch` commit `a0663ac586c61c4593e9b9c6031f43f464f61139`.
 - Fresh installed README workflow passed and printed package version `1.0.0` plus the expected gradient tensor.
 - `uv pip check` passed in the fresh environment; `python -m pip check` is unavailable because the uv-created venv has no `pip` module.
+- `twine check` passed for final `vptune-1.0.0` wheel and sdist.
+- Fresh sdist install into `/private/tmp/vptune-prod-sdist-venv-20260607` passed; the installed workflow, metadata check, and `uv pip check` all passed.
+- Fresh sdist install imports passed for `vptune`, `vptune.ext`, `vptune.adapters`, `vptune.adapters.transformers`, `vptune.adapters.distributed`, and `vptune.adapters.pilot` without installing the optional `transformers` extra.
 - `pip-audit` over the fresh site-packages found no known vulnerabilities in PyPI packages. It skipped `autobatch` and `vptune` because direct/local packages are not in PyPI advisory matching.
 - Warning review: full local test suite has 38 warnings, all from PyTorch internals: 18 `torch.jit.script` deprecations in attention tests, 14 `torch.jit.script_method` deprecations in standard runtime tests, and 6 `torch.fx` const-fold UserWarnings. Fresh install also shows PyTorch's no-NumPy warning when NumPy is absent. No package code calls `torch.jit.script` or `script_method`; adding NumPy solely to silence PyTorch would add an unused dependency.
+- `pytest -W error tests/test_public_api.py` fails in 9 JVP/GGN-related public tests because PyTorch emits the same `torch.jit.script` deprecation while loading forward-AD decompositions inside `torch.func.jvp`. Focused README/public gradient workflow passes with `-W error`.
+- Added exact pytest filters for known PyTorch internal warnings. Normal required `make test` now reports `862 passed, 11 skipped` with no warnings summary.
 - Final local lint gate after package edits: `make lint-fix` passed and `git diff --check` passed.
+- Commit `4fc34c1` pushed to origin/codex-implement-spec for final Ferranti verification.
+- Ferranti checkout `/home/hennig/hmx900/repos/vptune` fast-forwarded to `4fc34c1`.
+- Ferranti pinned-memory job `398527` on `h100-ferranti` passed 3 tests in 4.24s; Slurm state COMPLETED 0:0.
+- Ferranti 2-GPU hardware job `398526` on `h100-ferranti` is still pending by priority and must finish before production-ready certification.

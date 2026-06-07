@@ -70,8 +70,15 @@ packages = ["src/vptune"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-# torch emits this when numpy is absent; vptune neither imports nor depends on numpy
-filterwarnings = ["ignore:Failed to initialize NumPy:UserWarning"]
+filterwarnings = [
+    # torch emits this when numpy is absent; vptune neither imports nor depends on numpy
+    "ignore:Failed to initialize NumPy:UserWarning",
+    # torch 2.12 emits these from internal code paths exercised by required JVP,
+    # forward-AD, attention, and compile tests.
+    "ignore:`torch\\.jit\\.script` is deprecated\\. Please switch to `torch\\.compile` or `torch\\.export`\\.:DeprecationWarning:torch\\.jit\\._script",
+    "ignore:`torch\\.jit\\.script_method` is deprecated\\. Please switch to `torch\\.compile` or `torch\\.export`\\.:DeprecationWarning:torch\\.jit\\._script",
+    "ignore:Attempted to insert a get_attr Node with no underlying reference in the owning GraphModule.*:UserWarning:torch\\.fx\\.experimental\\.const_fold",
+]
 
 # Linting Configuration
 # See https://docs.astral.sh/ruff/rules/#legend
