@@ -1620,6 +1620,39 @@ def test_typed_softmax_cross_entropy_gradient_and_hvp_match_reference() -> None:
     )
 
 
+def test_public_tune_builtin_softmax_cross_entropy_gradient(
+    tmp_path: Path,
+) -> None:
+    model = typed_metric_model()
+    batch = {
+        "x": torch.tensor(
+            [[1.0, -0.5], [0.25, 2.0]],
+            dtype=torch.float64,
+        ),
+        "labels": torch.tensor([0, 1], dtype=torch.long),
+    }
+    vector = {
+        "weight": torch.tensor(
+            [[1.0, 0.0], [0.0, 0.0]],
+            dtype=torch.float64,
+        )
+    }
+    loss = vp.loss.softmax_cross_entropy(output="logits", labels="labels")
+    product = vp.gradient(model, loss, name="loss_gradient")
+    tuned = product.tune(
+        data=(batch,),
+        vectors=(vector,),
+        target=public_cpu_target(),
+        space=vp.space.standard(),
+        search=vp.search.exhaustive(),
+        run_dir=tmp_path,
+    )
+    expected = product(batch)
+
+    assert tuned.plan is not None
+    torch.testing.assert_close(tuned(batch)["weight"], expected["weight"])
+
+
 def test_typed_public_operators_record_typed_object_identities() -> None:
     model = typed_metric_model()
     loss = vp.loss.softmax_cross_entropy(output="logits", labels="labels")

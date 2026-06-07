@@ -2,6 +2,7 @@ import contextlib
 import dataclasses
 import math
 import re
+import tomllib
 import types
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
@@ -32,7 +33,7 @@ from vptune.checks import (
     validate_numeric_error_bound,
     validate_thresholds,
 )
-from vptune.data import FullSizeRecord, Measurement
+from vptune.data import PACKAGE_VERSION, FullSizeRecord, Measurement
 from vptune.errors import ReferenceFailedError
 from vptune.identities import (
     canonical_json,
@@ -6733,6 +6734,13 @@ def test_problem_signature_includes_axis_registry_identity() -> None:
 
     assert first_registry.signature() != second_registry.signature()
     assert first.input_signature() != second.input_signature()
+
+
+def test_package_version_matches_project_metadata() -> None:
+    pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
+    pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+
+    assert pyproject["project"]["version"] == PACKAGE_VERSION
 
 
 def test_package_owned_identities_use_package_version(

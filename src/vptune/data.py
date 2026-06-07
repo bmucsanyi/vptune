@@ -17,7 +17,7 @@ from vptune.identities import (
 from vptune.tensor_tree import TensorTree
 
 SCHEMA_VERSION = 1
-PACKAGE_VERSION = "0.0.1"
+PACKAGE_VERSION = "1.0.0"
 MIN_VARIANCE_REPEAT_COUNT = 2
 MIN_LINEAR_DOMAIN_VALUES = 3
 
