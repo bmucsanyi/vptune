@@ -8,6 +8,7 @@ import torch
 from torch.func import functional_call, grad, jvp, vjp
 
 from vptune.admission import admit_functional_call
+from vptune.errors import MaterializationError
 from vptune.tensor_tree import (
     TensorTree,
     tree_dot,
@@ -40,11 +41,19 @@ class AnchorRegistry:
         """Register an anchor implementation.
 
         Raises:
-            RuntimeError: If the anchor name is already registered.
+            MaterializationError: If the anchor declaration is invalid.
         """
+        if not isinstance(name, str) or not name:
+            message = "anchor name must be a nonempty string"
+            raise MaterializationError(message)
+
+        if not callable(anchor):
+            message = f"anchor implementation must be callable: {name}"
+            raise MaterializationError(message)
+
         if name in self.anchors:
             message = f"anchor already registered: {name}"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         self.anchors[name] = anchor
 
@@ -55,13 +64,17 @@ class AnchorRegistry:
             Registered anchor.
 
         Raises:
-            RuntimeError: If the anchor name is unknown.
+            MaterializationError: If the anchor name is unknown.
         """
+        if not isinstance(name, str) or not name:
+            message = "anchor name must be a nonempty string"
+            raise MaterializationError(message)
+
         anchor = self.anchors.get(name)
 
         if anchor is None:
             message = f"anchor is not registered: {name}"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         return anchor
 

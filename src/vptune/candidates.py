@@ -14,7 +14,7 @@ from vptune.admission import (
     admit_torch_func,
 )
 from vptune.data import PACKAGE_VERSION, Candidate, Family
-from vptune.errors import AdmissionError
+from vptune.errors import AdmissionError, MaterializationError
 
 AdmissionRule = Callable[[Candidate], tuple[bool, str | None]]
 
@@ -1047,22 +1047,6 @@ def _static_loss_scaling_error(
     return None
 
 
-BASELINE_ATTENTION_FRONTEND_VALUES = (
-    "transformers_eager",
-    "transformers_sdpa",
-    "pytorch_sdpa_direct",
-    "patched_eager",
-)
-
-
-def attention_frontend_requires_full_size_agreement(frontend: object) -> bool:
-    """Return whether an attention frontend needs full-size agreement."""
-    if not isinstance(frontend, str):
-        return True
-
-    return frontend not in BASELINE_ATTENTION_FRONTEND_VALUES
-
-
 FORWARD_AD_TRANSFORM_PATHS = ("torch_func_jvp", "jvp_grad")
 TORCH_FUNC_AXIS_EXCLUDED_FIELDS = {
     *FORWARD_AD_FIELDS,
@@ -1437,13 +1421,13 @@ def topological_families(families: Sequence[Family]) -> tuple[Family, ...]:
     """Return families in dependency order.
 
     Raises:
-        RuntimeError: If names are duplicated, missing, or cyclic.
+        MaterializationError: If names are duplicated, missing, or cyclic.
     """
     by_name = {family.name: family for family in families}
 
     if len(by_name) != len(families):
         message = "family names must be unique"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     ordered = []
     visiting = set()
@@ -1455,13 +1439,13 @@ def topological_families(families: Sequence[Family]) -> tuple[Family, ...]:
 
         if name in visiting:
             message = f"family DAG has a cycle at {name}"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         family = by_name.get(name)
 
         if family is None:
             message = f"family dependency is missing: {name}"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         visiting.add(name)
 

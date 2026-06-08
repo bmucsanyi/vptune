@@ -14,7 +14,7 @@ from vptune.data import (
     Measurement,
     TimingPolicy,
 )
-from vptune.errors import MeasurementError
+from vptune.errors import MeasurementError, VPTuneError
 from vptune.tensor_tree import TensorTree, tree_detach, tree_leaves, tree_signature
 
 
@@ -216,6 +216,7 @@ def measure_once(
 
     Raises:
         OperationMeasurementError: If the operation fails after timing starts.
+        VPTuneError: If package measurement state is invalid.
     """
     memory_backend.cleanup()
 
@@ -227,6 +228,8 @@ def measure_once(
 
     try:
         output = operation()
+    except VPTuneError:
+        raise
     except torch.cuda.OutOfMemoryError as error:
         memory_backend.synchronize()
         end = clock()
@@ -270,7 +273,7 @@ def measure_operation(
         Measured samples, detached output, and probe-call samples.
 
     Raises:
-        RuntimeError: If the timing policy asks for no measured calls.
+        MeasurementError: If the timing policy asks for no measured calls.
     """
     probe_elapsed, probe_memory, probe_output = measure_once(
         operation,
@@ -282,7 +285,7 @@ def measure_operation(
 
     if measured_calls <= 0:
         message = "timing policy produced no measured calls"
-        raise RuntimeError(message)
+        raise MeasurementError(message)
 
     if warmups == 0 and measured_calls == 1:
         return probe_memory, probe_output, probe_memory
@@ -330,6 +333,9 @@ def run_candidate(
 
     Returns:
         Passed or failed full-size record.
+
+    Raises:
+        VPTuneError: If package measurement or full-size-check state is invalid.
     """
     compile_counter_before = _compile_counter(candidate)
 
@@ -364,6 +370,8 @@ def run_candidate(
             reference_passed=reference_passed,
             samples=error.samples,
         )
+    except VPTuneError:
+        raise
     except torch.cuda.OutOfMemoryError as error:
         return failed_record(
             candidate,
@@ -479,7 +487,7 @@ def _median_elapsed(samples: tuple[Measurement, ...]) -> float:
 
     if not values:
         message = "selection metadata has no timing samples"
-        raise RuntimeError(message)
+        raise MeasurementError(message)
 
     midpoint = len(values) // 2
 

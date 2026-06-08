@@ -55,10 +55,14 @@ from vptune.data import (
 )
 from vptune.errors import AdmissionError, MaterializationError
 from vptune.identities import (
+    callable_signature,
     module_identity,
+    qualified_callable_name,
     stable_hash,
     tensor_signature,
+    tensor_value_signature,
     to_json_value,
+    validate_identity_fields,
 )
 from vptune.io import read_record
 from vptune.measure import MemoryBackend
@@ -69,6 +73,12 @@ from vptune.runtime import (
     composition_runtime_config,
     standard_operation_factory,
     standard_runtime_config,
+)
+from vptune.schemas import (
+    plan_input_signature_from_json,
+    plan_validation_order_from_json,
+    plan_validation_required_from_json,
+    selection_policy_from_json,
 )
 from vptune.tensor_tree import tree_leaves
 
@@ -164,7 +174,7 @@ class DeterminismPolicy:
 
     def __post_init__(self) -> None:
         """Validate deterministic-execution policy fields."""
-        _validate_identity_fields(self.fields, "determinism policy")
+        validate_identity_fields(self.fields, "determinism policy")
 
     def signature(self) -> Mapping[str, Any]:
         """Return stable deterministic-execution policy fields."""
@@ -179,7 +189,7 @@ class EnvironmentPolicy:
 
     def __post_init__(self) -> None:
         """Validate target environment-capture fields."""
-        _validate_identity_fields(self.fields, "environment policy")
+        validate_identity_fields(self.fields, "environment policy")
 
     def signature(self) -> Mapping[str, Any]:
         """Return stable target environment-capture fields."""
@@ -2328,7 +2338,7 @@ class _LossNamespace:
             identity_fields={
                 "kind": "loss.declared_psd_matrix_free",
                 "output": output,
-                "matvec": _qualified_callable_name(matvec),
+                "matvec": qualified_callable_name(matvec),
                 "version": version,
             },
             hessian_matvec=matvec,
@@ -2361,7 +2371,7 @@ class _MetricNamespace:
         return _metric_declaration(
             "diagonal_tree",
             batch={"metric_diagonal": diag},
-            identity_fields={"metric_diagonal": _tree_signature(diag)},
+            identity_fields={"metric_diagonal": tensor_value_signature(diag)},
         )
 
     @staticmethod
@@ -2387,9 +2397,11 @@ class _MetricNamespace:
                 "ekfac_corrected_eigenvalues": dict(corrected_eigenvalues),
             },
             identity_fields={
-                "ekfac_eigvecs_a": _tree_signature(eigvecs_a),
-                "ekfac_eigvecs_g": _tree_signature(eigvecs_g),
-                "ekfac_corrected_eigenvalues": _tree_signature(corrected_eigenvalues),
+                "ekfac_eigvecs_a": tensor_value_signature(eigvecs_a),
+                "ekfac_eigvecs_g": tensor_value_signature(eigvecs_g),
+                "ekfac_corrected_eigenvalues": tensor_value_signature(
+                    corrected_eigenvalues
+                ),
             },
         )
 
@@ -2408,8 +2420,8 @@ class _MetricNamespace:
             "low_rank_factors",
             batch={"low_rank_factors": {"basis": factor, "diagonal": diagonal}},
             identity_fields={
-                "factor": _tree_signature(factor),
-                "diagonal": _tree_signature(diagonal),
+                "factor": tensor_value_signature(factor),
+                "diagonal": tensor_value_signature(diagonal),
             },
         )
 
@@ -2435,7 +2447,7 @@ class _MetricNamespace:
             "block_diagonal",
             representation_fields={"block_names": tuple(blocks)},
             batch={"metric_blocks": tuple(blocks.values())},
-            identity_fields={"metric_blocks": _tree_signature(blocks)},
+            identity_fields={"metric_blocks": tensor_value_signature(blocks)},
         )
 
     @staticmethod
@@ -2480,7 +2492,7 @@ class _MetricNamespace:
             "kfac_factors",
             representation_fields={"blocks": tuple(blocks)},
             batch={"kfac_factors": factor_batch},
-            identity_fields={"kfac_factors": _tree_signature(factors)},
+            identity_fields={"kfac_factors": tensor_value_signature(factors)},
         )
 
     @staticmethod
@@ -2493,7 +2505,7 @@ class _MetricNamespace:
         return _metric_declaration(
             "ggn_derived_factors",
             batch={"ggn_factors": dict(factors)},
-            identity_fields={"ggn_factors": _tree_signature(factors)},
+            identity_fields={"ggn_factors": tensor_value_signature(factors)},
         )
 
     @staticmethod
@@ -5243,11 +5255,13 @@ class _PublicDataProvider:
         """Return stable public data identity fields."""
         return {
             "kind": "public_data",
-            "batches": tuple(_tree_signature(batch) for batch in self.batches),
+            "batches": tuple(tensor_value_signature(batch) for batch in self.batches),
             "reference": None
             if self.reference is None or self.reference.batch is None
-            else _tree_signature(self.reference.batch),
-            "probe_batches": tuple(_tree_signature(batch) for batch, _ in self.probes),
+            else tensor_value_signature(self.reference.batch),
+            "probe_batches": tuple(
+                tensor_value_signature(batch) for batch, _ in self.probes
+            ),
             "bound_operator": _bound_operator_signature(self.operator),
             "operator": self.operator.spec.signature(),
         }
@@ -5314,7 +5328,7 @@ def _bound_operator_signature(operator: Operator) -> Mapping[str, Any]:
     if operator.bound_batch is None:
         return {"is_bound": False, "batch": None}
 
-    return {"is_bound": True, "batch": _tree_signature(operator.bound_batch)}
+    return {"is_bound": True, "batch": tensor_value_signature(operator.bound_batch)}
 
 
 def _probe_inputs_from_public(
@@ -5362,12 +5376,12 @@ class _PublicVectorProvider:
         """Return stable public vector identity fields."""
         return {
             "kind": "public_vectors",
-            "vectors": tuple(_tree_signature(vector) for vector in self.vectors),
+            "vectors": tuple(tensor_value_signature(vector) for vector in self.vectors),
             "reference": None
             if self.reference is None or self.reference.vector is None
-            else _tree_signature(self.reference.vector),
+            else tensor_value_signature(self.reference.vector),
             "probe_vectors": tuple(
-                _tree_signature(vector) for _, vector in self.probes
+                tensor_value_signature(vector) for _, vector in self.probes
             ),
             "operator": self.operator.spec.signature(),
         }
@@ -5639,7 +5653,7 @@ def _load_operator_plan(
         materializer_identities={
             operator.spec.family: dict(runtime.materializer.identity())
         },
-        selection_policy=_selection_policy_from_saved(summary),
+        selection_policy=selection_policy_from_json(summary["policy"]),
         target_identity=dict(summary["target_identity"]),
         runtime_identities={operator.spec.family: runtime.identity()},
         adapter_identities={
@@ -5648,8 +5662,8 @@ def _load_operator_plan(
                 "adapter_version": PACKAGE_VERSION,
             }
         },
-        validation_required=bool(summary["validation_required"]),
-        validation_order=tuple(str(name) for name in summary["validation_order"]),
+        validation_required=plan_validation_required_from_json(summary),
+        validation_order=plan_validation_order_from_json(summary),
     )
 
     return _load_plan(
@@ -5669,7 +5683,7 @@ def _single_operator_saved_input_signature(
         message = "Operator.load requires a single-product run for this operator"
         raise MaterializationError(message)
 
-    input_signature = dict(summary["input_signature"])
+    input_signature = dict(plan_input_signature_from_json(summary))
 
     if "operator" not in input_signature:
         message = "Operator.load requires a single-product tuning summary"
@@ -5785,51 +5799,14 @@ def _operator_objective_signature(operator: Operator) -> Mapping[str, Any]:
         "operator": operator.spec.signature(),
         "model": operator.model.signature(),
         "scalar_objectives": {
-            key: _callable_signature(value)
+            key: callable_signature(value)
             for key, value in sorted(operator.scalar_objectives.items())
         },
         "function_objectives": {
-            key: _callable_signature(value)
+            key: callable_signature(value)
             for key, value in sorted(operator.function_objectives.items())
         },
     }
-
-
-def _callable_signature(value: Any) -> Any:
-    identity = getattr(value, "identity", None)
-
-    if callable(identity):
-        return identity()
-
-    signature = getattr(value, "signature", None)
-
-    if callable(signature):
-        return signature()
-
-    message = f"typed callable lacks identity: {type(value).__name__}"
-    raise MaterializationError(message)
-
-
-def _qualified_callable_name(value: Callable[..., Any]) -> str:
-    module = getattr(value, "__module__", None)
-    qualname = getattr(value, "__qualname__", None)
-
-    if isinstance(module, str) and module and isinstance(qualname, str) and qualname:
-        return f"{module}.{qualname}"
-
-    message = "typed callable must expose module and qualname"
-    raise MaterializationError(message)
-
-
-def _selection_policy_from_saved(summary: Mapping[str, Any]) -> SelectionPolicy:
-    policy = dict(summary["policy"])
-    expected = {field.name for field in dataclasses.fields(SelectionPolicy)}
-
-    if set(policy) != expected:
-        message = "saved selection policy fields differ"
-        raise MaterializationError(message)
-
-    return SelectionPolicy(**policy)
 
 
 def _operator_requires_batch(operator: Operator) -> bool:
@@ -6538,21 +6515,6 @@ def _require_nonempty_string(value: Any, name: str) -> None:
     raise MaterializationError(message)
 
 
-def _validate_identity_fields(fields: Mapping[str, Any], name: str) -> None:
-    if not isinstance(fields, Mapping):
-        message = f"{name} fields must be a mapping"
-        raise MaterializationError(message)
-
-    for key in fields:
-        _require_nonempty_string(key, f"{name} key")
-
-    try:
-        to_json_value(fields)
-    except TypeError as error:
-        message = f"{name} fields must be JSON-compatible"
-        raise MaterializationError(message) from error
-
-
 def _validate_string_tuple(
     values: tuple[str, ...],
     name: str,
@@ -6699,22 +6661,6 @@ def _require_same_keys(
 
     message = f"{name} must match"
     raise MaterializationError(message)
-
-
-def _tree_signature(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return tensor_signature(value)
-
-    if isinstance(value, Mapping):
-        return {
-            str(key): _tree_signature(nested)
-            for key, nested in sorted(value.items(), key=lambda item: str(item[0]))
-        }
-
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        return tuple(_tree_signature(item) for item in value)
-
-    return value
 
 
 __all__ = [

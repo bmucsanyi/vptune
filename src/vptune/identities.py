@@ -2,13 +2,16 @@
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import platform
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import torch
+
+from vptune.errors import MaterializationError
 
 JsonValue = (
     None | bool | int | float | str | tuple["JsonValue", ...] | dict[str, "JsonValue"]
@@ -69,6 +72,157 @@ def stable_hash(value: Any) -> str:
     payload = canonical_json(value).encode("utf-8")
 
     return hashlib.sha256(payload).hexdigest()
+
+
+def callable_identity(value: Callable[..., Any], name: str) -> Any:
+    """Return stable identity fields for a Python callable.
+
+    Raises:
+        MaterializationError: If the callable cannot provide stable identity.
+    """
+    explicit_identity = _explicit_callable_identity(value)
+
+    if explicit_identity is not None:
+        return explicit_identity
+
+    module = getattr(value, "__module__", None)
+    qualname = getattr(value, "__qualname__", None)
+
+    if not isinstance(module, str) or not isinstance(qualname, str):
+        message = f"{name} must provide identity() or signature()"
+        raise MaterializationError(message)
+
+    try:
+        source = inspect.getsource(value)
+    except (OSError, TypeError) as error:
+        message = f"{name} must provide identity() or signature()"
+        raise MaterializationError(message) from error
+
+    return {
+        "kind": "python_callable",
+        "module": module,
+        "qualname": qualname,
+        "source_hash": stable_hash({"source": source}),
+        "defaults": _json_identity(getattr(value, "__defaults__", None), name),
+        "kwdefaults": _json_identity(getattr(value, "__kwdefaults__", None), name),
+        "closure": _callable_closure_identity(value, name),
+    }
+
+
+def qualified_callable_name(value: Callable[..., Any]) -> str:
+    """Return the module-qualified name for a callable.
+
+    Raises:
+        MaterializationError: If the callable does not expose a stable name.
+    """
+    module = getattr(value, "__module__", None)
+    qualname = getattr(value, "__qualname__", None)
+
+    if isinstance(module, str) and module and isinstance(qualname, str) and qualname:
+        return f"{module}.{qualname}"
+
+    message = "typed callable must expose module and qualname"
+    raise MaterializationError(message)
+
+
+def callable_signature(value: Any) -> Any:
+    """Return the explicit identity payload exposed by a typed callable.
+
+    Raises:
+        MaterializationError: If the callable does not expose identity fields.
+    """
+    identity = getattr(value, "identity", None)
+
+    if callable(identity):
+        return identity()
+
+    signature = getattr(value, "signature", None)
+
+    if callable(signature):
+        return signature()
+
+    message = f"typed callable lacks identity: {type(value).__name__}"
+    raise MaterializationError(message)
+
+
+def validate_identity_fields(fields: Mapping[str, Any], name: str) -> None:
+    """Validate a public identity-field mapping.
+
+    Raises:
+        MaterializationError: If the mapping cannot produce a stable identity.
+    """
+    if not isinstance(fields, Mapping):
+        message = f"{name} fields must be a mapping"
+        raise MaterializationError(message)
+
+    for key in fields:
+        if not isinstance(key, str) or not key:
+            message = f"{name} key must be a nonempty string"
+            raise MaterializationError(message)
+
+    try:
+        to_json_value(fields)
+    except TypeError as error:
+        message = f"{name} fields must be JSON-compatible"
+        raise MaterializationError(message) from error
+
+
+def tensor_value_signature(value: Any) -> Any:
+    """Return nested identity fields with tensor leaves summarized."""
+    if isinstance(value, torch.Tensor):
+        return tensor_signature(value)
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): tensor_value_signature(nested)
+            for key, nested in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return tuple(tensor_value_signature(item) for item in value)
+
+    return value
+
+
+def _explicit_callable_identity(value: Callable[..., Any]) -> Any | None:
+    identity = getattr(value, "identity", None)
+
+    if callable(identity):
+        return {
+            "kind": "explicit_identity",
+            "value": _json_identity(identity(), "callable.identity"),
+        }
+
+    signature = getattr(value, "signature", None)
+
+    if callable(signature):
+        return {
+            "kind": "explicit_signature",
+            "value": _json_identity(signature(), "callable.signature"),
+        }
+
+    return None
+
+
+def _json_identity(value: Any, name: str) -> Any:
+    try:
+        return to_json_value(value)
+    except TypeError as error:
+        message = f"{name} must be JSON-compatible"
+        raise MaterializationError(message) from error
+
+
+def _callable_closure_identity(value: Callable[..., Any], name: str) -> tuple[Any, ...]:
+    closure = getattr(value, "__closure__", None)
+
+    if closure is None:
+        return ()
+
+    if closure:
+        message = f"{name} closes over runtime state; provide identity() or signature()"
+        raise MaterializationError(message)
+
+    return ()
 
 
 def tensor_signature(
@@ -240,7 +394,7 @@ def cuda_driver_version() -> Any:
     """Return the CUDA driver version reported by the CUDA runtime.
 
     Raises:
-        RuntimeError: If the CUDA runtime reports a failed driver-version query.
+        MaterializationError: If the CUDA runtime reports a failed driver-version query.
     """
     driver_version = getattr(torch.cuda.cudart(), "cudaDriverGetVersion", None)
 
@@ -254,7 +408,7 @@ def cuda_driver_version() -> Any:
 
         if error_code != 0:
             message = f"CUDA driver version query failed with code {error_code}"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         return driver_version
 
@@ -288,7 +442,7 @@ def device_signature(device: str | torch.device) -> dict[str, Any]:
     """Return hardware identity for one declared target device.
 
     Raises:
-        RuntimeError: If a CUDA device is declared while CUDA is unavailable.
+        MaterializationError: If a CUDA device is declared while CUDA is unavailable.
     """
     torch_device = torch.device(device)
 
@@ -302,7 +456,7 @@ def device_signature(device: str | torch.device) -> dict[str, Any]:
     if torch_device.type == "cuda":
         if not torch.cuda.is_available():
             message = f"CUDA target device is unavailable: {torch_device}"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         return cuda_device_signature(torch_device)
 

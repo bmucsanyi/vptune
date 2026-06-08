@@ -2,13 +2,16 @@
 
 from collections.abc import Mapping, Sequence
 
-from vptune.candidates import attention_frontend_requires_full_size_agreement
 from vptune.data import Candidate, FullSizeRecord, Measurement, SelectionPolicy
-from vptune.errors import NoPassedCandidateError
+from vptune.errors import MaterializationError, NoPassedCandidateError
 
+BASELINE_ATTENTION_FRONTENDS = (
+    "transformers_eager",
+    "transformers_sdpa",
+    "pytorch_sdpa_direct",
+    "patched_eager",
+)
 FULL_SIZE_AGREEMENT_KEY = "full_size_agreement_passed"
-COMPILED_SPEED_STATISTIC = "compile_amortized_steady_state_seconds"
-ACCEPTED_STATUS = "passed_current_reference_full_size_agreement_stable_memory"
 
 
 def memory_stable(record: FullSizeRecord) -> bool:
@@ -45,8 +48,6 @@ def select_accepted_family(
     Raises:
         NoPassedCandidateError: If no records are supplied.
     """
-    validate_selection_policy(policy)
-
     if not records:
         message = "candidate family has no accepted rows"
         raise NoPassedCandidateError(message)
@@ -79,7 +80,6 @@ def select_complete_cohort(
     Raises:
         NoPassedCandidateError: If no complete cohort is supplied.
     """
-    validate_selection_policy(policy)
     family_set = set(families)
     complete = tuple(cohort for cohort in cohorts if set(cohort) == family_set)
 
@@ -128,22 +128,14 @@ def selection_score_seconds(record: FullSizeRecord, policy: SelectionPolicy) -> 
 
 
 def selection_memory_mib(record: FullSizeRecord, policy: SelectionPolicy) -> float:
-    """Return row memory score in MiB.
-
-    Raises:
-        RuntimeError: If the reduction is unsupported or memory samples are missing.
-    """
+    """Return row memory score in MiB."""
     if policy.rank_memory_reduction == "max_peak_allocated":
-        return _max_peak_allocated_mib(record)
+        return record.peak_allocated_mib()
 
     if policy.rank_memory_reduction == "max_peak_reserved":
         return record.peak_reserved_mib()
 
-    if policy.rank_memory_reduction == "sum_peak_reserved":
-        return _sum_peak_reserved_mib(record)
-
-    message = f"unsupported rank memory reduction: {policy.rank_memory_reduction}"
-    raise RuntimeError(message)
+    return record.sum_peak_reserved_mib()
 
 
 def cohort_memory_mib(
@@ -152,62 +144,6 @@ def cohort_memory_mib(
 ) -> float:
     """Return summed family memory score."""
     return sum(selection_memory_mib(record, policy) for _, record in cohort.values())
-
-
-def validate_selection_policy(policy: SelectionPolicy) -> None:
-    """Validate supported selection policy fields.
-
-    Raises:
-        RuntimeError: If the policy requests an unsupported field.
-    """
-    if policy.near_fastest_multiplier < 1.0:
-        message = "near_fastest_multiplier must be at least 1.0"
-        raise RuntimeError(message)
-
-    if policy.speed_statistic != "median_elapsed_seconds":
-        message = f"unsupported speed statistic: {policy.speed_statistic}"
-        raise RuntimeError(message)
-
-    if policy.compiled_speed_statistic != COMPILED_SPEED_STATISTIC:
-        message = (
-            f"unsupported compiled speed statistic: {policy.compiled_speed_statistic}"
-        )
-        raise RuntimeError(message)
-
-    if policy.distributed_speed_statistic != "global_elapsed_seconds":
-        message = (
-            "unsupported distributed speed statistic: "
-            f"{policy.distributed_speed_statistic}"
-        )
-        raise RuntimeError(message)
-
-    if policy.rank_memory_reduction not in {
-        "max_peak_allocated",
-        "max_peak_reserved",
-        "sum_peak_reserved",
-    }:
-        message = f"unsupported rank memory reduction: {policy.rank_memory_reduction}"
-        raise RuntimeError(message)
-
-    if policy.tie_breaker != "min_peak_reserved_mib":
-        message = f"unsupported tie breaker: {policy.tie_breaker}"
-        raise RuntimeError(message)
-
-    if policy.cohort_speed_statistic != "sum_median_elapsed_seconds":
-        message = f"unsupported cohort speed statistic: {policy.cohort_speed_statistic}"
-        raise RuntimeError(message)
-
-    if policy.cohort_tie_breaker != "sum_peak_reserved_mib":
-        message = f"unsupported cohort tie breaker: {policy.cohort_tie_breaker}"
-        raise RuntimeError(message)
-
-    if policy.accepted_status != ACCEPTED_STATUS:
-        message = f"unsupported accepted status: {policy.accepted_status}"
-        raise RuntimeError(message)
-
-    if policy.compile_call_horizon <= 0:
-        message = "compile_call_horizon must be positive"
-        raise RuntimeError(message)
 
 
 def _eager_score_seconds(
@@ -250,7 +186,7 @@ def _attention_requires_full_size_agreement(
 ) -> bool:
     frontend = settings.get("attention.frontend")
 
-    if frontend is not None and attention_frontend_requires_full_size_agreement(
+    if frontend is not None and _attention_frontend_requires_full_size_agreement(
         frontend
     ):
         return True
@@ -274,6 +210,13 @@ def _attention_requires_full_size_agreement(
     return any(entry != "math" for entry in priority)
 
 
+def _attention_frontend_requires_full_size_agreement(frontend: object) -> bool:
+    if not isinstance(frontend, str):
+        return True
+
+    return frontend not in BASELINE_ATTENTION_FRONTENDS
+
+
 def _compile_requires_full_size_agreement(settings: Mapping[str, object]) -> bool:
     return (
         settings.get("compile.cuda_graphs") == "true"
@@ -294,37 +237,12 @@ def _is_distributed_record(record: FullSizeRecord) -> bool:
     return strategy is not None and strategy != "single_gpu"
 
 
-def _max_peak_allocated_mib(record: FullSizeRecord) -> float:
-    if not record.memory_samples:
-        message = "passed full-size record has no memory samples"
-        raise RuntimeError(message)
-
-    return max(sample.peak_allocated_mib for sample in record.memory_samples)
-
-
-def _sum_peak_reserved_mib(record: FullSizeRecord) -> float:
-    if not record.memory_samples:
-        message = "passed full-size record has no memory samples"
-        raise RuntimeError(message)
-
-    groups = {}
-
-    for sample in record.memory_samples:
-        key = (sample.rank, sample.device)
-        current = groups.get(key)
-
-        if current is None or sample.peak_reserved_mib > current:
-            groups[key] = sample.peak_reserved_mib
-
-    return sum(groups.values())
-
-
 def _metadata_float(metadata: Mapping[str, object], key: str) -> float:
     value = metadata.get(key)
 
     if not isinstance(value, int | float):
         message = f"row selection metadata missing {key}"
-        raise TypeError(message)
+        raise MaterializationError(message)
 
     return float(value)
 
@@ -334,10 +252,10 @@ def _metadata_int(metadata: Mapping[str, object], key: str) -> int:
 
     if not isinstance(value, int):
         message = f"row selection metadata missing {key}"
-        raise TypeError(message)
+        raise MaterializationError(message)
 
     if value < 0:
         message = f"compiled row selection metadata has negative {key}"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     return value

@@ -3,7 +3,6 @@
 import contextlib
 import dataclasses
 import importlib
-import inspect
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
@@ -70,7 +69,7 @@ from vptune.data import (
     ScalarObjective,
 )
 from vptune.errors import AdmissionError, MaterializationError, ReferenceFailedError
-from vptune.identities import stable_hash, tensor_signature, to_json_value
+from vptune.identities import callable_identity, tensor_signature, to_json_value
 from vptune.tensor_tree import (
     TensorTree,
     tree_add_foreach,
@@ -4702,7 +4701,7 @@ def _prepare_inner_compile_boundary(
     builder: CandidateOperation,
 ) -> StandardExecution:
     _require_compiled_execution(execution, settings)
-    compiled_inner = _compiled_operation(settings, builder)
+    compiled_inner = compile_candidate_operation(settings, builder)
 
     return dataclasses.replace(
         execution,
@@ -5116,7 +5115,7 @@ def _compile_operation(
     if _compile_boundary_runs_inside_operator(operator.kind, settings):
         return operation
 
-    return _compiled_operation(settings, operation)
+    return compile_candidate_operation(settings, operation)
 
 
 def _compile_boundary_runs_inside_operator(
@@ -5157,10 +5156,15 @@ def _compile_boundary_runs_inside_operator(
     }
 
 
-def _compiled_operation(
+def compile_candidate_operation(
     settings: Mapping[str, Any],
     operation: CandidateOperation,
 ) -> CandidateOperation:
+    """Compile a zero-argument candidate operation according to row settings.
+
+    Returns:
+        Candidate operation with compile settings applied.
+    """
     compiled_operation = _compiled_callable(
         settings,
         operation,
@@ -6135,7 +6139,7 @@ def _runtime_callable_identity(
     if value is None:
         return None
 
-    return _callable_identity(value, name)
+    return callable_identity(value, name)
 
 
 def _runtime_callable_map_identity(
@@ -6148,81 +6152,10 @@ def _runtime_callable_map_identity(
     return tuple(
         {
             "id": key,
-            "identity": _callable_identity(callback, f"{name}.{key}"),
+            "identity": callable_identity(callback, f"{name}.{key}"),
         }
         for key, callback in sorted(values.items())
     )
-
-
-def _callable_identity(value: Callable[..., Any], name: str) -> Any:
-    explicit_identity = _explicit_callable_identity(value)
-
-    if explicit_identity is not None:
-        return explicit_identity
-
-    module = getattr(value, "__module__", None)
-    qualname = getattr(value, "__qualname__", None)
-
-    if not isinstance(module, str) or not isinstance(qualname, str):
-        message = f"{name} must provide identity() or signature()"
-        raise MaterializationError(message)
-
-    try:
-        source = inspect.getsource(value)
-    except (OSError, TypeError) as error:
-        message = f"{name} must provide identity() or signature()"
-        raise MaterializationError(message) from error
-
-    return {
-        "kind": "python_callable",
-        "module": module,
-        "qualname": qualname,
-        "source_hash": stable_hash({"source": source}),
-        "defaults": _json_identity(getattr(value, "__defaults__", None), name),
-        "kwdefaults": _json_identity(getattr(value, "__kwdefaults__", None), name),
-        "closure": _callable_closure_identity(value, name),
-    }
-
-
-def _explicit_callable_identity(value: Callable[..., Any]) -> Any | None:
-    identity = getattr(value, "identity", None)
-
-    if callable(identity):
-        return {
-            "kind": "explicit_identity",
-            "value": _json_identity(identity(), "callable.identity"),
-        }
-
-    signature = getattr(value, "signature", None)
-
-    if callable(signature):
-        return {
-            "kind": "explicit_signature",
-            "value": _json_identity(signature(), "callable.signature"),
-        }
-
-    return None
-
-
-def _json_identity(value: Any, name: str) -> Any:
-    try:
-        return to_json_value(value)
-    except TypeError as error:
-        message = f"{name} must be JSON-compatible"
-        raise MaterializationError(message) from error
-
-
-def _callable_closure_identity(value: Callable[..., Any], name: str) -> tuple[Any, ...]:
-    closure = getattr(value, "__closure__", None)
-
-    if closure is None:
-        return ()
-
-    if closure:
-        message = f"{name} closes over runtime state; provide identity() or signature()"
-        raise MaterializationError(message)
-
-    return ()
 
 
 def _keyword_map(**kwargs: Any) -> dict[str, Any]:
@@ -17074,7 +17007,7 @@ def _runtime_output_to_buffer(
 
     try:
         return tree_map2(_copy_output_tensor, buffer, output)
-    except (RuntimeError, TypeError) as error:
+    except (MaterializationError, RuntimeError, TypeError) as error:
         message = "memory.output_buffers=preallocated output tree mismatch"
         raise MaterializationError(message) from error
 
@@ -17082,11 +17015,11 @@ def _runtime_output_to_buffer(
 def _copy_output_tensor(buffer: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
     if buffer.dtype != output.dtype:
         message = "preallocated output buffer dtype mismatch"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     if buffer.device != output.device:
         message = "preallocated output buffer device mismatch"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     buffer.copy_(output)
 

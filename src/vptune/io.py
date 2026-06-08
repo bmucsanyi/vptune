@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from vptune.errors import RecordFormatError
 from vptune.identities import to_json_value
 from vptune.schemas import validate_json_record
 
@@ -80,8 +81,18 @@ def read_record(path: Path) -> dict[str, Any]:
 
     Returns:
         Parsed saved record.
+
+    Raises:
+        RecordFormatError: If the saved record JSON is malformed.
     """
-    payload = read_json(path)
+    try:
+        payload = read_json(path)
+    except json.JSONDecodeError as error:
+        message = f"JSON file is invalid: {path}: {error.msg}"
+        raise RecordFormatError(message) from error
+    except TypeError as error:
+        raise RecordFormatError(str(error)) from error
+
     validate_json_record(payload)
 
     return payload

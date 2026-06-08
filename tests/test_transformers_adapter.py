@@ -720,6 +720,13 @@ def test_transformers_runtime_config_runs_full_size_check_and_materializer() -> 
         (output,),
         (),
     )
+    sample = vpx.Measurement(
+        elapsed_seconds=1.0,
+        peak_allocated_mib=1.0,
+        peak_reserved_mib=1.0,
+        post_allocated_mib=0.0,
+        post_reserved_mib=0.0,
+    )
     record = vpx.FullSizeRecord(
         family="gradient",
         candidate_id="transformers-gradient",
@@ -728,6 +735,8 @@ def test_transformers_runtime_config_runs_full_size_check_and_materializer() -> 
         candidate_settings=dict(candidate.settings),
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
+        timing_samples=(sample,),
+        memory_samples=(sample,),
     )
     selected = runtime.materializer(candidate, record)
     selected_output = selected(batch, vector)

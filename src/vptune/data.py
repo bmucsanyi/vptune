@@ -21,6 +21,22 @@ SCHEMA_VERSION = 1
 PACKAGE_VERSION = "1.0.0"
 MIN_VARIANCE_REPEAT_COUNT = 2
 MIN_LINEAR_DOMAIN_VALUES = 3
+SELECTION_POLICY_ALLOWED_VALUES = (
+    ("speed_statistic", ("median_elapsed_seconds",)),
+    ("compiled_speed_statistic", ("compile_amortized_steady_state_seconds",)),
+    ("distributed_speed_statistic", ("global_elapsed_seconds",)),
+    (
+        "rank_memory_reduction",
+        ("max_peak_allocated", "max_peak_reserved", "sum_peak_reserved"),
+    ),
+    ("tie_breaker", ("min_peak_reserved_mib",)),
+    ("cohort_speed_statistic", ("sum_median_elapsed_seconds",)),
+    ("cohort_tie_breaker", ("sum_peak_reserved_mib",)),
+    (
+        "accepted_status",
+        ("passed_current_reference_full_size_agreement_stable_memory",),
+    ),
+)
 
 
 Batch = Mapping[str, Any]
@@ -709,7 +725,7 @@ class TimingPolicy:
         """Validate timing policy fields.
 
         Raises:
-            RuntimeError: If thresholds or call counts are invalid.
+            MaterializationError: If thresholds or call counts are invalid.
         """
         thresholds = (
             ("short_seconds", self.short_seconds),
@@ -724,11 +740,11 @@ class TimingPolicy:
                 or value < 0
             ):
                 message = f"{name} must be finite and nonnegative"
-                raise RuntimeError(message)
+                raise MaterializationError(message)
 
         if self.medium_seconds < self.short_seconds:
             message = "medium_seconds must be at least short_seconds"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         warmups = (
             ("short_warmups", self.short_warmups),
@@ -739,7 +755,7 @@ class TimingPolicy:
         for name, value in warmups:
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 message = f"{name} must be a nonnegative integer"
-                raise RuntimeError(message)
+                raise MaterializationError(message)
 
         measured_calls = (
             ("short_measured_calls", self.short_measured_calls),
@@ -750,7 +766,7 @@ class TimingPolicy:
         for name, value in measured_calls:
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 message = f"{name} must be a positive integer"
-                raise RuntimeError(message)
+                raise MaterializationError(message)
 
     def plan(self, elapsed_seconds: float) -> tuple[int, int]:
         """Return warmup and measured-call counts."""
@@ -782,7 +798,7 @@ class SelectionPolicy:
         """Validate policy fields.
 
         Raises:
-            RuntimeError: If numeric policy fields are invalid.
+            MaterializationError: If policy fields are invalid.
         """
         if (
             isinstance(self.near_fastest_multiplier, bool)
@@ -791,7 +807,13 @@ class SelectionPolicy:
             or self.near_fastest_multiplier < 1.0
         ):
             message = "near_fastest_multiplier must be finite and at least 1.0"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
+
+        for field, allowed in SELECTION_POLICY_ALLOWED_VALUES:
+            if getattr(self, field) not in allowed:
+                label = field.replace("_", " ")
+                message = f"unsupported {label}: {getattr(self, field)}"
+                raise MaterializationError(message)
 
         if (
             not isinstance(self.compile_call_horizon, int)
@@ -799,7 +821,7 @@ class SelectionPolicy:
             or self.compile_call_horizon <= 0
         ):
             message = "compile_call_horizon must be positive"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -815,7 +837,7 @@ class SearchPolicy:
         """Validate the search strategy.
 
         Raises:
-            RuntimeError: If the search strategy is unsupported by the spec.
+            MaterializationError: If the search strategy is unsupported by the spec.
         """
         if self.strategy not in {
             "admission",
@@ -826,7 +848,7 @@ class SearchPolicy:
             "exhaustive",
         }:
             message = f"unsupported search strategy: {self.strategy}"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         if self.retained_top_count is not None and (
             not isinstance(self.retained_top_count, int)
@@ -834,25 +856,25 @@ class SearchPolicy:
             or self.retained_top_count <= 0
         ):
             message = "retained_top_count must be positive"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         if (
             self.strategy in {"balanced", "thorough"}
             and self.retained_top_count is None
         ):
             message = f"{self.strategy} search requires retained_top_count"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         if any(
             not isinstance(horizon, int) or isinstance(horizon, bool) or horizon <= 0
             for horizon in self.compile_call_horizons
         ):
             message = "compile_call_horizons must be positive"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         if self.strategy == "thorough" and not self.compile_call_horizons:
             message = "thorough search requires compile_call_horizons"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         if self.variance_repeat_count is not None and (
             not isinstance(self.variance_repeat_count, int)
@@ -862,11 +884,11 @@ class SearchPolicy:
             message = (
                 f"variance_repeat_count must be at least {MIN_VARIANCE_REPEAT_COUNT}"
             )
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         if self.strategy == "thorough" and self.variance_repeat_count is None:
             message = "thorough search requires variance_repeat_count"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -884,21 +906,21 @@ class CohortConstraint:
         """Validate supported cohort constraint modes.
 
         Raises:
-            RuntimeError: If a cohort mode is unsupported.
+            MaterializationError: If a cohort mode is unsupported.
         """
         if self.dependency_inheritance != "covered_families":
             message = (
                 "unsupported cohort dependency inheritance: "
                 f"{self.dependency_inheritance}"
             )
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         if self.selection_aggregation != "sum_median_elapsed_seconds":
             message = (
                 "unsupported cohort selection aggregation: "
                 f"{self.selection_aggregation}"
             )
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
     def signature(self) -> dict[str, Any]:
         """Return stable cohort-constraint identity."""
@@ -947,6 +969,44 @@ class Target:
     determinism_policy: Mapping[str, Any]
     environment_capture: Mapping[str, Any]
 
+    def __post_init__(self) -> None:
+        """Validate lower-layer target identity fields.
+
+        Raises:
+            MaterializationError: If target identity fields are invalid.
+        """
+        tuple_fields = (
+            ("target devices", self.devices, True),
+            ("allowed_dtypes", self.allowed_dtypes, False),
+            (
+                "allowed_attention_frontends",
+                self.allowed_attention_frontends,
+                False,
+            ),
+            ("allowed_sdpa_kernels", self.allowed_sdpa_kernels, False),
+            ("allowed_sharding_modes", self.allowed_sharding_modes, False),
+        )
+
+        for field, values, require_nonempty in tuple_fields:
+            _validate_target_string_tuple(
+                values,
+                field,
+                require_nonempty=require_nonempty,
+            )
+
+        if not isinstance(self.accelerator, str) or not self.accelerator:
+            message = "target accelerator must be a nonempty string"
+            raise MaterializationError(message)
+
+        _identity_mapping(
+            self.determinism_policy,
+            "determinism_policy",
+        )
+        _identity_mapping(
+            self.environment_capture,
+            "environment_capture",
+        )
+
     def signature(self) -> dict[str, Any]:
         """Return a stable target identity."""
         return {
@@ -967,6 +1027,29 @@ class Target:
         }
 
 
+def _validate_target_string_tuple(
+    values: tuple[str, ...],
+    field: str,
+    *,
+    require_nonempty: bool = False,
+) -> None:
+    if not isinstance(values, tuple):
+        message = f"{field} must be a tuple"
+        raise MaterializationError(message)
+
+    if require_nonempty and not values:
+        message = f"{field} must be nonempty"
+        raise MaterializationError(message)
+
+    if any(not isinstance(value, str) or not value for value in values):
+        message = f"{field} must contain nonempty strings"
+        raise MaterializationError(message)
+
+    if len(set(values)) != len(values):
+        message = f"{field} must not contain duplicates"
+        raise MaterializationError(message)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class ParameterSurface:
     """Ordered parameter surface."""
@@ -984,11 +1067,11 @@ class ParameterSurface:
         """Validate declared parameter-surface fields.
 
         Raises:
-            RuntimeError: If a declared policy or group is invalid.
+            MaterializationError: If a declared policy or group is invalid.
         """
         if self.parametrization_policy != "active":
             message = "parametrization_policy must be active"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         _validate_parameter_groups(self.names, self.layer_groups, "layer_groups")
         _validate_parameter_groups(self.names, self.block_groups, "block_groups")
@@ -1010,11 +1093,11 @@ def parameter_surface(
     """Return a parameter surface from a module.
 
     Raises:
-        RuntimeError: If the tied-weights policy is unsupported.
+        MaterializationError: If the tied-weights policy is unsupported.
     """
     if tied_weights not in {"preserve", "deduplicate"}:
         message = f"unsupported tied-weights policy: {tied_weights}"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     remove_duplicate = tied_weights == "deduplicate"
     pairs = tuple(
@@ -1050,17 +1133,17 @@ def _validate_parameter_groups(
 
     if any(not group for group in groups):
         message = f"{label} must not contain empty groups"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     flat = tuple(name for group in groups for name in group)
 
     if set(flat) != set(names):
         message = f"{label} must cover every parameter name exactly once"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     if len(flat) != len(set(flat)):
         message = f"{label} must not contain duplicate parameter names"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1329,6 +1412,23 @@ class FullSizeRecord:
     schema_version: int = SCHEMA_VERSION
     package_version: str = PACKAGE_VERSION
 
+    def __post_init__(self) -> None:
+        """Validate passed-row measurement state.
+
+        Raises:
+            MaterializationError: If a passed row has no selection samples.
+        """
+        if self.status != "passed":
+            return
+
+        if not self.timing_samples:
+            message = "passed full-size record has no timing samples"
+            raise MaterializationError(message)
+
+        if not self.memory_samples:
+            message = "passed full-size record has no memory samples"
+            raise MaterializationError(message)
+
     def row_key(self) -> dict[str, Any]:
         """Return direct fields that identify this full-size row."""
         return {
@@ -1350,13 +1450,13 @@ class FullSizeRecord:
         """Return median elapsed seconds.
 
         Raises:
-            RuntimeError: If the record has no timing samples.
+            MaterializationError: If the record has no timing samples.
         """
         values = sorted(sample.elapsed_seconds for sample in self.timing_samples)
 
         if not values:
             message = "passed full-size record has no timing samples"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         midpoint = len(values) // 2
 
@@ -1369,13 +1469,46 @@ class FullSizeRecord:
         """Return max peak reserved memory.
 
         Raises:
-            RuntimeError: If the record has no memory samples.
+            MaterializationError: If the record has no memory samples.
         """
         if not self.memory_samples:
             message = "passed full-size record has no memory samples"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         return max(sample.peak_reserved_mib for sample in self.memory_samples)
+
+    def peak_allocated_mib(self) -> float:
+        """Return max peak allocated memory.
+
+        Raises:
+            MaterializationError: If the record has no memory samples.
+        """
+        if not self.memory_samples:
+            message = "passed full-size record has no memory samples"
+            raise MaterializationError(message)
+
+        return max(sample.peak_allocated_mib for sample in self.memory_samples)
+
+    def sum_peak_reserved_mib(self) -> float:
+        """Return summed per-rank peak reserved memory.
+
+        Raises:
+            MaterializationError: If the record has no memory samples.
+        """
+        if not self.memory_samples:
+            message = "passed full-size record has no memory samples"
+            raise MaterializationError(message)
+
+        groups = {}
+
+        for sample in self.memory_samples:
+            key = (sample.rank, sample.device)
+            current = groups.get(key)
+
+            if current is None or sample.peak_reserved_mib > current:
+                groups[key] = sample.peak_reserved_mib
+
+        return sum(groups.values())
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1398,20 +1531,87 @@ class Problem:
         }
     )
 
+    def __post_init__(self) -> None:
+        """Validate problem adapter identity.
+
+        Raises:
+            MaterializationError: If the adapter identity is invalid.
+        """
+        adapter_identity = _identity_mapping(
+            self.adapter_identity,
+            "adapter_identity",
+            require_nonempty=True,
+        )
+
+        for key in ("adapter_id", "adapter_version"):
+            value = adapter_identity.get(key)
+
+            if not isinstance(value, str) or not value:
+                message = f"adapter_identity requires nonempty {key}"
+                raise MaterializationError(message)
+
     def input_signature(self) -> dict[str, Any]:
         """Return the declared problem identity."""
         return {
             "model": module_identity(self.model),
             "params": self.params.signature(),
-            "data": dict(self.data.signature()),
+            "data": _problem_provider_signature(self.data, "data"),
             "operator": self.operator.signature(),
-            "vectors": dict(self.vectors.signature()),
+            "vectors": _problem_provider_signature(self.vectors, "vectors"),
             "target": self.target.signature(),
-            "anchor_policy": dict(self.anchor_policy),
+            "anchor_policy": _identity_mapping(
+                self.anchor_policy,
+                "anchor_policy",
+            ),
             "runtime": self.runtime.identity(),
-            "replay_policy": dict(self.replay_policy),
-            "adapter": dict(self.adapter_identity),
+            "replay_policy": _identity_mapping(
+                self.replay_policy,
+                "replay_policy",
+            ),
+            "adapter": _identity_mapping(
+                self.adapter_identity,
+                "adapter_identity",
+                require_nonempty=True,
+            ),
         }
+
+
+def _problem_provider_signature(value: Any, label: str) -> dict[str, Any]:
+    signature = getattr(value, "signature", None)
+
+    if not callable(signature):
+        message = f"{label} provider must expose signature()"
+        raise MaterializationError(message)
+
+    return _identity_mapping(signature(), f"{label} signature")
+
+
+def _identity_mapping(
+    value: Any,
+    label: str,
+    *,
+    require_nonempty: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        message = f"{label} must be a mapping"
+        raise MaterializationError(message)
+
+    if require_nonempty and not value:
+        message = f"{label} must be nonempty"
+        raise MaterializationError(message)
+
+    for key in value:
+        if not isinstance(key, str) or not key:
+            message = f"{label} keys must be nonempty strings"
+            raise MaterializationError(message)
+
+    try:
+        to_json_value(value)
+    except TypeError as error:
+        message = f"{label} must be JSON-compatible"
+        raise MaterializationError(message) from error
+
+    return dict(value)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1646,7 +1846,7 @@ class Plan:
         """Return selected materializer identities by family.
 
         Raises:
-            RuntimeError: If a selected family has no materializer.
+            MaterializationError: If a selected family has no materializer.
         """
         missing = tuple(
             family for family in self.selected if family not in self.materializers
@@ -1654,7 +1854,7 @@ class Plan:
 
         if missing:
             message = f"selected families are missing materializers: {missing}"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         return {
             family: dict(self.materializers[family].identity())
@@ -1683,21 +1883,44 @@ class Plan:
     def selected_runtime_identities(self) -> dict[str, dict[str, Any]]:
         """Return runtime identities for selected families."""
         return {
-            family: dict(self.runtime_identities.get(family, {}))
+            family: _require_plan_identity_mapping(
+                self.runtime_identities.get(family),
+                f"runtime identity for selected family: {family}",
+            )
             for family in sorted(self.selected)
         }
 
     def selected_adapter_identities(self) -> dict[str, dict[str, Any]]:
         """Return adapter identities for selected families."""
         return {
-            family: dict(self.adapter_identities.get(family, {}))
+            family: _require_plan_identity_mapping(
+                self.adapter_identities.get(family),
+                f"adapter identity for selected family: {family}",
+            )
             for family in sorted(self.selected)
         }
 
     def selected_validator_identities(self) -> dict[str, dict[str, Any]]:
-        """Return validator identities for selected families."""
+        """Return validator identities for selected families.
+
+        Raises:
+            MaterializationError: If required validator identities are missing.
+        """
+        if self.validator_identities and set(self.validator_identities) != set(
+            self.selected
+        ):
+            message = "plan replay requires validator identities for selected families"
+            raise MaterializationError(message)
+
+        if self.validation_required and not self.validator_identities:
+            message = "plan replay requires validator identities for selected families"
+            raise MaterializationError(message)
+
         return {
-            family: dict(self.validator_identities.get(family, {}))
+            family: _require_plan_identity_mapping(
+                self.validator_identities.get(family),
+                f"validator identity for selected family: {family}",
+            )
             for family in sorted(self.validator_identities)
         }
 
@@ -1745,6 +1968,11 @@ class Plan:
 
     def to_record(self) -> dict[str, Any]:
         """Return the saved plan record."""
+        target_identity = _require_plan_identity_mapping(
+            self.target_identity,
+            "target identity",
+        )
+
         return {
             "record_type": "summary",
             "schema_version": self.schema_version,
@@ -1787,8 +2015,19 @@ class Plan:
             ),
             "selected_dependency_identities": self.selected_dependency_identities(),
             "materializer_identities": self.materializer_identities(),
-            "target_identity": dict(self.target_identity),
+            "target_identity": target_identity,
             "runtime_identities": self.selected_runtime_identities(),
             "adapter_identities": self.selected_adapter_identities(),
             "policy": dataclasses.asdict(self.policy),
         }
+
+
+def _require_plan_identity_mapping(
+    value: Mapping[str, Any] | None,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or not value:
+        message = f"plan replay requires {label}"
+        raise MaterializationError(message)
+
+    return dict(value)

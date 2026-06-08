@@ -7833,6 +7833,12 @@ def test_standard_runtime_executes_preallocated_output_buffers() -> None:
     assert torch.equal(second["w"], torch.tensor([6.0], dtype=torch.float64))
     assert first["w"].data_ptr() == second["w"].data_ptr()
 
+    with pytest.raises(vp.MaterializationError, match="preallocated output tree"):
+        runtime_module._runtime_output_to_buffer(
+            {"w": torch.ones(2, dtype=torch.float64)},
+            {"w": torch.empty(1, dtype=torch.float64)},
+        )
+
 
 def test_preallocated_output_buffers_execute_metric_multiply() -> None:
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}

@@ -20,14 +20,12 @@ from vptune.data import (
     ReplayContext,
     SelectionPolicy,
 )
-from vptune.errors import RecordFormatError, StaleRecordError
+from vptune.errors import MaterializationError, RecordFormatError, StaleRecordError
 from vptune.identities import (
     canonical_json,
     to_json_value,
 )
 from vptune.selection_core import (
-    ACCEPTED_STATUS,
-    COMPILED_SPEED_STATISTIC,
     full_size_agreement_satisfied,
     memory_stable,
     select_accepted_family,
@@ -260,7 +258,13 @@ def _validate_adapter_identity(identity: Mapping[str, Any], label: str) -> None:
 
 def _validate_summary_identity_fields(record: Mapping[str, Any]) -> None:
     if record["generator_id"] == "selected_plan_validation":
-        nested = record["input_signature"].get("input_signature")
+        input_signature = record["input_signature"]
+
+        if not isinstance(input_signature, Mapping):
+            message = "selected-plan validation summary input signature is missing"
+            raise RecordFormatError(message)
+
+        nested = input_signature.get("input_signature")
 
         if not isinstance(nested, Mapping):
             message = "selected-plan validation summary input signature is missing"
@@ -280,7 +284,12 @@ def _validate_summary_identity_fields(record: Mapping[str, Any]) -> None:
         message = "plan summary target environment is missing"
         raise RecordFormatError(message)
 
-    selected = set(dict(record["selected"]))
+    selected = _selected_family_names(record)
+    _validate_summary_family_identities(
+        "runtime",
+        record["runtime_identities"],
+        selected,
+    )
     _validate_summary_family_identities(
         "adapter",
         record["adapter_identities"],
@@ -311,51 +320,91 @@ def _validate_summary_family_identities(
             _validate_adapter_identity(identity, f"plan summary adapter {family}")
 
 
-def _validate_replay_selection_policy(policy: SelectionPolicy) -> None:
-    if policy.speed_statistic != "median_elapsed_seconds":
-        message = f"unsupported speed statistic: {policy.speed_statistic}"
+def _record_mapping_field(
+    record: Mapping[str, Any],
+    field: str,
+    label: str,
+) -> Mapping[Any, Any]:
+    try:
+        value = record[field]
+    except KeyError as error:
+        message = f"{label} field is missing"
+        raise RecordFormatError(message) from error
+
+    if not isinstance(value, Mapping):
+        message = f"{label} must be a mapping"
         raise RecordFormatError(message)
 
-    if policy.compiled_speed_statistic != COMPILED_SPEED_STATISTIC:
-        message = (
-            f"unsupported compiled speed statistic: {policy.compiled_speed_statistic}"
-        )
+    return value
+
+
+def _selected_candidate_records(record: Mapping[str, Any]) -> Mapping[Any, Any]:
+    return _record_mapping_field(
+        record,
+        "selected",
+        "plan summary selected candidates",
+    )
+
+
+def _selected_family_names(record: Mapping[str, Any]) -> set[str]:
+    return {str(family) for family in _selected_candidate_records(record)}
+
+
+def plan_input_signature_from_json(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the input signature from a saved plan summary.
+
+    Raises:
+        RecordFormatError: If the input signature is malformed.
+    """
+    try:
+        input_signature = record["input_signature"]
+    except KeyError as error:
+        message = "plan summary input_signature field is missing"
+        raise RecordFormatError(message) from error
+
+    if not isinstance(input_signature, Mapping):
+        message = "plan summary input_signature must be a mapping"
         raise RecordFormatError(message)
 
-    if policy.distributed_speed_statistic != "global_elapsed_seconds":
-        message = (
-            "unsupported distributed speed statistic: "
-            f"{policy.distributed_speed_statistic}"
-        )
+    return input_signature
+
+
+def plan_validation_order_from_json(record: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return the validation order from a saved plan summary.
+
+    Raises:
+        RecordFormatError: If the validation order is malformed.
+    """
+    try:
+        value = record["validation_order"]
+    except KeyError as error:
+        message = "plan summary validation_order field is missing"
+        raise RecordFormatError(message) from error
+
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        message = "plan summary validation_order must be a sequence"
         raise RecordFormatError(message)
 
-    if policy.rank_memory_reduction not in {
-        "max_peak_allocated",
-        "max_peak_reserved",
-        "sum_peak_reserved",
-    }:
-        message = f"unsupported rank memory reduction: {policy.rank_memory_reduction}"
+    return tuple(str(family) for family in value)
+
+
+def plan_validation_required_from_json(record: Mapping[str, Any]) -> bool:
+    """Return the validation-required flag from a saved plan summary.
+
+    Raises:
+        RecordFormatError: If the validation-required flag is malformed.
+    """
+    try:
+        value = record["validation_required"]
+    except KeyError as error:
+        message = "plan summary validation_required field is missing"
+        raise RecordFormatError(message) from error
+
+    if value is not True and value is not False:
+        message = "plan summary validation_required must be a bool"
         raise RecordFormatError(message)
 
-    if policy.tie_breaker != "min_peak_reserved_mib":
-        message = f"unsupported tie breaker: {policy.tie_breaker}"
-        raise RecordFormatError(message)
-
-    if policy.cohort_speed_statistic != "sum_median_elapsed_seconds":
-        message = f"unsupported cohort speed statistic: {policy.cohort_speed_statistic}"
-        raise RecordFormatError(message)
-
-    if policy.cohort_tie_breaker != "sum_peak_reserved_mib":
-        message = f"unsupported cohort tie breaker: {policy.cohort_tie_breaker}"
-        raise RecordFormatError(message)
-
-    if policy.accepted_status != ACCEPTED_STATUS:
-        message = f"unsupported accepted status: {policy.accepted_status}"
-        raise RecordFormatError(message)
-
-    if policy.compile_call_horizon <= 0:
-        message = "compile_call_horizon must be positive"
-        raise RecordFormatError(message)
+    return value
 
 
 def record_current(
@@ -540,32 +589,49 @@ def candidate_record_to_json(
 
 def candidate_from_signature(record: Mapping[str, Any]) -> Candidate:
     """Return a candidate from a saved candidate signature."""
-    candidate = Candidate(
-        family=str(record["family"]),
-        candidate_id=str(record["candidate_id"]),
-        settings=dict(record["settings"]),
-        changed_axes=tuple(str(axis) for axis in record["changed_axes"]),
-        dependency_identities={
-            str(key): dict(value)
-            for key, value in dict(record["dependency_identities"]).items()
-        },
-        cohort_assignment=dict(record["cohort_assignment"]),
-        admission_status=str(record["admission_status"]),
-        admission_error=(
-            None
-            if record.get("admission_error") is None
-            else str(record["admission_error"])
-        ),
-        generator_id=str(record["generator_id"]),
-        generator_version=str(record["generator_version"]),
-        migration_source_id=(
-            None
-            if record.get("migration_source_id") is None
-            else str(record["migration_source_id"])
-        ),
+    return _candidate_from_record_fields(
+        record,
+        settings_field="settings",
+        status_field="admission_status",
+        label="candidate signature",
     )
 
-    return candidate
+
+def _candidate_from_record_fields(
+    record: Mapping[str, Any],
+    *,
+    settings_field: str,
+    status_field: str,
+    label: str,
+) -> Candidate:
+    try:
+        return Candidate(
+            family=str(record["family"]),
+            candidate_id=str(record["candidate_id"]),
+            settings=dict(record[settings_field]),
+            changed_axes=tuple(str(axis) for axis in record["changed_axes"]),
+            dependency_identities={
+                str(key): dict(value)
+                for key, value in dict(record["dependency_identities"]).items()
+            },
+            cohort_assignment=dict(record["cohort_assignment"]),
+            admission_status=str(record[status_field]),
+            admission_error=(
+                None
+                if record.get("admission_error") is None
+                else str(record["admission_error"])
+            ),
+            generator_id=str(record["generator_id"]),
+            generator_version=str(record["generator_version"]),
+            migration_source_id=(
+                None
+                if record.get("migration_source_id") is None
+                else str(record["migration_source_id"])
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        message = f"{label} is invalid: {error}"
+        raise RecordFormatError(message) from error
 
 
 def candidate_record_from_json(record: Mapping[str, Any]) -> Candidate:
@@ -581,29 +647,11 @@ def candidate_record_from_json(record: Mapping[str, Any]) -> Candidate:
         message = "candidate replay requires a candidate record"
         raise RecordFormatError(message)
 
-    candidate = Candidate(
-        family=str(record["family"]),
-        candidate_id=str(record["candidate_id"]),
-        settings=dict(record["candidate_settings"]),
-        changed_axes=tuple(str(axis) for axis in record["changed_axes"]),
-        dependency_identities={
-            str(key): dict(value)
-            for key, value in dict(record["dependency_identities"]).items()
-        },
-        cohort_assignment=dict(record["cohort_assignment"]),
-        admission_status=str(record["status"]),
-        admission_error=(
-            None
-            if record.get("admission_error") is None
-            else str(record["admission_error"])
-        ),
-        generator_id=str(record["generator_id"]),
-        generator_version=str(record["generator_version"]),
-        migration_source_id=(
-            None
-            if record.get("migration_source_id") is None
-            else str(record["migration_source_id"])
-        ),
+    candidate = _candidate_from_record_fields(
+        record,
+        settings_field="candidate_settings",
+        status_field="status",
+        label="candidate record",
     )
 
     if not record_current(
@@ -639,7 +687,7 @@ def check_record_from_json(record: Mapping[str, Any]) -> CheckRecord:
 
     Raises:
         StaleRecordError: If the reference row differs from its fields.
-        RecordFormatError: If the row is not a reference record.
+        RecordFormatError: If the row is malformed or is not a reference record.
     """
     validate_json_record(record)
 
@@ -647,15 +695,35 @@ def check_record_from_json(record: Mapping[str, Any]) -> CheckRecord:
         message = "check replay requires a reference record"
         raise RecordFormatError(message)
 
-    payload = dict(record)
-    payload.pop("record_type")
-    check_record = CheckRecord(**payload)
+    try:
+        payload = _check_record_payload(record)
+        check_record = CheckRecord(**payload)
+        current = check_record_current(check_record)
+    except (KeyError, TypeError, ValueError) as error:
+        message = f"reference record is invalid: {error}"
+        raise RecordFormatError(message) from error
 
-    if not check_record_current(check_record):
+    if not current:
         message = "reference record fields differ"
         raise StaleRecordError(message)
 
     return check_record
+
+
+def _check_record_payload(record: Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(record)
+    payload.pop("record_type")
+    payload["input_signature"] = dict(payload["input_signature"])
+    payload["candidate_settings"] = dict(payload["candidate_settings"])
+    payload["thresholds"] = dict(payload["thresholds"])
+    payload["measurements"] = dict(payload["measurements"])
+    payload["dependency_identities"] = {
+        str(key): dict(identity)
+        for key, identity in dict(payload["dependency_identities"]).items()
+    }
+    payload["cohort_assignment"] = dict(payload["cohort_assignment"])
+
+    return payload
 
 
 def check_record_current(record: CheckRecord) -> bool:
@@ -689,27 +757,43 @@ def full_size_record_to_json(record: FullSizeRecord) -> dict[str, Any]:
 
 
 def measurement_from_json(record: Mapping[str, Any]) -> Measurement:
-    """Return a measurement from a JSON row."""
-    return Measurement(**dict(record))
+    """Return a measurement from a JSON row.
+
+    Raises:
+        RecordFormatError: If the measurement row is malformed.
+    """
+    try:
+        return Measurement(**dict(record))
+    except (KeyError, TypeError, ValueError) as error:
+        message = f"measurement record is invalid: {error}"
+        raise RecordFormatError(message) from error
 
 
 def full_size_record_from_json(record: Mapping[str, Any]) -> FullSizeRecord:
     """Return a full-size record from a JSON row.
 
     Raises:
+        RecordFormatError: If the row is malformed.
         StaleRecordError: If the full-size row differs from its fields.
     """
     validate_json_record(record)
-    payload = dict(record)
-    payload.pop("record_type")
-    payload["timing_samples"] = tuple(
-        measurement_from_json(sample) for sample in payload["timing_samples"]
-    )
-    payload["memory_samples"] = tuple(
-        measurement_from_json(sample) for sample in payload["memory_samples"]
-    )
 
-    full_size_record = FullSizeRecord(**payload)
+    try:
+        payload = dict(record)
+        payload.pop("record_type")
+        payload["timing_samples"] = tuple(
+            measurement_from_json(sample) for sample in payload["timing_samples"]
+        )
+        payload["memory_samples"] = tuple(
+            measurement_from_json(sample) for sample in payload["memory_samples"]
+        )
+        full_size_record = FullSizeRecord(**payload)
+    except MaterializationError as error:
+        message = f"full-size record is invalid: {error}"
+        raise RecordFormatError(message) from error
+    except (KeyError, TypeError, ValueError) as error:
+        message = f"full-size record is invalid: {error}"
+        raise RecordFormatError(message) from error
 
     if not full_size_record_current(full_size_record):
         message = "full-size record fields differ"
@@ -964,6 +1048,24 @@ def _check_row_lookup_key(row_key: Mapping[str, Any]) -> str:
     return canonical_json(lookup)
 
 
+def _record_sequence_field(
+    record: Mapping[str, Any],
+    field: str,
+    label: str,
+) -> tuple[Any, ...]:
+    try:
+        value = record[field]
+    except KeyError as error:
+        message = f"{label} field is missing"
+        raise RecordFormatError(message) from error
+
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        message = f"{label} must be a sequence"
+        raise RecordFormatError(message)
+
+    return tuple(value)
+
+
 def _records_in_saved_order(
     row_keys: Sequence[Any],
     records_by_key: Mapping[str, Any],
@@ -994,9 +1096,15 @@ def _check_records_in_saved_order(
     label: str,
 ) -> tuple[CheckRecord, ...]:
     ordered = []
+    row_lookup_keys = []
 
     for value in row_keys:
-        row_key = _check_row_lookup_key(dict(value))
+        if not isinstance(value, Mapping):
+            message = f"plan replay {label} row key must be a mapping"
+            raise RecordFormatError(message)
+
+        row_key = _check_row_lookup_key(value)
+        row_lookup_keys.append(row_key)
         record = records_by_key.get(row_key)
 
         if record is None:
@@ -1009,16 +1117,23 @@ def _check_records_in_saved_order(
 
         ordered.append(record)
 
-    if set(records_by_key) != {
-        _check_row_lookup_key(dict(value)) for value in row_keys
-    }:
+    if set(records_by_key) != set(row_lookup_keys):
         message = f"plan replay received extra {label} rows"
         raise RecordFormatError(message)
 
     return tuple(ordered)
 
 
-def _selection_policy_from_json(record: Mapping[str, Any]) -> SelectionPolicy:
+def selection_policy_from_json(record: Mapping[str, Any]) -> SelectionPolicy:
+    """Return a selection policy parsed from saved JSON.
+
+    Raises:
+        RecordFormatError: If the saved policy fields are malformed.
+    """
+    if not isinstance(record, Mapping):
+        message = "plan replay selection policy must be a mapping"
+        raise RecordFormatError(message)
+
     policy = dict(record)
     expected = {field.name for field in dataclasses.fields(SelectionPolicy)}
 
@@ -1026,57 +1141,139 @@ def _selection_policy_from_json(record: Mapping[str, Any]) -> SelectionPolicy:
         message = "plan replay selection policy fields differ"
         raise RecordFormatError(message)
 
-    return SelectionPolicy(**policy)
+    try:
+        return SelectionPolicy(**policy)
+    except MaterializationError as error:
+        message = f"plan replay selection policy is invalid: {error}"
+        raise RecordFormatError(message) from error
 
 
-def _cohort_assignment_from_json(
+def cohort_assignment_from_json(
     record: Mapping[str, Any] | None,
 ) -> CohortAssignment | None:
+    """Return a cohort assignment parsed from saved JSON.
+
+    Raises:
+        RecordFormatError: If the saved assignment fields are malformed.
+    """
     if record is None:
         return None
 
+    for field in ("assignment_id", "values", "constraints", "covered_families"):
+        if field not in record:
+            message = f"plan replay cohort assignment field is missing: {field}"
+            raise RecordFormatError(message)
+
+    values = record["values"]
+
+    if not isinstance(values, Mapping):
+        message = "plan replay cohort assignment values must be a mapping"
+        raise RecordFormatError(message)
+
+    constraints = record["constraints"]
+
+    if isinstance(constraints, str) or not isinstance(constraints, Sequence):
+        message = "plan replay cohort assignment constraints must be a sequence"
+        raise RecordFormatError(message)
+
+    covered_families = record["covered_families"]
+
+    if isinstance(covered_families, str) or not isinstance(
+        covered_families,
+        Sequence,
+    ):
+        message = "plan replay cohort assignment covered_families must be a sequence"
+        raise RecordFormatError(message)
+
     return CohortAssignment(
         assignment_id=str(record["assignment_id"]),
-        values=dict(record["values"]),
-        constraints=tuple(str(name) for name in record["constraints"]),
-        covered_families=tuple(str(family) for family in record["covered_families"]),
+        values=dict(values),
+        constraints=tuple(str(name) for name in constraints),
+        covered_families=tuple(str(family) for family in covered_families),
     )
 
 
-def _cohort_constraints_from_json(
-    records: Sequence[Mapping[str, Any]],
-) -> tuple[CohortConstraint, ...]:
-    return tuple(
-        CohortConstraint(
-            name=str(record["name"]),
-            settings_keys=tuple(str(key) for key in record["settings_keys"]),
-            assignments=tuple(
-                dict(assignment) for assignment in tuple(record["assignments"])
-            ),
-            families=tuple(str(family) for family in record["families"]),
-            dependency_inheritance=str(record["dependency_inheritance"]),
-            selection_aggregation=str(record["selection_aggregation"]),
-        )
-        for record in records
+def _cohort_constraints_from_json(records: Any) -> tuple[CohortConstraint, ...]:
+    if isinstance(records, str) or not isinstance(records, Sequence):
+        message = "plan replay cohort constraints must be a sequence"
+        raise RecordFormatError(message)
+
+    try:
+        return tuple(_cohort_constraint_from_json(record) for record in records)
+    except (KeyError, TypeError, ValueError, MaterializationError) as error:
+        message = f"plan replay cohort constraints are invalid: {error}"
+        raise RecordFormatError(message) from error
+
+
+def _cohort_constraint_from_json(record: Any) -> CohortConstraint:
+    if not isinstance(record, Mapping):
+        message = "plan replay cohort constraints must contain mappings"
+        raise RecordFormatError(message)
+
+    settings_keys = _record_sequence_field(
+        record,
+        "settings_keys",
+        "plan replay cohort constraint settings_keys",
     )
+    assignments = _cohort_constraint_assignments_from_json(
+        _record_sequence_field(
+            record,
+            "assignments",
+            "plan replay cohort constraint assignments",
+        ),
+    )
+    families = _record_sequence_field(
+        record,
+        "families",
+        "plan replay cohort constraint families",
+    )
+
+    return CohortConstraint(
+        name=str(record["name"]),
+        settings_keys=tuple(str(key) for key in settings_keys),
+        assignments=assignments,
+        families=tuple(str(family) for family in families),
+        dependency_inheritance=str(record["dependency_inheritance"]),
+        selection_aggregation=str(record["selection_aggregation"]),
+    )
+
+
+def _cohort_constraint_assignments_from_json(
+    records: Sequence[Any],
+) -> tuple[Mapping[str, Any], ...]:
+    assignments = []
+
+    for assignment in records:
+        if not isinstance(assignment, Mapping):
+            message = "plan replay cohort constraint assignments must contain mappings"
+            raise RecordFormatError(message)
+
+        assignments.append(dict(assignment))
+
+    return tuple(assignments)
 
 
 def _validation_replay_identity(
     record: Mapping[str, Any],
     replay_context: ReplayContext,
 ) -> _ValidationReplayIdentity:
-    saved_required = record["validation_required"]
+    saved_required = plan_validation_required_from_json(record)
+    required = saved_required or replay_context.validation_required
+    validator_identities = {
+        str(family): dict(identity)
+        for family, identity in replay_context.validator_identities.items()
+    }
 
-    if saved_required is not True and saved_required is not False:
-        message = "plan validation_required must be a bool"
+    if required and (
+        not validator_identities
+        or any(not identity for identity in validator_identities.values())
+    ):
+        message = "plan replay validator identities are missing"
         raise RecordFormatError(message)
 
     return _ValidationReplayIdentity(
-        required=saved_required or replay_context.validation_required,
-        validator_identities={
-            str(family): dict(identity)
-            for family, identity in replay_context.validator_identities.items()
-        },
+        required=required,
+        validator_identities=validator_identities,
     )
 
 
@@ -1145,7 +1342,11 @@ def _selected_record_keys(
 ) -> dict[str, str]:
     selected_record_keys = {
         str(family): canonical_json(row_key)
-        for family, row_key in dict(record["records"]).items()
+        for family, row_key in _record_mapping_field(
+            record,
+            "records",
+            "plan summary selected records",
+        ).items()
     }
 
     if set(selected_record_keys) != set(selected):
@@ -1163,6 +1364,18 @@ def _selected_record_keys(
         raise RecordFormatError(message)
 
     return selected_record_keys
+
+
+def selected_records_from_json(
+    record: Mapping[str, Any],
+    selected: Mapping[str, Candidate],
+    full_size_records: Sequence[FullSizeRecord],
+) -> dict[str, FullSizeRecord]:
+    """Return selected full-size rows from a saved plan summary."""
+    full_size_by_key = _record_by_row_key(full_size_records, "full-size")
+    selected_record_keys = _selected_record_keys(record, selected, full_size_by_key)
+
+    return _selected_records(selected, selected_record_keys, full_size_by_key)
 
 
 def _validate_materializers(
@@ -1194,10 +1407,13 @@ def _validate_replay_context(
     ordered_full_size: Sequence[FullSizeRecord],
     ordered_checks: Sequence[CheckRecord],
 ) -> None:
-    selected_families = tuple(str(family) for family in dict(record["selected"]))
-    selected_record_keys = {
-        canonical_json(row_key) for row_key in dict(record["records"]).values()
-    }
+    selected_families = tuple(_selected_family_names(record))
+    records = _record_mapping_field(
+        record,
+        "records",
+        "plan summary selected records",
+    )
+    selected_record_keys = {canonical_json(row_key) for row_key in records.values()}
 
     _validate_replay_run_identity(record, replay_context)
     _validate_replay_materializers(record, replay_context, materializers)
@@ -1258,13 +1474,13 @@ def _validate_replay_run_identity(
     record: Mapping[str, Any],
     replay_context: ReplayContext,
 ) -> None:
-    if to_json_value(record["input_signature"]) != to_json_value(
+    if to_json_value(plan_input_signature_from_json(record)) != to_json_value(
         dict(replay_context.input_signature)
     ):
         message = "plan replay input signature is stale"
         raise StaleRecordError(message)
 
-    saved_policy = _selection_policy_from_json(record["policy"])
+    saved_policy = selection_policy_from_json(record["policy"])
 
     if to_json_value(dataclasses.asdict(saved_policy)) != to_json_value(
         dataclasses.asdict(replay_context.selection_policy)
@@ -1579,7 +1795,7 @@ def _validate_candidate_records(
 ) -> dict[str, Candidate]:
     by_key = _candidate_records_by_key(candidate_records)
     expected_by_key = {
-        _candidate_record_key(candidate_from_signature(dict(candidate_record))): (
+        _candidate_record_key(candidate_from_signature(candidate_record)): (
             candidate_record
         )
         for candidate_record in summary_candidate_rows
@@ -1946,18 +2162,54 @@ def _validate_recomputed_cohort_selection(
             raise StaleRecordError(message)
 
 
-def _selected_candidates_from_record(record: Mapping[str, Any]) -> dict[str, Candidate]:
-    return {
-        str(family): candidate_from_signature(dict(candidate_record))
-        for family, candidate_record in dict(record["selected"]).items()
-    }
+def selected_candidates_from_json(record: Mapping[str, Any]) -> dict[str, Candidate]:
+    """Return selected candidates from a saved plan summary.
+
+    Raises:
+        RecordFormatError: If selected-candidate fields are malformed.
+    """
+    candidates = {}
+
+    for family, candidate_record in _selected_candidate_records(record).items():
+        if not isinstance(candidate_record, Mapping):
+            message = f"plan replay selected candidate is invalid: {family}"
+            raise RecordFormatError(message)
+
+        candidates[str(family)] = candidate_from_signature(candidate_record)
+
+    return candidates
 
 
 def _candidate_rows_from_record(record: Mapping[str, Any]) -> tuple[Candidate, ...]:
     return tuple(
-        candidate_from_signature(dict(candidate_record))
-        for candidate_record in tuple(record["candidate_rows"])
+        candidate_from_signature(candidate_record)
+        for candidate_record in _candidate_row_records_from_json(record)
     )
+
+
+def _candidate_row_records_from_json(
+    record: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], ...]:
+    try:
+        rows = record["candidate_rows"]
+    except KeyError as error:
+        message = "plan summary candidate_rows field is missing"
+        raise RecordFormatError(message) from error
+
+    if isinstance(rows, str) or not isinstance(rows, Sequence):
+        message = "plan summary candidate_rows must be a sequence"
+        raise RecordFormatError(message)
+
+    candidate_rows = []
+
+    for candidate_record in rows:
+        if not isinstance(candidate_record, Mapping):
+            message = "plan summary candidate_rows must contain mappings"
+            raise RecordFormatError(message)
+
+        candidate_rows.append(candidate_record)
+
+    return tuple(candidate_rows)
 
 
 def _replay_rows(
@@ -1969,12 +2221,20 @@ def _replay_rows(
     full_size_by_key = _record_by_row_key(full_size_records, "full-size")
     check_by_key = _check_record_by_lookup_key(check_records, "reference")
     ordered_full_size = _records_in_saved_order(
-        tuple(record["full_size_records"]),
+        _record_sequence_field(
+            record,
+            "full_size_records",
+            "plan summary full-size records",
+        ),
         full_size_by_key,
         "full-size",
     )
     ordered_checks = _check_records_in_saved_order(
-        tuple(record["check_records"]),
+        _record_sequence_field(
+            record,
+            "check_records",
+            "plan summary reference records",
+        ),
         check_by_key,
         "reference",
     )
@@ -1994,10 +2254,20 @@ def _replay_rows(
 
 
 def _dependencies_from_record(record: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
-    return {
-        str(family): tuple(str(dependency) for dependency in dependencies)
-        for family, dependencies in dict(record["dependencies_by_family"]).items()
-    }
+    records = _record_mapping_field(
+        record,
+        "dependencies_by_family",
+        "plan summary dependencies",
+    )
+
+    try:
+        return {
+            str(family): tuple(str(dependency) for dependency in dependencies)
+            for family, dependencies in records.items()
+        }
+    except TypeError as error:
+        message = f"plan replay dependencies are invalid: {error}"
+        raise RecordFormatError(message) from error
 
 
 def _replayed_plan(
@@ -2024,7 +2294,7 @@ def _replayed_plan(
         check_records=rows.ordered_checks,
         validation_records=rows.ordered_validation,
         materializers={family: materializers[family] for family in selected},
-        validation_order=tuple(str(family) for family in record["validation_order"]),
+        validation_order=plan_validation_order_from_json(record),
         dependencies_by_family=dict(dependencies_by_family),
         cohort_assignment=cohort_assignment,
         cohort_constraints=cohort_constraints,
@@ -2066,6 +2336,13 @@ def _validate_replay_validation_summary(
     if validation_summary is None:
         return
 
+    validate_json_record(validation_summary)
+    _record_sequence_field(
+        validation_summary,
+        "records",
+        "selected-plan validation summary records",
+    )
+
     if not selected_plan_validation_summary_current(
         validation_summary,
         plan,
@@ -2089,9 +2366,9 @@ def _validate_replay_validation_order(
     record: Mapping[str, Any],
     replay_context: ReplayContext,
 ) -> None:
-    if replay_context.validation_order and tuple(record["validation_order"]) != tuple(
-        replay_context.validation_order
-    ):
+    if replay_context.validation_order and plan_validation_order_from_json(
+        record
+    ) != tuple(replay_context.validation_order):
         message = "plan replay validation order is stale"
         raise StaleRecordError(message)
 
@@ -2115,13 +2392,12 @@ def plan_from_json(
         RecordFormatError: If the record is not a summary or required rows are missing.
     """
     validate_json_record(record)
-    _validate_replay_selection_policy(replay_context.selection_policy)
 
     if record["record_type"] != "summary":
         message = "plan replay requires a summary record"
         raise RecordFormatError(message)
 
-    selected = _selected_candidates_from_record(record)
+    selected = selected_candidates_from_json(record)
     rows = _replay_rows(record, full_size_records, check_records, validation_records)
     _validate_replay_context(
         record,
@@ -2146,7 +2422,7 @@ def plan_from_json(
         rows.ordered_full_size,
         rows.ordered_checks,
         candidate_records,
-        tuple(record["candidate_rows"]),
+        _candidate_row_records_from_json(record),
     )
     candidate_rows = tuple(
         candidates_by_key[_candidate_record_key(candidate)]
@@ -2154,10 +2430,8 @@ def plan_from_json(
     )
     dependencies_by_family = _dependencies_from_record(record)
     validation_identity = _validation_replay_identity(record, replay_context)
-    cohort_assignment = _cohort_assignment_from_json(record["cohort_assignment"])
-    cohort_constraints = _cohort_constraints_from_json(
-        tuple(record["cohort_constraints"])
-    )
+    cohort_assignment = cohort_assignment_from_json(record["cohort_assignment"])
+    cohort_constraints = _cohort_constraints_from_json(record["cohort_constraints"])
     _validate_dependency_identities(
         selected,
         selected_records,
@@ -2209,7 +2483,11 @@ def _plan_validation_records(
     record: Mapping[str, Any],
     validation_records: Sequence[CheckRecord],
 ) -> tuple[CheckRecord, ...]:
-    row_keys = tuple(record["validation_records"])
+    row_keys = _record_sequence_field(
+        record,
+        "validation_records",
+        "plan summary selected-plan validation records",
+    )
 
     if not row_keys:
         return ()
@@ -2226,7 +2504,11 @@ def _summary_validation_records(
     validation_records: Sequence[CheckRecord],
 ) -> tuple[CheckRecord, ...]:
     return _check_records_in_saved_order(
-        tuple(summary["records"]),
+        _record_sequence_field(
+            summary,
+            "records",
+            "selected-plan validation summary records",
+        ),
         _check_record_by_lookup_key(validation_records, "selected-plan validation"),
         "selected-plan validation",
     )

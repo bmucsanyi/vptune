@@ -1929,7 +1929,7 @@ def test_reduce_rank_statuses_records_global_failure() -> None:
     assert global_status["status"] == "failed"
     assert global_status["failed_ranks"] == (1,)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(MaterializationError):
         reduce_rank_statuses(())
 
 
@@ -2138,6 +2138,8 @@ def test_distributed_runtime_config_records_rank_selection_metadata() -> None:
         candidate_settings=dict(candidate.settings),
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
+        timing_samples=samples,
+        memory_samples=samples,
     )
     selected = runtime.materializer(candidate, record)
     selected_map = tensor_dict(selected(batch, vector))

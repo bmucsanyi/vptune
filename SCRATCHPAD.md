@@ -1,51 +1,284 @@
 # Scratchpad
-Branch: codex-implement-spec @ b112e52 + uncommitted validation audit fixes
+Branch: codex-implement-spec @ 2898688
 
 ## TODO
-- [x] Read SPEC.md in full.
-- [x] Read FEATURES.md in full.
-- [x] Read FAILURE_MODE_ANALYSIS.md in full.
-- [x] Read REPO_AUDIT.md and extract mistakes to avoid.
-- [x] Build a source-backed engineering checklist from current primary sources.
-- [x] Patch package metadata, security files, dependency bounds, and sdist contents.
-- [x] Patch candidate generation to reject empty extension-axis value lists.
-- [x] Patch fresh-install PyTorch NumPy warning by adding explicit NumPy runtime dependency.
-- [x] Patch timing policy validation.
-- [x] Patch public target and policy identity validation.
-- [x] Patch selection/search policy integer validation.
-- [x] Run `make lint-fix`.
-- [x] Run `make lint`.
-- [x] Run full local `make test`: 889 passed, 11 skipped.
-- [x] Run `git diff --check`.
-- [x] Build current wheel/sdist at `/private/tmp/vptune-audit-final-dist-5`.
-- [x] Run `twine check` on current wheel/sdist.
-- [x] Fresh-install current wheel/sdist into Python 3.14 envs.
-- [x] Run warning-as-error imports from both fresh installs.
-- [x] Run warning-as-error README-style CPU tuning workflow from both fresh installs.
-- [x] Run `uv pip check` in both fresh installs.
-- [x] Run `pip-audit` on final wheel env by path.
-- [x] Cancel stale Ferranti job `398531`.
-- [ ] Commit and push final validation audit fixes.
-- [ ] Pull final commit on Ferranti.
-- [ ] Submit current-code hardware tests to `h100-ferranti`.
-- [ ] Poll current-code Ferranti job and read output.
+- [x] Convert AnchorRegistry extension misuse errors to `MaterializationError`.
+- [x] Add direct AnchorRegistry failure-path coverage.
+- [x] Run focused AnchorRegistry test.
+- [x] Run `make lint-fix` after AnchorRegistry patch.
+- [x] Run full local `make test`: 922 passed, 11 skipped.
+- [x] Run `git diff --check` after AnchorRegistry patch.
+- [x] Prune redundant audit-test scaffolding after diff-size review.
+- [x] Run focused pruned boundary tests: 34 passed.
+- [x] Run `make lint-fix` after test pruning.
+- [x] Run full local `make test` after test pruning: 922 passed, 11 skipped.
+- [x] Run `git diff --check` after test pruning.
+- [x] Revert unjustified shared replay identity validator expansion after user called out validator bloat.
+- [x] Add `FullSizeRecord` passed-row sample invariant and schema error conversion.
+- [x] Update existing adapter tests that built passed full-size rows without samples.
+- [x] Run focused FullSizeRecord and adapter tests: 2 passed.
+- [x] Run `make lint-fix` after FullSizeRecord invariant patch.
+- [x] Run full local `make test` after FullSizeRecord invariant patch: 923 passed, 11 skipped.
+- [x] Run `git diff --check` after FullSizeRecord invariant patch.
+- [x] Remove constructor-only SearchPolicy tests and broad SelectionPolicy closed-set tests.
+- [x] Reduce Problem, ReplayContext, and AnchorRegistry tests to representative boundary failures.
+- [x] Collapse duplicate target/problem identity mapping validation helper code.
+- [x] Run focused compactness-preserving tests: 14 passed.
+- [x] Run `make lint-fix` after compactness pruning.
+- [x] Run full local `make test` after compactness pruning: 888 passed, 11 skipped.
+- [x] Run `git diff --check` after compactness pruning.
+- [x] Remove duplicate schema-side SelectionPolicy closed-set validation.
+- [x] Inline single-use SelectionPolicy constants and compact target validation helpers.
+- [x] Reduce `Problem.__post_init__` to adapter replay identity validation.
+- [x] Run focused replay/policy/target tests: 14 passed.
+- [x] Run `make lint-fix` after source compactness pruning.
+- [x] Run full local `make test` after source compactness pruning: 887 passed, 11 skipped.
+- [x] Run `git diff --check` after source compactness pruning.
+- [x] Move selection memory statistics into `FullSizeRecord` and remove duplicate selector memory helpers.
+- [x] Cover all `rank_memory_reduction` policy values in the existing selection memory test.
+- [x] Convert malformed selection metadata errors to `MaterializationError`.
+- [x] Convert invalid family DAG validation errors to `MaterializationError`.
+- [x] Run focused selection and family DAG tests: 5 passed.
+- [x] Run `make lint-fix` after selection and DAG error-taxonomy patches.
+- [x] Run full local `make test` after selection and DAG error-taxonomy patches: 888 passed, 11 skipped.
+- [x] Run `git diff --check` after selection and DAG error-taxonomy patches.
+- [x] Remove negative `recompile_count` exception-only assertion.
+- [x] Fold invalid family DAG coverage into public `tune_run` preflight instead of direct helper testing.
+- [x] Run focused selection and public DAG preflight tests after pruning: 5 passed.
+- [x] Run `make lint-fix` after test pruning.
+- [x] Run full local `make test` after test pruning: 887 passed, 11 skipped.
+- [x] Run `git diff --check` after test pruning.
+- [x] Propagate package errors out of `measure_once()` and `run_candidate()` instead of recording them as candidate failures.
+- [x] Convert invalid timing-policy measurement state and empty compiled timing samples to `MeasurementError`.
+- [x] Convert CUDA driver-version and unavailable CUDA target identity failures to `MaterializationError`.
+- [x] Run focused measurement and identity boundary tests: 5 passed.
+- [x] Run `make lint-fix` after measurement and identity patches.
+- [x] Run full local `make test` after measurement and identity patches: 887 passed, 11 skipped.
+- [x] Run `git diff --check` after measurement and identity patches.
+- [x] Convert tensor-tree shape/key/length/leaf-count/dtype/device mismatches to `MaterializationError`.
+- [x] Keep unsupported non-tree objects as `TypeError`.
+- [x] Convert empty distributed rank-status reduction to `MaterializationError`.
+- [x] Run focused tensor-tree and distributed status tests: 4 passed.
+- [x] Run `make lint-fix` after tensor-tree and distributed patches.
+- [x] Run full local `make test` after tensor-tree and distributed patches: 887 passed, 11 skipped.
+- [x] Run `git diff --check` after tensor-tree and distributed patches.
+- [x] Restore runtime preallocated-output wrapper for `MaterializationError` from tensor-tree mismatches.
+- [x] Convert preallocated output buffer dtype/device mismatch internals to `MaterializationError`.
+- [x] Run focused preallocated-output runtime test: 1 passed.
+- [x] Run `make lint-fix` after runtime output-buffer patch.
+- [x] Run full local `make test` after runtime output-buffer patch: 887 passed, 11 skipped.
+- [x] Run `git diff --check` after runtime output-buffer patch.
+- [x] Prune duplicate `ReplayContext` constructor replay-identity validation.
+- [x] Fold missing selected-plan materializer coverage into `Plan.to_record()` serialization coverage.
+- [x] Move attention full-size-agreement ownership into `selection_core.py`.
+- [x] Run focused replay and selection boundary tests after the pruning.
+- [x] Run `make lint-fix` after replay and selection ownership pruning.
+- [x] Run full local `make test` after replay and selection ownership pruning: 884 passed, 11 skipped.
+- [x] Run `git diff --check` after replay and selection ownership pruning.
+- [x] Move public `Operator.load` saved-policy parsing into the schema parser.
+- [x] Add public load coverage for malformed saved selection policy.
+- [x] Run focused public saved-policy load test: 1 passed.
+- [x] Run `make lint-fix` after public/schema replay parser change.
+- [x] Run full local `make test` after public/schema replay parser change: 885 passed, 11 skipped.
+- [x] Run `git diff --check` after public/schema replay parser change.
+- [x] Move cohort assignment saved parsing into the schema parser.
+- [x] Add `load_tuned_run` coverage for missing saved run cohort assignment.
+- [x] Run focused DAG/load replay test after cohort parser change: 1 passed.
+- [x] Run `make lint-fix` after cohort parser change.
+- [x] Run full local `make test` after cohort parser change: 885 passed, 11 skipped.
+- [x] Run `git diff --check` after cohort parser change.
+- [x] Move generic callable identity calculation from `runtime.py` to `identities.py`.
+- [x] Run focused standard-runtime callback identity tests: 2 passed.
+- [x] Run `make lint-fix` after callable identity move.
+- [x] Run full local `make test` after callable identity move: 885 passed, 11 skipped.
+- [x] Run `git diff --check` after callable identity move.
+- [x] Move generic qualified callable naming from `public.py` to `identities.py`.
+- [x] Run focused public declared-PSD matrix-free loss identity test: 1 passed.
+- [x] Run `make lint-fix` after qualified callable name move.
+- [x] Run full local `make test` after qualified callable name move: 885 passed, 11 skipped.
+- [x] Run `git diff --check` after qualified callable name move.
+- [x] Move public identity-field validation and tensor-valued signatures from `public.py` to `identities.py`.
+- [x] Run focused public policy/input-signature tests after public identity helper move: 3 passed.
+- [x] Run `make lint-fix` after public identity helper move.
+- [x] Run full local `make test` after public identity helper move: 885 passed, 11 skipped.
+- [x] Run `git diff --check` after public identity helper move.
+- [x] Move generic typed-callable signature extraction from `public.py` to `identities.py`.
+- [x] Run focused public objective-signature tests after typed-callable helper move: 3 passed.
+- [x] Run `make lint-fix` after typed-callable helper move.
+- [x] Run full local `make test` after typed-callable helper move: 885 passed, 11 skipped.
+- [x] Run `git diff --check` after typed-callable helper move.
+- [x] Convert non-object saved-record JSON reads to `RecordFormatError` at `src/vptune/io.py:79`.
+- [x] Add read-record boundary coverage for non-object JSON.
+- [x] Run focused read-record IO test: 1 passed.
+- [x] Run `make lint-fix` after read-record IO patch.
+- [x] Run full local `make test` after read-record IO patch: 886 passed, 11 skipped.
+- [x] Run `git diff --check` after read-record IO patch.
+- [x] Convert malformed saved candidate field shapes to `RecordFormatError` in `schemas.py`.
+- [x] Add saved-candidate parser coverage for malformed cohort assignment.
+- [x] Run focused saved-candidate parser tests: 2 passed.
+- [x] Run `make lint-fix` after saved-candidate parser patch.
+- [x] Run full local `make test` after saved-candidate parser patch: 887 passed, 11 skipped.
+- [x] Run `git diff --check` after saved-candidate parser patch.
+- [x] Convert malformed saved reference rows and measurement samples to `RecordFormatError` in `schemas.py`.
+- [x] Add saved reference-row and measurement-sample parser coverage.
+- [x] Run focused saved-row parser tests: 4 passed.
+- [x] Run `make lint-fix` after saved-row parser patch.
+- [x] Run full local `make test` after saved-row parser patch: 889 passed, 11 skipped.
+- [x] Run `git diff --check` after saved-row parser patch.
+- [x] Move saved selected-candidate summary parsing from `run.py` to `schemas.py`.
+- [x] Move saved selected-record lookup from `run.py` to `schemas.py`.
+- [x] Add `load_tuned_run` coverage for malformed saved summary selected/records fields.
+- [x] Run focused run replay summary parser tests: 1 passed.
+- [x] Run `make lint-fix` after run replay summary parser patch.
+- [x] Run full local `make test` after run replay summary parser patch: 889 passed, 11 skipped.
+- [x] Run `git diff --check` after run replay summary parser patch.
+- [x] Move saved plan input-signature parsing from `public.py` to `schemas.py`.
+- [x] Add public `Operator.load` coverage for malformed saved input signature.
+- [x] Move saved public load input-signature parsing into `schemas.py` and verify it.
+- [x] Move saved plan validation-order parsing from `public.py` and replay construction to `schemas.py`.
+- [x] Add public `Operator.load` coverage for malformed saved validation order.
+- [x] Move saved validation-order parsing into `schemas.py` and verify it.
+- [x] Move saved plan validation-required parsing from `public.py` and replay checks to `schemas.py`.
+- [x] Add public `Operator.load` coverage for malformed saved validation_required.
+- [x] Move saved validation-required parsing into `schemas.py` and verify it.
+- [x] Convert non-mapping saved selection policy to `RecordFormatError` in `schemas.py`.
+- [x] Add public `Operator.load` coverage for non-mapping saved policy.
+- [x] Run focused public load saved-policy shape test: 1 passed.
+- [x] Run `make lint-fix` after saved-policy shape patch.
+- [x] Run full local `make test` after saved-policy shape patch: 889 passed, 11 skipped.
+- [x] Run `git diff --check` after saved-policy shape patch.
+- [x] Convert malformed saved cohort constraints to `RecordFormatError` in `schemas.py`.
+- [x] Add plan replay coverage for malformed saved cohort constraints.
+- [x] Run focused cohort replay parser test: 1 passed.
+- [x] Run `make lint-fix` after cohort-constraint parser patch.
+- [x] Run full local `make test` after cohort-constraint parser patch: 889 passed, 11 skipped.
+- [x] Run `git diff --check` after cohort-constraint parser patch.
+- [x] Convert malformed saved dependency-family mappings to `RecordFormatError` with replay coverage and verification.
+- [x] Convert malformed saved summary candidate rows to `RecordFormatError` with replay coverage and verification.
+- [x] Convert malformed saved replay row-key sequence fields to `RecordFormatError`.
+- [x] Add saved full-size row-key sequence coverage.
+- [x] Run focused replay row-key parser test: 1 passed.
+- [x] Run `make lint-fix` after replay row-key parser patch.
+- [x] Run full local `make test` after replay row-key parser patch: 889 passed, 11 skipped.
+- [x] Run `git diff --check` after replay row-key parser patch.
+- [x] Convert malformed saved reference row-key entries to `RecordFormatError`.
+- [x] Add saved reference row-key shape coverage.
+- [x] Run focused replay row-key parser test after reference row-key patch: 1 passed.
+- [x] Run `make lint-fix` after reference row-key patch.
+- [x] Run full local `make test` after reference row-key patch: 889 passed, 11 skipped.
+- [x] Run `git diff --check` after reference row-key patch.
+- [x] Convert malformed saved cohort-constraint assignment rows to `RecordFormatError`.
+- [x] Add saved cohort-constraint assignment-row coverage.
+- [x] Run focused replay parser test after cohort-constraint assignment patch: 1 passed.
+- [x] Run `make lint-fix` after cohort-constraint assignment patch.
+- [x] Run full local `make test` after cohort-constraint assignment patch: 889 passed, 11 skipped.
+- [x] Run `git diff --check` after cohort-constraint assignment patch.
+- [x] Inspect saved runtime identity summary validation.
+- [x] Move saved runtime identity shape validation into summary validation.
+- [x] Add replay coverage for malformed saved runtime identities.
+- [x] Run focused replay parser test after runtime identity parser patch: 1 passed.
+- [x] Run `make lint-fix` after runtime identity parser patch.
+- [x] Run full local `make test` after runtime identity parser patch: 889 passed, 11 skipped.
+- [x] Run `git diff --check` after runtime identity parser patch.
+- [x] Inspect selected-plan validation summary input-signature parsing.
+- [x] Convert non-mapping saved selected-plan validation summary input-signature values to `RecordFormatError`.
+- [x] Add `write_record` coverage for malformed selected-plan validation summary input signature.
+- [x] Run focused selected-plan validation summary parser test: 1 passed.
+- [x] Run `make lint-fix` after selected-plan validation summary parser patch.
+- [x] Run full local `make test` after selected-plan validation summary parser patch: 889 passed, 11 skipped.
+- [x] Run `git diff --check` after selected-plan validation summary parser patch.
+- [x] Inspect selected-plan validation replay summary row-key parsing.
+- [x] Convert malformed selected-plan validation summary records field to `RecordFormatError`.
+- [x] Add replay coverage for malformed selected-plan validation summary records.
+- [x] Run focused selected-plan validation replay parser test: 1 passed.
+- [x] Run `make lint-fix` after selected-plan validation replay parser patch.
+- [x] Run full local `make test` after selected-plan validation replay parser patch: 889 passed, 11 skipped.
+- [x] Run `git diff --check` after selected-plan validation replay parser patch.
+- [x] Convert invalid saved-record JSON text to `RecordFormatError` in `read_record`.
+- [x] Add read-record invalid JSON coverage.
+- [x] Run focused read-record IO parser test: 1 passed.
+- [x] Run `make lint-fix` after read-record JSON parser patch.
+- [x] Run full local `make test` after read-record JSON parser patch: 889 passed, 11 skipped.
+- [x] Run `git diff --check` after read-record JSON parser patch.
 
 ## Open questions for the user
 
 ## Uncertain / ideas to explore
-- Direct git dependency on `autobatch` works for local, wheel, and sdist installs, but public advisory tooling skips it because it is not a PyPI package.
-- `pyproject.toml` declares `import-names = ["vptune"]`, but emitted wheel metadata stays at Core Metadata 2.4 because current Twine rejects Core Metadata 2.5.
-- Remaining pytest warning filters are exact PyTorch internal warning filters for `torch.jit` and `torch.fx` paths required by the test suite. Fresh install imports and README workflow pass with `-W error`.
+- Large-module file splitting remains constrained by the spec package layout. Extraction points made so far: `runtime.compile_candidate_operation()` as the public internal compile boundary, and full-size-agreement selection logic moved fully into `selection_core.py`.
+- `run._cohort_assignment_from_record()` was removed; `schemas.cohort_assignment_from_json()` now owns saved cohort assignment parsing. `load_tuned_run` still rejects `None` because multi-family run replay always needs an assignment signature.
+- Runtime `_batch_signature()` is still runtime-local because its active behavior is tied to materializer fixed-batch state; moving it would need a real state-transition test.
+- `Operator.load()` plan input-signature parsing now goes through `schemas.plan_input_signature_from_json()`.
+- `load_tuned_run` selected-candidate and selected-record saved summary parsing now goes through `schemas.py`.
+- `Operator.load()` saved plan validation-order parsing now goes through `schemas.plan_validation_order_from_json()`.
+- `Operator.load()` saved plan validation-required parsing now goes through `schemas.plan_validation_required_from_json()`.
+- `selection_policy_from_json()` now rejects non-mapping saved policy values before dataclass construction.
+- `_dependencies_from_record()` now converts malformed saved dependency-family fields to `RecordFormatError`.
+- `_candidate_rows_from_record()` now gets mapping-shaped rows from `_candidate_row_records_from_json()`.
+- Saved replay row-key fields now go through `_record_sequence_field()` before row matching; malformed non-sequence values now stay in `RecordFormatError`.
+- Saved reference row keys are now mapping-checked before stale-row matching.
+- Saved cohort-constraint assignment rows are now mapping-checked in `schemas.py` before cohort semantic validation.
+- Saved runtime identity shape now has the same summary-level parser ownership as adapter and materializer identities.
+- Selected-plan validation summary input signatures are now mapping-checked before nested signature validation.
+- Selected-plan validation replay now checks summary row-key field shape before stale-summary comparison.
+- `read_record()` now keeps invalid JSON text in `RecordFormatError`, matching non-object saved JSON.
 
 ## Notes to self
 - `BLOCKERS.md` currently contains `None`.
-- `make test` final local count after validation fixes: 889 passed, 11 skipped, coverage 82%.
-- Current wheel metadata includes SPDX license, license file, NumPy, PyTorch `>=2.12,<2.13`, and no legacy license classifier.
-- Current sdist includes `.github/CODEOWNERS`, `.github/dependabot.yml`, `SECURITY.md`, SPEC/FEATURES/BLOCKERS, tests, source, README, LICENSE, Makefile, pyproject, and uv.lock.
 - `settings_product` now raises `AdmissionError` for an empty axis value list instead of leaking an unbound local.
 - `TimingPolicy` now rejects invalid thresholds, negative warmups, and nonpositive measured-call counts.
 - Public `Target` now rejects empty/duplicate devices, empty accelerator, duplicate allowed values, non-tuple allowed values, and empty allowed entries.
 - `DeterminismPolicy` and `EnvironmentPolicy` now require string keys and JSON-compatible values.
 - `SelectionPolicy` now rejects invalid `near_fastest_multiplier` and non-integer or nonpositive `compile_call_horizon`.
 - `SearchPolicy` now rejects bool/non-integer retained counts, compile horizons, and variance repeat counts.
-- Stale Ferranti job `398531` was canceled because it targeted commit `b112e52` before the validation fixes.
+- Lower `Target` now validates devices, accelerator, allowed-value tuples, and identity maps.
+- `TimingPolicy`, `SelectionPolicy`, `SearchPolicy`, `CohortConstraint`, and `ParameterSurface` invalid construction now raises `MaterializationError`.
+- Selection statistic token ownership now lives in `SelectionPolicy`; selection code assumes a valid policy object.
+- Saved replay policy parsing converts `SelectionPolicy` construction failures into `RecordFormatError`.
+- `run._probe_inputs` now raises `MaterializationError` for empty probes, empty vectors, and count mismatch.
+- `Plan.materializer_identities()` now raises `MaterializationError` for missing materializers.
+- `Plan.to_record()` now requires nonempty target, runtime, and adapter identities for selected plans.
+- `Plan.to_record()` now requires selected validator identities when selected-plan validation is required.
+- `schemas._validation_replay_identity()` now raises `RecordFormatError` for validation-required replay without validator identities.
+- `attention.py` now imports `compile_candidate_operation` instead of importing a private `_compiled_operation` from `runtime.py`.
+- `runtime.py` exposes `compile_candidate_operation` as the named boundary for zero-argument candidate operation compilation.
+- `ReplayContext` no longer validates replay identity completeness at construction; saved/current replay identity checks live in `schemas.py` during replay load.
+- `Problem` now validates data/vector signatures, anchor/replay policy identity maps, and adapter identity at construction.
+- `Problem.input_signature()` now revalidates data/vector signatures and identity maps before writing replay input identity.
+- `AnchorRegistry` now raises `MaterializationError` for invalid names, non-callable anchors, duplicate registrations, and unknown lookups.
+- Test pruning removed the redundant `target_for_validation()` helper and `unchecked_problem_field()`, shortened invalid provider classes by subclassing valid test providers, collapsed repeated selected-plan setup into `_selected_identity_plan()`, removed broad constructor-only SearchPolicy tests, removed the SelectionPolicy closed-set grid, and kept representative replay/state boundary tests.
+- The shared replay identity validator expansion was removed after review because it was not justified tightly enough against current failure evidence.
+- `FullSizeRecord(status="passed")` now rejects missing timing or memory samples at construction; `full_size_record_from_json()` converts that to `RecordFormatError` for malformed saved rows.
+- Schema replay no longer rechecks SelectionPolicy closed-set fields separately; saved policy parsing constructs `SelectionPolicy` and converts construction failures to `RecordFormatError`.
+- `Problem.__post_init__` now only validates adapter replay identity fields; provider and policy identity maps are validated when `input_signature()` is built.
+- Compactness rule after the user's pushback: tests stay only when they protect a real ingress or replay boundary failure; duplicate constructor grids and exception-class-only checks do not qualify.
+- `FullSizeRecord` now owns `peak_allocated_mib()`, `peak_reserved_mib()`, and `sum_peak_reserved_mib()`; `selection_core.py` delegates memory scoring to those methods.
+- `selection_core.py` now has no plain `RuntimeError` raises; malformed selection metadata raises `MaterializationError`.
+- `selection_core.py` owns the attention frontend full-size-agreement predicate; there is no remaining import from `selection_core.py` to `candidates.py`.
+- The existing rank-memory selection test now exercises `max_peak_allocated`, `max_peak_reserved`, and `sum_peak_reserved`.
+- `topological_families()` now raises `MaterializationError` for duplicate family names, missing dependencies, and family DAG cycles.
+- Removed the negative `recompile_count` assertion because it only proved an exception path; the missing-metadata selection test still covers malformed selection metadata entering selection.
+- Invalid family DAG coverage now enters through public `vp.tune_run` preflight and asserts no summary is written.
+- `measure_once()` and `run_candidate()` now re-raise package `VPTuneError` instances before broad runtime-failure handling, so package state/check errors are not saved as candidate failures.
+- `measure_operation()` now raises `MeasurementError` if a timing policy produces no measured calls; `_median_elapsed()` raises `MeasurementError` for empty timing samples.
+- CUDA identity failures now use `MaterializationError`: failed CUDA driver-version query and declared CUDA target while CUDA is unavailable.
+- `tensor_tree.py` now raises `MaterializationError` for valid tensor trees with mismatched shapes, keys, lengths, leaf counts, foreach dtypes, or foreach devices; unsupported non-tree objects still raise `TypeError`.
+- `reduce_rank_statuses(())` now raises `MaterializationError` instead of `RuntimeError`.
+- `_runtime_output_to_buffer()` now catches `MaterializationError` from tensor-tree mismatch checks and preserves the feature-specific preallocated-output message.
+- `_copy_output_tensor()` now raises `MaterializationError` for preallocated output buffer dtype/device mismatch.
+- Remaining plain `RuntimeError` sites checked after the runtime output-buffer audit are `AutobatchDomain` validation, nonfinite candidate output recorded as candidate failure, and the autobatch probe bridge. Autobatch was left alone per user instruction.
+- Removed duplicate `ReplayContext` constructor replay-identity validation and the direct constructor-only test; replay load still rejects stale current state through `plan_from_json()`.
+- The missing selected-plan materializer case is now covered through `Plan.to_record()` instead of only `Plan.materializer_identities()`.
+- `schemas.selection_policy_from_json()` now owns saved selection-policy parsing; public `Operator.load` uses it when building replay context.
+- `schemas.cohort_assignment_from_json()` now owns saved cohort assignment parsing; run replay uses it instead of a duplicate parser.
+- `load_tuned_run` now raises `RecordFormatError` when a saved run summary has no cohort assignment.
+- Malformed saved cohort assignment mappings now raise `RecordFormatError` instead of leaking missing-field or type errors.
+- Generic callable identity and public callable-signature helpers now live in `identities.py`.
+- `read_record()` now converts the non-object JSON `TypeError` from `read_json()` to `RecordFormatError`, keeping malformed saved-record files in the record-format error class.
+- `schemas._candidate_from_record_fields()` now owns saved candidate field coercion for both candidate signatures and candidate rows, converting malformed field shapes to `RecordFormatError`.
+- `schemas.check_record_from_json()` now coerces reference-row mapping fields before construction, so malformed thresholds or identity fields raise `RecordFormatError`.
+- `schemas.measurement_from_json()` now owns malformed measurement sample parsing; full-size replay samples inherit that error class.
+- `schemas.selected_candidates_from_json()` and `schemas.selected_records_from_json()` own saved selected-candidate and selected-row parsing.
+- `schemas.plan_input_signature_from_json()`, `schemas.plan_validation_order_from_json()`, and `schemas.plan_validation_required_from_json()` own saved summary scalar replay fields.
+- `selection_policy_from_json()` now converts non-mapping saved policy values to `RecordFormatError`.
+- `_cohort_constraints_from_json()` now converts malformed saved constraint fields to `RecordFormatError`.
+- Latest parser verification: focused read-record parser test passes, `make lint-fix` passes, full local `make test` stays at 889 passed and 11 skipped after the invalid JSON parser patch.

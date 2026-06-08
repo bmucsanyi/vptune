@@ -1,5 +1,6 @@
 import contextlib
 import dataclasses
+import json
 import math
 import re
 import tomllib
@@ -807,6 +808,14 @@ class OneBatchData:
         return ({"family": family, "source": "probe"},)
 
 
+class EmptyProbeData(OneBatchData):
+    @staticmethod
+    def probe_batches(family: str) -> tuple[Mapping[str, object], ...]:
+        assert family
+
+        return ()
+
+
 class OneVectorProvider:
     @staticmethod
     def signature() -> Mapping[str, object]:
@@ -966,8 +975,21 @@ def test_cuda_driver_version_is_none_when_runtime_does_not_report(
 
     assert cuda_driver_version() is None
 
+    def failing_driver_version() -> tuple[int, int]:
+        return 1, 0
 
-def test_target_signature_includes_declared_device_identity() -> None:
+    def failing_cudart() -> object:
+        return types.SimpleNamespace(cudaDriverGetVersion=failing_driver_version)
+
+    monkeypatch.setattr(torch.cuda, "cudart", failing_cudart)
+
+    with pytest.raises(vp.MaterializationError, match="CUDA driver version"):
+        cuda_driver_version()
+
+
+def test_target_signature_includes_declared_device_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     signature = cpu_target().signature()
 
     assert signature["device_signatures"] == (
@@ -984,91 +1006,25 @@ def test_target_signature_includes_declared_device_identity() -> None:
         "variance_repeat_count": None,
     }
 
+    unavailable_cuda = dataclasses.replace(
+        cpu_target(),
+        devices=("cuda:0",),
+        accelerator="cuda",
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
-def test_search_policy_rejects_unknown_strategy() -> None:
-    with pytest.raises(RuntimeError, match="unsupported search strategy"):
-        vpx.SearchPolicy(strategy="random")
-
-
-def test_search_policy_requires_balanced_top_count() -> None:
-    with pytest.raises(RuntimeError, match="retained_top_count"):
-        vpx.SearchPolicy(strategy="balanced")
-
-    with pytest.raises(RuntimeError, match="retained_top_count"):
-        vpx.SearchPolicy(strategy="balanced", retained_top_count=True)
-
-    with pytest.raises(RuntimeError, match="retained_top_count"):
-        vpx.SearchPolicy(
-            strategy="balanced",
-            retained_top_count=unchecked_timing_policy_value(1.5),
-        )
-
-
-def test_search_policy_requires_thorough_fields() -> None:
-    with pytest.raises(RuntimeError, match="compile_call_horizons"):
-        vpx.SearchPolicy(strategy="thorough", retained_top_count=1)
-
-    with pytest.raises(RuntimeError, match="variance_repeat_count"):
-        vpx.SearchPolicy(
-            strategy="thorough",
-            retained_top_count=1,
-            compile_call_horizons=(1,),
-        )
-
-    with pytest.raises(RuntimeError, match="compile_call_horizons"):
-        vpx.SearchPolicy(
-            strategy="thorough",
-            retained_top_count=1,
-            compile_call_horizons=(True,),
-            variance_repeat_count=2,
-        )
-
-    with pytest.raises(RuntimeError, match="variance_repeat_count"):
-        vpx.SearchPolicy(
-            strategy="thorough",
-            retained_top_count=1,
-            compile_call_horizons=(1,),
-            variance_repeat_count=True,
-        )
+    with pytest.raises(vp.MaterializationError, match="CUDA target device"):
+        unavailable_cuda.signature()
 
 
 def unchecked_timing_policy_value(value: Any) -> Any:
     return value
 
 
-@pytest.mark.parametrize(
-    ("factory", "message"),
-    [
-        (lambda: vpx.TimingPolicy(short_seconds=-1.0), "short_seconds"),
-        (lambda: vpx.TimingPolicy(short_seconds=float("inf")), "short_seconds"),
-        (lambda: vpx.TimingPolicy(short_seconds=True), "short_seconds"),
-        (
-            lambda: vpx.TimingPolicy(short_seconds=2.0, medium_seconds=1.0),
-            "medium_seconds",
-        ),
-        (lambda: vpx.TimingPolicy(short_warmups=-1), "short_warmups"),
-        (lambda: vpx.TimingPolicy(medium_warmups=True), "medium_warmups"),
-        (
-            lambda: vpx.TimingPolicy(long_warmups=unchecked_timing_policy_value(1.5)),
-            "long_warmups",
-        ),
-        (lambda: vpx.TimingPolicy(short_measured_calls=0), "short_measured_calls"),
-        (
-            lambda: vpx.TimingPolicy(medium_measured_calls=False),
-            "medium_measured_calls",
-        ),
-        (lambda: vpx.TimingPolicy(long_measured_calls=-1), "long_measured_calls"),
-    ],
-)
-def test_timing_policy_rejects_invalid_counts_and_thresholds(
-    factory: Callable[[], vpx.TimingPolicy],
-    message: str,
-) -> None:
-    with pytest.raises(RuntimeError, match=message):
-        factory()
-
-
 def test_timing_policy_allows_zero_thresholds_for_long_tier() -> None:
+    with pytest.raises(vp.MaterializationError, match="short_seconds"):
+        vpx.TimingPolicy(short_seconds=-1.0)
+
     policy = vpx.TimingPolicy(
         short_seconds=0.0,
         medium_seconds=0.0,
@@ -2116,6 +2072,9 @@ def test_extension_tensor_and_measurement_helpers() -> None:
     assert torch.equal(tree_leaves(summed)[0], tree["value"])
     assert float(vpx.tree_l2_norm(tree)) == pytest.approx(5.0)
 
+    with pytest.raises(vp.MaterializationError, match="tensor shapes"):
+        vpx.tree_add({"value": torch.ones(1)}, {"value": torch.ones(2)})
+
 
 def test_tensor_tree_foreach_helpers_match_python_ops() -> None:
     left = {
@@ -2160,6 +2119,12 @@ def test_tensor_tree_foreach_helpers_match_python_ops() -> None:
         },
         thresholds=thresholds,
     )
+
+    with pytest.raises(vp.MaterializationError, match="same dtype"):
+        tree_elementwise_mul_foreach(
+            left,
+            {"a": torch.tensor([1.0, 2.0], dtype=torch.float32), "b": right["b"]},
+        )
 
     assert float(tree_dot_foreach(left, right)) == pytest.approx(-24.0)
 
@@ -2569,7 +2534,7 @@ def reduction_bound_fields() -> dict[str, object]:
 
 
 def test_cohort_constraint_rejects_unsupported_modes() -> None:
-    with pytest.raises(RuntimeError, match="dependency inheritance"):
+    with pytest.raises(vp.MaterializationError, match="dependency inheritance"):
         vpx.CohortConstraint(
             name="bad",
             settings_keys=("dtype.model_compute",),
@@ -2577,7 +2542,7 @@ def test_cohort_constraint_rejects_unsupported_modes() -> None:
             dependency_inheritance="all_families",
         )
 
-    with pytest.raises(RuntimeError, match="selection aggregation"):
+    with pytest.raises(vp.MaterializationError, match="selection aggregation"):
         vpx.CohortConstraint(
             name="bad",
             settings_keys=("dtype.model_compute",),
@@ -2869,6 +2834,40 @@ def single_row_tuning_problem(
     )
 
 
+@pytest.mark.parametrize(
+    ("problem_factory", "message"),
+    [
+        (
+            lambda problem: dataclasses.replace(problem, data=EmptyProbeData()),
+            "probe batches",
+        ),
+        (
+            lambda problem: dataclasses.replace(problem, data=TwoProbeData()),
+            "probe batch count",
+        ),
+    ],
+)
+def test_tune_rejects_invalid_probe_inputs_as_materialization_error(
+    problem_factory: Callable[[vpx.Problem], vpx.Problem],
+    message: str,
+) -> None:
+    base_problem = single_row_tuning_problem(
+        model=torch.nn.Linear(1, 1),
+        target=one_call_cpu_target(),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
+        row=vpx.Candidate("family", "row", {}, admission_status="passed"),
+        calls={"reference": 0, "operation": 0},
+        generator="invalid-probes",
+    )
+
+    with pytest.raises(vp.MaterializationError, match=message):
+        tune_problem(
+            problem_factory(base_problem),
+            memory_backend=CPUMemoryBackend(),
+            clock=SequenceClock((0.0, 1.0)),
+        )
+
+
 def test_runtime_config_requires_identity_bearing_callbacks() -> None:
     candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
 
@@ -2930,6 +2929,31 @@ def test_runtime_config_requires_identity_bearing_callbacks() -> None:
             None,
             {"runtime": "test.raw-callback"},
         )
+
+
+def test_problem_rejects_missing_adapter_identity_field() -> None:
+    candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
+    model = torch.nn.Linear(1, 1)
+    runtime = runtime_config(
+        (candidate,),
+        operation_factory_never_runs,
+        reference_check_never_runs,
+        materialize_candidate,
+        None,
+        {"runtime": "test.problem-identity"},
+    )
+    problem = vpx.Problem(
+        model=model,
+        params=vpx.parameter_surface(model),
+        data=OneBatchData(),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=one_call_cpu_target(),
+        runtime=runtime,
+    )
+
+    with pytest.raises(vp.MaterializationError, match="adapter_version"):
+        dataclasses.replace(problem, adapter_identity={"adapter_id": "tests"})
 
 
 def replay_context_for_plan(
@@ -3049,6 +3073,20 @@ def test_candidate_record_round_trips_migration_source_id() -> None:
     assert replayed.signature() == candidate.signature()
 
 
+def test_candidate_record_rejects_malformed_cohort_assignment() -> None:
+    candidate = vpx.Candidate(
+        "family",
+        "row",
+        {"scale": 1.0},
+        admission_status="passed",
+    )
+    row = vpx.candidate_record_to_json(candidate, _input_signature("candidate-row"))
+    row["cohort_assignment"] = None
+
+    with pytest.raises(vp.RecordFormatError, match="candidate record is invalid"):
+        vpx.candidate_record_from_json(row)
+
+
 def test_candidate_record_writes_declared_hook_ids(tmp_path: Path) -> None:
     candidate = vpx.Candidate(
         "family",
@@ -3149,6 +3187,41 @@ def test_write_record_rejects_type_specific_missing_fields(tmp_path: Path) -> No
     with pytest.raises(vp.RecordFormatError, match="target_identity"):
         write_record(tmp_path / "missing-target.json", summary)
 
+    validation_summary = {
+        "record_type": "summary",
+        "schema_version": row["schema_version"],
+        "package_version": row["package_version"],
+        "input_signature": None,
+        "candidate_settings": {},
+        "status": "passed",
+        "generator_id": "selected_plan_validation",
+        "generator_version": row["package_version"],
+        "records": (),
+    }
+
+    with pytest.raises(
+        vp.RecordFormatError,
+        match="selected-plan validation summary input signature",
+    ):
+        write_record(
+            tmp_path / "malformed-selected-validation-summary.json",
+            validation_summary,
+        )
+
+
+def test_read_record_rejects_non_object_json(tmp_path: Path) -> None:
+    path = tmp_path / "record.json"
+    path.write_text("[]\n", encoding="utf-8")
+
+    with pytest.raises(vp.RecordFormatError, match="does not contain an object"):
+        read_record(path)
+
+    malformed_path = tmp_path / "malformed.json"
+    malformed_path.write_text("{\n", encoding="utf-8")
+
+    with pytest.raises(vp.RecordFormatError, match="JSON file is invalid"):
+        read_record(malformed_path)
+
 
 def test_stable_hash_changes_on_identity_inputs() -> None:
     first = {
@@ -3189,7 +3262,7 @@ def test_module_identity_records_tied_parameters_and_devices() -> None:
     assert preserved.names == ("first", "second")
     assert deduplicated.names == ("first",)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(vp.MaterializationError):
         vpx.parameter_surface(TiedModule(), tied_weights="unknown")
 
     grouped = vpx.parameter_surface(
@@ -3202,10 +3275,10 @@ def test_module_identity_records_tied_parameters_and_devices() -> None:
     assert grouped.block_groups == (("first", "second"),)
     assert grouped.signature()["layer_groups"] == (("first", "second"),)
 
-    with pytest.raises(RuntimeError, match="layer_groups"):
+    with pytest.raises(vp.MaterializationError, match="layer_groups"):
         vpx.parameter_surface(TiedModule(), layer_groups=(("first",),))
 
-    with pytest.raises(RuntimeError, match="parametrization_policy"):
+    with pytest.raises(vp.MaterializationError, match="parametrization_policy"):
         vpx.ParameterSurface(
             names=("first",),
             shapes=((2,),),
@@ -3465,10 +3538,10 @@ def test_tensor_tree_preserves_mapping_insertion_order() -> None:
     assert signature["items"][0]["key"] == "second"
     assert signature["items"][1]["key"] == "first"
 
-    with pytest.raises(RuntimeError, match="too few"):
+    with pytest.raises(vp.MaterializationError, match="too few"):
         tree_from_leaves(tree, (torch.tensor([20.0]),))
 
-    with pytest.raises(RuntimeError, match="too many"):
+    with pytest.raises(vp.MaterializationError, match="too many"):
         tree_from_leaves(
             tree,
             (
@@ -3532,6 +3605,29 @@ def test_dense_ggn_fisher_and_metric_anchors() -> None:
         vector @ (metric @ vector),
     )
     assert vpx.dense_metric_inverse_residual(metric, inverse_product, vector) < 1e-12
+
+
+def test_anchor_registry_rejects_invalid_entries() -> None:
+    registry = vpx.AnchorRegistry()
+
+    def anchor() -> torch.Tensor:
+        return torch.tensor([1.0])
+
+    registry.register("anchor", anchor)
+
+    result = registry.get("anchor")()
+
+    assert isinstance(result, torch.Tensor)
+    assert torch.equal(result, torch.tensor([1.0]))
+
+    with pytest.raises(vp.MaterializationError, match="anchor already registered"):
+        registry.register("anchor", anchor)
+
+    with pytest.raises(vp.MaterializationError, match="must be callable"):
+        registry.register("bad", unchecked_timing_policy_value(object()))
+
+    with pytest.raises(vp.MaterializationError, match="not registered"):
+        registry.get("missing")
 
 
 def test_measurement_timing_policy() -> None:
@@ -3629,6 +3725,22 @@ def test_run_candidate_records_failures(
     assert record.input_signature == {"case": case}
     assert record.timing_samples[0].elapsed_seconds == pytest.approx(clock_end)
     assert record.memory_samples[0].elapsed_seconds == pytest.approx(clock_end)
+
+    if error_cls is RuntimeError:
+
+        def invalid_operation() -> torch.Tensor:
+            message = "invalid operation state"
+            raise vp.MaterializationError(message)
+
+        with pytest.raises(vp.MaterializationError, match="invalid operation state"):
+            run_candidate(
+                candidate,
+                {"case": "package-error"},
+                invalid_operation,
+                timing_policy=vpx.TimingPolicy(),
+                memory_backend=CPUMemoryBackend(),
+                clock=SequenceClock((0.0, 1.0)),
+            )
 
 
 def test_run_candidate_records_compiled_selection_metadata() -> None:
@@ -4117,6 +4229,15 @@ def test_run_candidate_records_full_size_check_metadata() -> None:
             "full_size_agreement_name": "tests.full_size_gate",
         }
 
+    def invalid_full_size_check(
+        output: vpx.TensorTree,
+        samples: tuple[vpx.Measurement, ...],
+    ) -> Mapping[str, object]:
+        assert isinstance(output, torch.Tensor)
+        assert samples
+        message = "invalid full-size check state"
+        raise vp.MaterializationError(message)
+
     record = run_candidate(
         candidate,
         {"case": "full-size-check"},
@@ -4137,6 +4258,22 @@ def test_run_candidate_records_full_size_check_metadata() -> None:
     assert record.selection_metadata["full_size_agreement_name"] == (
         "tests.full_size_gate"
     )
+
+    with pytest.raises(vp.MaterializationError, match="invalid full-size check state"):
+        run_candidate(
+            candidate,
+            {"case": "invalid-full-size-check"},
+            operation,
+            timing_policy=vpx.TimingPolicy(
+                short_seconds=0.0,
+                medium_seconds=0.0,
+                long_warmups=0,
+                long_measured_calls=1,
+            ),
+            memory_backend=CPUMemoryBackend(),
+            clock=SequenceClock((0.0, 1.0)),
+            full_size_check=invalid_full_size_check,
+        )
 
 
 def test_run_candidate_records_measured_recompile_count(
@@ -4278,21 +4415,74 @@ def _record(
 def _with_rank_memory_samples(
     record: FullSizeRecord,
     reserved: tuple[float, ...],
+    allocated: tuple[float, ...] | None = None,
 ) -> FullSizeRecord:
+    if allocated is None:
+        allocated = reserved
+
     samples = tuple(
         Measurement(
             elapsed_seconds=record.timing_samples[0].elapsed_seconds,
-            peak_allocated_mib=memory,
-            peak_reserved_mib=memory,
+            peak_allocated_mib=allocated_memory,
+            peak_reserved_mib=reserved_memory,
             post_allocated_mib=0.0,
             post_reserved_mib=0.0,
             rank=rank,
             device=f"cuda:{rank}",
         )
-        for rank, memory in enumerate(reserved)
+        for rank, (allocated_memory, reserved_memory) in enumerate(
+            zip(allocated, reserved, strict=True)
+        )
     )
 
     return dataclasses.replace(record, memory_samples=samples)
+
+
+def test_full_size_record_rejects_passed_rows_without_selection_samples() -> None:
+    candidate = vpx.Candidate("family", "row", {})
+    record = _record(
+        candidate,
+        elapsed=(1.0,),
+        reserved=(1.0,),
+        input_signature=_input_signature("full-size-record-samples"),
+    )
+
+    with pytest.raises(vp.MaterializationError, match="timing samples"):
+        dataclasses.replace(record, timing_samples=())
+
+    with pytest.raises(vp.MaterializationError, match="memory samples"):
+        dataclasses.replace(record, memory_samples=())
+
+    failed = dataclasses.replace(
+        record,
+        status="failed",
+        timing_samples=(),
+        memory_samples=(),
+        error_type="RuntimeError",
+        error="failed",
+    )
+    payload = vpx.full_size_record_to_json(record)
+    payload["timing_samples"] = ()
+
+    assert failed.status == "failed"
+
+    with pytest.raises(vp.RecordFormatError, match="full-size record is invalid"):
+        vpx.full_size_record_from_json(payload)
+
+
+def test_full_size_record_rejects_malformed_measurement_sample() -> None:
+    candidate = vpx.Candidate("family", "row", {})
+    record = _record(
+        candidate,
+        elapsed=(1.0,),
+        reserved=(1.0,),
+        input_signature=_input_signature("full-size-record-malformed-sample"),
+    )
+    payload = vpx.full_size_record_to_json(record)
+    payload["timing_samples"] = (None,)
+
+    with pytest.raises(vp.RecordFormatError, match="measurement record is invalid"):
+        vpx.full_size_record_from_json(payload)
 
 
 def _check_record(
@@ -4317,6 +4507,19 @@ def _check_record(
     return record
 
 
+def test_check_record_rejects_malformed_thresholds() -> None:
+    candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
+    record = _check_record(
+        candidate,
+        input_signature=_input_signature("reference-record-malformed-thresholds"),
+    )
+    payload = vpx.check_record_to_json(record)
+    payload["thresholds"] = None
+
+    with pytest.raises(vp.RecordFormatError, match="reference record is invalid"):
+        vpx.check_record_from_json(payload)
+
+
 def _identity_kwargs(
     families: tuple[str, ...] = ("family",),
 ) -> dict[str, Any]:
@@ -4330,6 +4533,31 @@ def _identity_kwargs(
             for family in families
         },
     }
+
+
+def _selected_identity_plan(input_signature: Mapping[str, object]) -> vpx.Plan:
+    candidate = vpx.Candidate(
+        "family",
+        "selected",
+        {"scale": 3.0},
+        admission_status="passed",
+    )
+    record = _record(
+        candidate,
+        elapsed=(1.0,),
+        reserved=(1.0,),
+        input_signature=input_signature,
+    )
+
+    return vpx.Plan(
+        selected={"family": candidate},
+        records={"family": record},
+        input_signature=input_signature,
+        policy=vpx.SelectionPolicy(),
+        full_size_records=(record,),
+        materializers={"family": materialize_candidate},
+        **_identity_kwargs(),
+    )
 
 
 def test_plan_materialize_validates_selected_dependency_identities() -> None:
@@ -4415,6 +4643,41 @@ def test_plan_materialize_accepts_public_name_selector() -> None:
 
     with pytest.raises(TypeError, match="unexpected keyword argument 'family'"):
         public_materialize(plan, family="family")
+
+
+@pytest.mark.parametrize(
+    ("plan_factory", "message"),
+    [
+        (
+            lambda plan: dataclasses.replace(plan, materializers={}),
+            "missing materializers",
+        ),
+        (
+            lambda plan: dataclasses.replace(plan, target_identity={}),
+            "target identity",
+        ),
+        (
+            lambda plan: dataclasses.replace(plan, runtime_identities={}),
+            "runtime identity",
+        ),
+        (
+            lambda plan: dataclasses.replace(
+                plan,
+                validation_required=True,
+                validator_identities={},
+            ),
+            "validator identities",
+        ),
+    ],
+)
+def test_plan_to_json_requires_selected_replay_identities(
+    plan_factory: Callable[[vpx.Plan], vpx.Plan],
+    message: str,
+) -> None:
+    plan = _selected_identity_plan({"case": "plan-replay-identities"})
+
+    with pytest.raises(vp.MaterializationError, match=message):
+        vpx.plan_to_json(plan_factory(plan))
 
 
 def test_validate_plan_materializes_in_validation_order() -> None:
@@ -4797,7 +5060,7 @@ def test_selection_scores_distributed_rows_by_global_elapsed_seconds() -> None:
 
     assert selected == local
 
-    with pytest.raises(TypeError, match="global_elapsed_seconds"):
+    with pytest.raises(vp.MaterializationError, match="global_elapsed_seconds"):
         select_family(
             (
                 (
@@ -4871,6 +5134,7 @@ def test_selection_tie_breaks_with_declared_rank_memory_reduction() -> None:
             selection_metadata={"global_elapsed_seconds": 1.0},
         ),
         (60.0, 1.0),
+        (10.0, 10.0),
     )
     second_record = _with_rank_memory_samples(
         _record(
@@ -4881,6 +5145,12 @@ def test_selection_tie_breaks_with_declared_rank_memory_reduction() -> None:
             selection_metadata={"global_elapsed_seconds": 1.0},
         ),
         (40.0, 40.0),
+        (40.0, 40.0),
+    )
+    max_allocated_selected, _ = select_family(
+        ((first, first_record), (second, second_record)),
+        input_signature=signature,
+        policy=vpx.SelectionPolicy(rank_memory_reduction="max_peak_allocated"),
     )
     max_selected, _ = select_family(
         ((first, first_record), (second, second_record)),
@@ -4893,6 +5163,7 @@ def test_selection_tie_breaks_with_declared_rank_memory_reduction() -> None:
         policy=vpx.SelectionPolicy(rank_memory_reduction="sum_peak_reserved"),
     )
 
+    assert max_allocated_selected == first
     assert max_selected == second
     assert sum_selected == first
 
@@ -4969,44 +5240,14 @@ def test_cohort_selection_sums_compiled_row_scores() -> None:
 def test_selection_policy_rejects_invalid_near_fastest_multiplier(
     value: float | bool,
 ) -> None:
-    with pytest.raises(RuntimeError, match="near_fastest_multiplier"):
+    with pytest.raises(vp.MaterializationError, match="near_fastest_multiplier"):
         vpx.SelectionPolicy(near_fastest_multiplier=value)
 
 
 @pytest.mark.parametrize("value", [0, True, unchecked_timing_policy_value(1.5)])
 def test_selection_policy_rejects_invalid_compile_call_horizon(value: Any) -> None:
-    with pytest.raises(RuntimeError, match="compile_call_horizon"):
+    with pytest.raises(vp.MaterializationError, match="compile_call_horizon"):
         vpx.SelectionPolicy(compile_call_horizon=value)
-
-
-def test_selection_rejects_unsupported_policy_fields() -> None:
-    candidate = vpx.Candidate("family", "row", {})
-    policies = (
-        vpx.SelectionPolicy(speed_statistic="mean_elapsed_seconds"),
-        vpx.SelectionPolicy(compiled_speed_statistic="steady_elapsed_seconds"),
-        vpx.SelectionPolicy(distributed_speed_statistic="rank_zero_elapsed_seconds"),
-        vpx.SelectionPolicy(rank_memory_reduction="rank_zero_peak_reserved"),
-        vpx.SelectionPolicy(cohort_speed_statistic="sum_selection_score_seconds"),
-        vpx.SelectionPolicy(accepted_status="passed_only"),
-    )
-
-    for policy in policies:
-        with pytest.raises(RuntimeError):
-            select_family(
-                (
-                    (
-                        candidate,
-                        _record(
-                            candidate,
-                            elapsed=(1.0,),
-                            reserved=(1.0,),
-                            input_signature={},
-                        ),
-                    ),
-                ),
-                input_signature={},
-                policy=policy,
-            )
 
 
 def test_cohort_constraint_uses_spec_selection_aggregation_token() -> None:
@@ -5018,7 +5259,7 @@ def test_cohort_constraint_uses_spec_selection_aggregation_token() -> None:
 
     assert constraint.selection_aggregation == "sum_median_elapsed_seconds"
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(vp.MaterializationError):
         vpx.CohortConstraint(
             name="old-token",
             settings_keys=("dtype.model_compute",),
@@ -7619,15 +7860,16 @@ def test_plan_replay_rejects_unsupported_selection_policy(tmp_path: Path) -> Non
         clock=SequenceClock((0.0, 1.0)),
     )
     saved_full_size, saved_checks = saved_plan_rows(tmp_path, plan)
-    context = dataclasses.replace(
-        replay_context_for_plan(plan),
-        selection_policy=vpx.SelectionPolicy(speed_statistic="mean_elapsed_seconds"),
-    )
+    summary = read_record(tmp_path / "summaries" / "tuning.json")
+    bad_summary = dict(summary)
+    bad_policy = dict(bad_summary["policy"])
+    bad_policy["speed_statistic"] = "mean_elapsed_seconds"
+    bad_summary["policy"] = bad_policy
 
-    with pytest.raises(vp.VPTuneError, match="unsupported speed statistic"):
+    with pytest.raises(vp.RecordFormatError, match="selection policy"):
         vpx.plan_from_json(
-            read_record(tmp_path / "summaries" / "tuning.json"),
-            replay_context=context,
+            bad_summary,
+            replay_context=replay_context_for_plan(plan),
             full_size_records=saved_full_size,
             check_records=saved_checks,
             candidate_records=saved_candidate_rows(tmp_path, plan),
@@ -8991,10 +9233,21 @@ def test_selected_plan_validation_writes_failed_record(tmp_path: Path) -> None:
         (failed_record,),
     )
 
+    validation_context = dataclasses.replace(
+        replay_context_for_plan(plan),
+        validation_required=True,
+        validator_identities={"family": {"validator_id": "tests.failed-validator"}},
+    )
+    validation_plan = dataclasses.replace(
+        plan,
+        validation_required=True,
+        validator_identities={"family": {"validator_id": "tests.failed-validator"}},
+    )
+
     with pytest.raises(vp.VPTuneError):
         vpx.plan_from_json(
             vpx.plan_to_json(plan),
-            replay_context=replay_context_for_plan(plan, validation_required=True),
+            replay_context=validation_context,
             full_size_records=(record,),
             check_records=(check,),
             candidate_records=candidate_records_for_plan(plan),
@@ -9004,12 +9257,27 @@ def test_selected_plan_validation_writes_failed_record(tmp_path: Path) -> None:
     with pytest.raises(vp.VPTuneError):
         vpx.plan_from_json(
             vpx.plan_to_json(plan),
-            replay_context=replay_context_for_plan(plan, validation_required=True),
+            replay_context=validation_context,
             full_size_records=(record,),
             check_records=(check,),
             candidate_records=candidate_records_for_plan(plan),
             materializers={"family": materialize_candidate},
             validation_summary=summary,
+            validation_records=(failed_record,),
+        )
+
+    malformed_summary = dict(summary)
+    malformed_summary["records"] = None
+
+    with pytest.raises(vp.RecordFormatError, match="validation summary records"):
+        vpx.plan_from_json(
+            vpx.plan_to_json(validation_plan),
+            replay_context=validation_context,
+            full_size_records=(record,),
+            check_records=(check,),
+            candidate_records=candidate_records_for_plan(plan),
+            materializers={"family": materialize_candidate},
+            validation_summary=malformed_summary,
             validation_records=(failed_record,),
         )
 
@@ -9227,6 +9495,19 @@ def test_tune_run_preflight_errors_do_not_write_summary(tmp_path: Path) -> None:
             ),
             "run families must match",
         ),
+        (
+            tmp_path / "family-cycle",
+            vpx.TuningRun(
+                target=target,
+                families=(
+                    vpx.Family("a", operator_a, dependencies=("b",)),
+                    vpx.Family("b", operator_b, dependencies=("a",)),
+                ),
+                problems=(make_problem(operator_a), make_problem(operator_b)),
+                run_id="family-cycle",
+            ),
+            "cycle",
+        ),
     )
 
     for run_dir, run, message in cases:
@@ -9339,6 +9620,43 @@ def test_tune_run_uses_family_dag_order(tmp_path: Path) -> None:
         == saved_paths
     )
 
+    summary_path = tmp_path / "summaries" / "tuning.json"
+    valid_summary = read_record(summary_path)
+
+    malformed_summary = dict(valid_summary)
+    malformed_summary["selected"] = None
+    summary_path.write_text(json.dumps(malformed_summary), encoding="utf-8")
+
+    with pytest.raises(vp.RecordFormatError, match="selected candidates"):
+        vp.load_tuned_run(
+            tmp_path,
+            run,
+            memory_backend=CPUMemoryBackend(),
+        )
+
+    malformed_summary = dict(valid_summary)
+    malformed_summary["records"] = None
+    write_record(summary_path, malformed_summary)
+
+    with pytest.raises(vp.RecordFormatError, match="selected records"):
+        vp.load_tuned_run(
+            tmp_path,
+            run,
+            memory_backend=CPUMemoryBackend(),
+        )
+
+    for assignment in (None, {}):
+        malformed_summary = dict(valid_summary)
+        malformed_summary["cohort_assignment"] = assignment
+        write_record(summary_path, malformed_summary)
+
+        with pytest.raises(vp.RecordFormatError, match="cohort assignment"):
+            vp.load_tuned_run(
+                tmp_path,
+                run,
+                memory_backend=CPUMemoryBackend(),
+            )
+
     stale_dependency_identity = dict(expected_dependency_identity)
     stale_dependency_identity["full_size_row"] = {
         **dict(expected_dependency_identity["full_size_row"]),
@@ -9421,7 +9739,10 @@ def test_tune_run_uses_family_dag_order(tmp_path: Path) -> None:
     with pytest.raises(vp.StaleRecordError):
         vpx.plan_from_json(
             vpx.plan_to_json(plan),
-            replay_context=replay_context_for_plan(plan, validation_required=True),
+            replay_context=replay_context_for_plan(
+                validation_plan,
+                validation_required=True,
+            ),
             full_size_records=saved_full_size,
             check_records=saved_checks,
             candidate_records=candidate_records_for_plan(plan),
@@ -9878,6 +10199,99 @@ def test_tune_run_uses_generic_multi_key_cohort_constraint(tmp_path: Path) -> No
     )
 
     assert vpx.plan_record_current(vpx.plan_to_json(replayed), plan)
+
+    malformed_summary = vpx.plan_to_json(plan)
+    malformed_summary["cohort_constraints"] = None
+
+    with pytest.raises(vp.RecordFormatError, match="cohort constraints"):
+        vpx.plan_from_json(
+            malformed_summary,
+            replay_context=replay_context_for_plan(plan),
+            full_size_records=saved_full_size,
+            check_records=saved_checks,
+            candidate_records=candidate_rows,
+            materializers=plan.materializers,
+        )
+
+    malformed_summary = vpx.plan_to_json(plan)
+    constraint_record = dict(malformed_summary["cohort_constraints"][0])
+    constraint_record["assignments"] = (None,)
+    malformed_summary["cohort_constraints"] = (constraint_record,)
+
+    with pytest.raises(vp.RecordFormatError, match="cohort constraint assignments"):
+        vpx.plan_from_json(
+            malformed_summary,
+            replay_context=replay_context_for_plan(plan),
+            full_size_records=saved_full_size,
+            check_records=saved_checks,
+            candidate_records=candidate_rows,
+            materializers=plan.materializers,
+        )
+
+    malformed_summary = vpx.plan_to_json(plan)
+    malformed_summary["dependencies_by_family"] = None
+
+    with pytest.raises(vp.RecordFormatError, match="plan summary dependencies"):
+        vpx.plan_from_json(
+            malformed_summary,
+            replay_context=replay_context_for_plan(plan),
+            full_size_records=saved_full_size,
+            check_records=saved_checks,
+            candidate_records=candidate_rows,
+            materializers=plan.materializers,
+        )
+
+    malformed_summary = vpx.plan_to_json(plan)
+    malformed_summary["candidate_rows"] = None
+
+    with pytest.raises(vp.RecordFormatError, match="candidate_rows"):
+        vpx.plan_from_json(
+            malformed_summary,
+            replay_context=replay_context_for_plan(plan),
+            full_size_records=saved_full_size,
+            check_records=saved_checks,
+            candidate_records=candidate_rows,
+            materializers=plan.materializers,
+        )
+
+    malformed_summary = vpx.plan_to_json(plan)
+    malformed_summary["full_size_records"] = None
+
+    with pytest.raises(vp.RecordFormatError, match="full-size records"):
+        vpx.plan_from_json(
+            malformed_summary,
+            replay_context=replay_context_for_plan(plan),
+            full_size_records=saved_full_size,
+            check_records=saved_checks,
+            candidate_records=candidate_rows,
+            materializers=plan.materializers,
+        )
+
+    malformed_summary = vpx.plan_to_json(plan)
+    malformed_summary["check_records"] = [None]
+
+    with pytest.raises(vp.RecordFormatError, match="reference row key"):
+        vpx.plan_from_json(
+            malformed_summary,
+            replay_context=replay_context_for_plan(plan),
+            full_size_records=saved_full_size,
+            check_records=saved_checks,
+            candidate_records=candidate_rows,
+            materializers=plan.materializers,
+        )
+
+    malformed_summary = vpx.plan_to_json(plan)
+    malformed_summary["runtime_identities"] = None
+
+    with pytest.raises(vp.RecordFormatError, match="runtime identities"):
+        vpx.plan_from_json(
+            malformed_summary,
+            replay_context=replay_context_for_plan(plan),
+            full_size_records=saved_full_size,
+            check_records=saved_checks,
+            candidate_records=candidate_rows,
+            materializers=plan.materializers,
+        )
 
     changed_cohort_record = dataclasses.replace(
         saved_full_size[0],

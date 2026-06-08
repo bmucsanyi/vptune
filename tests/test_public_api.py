@@ -12,6 +12,7 @@ import vptune.ext as vpx
 import vptune.public as public_module
 import vptune.run as run_module
 import vptune.runtime as runtime_module
+from vptune.io import read_record, write_record
 from vptune.tensor_tree import tree_leaves
 
 
@@ -2652,6 +2653,67 @@ def test_public_operator_load_rejects_stale_model_identity(
     model.module.eval()
 
     with pytest.raises(vp.MaterializationError, match="model identity differs"):
+        vp.gradient(model, loss, name="grad_product").load(run_dir)
+
+
+def test_public_operator_load_reports_malformed_saved_policy_as_record_format(
+    tmp_path: Path,
+) -> None:
+    model = typed_metric_model()
+    loss = vp.loss.from_scalar(
+        squared_weight_loss,
+        output="logits",
+        version="squared-weight-v1",
+    )
+    product = vp.gradient(model, loss, name="grad_product")
+    batch = {"x": torch.tensor([[1.0, 2.0]], dtype=torch.float64)}
+    run_dir = tmp_path / "operator"
+    vector = typed_vector()
+
+    product.tune(
+        data=(batch,),
+        vectors=(vector,),
+        target=public_cpu_target(),
+        space=vp.space.standard(),
+        search=vp.search.exhaustive(),
+        run_dir=run_dir,
+    )
+    summary_path = run_dir / "summaries" / "tuning.json"
+    summary = read_record(summary_path)
+    malformed_summary = dict(summary)
+    malformed_summary["input_signature"] = None
+    write_record(summary_path, malformed_summary)
+
+    with pytest.raises(vp.RecordFormatError, match="input_signature"):
+        vp.gradient(model, loss, name="grad_product").load(run_dir)
+
+    malformed_summary = dict(summary)
+    malformed_summary["validation_order"] = None
+    write_record(summary_path, malformed_summary)
+
+    with pytest.raises(vp.RecordFormatError, match="validation_order"):
+        vp.gradient(model, loss, name="grad_product").load(run_dir)
+
+    malformed_summary = dict(summary)
+    malformed_summary["validation_required"] = "yes"
+    write_record(summary_path, malformed_summary)
+
+    with pytest.raises(vp.RecordFormatError, match="validation_required"):
+        vp.gradient(model, loss, name="grad_product").load(run_dir)
+
+    malformed_summary = dict(summary)
+    malformed_summary["policy"] = None
+    write_record(summary_path, malformed_summary)
+
+    with pytest.raises(vp.RecordFormatError, match="selection policy"):
+        vp.gradient(model, loss, name="grad_product").load(run_dir)
+
+    policy = dict(summary["policy"])
+    policy["rank_memory_reduction"] = "invalid"
+    summary["policy"] = policy
+    write_record(summary_path, summary)
+
+    with pytest.raises(vp.RecordFormatError, match="selection policy"):
         vp.gradient(model, loss, name="grad_product").load(run_dir)
 
 

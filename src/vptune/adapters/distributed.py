@@ -2770,11 +2770,11 @@ def reduce_rank_statuses(statuses: Sequence[RankStatus]) -> dict[str, Any]:
     """Return global status from rank-local statuses.
 
     Raises:
-        RuntimeError: If no rank status is supplied.
+        MaterializationError: If no rank status is supplied.
     """
     if not statuses:
         message = "distributed status reduction requires rank statuses"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     failed = tuple(status for status in statuses if status.status != "passed")
 

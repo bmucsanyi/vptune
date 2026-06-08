@@ -5,6 +5,8 @@ from typing import Any, TypeGuard
 
 import torch
 
+from vptune.errors import MaterializationError
+
 TensorTree = torch.Tensor | tuple["TensorTree", ...] | dict[str, "TensorTree"]
 
 
@@ -14,6 +16,10 @@ def _is_tree_dict(tree: TensorTree) -> TypeGuard[dict[str, TensorTree]]:
 
 def _is_tree_tuple(tree: TensorTree) -> TypeGuard[tuple[TensorTree, ...]]:
     return isinstance(tree, tuple)
+
+
+def _is_tree_node(tree: object) -> bool:
+    return isinstance(tree, torch.Tensor | dict | tuple)
 
 
 def tree_map(
@@ -51,33 +57,38 @@ def tree_map2(
         Mapped tensor tree.
 
     Raises:
-        RuntimeError: If matching container sizes differ.
-        TypeError: If tree structures differ.
+        MaterializationError: If matching containers, structures, or tensor shapes
+            differ.
+        TypeError: If a leaf is not a tensor tree node.
     """
     if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
         if left.shape != right.shape:
             message = "tensor tree tensor shapes differ"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         return fn(left, right)
 
     if _is_tree_dict(left) and _is_tree_dict(right):
         if set(left) != set(right):
             message = "tensor tree mapping keys differ"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         return {key: tree_map2(fn, left[key], right[key]) for key in left}
 
     if _is_tree_tuple(left) and _is_tree_tuple(right):
         if len(left) != len(right):
             message = "tensor tree sequence lengths differ"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         return tuple(
             tree_map2(fn, lval, rval) for lval, rval in zip(left, right, strict=True)
         )
 
-    message = "tensor tree structures differ"
+    if _is_tree_node(left) and _is_tree_node(right):
+        message = "tensor tree structures differ"
+        raise MaterializationError(message)
+
+    message = "unsupported tensor tree node"
     raise TypeError(message)
 
 
@@ -117,7 +128,7 @@ def tree_from_leaves(
     """Return a tensor tree with the template structure and supplied leaves.
 
     Raises:
-        RuntimeError: If too many leaves are supplied.
+        MaterializationError: If the leaf count differs from the template.
     """
     index = 0
 
@@ -127,7 +138,7 @@ def tree_from_leaves(
         if isinstance(node, torch.Tensor):
             if index >= len(leaves):
                 message = "too few tensor leaves supplied"
-                raise RuntimeError(message)
+                raise MaterializationError(message)
 
             leaf = leaves[index]
             index += 1
@@ -147,7 +158,7 @@ def tree_from_leaves(
 
     if index != len(leaves):
         message = "too many tensor leaves supplied"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     return result
 
@@ -368,11 +379,11 @@ def _foreach_binary_groups(
     for index, (left, right) in enumerate(zip(left_leaves, right_leaves, strict=True)):
         if left.device != right.device:
             message = "foreach tensor pairs must be on the same device"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         if left.dtype != right.dtype:
             message = "foreach tensor pairs must have the same dtype"
-            raise RuntimeError(message)
+            raise MaterializationError(message)
 
         key = (left.device, left.dtype)
 

@@ -41,6 +41,7 @@ from vptune.errors import (
     AdmissionError,
     MaterializationError,
     NoPassedCandidateError,
+    RecordFormatError,
     ReferenceFailedError,
 )
 from vptune.identities import canonical_json, stable_hash
@@ -60,17 +61,19 @@ from vptune.runtime import (
     standard_runtime_with_matrix_free_bindings,
 )
 from vptune.schemas import (
-    candidate_from_signature,
     candidate_record_from_json,
     candidate_record_to_json,
     check_record_from_json,
     check_record_to_json,
+    cohort_assignment_from_json,
     full_size_record_from_json,
     full_size_record_to_json,
     plan_from_json,
     plan_to_json,
+    selected_candidates_from_json,
     selected_plan_validation_input_signature,
     selected_plan_validation_summary_record,
+    selected_records_from_json,
 )
 from vptune.select import (
     record_accepted,
@@ -213,15 +216,15 @@ def _probe_inputs(problem: Problem) -> tuple[tuple[Batch, TensorTree], ...]:
 
     if not batches:
         message = "problem data provider must return probe batches"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     if not vectors:
         message = "problem vector provider must return probe vectors"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     if len(batches) != len(vectors):
         message = "probe batch count must match probe vector count"
-        raise RuntimeError(message)
+        raise MaterializationError(message)
 
     return tuple(zip(batches, vectors, strict=True))
 
@@ -3918,11 +3921,8 @@ def load_tuned_run(
     index = _run_problem_index(run, run_dir)
     _validate_run_validators(run, index.family_names)
     summary = read_record(run_dir / "summaries" / "tuning.json")
-    selected = {
-        str(family): candidate_from_signature(dict(candidate_record))
-        for family, candidate_record in dict(summary["selected"]).items()
-    }
-    selected_records = _selected_records_for_summary(run_dir, summary)
+    selected = selected_candidates_from_json(summary)
+    selected_records = _selected_records_for_summary(run_dir, summary, selected)
     materializers = {
         family: _runtime(index.problems_by_family[family]).materializer
         for family in index.family_names
@@ -3948,26 +3948,14 @@ def load_tuned_run(
 def _selected_records_for_summary(
     run_dir: Path,
     summary: Mapping[str, Any],
+    selected: Mapping[str, Candidate],
 ) -> dict[str, FullSizeRecord]:
     full_size_records = tuple(
         full_size_record_from_json(read_record(path))
         for path in sorted((run_dir / "full_size").rglob("*.json"))
     )
-    full_size_by_key = {
-        canonical_json(record.row_key()): record for record in full_size_records
-    }
-    selected_records = {}
 
-    for family, row_key in dict(summary["records"]).items():
-        record = full_size_by_key.get(canonical_json(row_key))
-
-        if record is None:
-            message = f"run replay selected full-size row is missing: {family}"
-            raise MaterializationError(message)
-
-        selected_records[str(family)] = record
-
-    return selected_records
+    return selected_records_from_json(summary, selected, full_size_records)
 
 
 def _replay_context_for_run(
@@ -3986,7 +3974,11 @@ def _replay_context_for_run(
     records_so_far = {}
     family_input_signatures = {}
     runtime_identities = {}
-    assignment = _cohort_assignment_from_record(summary["cohort_assignment"])
+    assignment = cohort_assignment_from_json(summary["cohort_assignment"])
+
+    if assignment is None:
+        message = "run replay cohort assignment is missing"
+        raise RecordFormatError(message)
 
     for family in ordered_families:
         problem = problems_by_family[family.name]
@@ -4047,15 +4039,6 @@ def _replay_context_for_run(
         },
         validation_required=len(run.validators) > 0,
         validation_order=family_names,
-    )
-
-
-def _cohort_assignment_from_record(record: Mapping[str, Any]) -> CohortAssignment:
-    return CohortAssignment(
-        assignment_id=str(record["assignment_id"]),
-        values=dict(record["values"]),
-        constraints=tuple(str(name) for name in record["constraints"]),
-        covered_families=tuple(str(family) for family in record["covered_families"]),
     )
 
 
