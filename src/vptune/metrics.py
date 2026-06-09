@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-from vptune import runtime, runtime_values, vectorization
+from vptune import layout, runtime, runtime_values, vectorization
 from vptune.anchors import (
     dense_metric_inverse_multiply,
     dense_metric_multiply,
@@ -243,7 +243,7 @@ def _inverse_metric_inner_residual(
             batch,
             params,
         )
-        applied = runtime.matmul_runtime(
+        applied = layout.matmul_runtime(
             candidate.settings,
             solution_matrix,
             inverse_matrix.T,
@@ -499,7 +499,7 @@ def _diagonal_inverse_denominator(
     runtime_diagonal = runtime.runtime_intermediate_tree(diagonal, settings)
     damping_tree = _diagonal_group_damping_tree(operator, runtime_diagonal)
 
-    if runtime.layout_vector_ops(settings) == "foreach":
+    if layout.layout_vector_ops(settings) == "foreach":
         return tree_add_foreach(runtime_diagonal, damping_tree)
 
     return tree_map2(torch.add, runtime_diagonal, damping_tree)
@@ -669,7 +669,7 @@ def _block_diagonal_apply(
             message = "metric blocks do not match vector length"
             raise MaterializationError(message)
 
-        parts.append(runtime.matmul_runtime(settings, block, part))
+        parts.append(layout.matmul_runtime(settings, block, part))
         offset += width
 
     if offset != vector.numel():
@@ -783,11 +783,11 @@ def _low_rank_metric_multiply(
     basis, diagonal = _low_rank_factors(batch, vector)
     basis = runtime.runtime_intermediate_tensor(basis, settings)
     diagonal = runtime.runtime_intermediate_tensor(diagonal, settings)
-    basis_projection = runtime.matmul_runtime(settings, basis.T, flat_vector)
+    basis_projection = layout.matmul_runtime(settings, basis.T, flat_vector)
     result = (
         runtime.accumulation_tensor(diagonal, settings)
         * runtime.accumulation_tensor(flat_vector, settings)
-    ) + runtime.matmul_runtime(settings, basis, basis_projection)
+    ) + layout.matmul_runtime(settings, basis, basis_projection)
     runtime_values.require_finite_tensor(result, "low-rank metric result")
 
     return runtime_values.wrap_flat_vector(vector, result)
@@ -1251,9 +1251,9 @@ def _ekfac_apply_leaf(
 ) -> torch.Tensor:
     spectrum = eigenvalues + damping if inverse else eigenvalues
     _require_positive_spectrum(spectrum.reshape(-1), "EKFAC spectrum")
-    rotated = runtime.matmul_runtime(
+    rotated = layout.matmul_runtime(
         settings,
-        runtime.matmul_runtime(settings, eigvecs_a.T, value),
+        layout.matmul_runtime(settings, eigvecs_a.T, value),
         eigvecs_g,
     )
 
@@ -1265,9 +1265,9 @@ def _ekfac_apply_leaf(
         factors = spectrum
 
     scaled = factors * rotated
-    result = runtime.matmul_runtime(
+    result = layout.matmul_runtime(
         settings,
-        runtime.matmul_runtime(settings, eigvecs_a, scaled),
+        layout.matmul_runtime(settings, eigvecs_a, scaled),
         eigvecs_g.T,
     )
     runtime_values.require_finite_tensor(result, "EKFAC metric result")
@@ -1421,9 +1421,9 @@ def _ggn_metric_multiply(
     _ = operator
     flat_vector = runtime_values.flatten_vector(vector)
     jacobian, loss_hessian = _ggn_metric_factors(batch, vector)
-    output_vector = runtime.matmul_runtime(settings, jacobian, flat_vector)
-    loss_vector = runtime.matmul_runtime(settings, loss_hessian, output_vector)
-    result = runtime.matmul_runtime(settings, jacobian.T, loss_vector)
+    output_vector = layout.matmul_runtime(settings, jacobian, flat_vector)
+    loss_vector = layout.matmul_runtime(settings, loss_hessian, output_vector)
+    result = layout.matmul_runtime(settings, jacobian.T, loss_vector)
     runtime_values.require_finite_tensor(result, "GGN-derived metric result")
 
     return runtime_values.wrap_flat_vector(vector, result)
@@ -2528,7 +2528,7 @@ def _metric_inner_reduce_matrices(
         message = "metric inner block widths differ"
         raise MaterializationError(message)
 
-    result = runtime.matmul_runtime(
+    result = layout.matmul_runtime(
         execution.candidate.settings, left_matrix, right_matrix.T
     )
     runtime_values.require_finite_tensor(result, "metric inner block result")
@@ -3190,7 +3190,7 @@ def metric_multiply_by_path(
         vector_tensor = runtime_values.flatten_vector(vector)
         runtime_values.require_finite_tensor(matrix, "metric matrix")
         runtime_values.require_finite_tensor(vector_tensor, "metric vector")
-        flat_result = runtime.matmul_runtime(settings, matrix, vector_tensor)
+        flat_result = layout.matmul_runtime(settings, matrix, vector_tensor)
         runtime_values.require_finite_tensor(flat_result, "metric result")
 
         return runtime_values.wrap_flat_vector(vector, flat_result)
@@ -3294,9 +3294,9 @@ def _streaming_kfac_metric_multiply(
         right: torch.Tensor,
         value: torch.Tensor,
     ) -> torch.Tensor:
-        left_product = runtime.matmul_runtime(settings, left, value)
+        left_product = layout.matmul_runtime(settings, left, value)
 
-        return runtime.matmul_runtime(settings, left_product, right.T)
+        return layout.matmul_runtime(settings, left_product, right.T)
 
     return _kfac_block_results(
         _kfac_blocks(operator),
@@ -4340,9 +4340,9 @@ class KFACMetricOperator:
             right: torch.Tensor,
             value: torch.Tensor,
         ) -> torch.Tensor:
-            return runtime.matmul_runtime(
+            return layout.matmul_runtime(
                 self.settings,
-                runtime.matmul_runtime(self.settings, left, value),
+                layout.matmul_runtime(self.settings, left, value),
                 right.T,
             )
 
@@ -5094,7 +5094,7 @@ def _tree_elementwise_mul_runtime(
     left = runtime.runtime_intermediate_tree(left, settings)
     right = runtime.runtime_intermediate_tree(right, settings)
 
-    if runtime.layout_vector_ops(settings) == "foreach":
+    if layout.layout_vector_ops(settings) == "foreach":
         return tree_elementwise_mul_foreach(left, right)
 
     return tree_map2(torch.mul, left, right)
@@ -5108,7 +5108,7 @@ def _tree_elementwise_div_runtime(
     left = runtime.runtime_intermediate_tree(left, settings)
     right = runtime.runtime_intermediate_tree(right, settings)
 
-    if runtime.layout_vector_ops(settings) == "foreach":
+    if layout.layout_vector_ops(settings) == "foreach":
         return tree_elementwise_div_foreach(left, right)
 
     return tree_map2(torch.div, left, right)
@@ -5121,7 +5121,7 @@ def _tree_add_scalar_runtime(
 ) -> TensorTree:
     tree = runtime.runtime_intermediate_tree(tree, settings)
 
-    if runtime.layout_vector_ops(settings) == "foreach":
+    if layout.layout_vector_ops(settings) == "foreach":
         return tree_add_scalar_foreach(tree, scalar)
 
     return tree_map(lambda tensor: tensor + scalar, tree)

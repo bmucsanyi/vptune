@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from vptune import derivatives, runtime, runtime_values, vectorization
+from vptune import derivatives, layout, runtime, runtime_values, vectorization
 from vptune.anchors import (
     jvp_anchor,
 )
@@ -56,7 +56,7 @@ def ggn_inner_product_measurements(
         batch,
         symmetry_vector,
     )()
-    left = runtime.layout_aware_tree_dot(
+    left = layout.layout_aware_tree_dot(
         candidate.settings,
         runtime.runtime_vector(
             symmetry_vector,
@@ -66,7 +66,7 @@ def ggn_inner_product_measurements(
         ),
         candidate_output,
     )
-    right = runtime.layout_aware_tree_dot(
+    right = layout.layout_aware_tree_dot(
         candidate.settings,
         runtime.runtime_vector(
             vector,
@@ -326,7 +326,7 @@ def augment_ggn_dense_cross_check(
         ),
     )
     dense_output = candidate_factory(dense_candidate, batch, vector)()
-    errors = runtime.layout_aware_tree_error_measurements(
+    errors = layout.layout_aware_tree_error_measurements(
         candidate,
         candidate_output,
         dense_output,
@@ -853,7 +853,7 @@ def _ggn_autodiff_loss_hvp(
         runtime_values.require_finite_tensor(flat_output_jvp, "GGN output JVP")
 
     def output_loss(flat_value: torch.Tensor) -> torch.Tensor:
-        hessian_value = runtime.matmul_runtime(
+        hessian_value = layout.matmul_runtime(
             execution.candidate.settings,
             loss_hessian,
             flat_value,
@@ -1158,7 +1158,7 @@ def _jacobian_transpose_product(
     )
 
     if ranges is None:
-        return runtime.matmul_runtime(settings, jacobian.T, cotangent)
+        return layout.matmul_runtime(settings, jacobian.T, cotangent)
 
     if jacobian.ndim != runtime_values.MATRIX_DIMS:
         message = "GGN jacobian must be two-dimensional"
@@ -1176,7 +1176,7 @@ def _jacobian_transpose_product(
 
     for start, stop in ranges:
         chunks.append(
-            runtime.matmul_runtime(settings, jacobian[:, start:stop].T, cotangent)
+            layout.matmul_runtime(settings, jacobian[:, start:stop].T, cotangent)
         )
 
     return torch.cat(tuple(chunks))

@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from vptune import fisher, runtime, runtime_values, vectorization
+from vptune import fisher, layout, runtime, runtime_values, vectorization
 from vptune.anchors import (
     finite_difference_hvp,
     forward_ad_jvp_anchor,
@@ -113,7 +113,7 @@ def hvp_finite_difference_measurements(
         params,
         vector,
     )
-    errors = runtime.layout_aware_tree_error_measurements(
+    errors = layout.layout_aware_tree_error_measurements(
         candidate,
         candidate_output,
         finite_difference,
@@ -132,7 +132,7 @@ def hvp_finite_difference_measurements(
         batch,
         symmetry_vector,
     )()
-    left = runtime.layout_aware_tree_dot(
+    left = layout.layout_aware_tree_dot(
         candidate.settings,
         runtime.runtime_vector(
             symmetry_vector,
@@ -142,7 +142,7 @@ def hvp_finite_difference_measurements(
         ),
         candidate_output,
     )
-    right = runtime.layout_aware_tree_dot(
+    right = layout.layout_aware_tree_dot(
         candidate.settings,
         runtime.runtime_vector(
             vector,

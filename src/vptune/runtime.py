@@ -11,7 +11,15 @@ from typing import Any
 import torch
 from torch.utils.checkpoint import checkpoint, noop_context_fn
 
-from vptune import derivatives, fisher, ggn, metrics, runtime_values, vectorization
+from vptune import (
+    derivatives,
+    fisher,
+    ggn,
+    layout,
+    metrics,
+    runtime_values,
+    vectorization,
+)
 from vptune.admission import (
     FUNCTIONAL_CALL_FIELDS,
     TORCH_FUNC_FIELDS,
@@ -395,7 +403,7 @@ def _first_order_reference_measurements(
             return scalar(active_params, buffers, batch, context)
 
         finite_difference = finite_difference_jvp(scalar_function, params, vector)
-        directional = layout_aware_tree_dot(
+        directional = layout.layout_aware_tree_dot(
             candidate.settings,
             candidate_output,
             vector,
@@ -425,7 +433,7 @@ def _first_order_reference_measurements(
             )
 
         finite_difference = finite_difference_jvp(tensor_function, params, vector)
-        errors = layout_aware_tree_error_measurements(
+        errors = layout.layout_aware_tree_error_measurements(
             candidate,
             candidate_output,
             finite_difference,
@@ -1016,7 +1024,7 @@ def _execution_with_inside_input_residency(
 
     return dataclasses.replace(
         execution,
-        batch=_runtime_batch_input_residency(
+        batch=runtime_batch_input_residency(
             execution.batch,
             execution.candidate.settings,
         ),
@@ -1751,7 +1759,7 @@ def _standard_reference_measurements(
     function_objectives: Mapping[str, FunctionObjective],
     parameter_surface: ParameterSurface | None,
 ) -> dict[str, Any]:
-    measurements = layout_aware_tree_error_measurements(
+    measurements = layout.layout_aware_tree_error_measurements(
         candidate,
         candidate_output,
         anchor_output,
@@ -1828,45 +1836,6 @@ def _standard_reference_measurements(
     )
 
     return measurements
-
-
-def layout_aware_tree_error_measurements(
-    candidate: Candidate,
-    candidate_output: TensorTree,
-    anchor_output: TensorTree,
-) -> dict[str, float]:
-    """Return layout-aware tree error measurements.
-
-    Returns:
-        The layout-aware tree error measurements.
-    """
-    if candidate.settings.get("layout.output") != "flat_contiguous":
-        return tree_error_measurements(candidate_output, anchor_output)
-
-    return tree_error_measurements(
-        runtime_values.flatten_vector(candidate_output),
-        runtime_values.flatten_vector(anchor_output),
-    )
-
-
-def layout_aware_tree_dot(
-    settings: Mapping[str, Any],
-    left: TensorTree,
-    right: TensorTree,
-) -> torch.Tensor:
-    """Return the layout-aware dot product of two trees.
-
-    Returns:
-        The layout-aware dot product of two trees.
-    """
-    if settings.get("layout.output") != "flat_contiguous":
-        return tree_dot_runtime(settings, left, right)
-
-    return dot_runtime(
-        settings,
-        runtime_values.flatten_vector(left),
-        runtime_values.flatten_vector(right),
-    )
 
 
 def _runtime_callable_identity(
@@ -2471,7 +2440,7 @@ def parameter_blocked_matrix_vector_product(
     )
 
     if column_ranges is None:
-        return matmul_runtime(settings, matrix, vector)
+        return layout.matmul_runtime(settings, matrix, vector)
 
     if matrix.ndim != runtime_values.MATRIX_DIMS:
         message = "parameter-block matrix must be two-dimensional"
@@ -2489,7 +2458,7 @@ def parameter_blocked_matrix_vector_product(
 
     for start, stop in column_ranges:
         chunks.append(
-            matmul_runtime(settings, matrix[:, start:stop], vector[start:stop])
+            layout.matmul_runtime(settings, matrix[:, start:stop], vector[start:stop])
         )
 
     result = chunks[0]
@@ -2864,7 +2833,7 @@ def require_supported_standard_settings(
         raise MaterializationError(message)
 
     path = runtime_path(operator, candidate)
-    _require_dtype_runtime_settings(candidate.settings)
+    layout.require_dtype_runtime_settings(candidate.settings)
     _require_teacher_output_settings(candidate.settings)
     _require_input_schedule_settings(operator, path, candidate.settings, batch_layout)
     _require_input_residency_settings(candidate.settings)
@@ -2930,26 +2899,7 @@ def require_supported_standard_settings(
     metrics.require_inverse_metric_multi_rhs_settings(
         operator, path, candidate.settings
     )
-    _require_layout_runtime_settings(candidate.settings)
-
-
-def _require_dtype_runtime_settings(settings: Mapping[str, Any]) -> None:
-    model_compute = settings.get("dtype.model_compute")
-    autodiff_compute = settings.get("dtype.autodiff_compute")
-
-    if model_compute is None or autodiff_compute is None:
-        return
-
-    if model_compute == autodiff_compute:
-        return
-
-    if settings.get("call.path") == "stateful_module":
-        return
-
-    message = (
-        "split model and autodiff compute dtypes require call.path=stateful_module"
-    )
-    raise MaterializationError(message)
+    layout.require_layout_runtime_settings(candidate.settings)
 
 
 def _require_teacher_output_settings(settings: Mapping[str, Any]) -> None:
@@ -3057,9 +3007,9 @@ def model_compute_tree(
     Returns:
         The tree cast to the declared model compute dtype.
     """
-    dtype = _dtype_setting(settings, "dtype.model_compute")
+    dtype = layout.dtype_setting(settings, "dtype.model_compute")
 
-    return _runtime_named_tensor_dtype(values, dtype)
+    return layout.runtime_named_tensor_dtype(values, dtype)
 
 
 def model_compute_batch(
@@ -3071,7 +3021,7 @@ def model_compute_batch(
     Returns:
         The batch cast to the declared model compute dtype.
     """
-    dtype = _dtype_setting(settings, "dtype.model_compute")
+    dtype = layout.dtype_setting(settings, "dtype.model_compute")
 
     if dtype is None:
         return batch
@@ -3437,93 +3387,6 @@ def _require_disabled_checkpoint_settings(
             raise MaterializationError(message)
 
 
-def _require_layout_runtime_settings(settings: Mapping[str, Any]) -> None:
-    flatten_order = settings.get("layout.flatten_order")
-
-    if flatten_order is not None and flatten_order != "canonical_parameter_order":
-        message = f"layout.flatten_order is unsupported: {flatten_order}"
-        raise MaterializationError(message)
-
-    _layout_tree_input(settings, "layout.params")
-    _layout_tree_input(settings, "layout.vector")
-    _layout_output(settings)
-    _layout_single_value(
-        settings,
-        "layout.aliasing",
-        "preserve_tied_weight_aliases",
-    )
-    _layout_single_value(
-        settings,
-        "layout.parametrizations",
-        "preserve_active_parametrizations",
-    )
-    layout_vector_ops(settings)
-
-
-def _layout_tree_input(settings: Mapping[str, Any], key: str) -> None:
-    value = settings.get(key)
-
-    if value is None or value == "parameter_tree":
-        return
-
-    if value in {"flat_contiguous", "per_layer_flat", "per_block_flat"}:
-        return
-
-    message = f"{key}={value} requires tree reconstruction support"
-    raise MaterializationError(message)
-
-
-def _layout_output(settings: Mapping[str, Any]) -> str:
-    value = settings.get("layout.output")
-
-    if value is None or value == "parameter_tree":
-        return "parameter_tree"
-
-    if value == "flat_contiguous":
-        return "flat_contiguous"
-
-    if value in {"per_layer_flat", "per_block_flat"}:
-        return "parameter_tree"
-
-    message = f"layout.output is unsupported: {value}"
-    raise MaterializationError(message)
-
-
-def _layout_single_value(
-    settings: Mapping[str, Any],
-    key: str,
-    expected: str,
-) -> None:
-    value = settings.get(key)
-
-    if value is None or value == expected:
-        return
-
-    message = f"{key} is unsupported: {value}"
-    raise MaterializationError(message)
-
-
-def layout_vector_ops(settings: Mapping[str, Any]) -> str:
-    """Return the declared layout.vector_ops setting value.
-
-    Returns:
-        the declared layout.vector_ops setting value.
-
-    Raises:
-        MaterializationError: If the declared inputs are invalid.
-    """
-    value = settings.get("layout.vector_ops")
-
-    if value is None or value == "python_loop":
-        return "python_loop"
-
-    if value == "foreach":
-        return "foreach"
-
-    message = f"layout.vector_ops is unsupported: {value}"
-    raise MaterializationError(message)
-
-
 def tree_dot_runtime(
     settings: Mapping[str, Any],
     left: TensorTree,
@@ -3539,7 +3402,7 @@ def tree_dot_runtime(
     left = _accumulation_tree(left, settings)
     right = _accumulation_tree(right, settings)
 
-    if layout_vector_ops(settings) == "foreach":
+    if layout.layout_vector_ops(settings) == "foreach":
         return tree_dot_foreach(left, right)
 
     return tree_dot(left, right)
@@ -3560,7 +3423,7 @@ def tree_add_runtime(
     left = _accumulation_tree(left, settings)
     right = _accumulation_tree(right, settings)
 
-    if layout_vector_ops(settings) == "foreach":
+    if layout.layout_vector_ops(settings) == "foreach":
         return tree_add_foreach(left, right)
 
     return tree_map2(torch.add, left, right)
@@ -3585,25 +3448,6 @@ def dot_runtime(
     )
 
 
-def matmul_runtime(
-    settings: Mapping[str, Any],
-    left: torch.Tensor,
-    right: torch.Tensor,
-) -> torch.Tensor:
-    """Return the runtime matrix product under the declared precision.
-
-    Returns:
-        the runtime matrix product under the declared precision.
-    """
-    left = runtime_intermediate_tensor(left, settings)
-    right = runtime_intermediate_tensor(right, settings)
-
-    return accumulation_tensor(left, settings) @ accumulation_tensor(
-        right,
-        settings,
-    )
-
-
 def tree_scale_runtime(
     settings: Mapping[str, Any],
     tree: TensorTree,
@@ -3616,7 +3460,7 @@ def tree_scale_runtime(
     """
     tree = runtime_intermediate_tree(tree, settings)
 
-    if layout_vector_ops(settings) == "foreach":
+    if layout.layout_vector_ops(settings) == "foreach":
         return tree_mul_foreach(tree, scale)
 
     return tree_map(lambda tensor: tensor * scale, tree)
@@ -3643,7 +3487,7 @@ def runtime_intermediate_tensor(
     Returns:
         an intermediate tensor in the declared residency and dtype.
     """
-    dtype = _dtype_setting(settings, "dtype.intermediate")
+    dtype = layout.dtype_setting(settings, "dtype.intermediate")
 
     if dtype is None or not tensor.is_floating_point():
         return tensor
@@ -3659,12 +3503,12 @@ def _runtime_params(
     runtime_values.require_parameter_surface_runtime_settings(
         parameter_surface, settings
     )
-    dtype = _parameter_dtype(settings)
-    result = _runtime_named_tensor_dtype(params, dtype)
-    result = _runtime_named_tensor_contiguity(result, settings)
+    dtype = layout.parameter_dtype(settings)
+    result = layout.runtime_named_tensor_dtype(params, dtype)
+    result = layout.runtime_named_tensor_contiguity(result, settings)
 
     if settings.get("layout.params") == "flat_contiguous":
-        _require_alias_safe_parameter_layout(result, settings)
+        layout.require_alias_safe_parameter_layout(result, settings)
 
         return runtime_values.wrap_flat_parameter_tree(
             result,
@@ -3672,9 +3516,9 @@ def _runtime_params(
         )
 
     if settings.get("layout.params") in {"per_layer_flat", "per_block_flat"}:
-        _require_alias_safe_parameter_layout(result, settings)
+        layout.require_alias_safe_parameter_layout(result, settings)
 
-    return _runtime_grouped_parameter_layout(
+    return layout.runtime_grouped_parameter_layout(
         result,
         settings,
         "layout.params",
@@ -3682,71 +3526,16 @@ def _runtime_params(
     )
 
 
-def _runtime_grouped_parameter_layout(
-    tree: ParameterTree,
-    settings: Mapping[str, Any],
-    key: str,
-    parameter_surface: ParameterSurface | None,
-) -> ParameterTree:
-    groups = _parameter_layout_groups(settings, key, parameter_surface)
-
-    if groups is None:
-        return tree
-
-    return runtime_values.wrap_grouped_parameter_tree(tree, groups, key)
-
-
-def _parameter_layout_groups(
-    settings: Mapping[str, Any],
-    key: str,
-    parameter_surface: ParameterSurface | None,
-) -> tuple[tuple[str, ...], ...] | None:
-    layout = settings.get(key)
-
-    if layout in {None, "parameter_tree", "flat_contiguous"}:
-        return None
-
-    if layout == "per_layer_flat":
-        return runtime_values.declared_parameter_groups(
-            parameter_surface, "layer_groups", key
-        )
-
-    if layout == "per_block_flat":
-        return runtime_values.declared_parameter_groups(
-            parameter_surface, "block_groups", key
-        )
-
-    return None
-
-
-def _runtime_grouped_output_layout(
-    tree: TensorTree,
-    settings: Mapping[str, Any],
-    parameter_surface: ParameterSurface | None,
-) -> TensorTree:
-    groups = _parameter_layout_groups(settings, "layout.output", parameter_surface)
-
-    if groups is None:
-        return tree
-
-    result = runtime_values.parameter_tree_from_tensor_tree(
-        tree,
-        "grouped output layout",
-    )
-
-    return runtime_values.wrap_grouped_parameter_tree(result, groups, "layout.output")
-
-
 def _runtime_buffers(
     buffers: BufferTree,
     settings: Mapping[str, Any],
 ) -> BufferTree:
-    dtype = _parameter_dtype(settings)
+    dtype = layout.parameter_dtype(settings)
 
     if dtype is None:
-        return _runtime_named_tensor_contiguity(buffers, settings)
+        return layout.runtime_named_tensor_contiguity(buffers, settings)
 
-    return _runtime_named_tensor_contiguity(
+    return layout.runtime_named_tensor_contiguity(
         {key: tensor.to(dtype=dtype) for key, tensor in buffers.items()},
         settings,
     )
@@ -3764,8 +3553,8 @@ def runtime_batch(
     Returns:
         The runtime batch.
     """
-    dtype = _batch_dtype(settings)
-    metric_factor_dtype = _dtype_setting(settings, "dtype.metric_factor")
+    dtype = layout.batch_dtype(settings)
+    metric_factor_dtype = layout.dtype_setting(settings, "dtype.metric_factor")
     metric_factor_residency = settings.get("memory.factor_residency")
 
     if (
@@ -3773,7 +3562,7 @@ def runtime_batch(
         and metric_factor_dtype is None
         and metric_factor_residency is None
     ):
-        return _runtime_batch_after_contiguity(
+        return layout.runtime_batch_after_contiguity(
             batch,
             settings,
             move_input_residency=move_input_residency,
@@ -3789,7 +3578,7 @@ def runtime_batch(
     )
 
     if metric_factor_dtype is None and metric_factor_residency is None:
-        return _runtime_batch_after_contiguity(
+        return layout.runtime_batch_after_contiguity(
             result,
             settings,
             move_input_residency=move_input_residency,
@@ -3812,7 +3601,7 @@ def runtime_batch(
             for key, value in result.items()
         }
 
-    return _runtime_batch_after_contiguity(
+    return layout.runtime_batch_after_contiguity(
         result,
         settings,
         move_input_residency=move_input_residency,
@@ -3827,7 +3616,7 @@ def _runtime_declared_batch_transforms(
 ) -> Batch:
     result = batch
 
-    if _uses_declared_batch_layout(candidate.settings):
+    if layout.uses_declared_batch_layout(candidate.settings):
         if batch_layout is None:
             message = "input batch layout requires declared binding"
             raise MaterializationError(message)
@@ -3844,33 +3633,15 @@ def _runtime_declared_batch_transforms(
     return result
 
 
-def _uses_declared_batch_layout(settings: Mapping[str, Any]) -> bool:
-    return (
-        settings.get("input.batch_layout")
-        in {"packed_with_inverse_permutation", "variable_length"}
-        or settings.get("input.length_grouping") == "exact_length_bucket"
-        or settings.get("schedule.per_token") == "packed"
-    )
-
-
-def _runtime_batch_after_contiguity(
-    batch: Batch,
-    settings: Mapping[str, Any],
-    *,
-    move_input_residency: bool,
-) -> Batch:
-    result = _runtime_batch_contiguity(batch, settings)
-
-    if move_input_residency:
-        result = _runtime_batch_input_residency(result, settings)
-
-    return _runtime_batch_teacher_outputs(result, settings)
-
-
-def _runtime_batch_input_residency(
+def runtime_batch_input_residency(
     batch: Batch,
     settings: Mapping[str, Any],
 ) -> Batch:
+    """Return the batch moved to the declared input residency.
+
+    Returns:
+        The batch moved to the declared input residency.
+    """
     residency = settings.get("input.residency")
 
     if residency is None:
@@ -3957,55 +3728,6 @@ def runtime_residency_tensor(
     return _residency_tensor(tensor, residency, key, mmap_residency)
 
 
-def _runtime_batch_teacher_outputs(
-    batch: Batch,
-    settings: Mapping[str, Any],
-) -> Batch:
-    value = settings.get("teacher_outputs")
-
-    if value is None:
-        return batch
-
-    if "teacher_outputs" not in batch:
-        message = "teacher_outputs batch field is required"
-        raise MaterializationError(message)
-
-    result = dict(batch)
-
-    if value == "precomputed_cpu":
-        result["teacher_outputs"] = _teacher_outputs_to_device(
-            batch["teacher_outputs"],
-            torch.device("cpu"),
-        )
-
-        return result
-
-    if value == "precomputed_cpu_pinned":
-        result["teacher_outputs"] = _teacher_outputs_pin_cpu(batch["teacher_outputs"])
-
-        return result
-
-    if value == "precomputed_gpu":
-        if not torch.cuda.is_available():
-            message = "precomputed_gpu teacher outputs require CUDA"
-            raise MaterializationError(message)
-
-        result["teacher_outputs"] = _teacher_outputs_to_device(
-            batch["teacher_outputs"],
-            torch.device("cuda"),
-        )
-
-        return result
-
-    if value == "recomputed_with_equality_check":
-        _require_teacher_output_tree(batch["teacher_outputs"])
-
-        return result
-
-    message = f"teacher_outputs is unsupported: {value}"
-    raise MaterializationError(message)
-
-
 def _execution_with_recomputed_teacher_outputs(
     execution: runtime_values.StandardExecution,
 ) -> runtime_values.StandardExecution:
@@ -4019,7 +3741,7 @@ def _execution_with_recomputed_teacher_outputs(
         raise MaterializationError(message)
 
     fixed_outputs = execution.batch.get("teacher_outputs")
-    _require_teacher_output_tree(fixed_outputs)
+    require_teacher_output_tree(fixed_outputs)
     settings = execution.candidate.settings
     recomputed_outputs = execution.teacher_objective(
         model_compute_tree(execution.params, settings),
@@ -4034,15 +3756,8 @@ def _execution_with_recomputed_teacher_outputs(
     return dataclasses.replace(execution, batch=batch)
 
 
-def _teacher_outputs_to_device(value: Any, device: torch.device) -> TensorTree:
-    return runtime_values.runtime_nested_tensor_value(
-        value,
-        lambda tensor: tensor.to(device=device),
-        error_message="teacher_outputs batch field must be a tensor tree",
-    )
-
-
-def _require_teacher_output_tree(value: Any) -> None:
+def require_teacher_output_tree(value: Any) -> None:
+    """Validate the declared teacher output tree."""
     runtime_values.runtime_nested_tensor_value(
         value,
         lambda tensor: tensor,
@@ -4077,12 +3792,6 @@ def _teacher_outputs_equal(left: Any, right: Any) -> bool:
     return False
 
 
-def _teacher_outputs_pin_cpu(value: Any) -> TensorTree:
-    cpu_value = _teacher_outputs_to_device(value, torch.device("cpu"))
-
-    return tree_map(runtime_values.pin_cpu_tensor, cpu_value)
-
-
 def runtime_vector(
     vector: TensorTree,
     settings: Mapping[str, Any],
@@ -4095,7 +3804,7 @@ def runtime_vector(
     Returns:
         The runtime vector.
     """
-    dtype = _dtype_setting(settings, "dtype.vector")
+    dtype = layout.dtype_setting(settings, "dtype.vector")
 
     if dtype is None:
         result = vector
@@ -4103,74 +3812,14 @@ def runtime_vector(
         result = tree_map(lambda tensor: tensor.to(dtype=dtype), vector)
 
     result = _runtime_vector_residency(result, settings, mmap_residency)
-    result = _runtime_vector_layout(
+    result = layout.runtime_vector_layout(
         result,
         settings,
         vector if template is None else template,
         parameter_surface,
     )
 
-    return _runtime_tree_contiguity(result, settings)
-
-
-def _runtime_vector_layout(
-    vector: TensorTree,
-    settings: Mapping[str, Any],
-    template: TensorTree,
-    parameter_surface: ParameterSurface | None,
-) -> TensorTree:
-    layout = settings.get("layout.vector")
-
-    if layout is None or layout == "parameter_tree":
-        return vector
-
-    if isinstance(vector, torch.Tensor):
-        flat_vector = vector.reshape(-1).contiguous()
-    else:
-        flat_vector = runtime_values.flatten_vector_like(template, vector).contiguous()
-
-    if layout == "flat_contiguous":
-        return runtime_values.wrap_flat_vector(template, flat_vector)
-
-    wrapped = runtime_values.wrap_flat_vector(template, flat_vector)
-    parameter_tree = runtime_values.parameter_tree_from_tensor_tree(
-        wrapped,
-        f"layout.vector={layout}",
-    )
-
-    return _runtime_grouped_parameter_layout(
-        parameter_tree,
-        settings,
-        "layout.vector",
-        parameter_surface,
-    )
-
-
-def _runtime_named_tensor_dtype(
-    tree: dict[str, torch.Tensor],
-    dtype: torch.dtype | None,
-) -> dict[str, torch.Tensor]:
-    if dtype is None:
-        return tree
-
-    return runtime_values.runtime_named_tensor_map_preserve_alias(
-        tree,
-        lambda tensor: tensor.to(dtype=dtype),
-    )
-
-
-def _require_alias_safe_parameter_layout(
-    params: ParameterTree,
-    settings: Mapping[str, Any],
-) -> None:
-    if not runtime_values.preserves_parameter_aliases(settings):
-        return
-
-    if not runtime_values.has_parameter_aliases(params):
-        return
-
-    message = "non-tree parameter layout cannot preserve tied parameter aliases"
-    raise MaterializationError(message)
+    return layout.runtime_tree_contiguity(result, settings)
 
 
 def _runtime_vector_residency(
@@ -4204,15 +3853,15 @@ def runtime_output(
     Returns:
         The runtime output tree for declared output settings.
     """
-    dtype = _dtype_setting(settings, "dtype.output")
+    dtype = layout.dtype_setting(settings, "dtype.output")
 
     if dtype is not None:
         output = tree_map(lambda tensor: tensor.to(dtype=dtype), output)
 
-    if _layout_output(settings) == "flat_contiguous":
+    if layout.layout_output(settings) == "flat_contiguous":
         return runtime_values.flatten_vector(output).contiguous()
 
-    return _runtime_grouped_output_layout(output, settings, parameter_surface)
+    return layout.runtime_grouped_output_layout(output, settings, parameter_surface)
 
 
 def _standard_output_buffer(
@@ -4266,7 +3915,7 @@ def accumulation_tensor(
     Returns:
         the accumulation tensor for the declared accumulation dtype.
     """
-    dtype = _dtype_setting(settings, "dtype.accumulation")
+    dtype = layout.dtype_setting(settings, "dtype.accumulation")
 
     if dtype is None:
         return tensor
@@ -4275,115 +3924,12 @@ def accumulation_tensor(
 
 
 def _accumulation_tree(tree: TensorTree, settings: Mapping[str, Any]) -> TensorTree:
-    dtype = _dtype_setting(settings, "dtype.accumulation")
+    dtype = layout.dtype_setting(settings, "dtype.accumulation")
 
     if dtype is None:
         return tree
 
     return tree_map(lambda tensor: tensor.to(dtype=dtype), tree)
-
-
-def _runtime_tree_contiguity(
-    tree: TensorTree,
-    settings: Mapping[str, Any],
-) -> TensorTree:
-    if not _layout_contiguity_enabled(settings):
-        return tree
-
-    return tree_map(lambda tensor: tensor.contiguous(), tree)
-
-
-def _runtime_named_tensor_contiguity(
-    tree: dict[str, torch.Tensor],
-    settings: Mapping[str, Any],
-) -> dict[str, torch.Tensor]:
-    if not _layout_contiguity_enabled(settings):
-        return tree
-
-    return runtime_values.runtime_named_tensor_map_preserve_alias(
-        tree,
-        lambda tensor: tensor.contiguous(),
-    )
-
-
-def _runtime_batch_contiguity(
-    batch: Batch,
-    settings: Mapping[str, Any],
-) -> Batch:
-    if not _layout_contiguity_enabled(settings):
-        return batch
-
-    return {
-        key: runtime_values.runtime_nested_tensor_value(
-            value, lambda tensor: tensor.contiguous()
-        )
-        for key, value in batch.items()
-    }
-
-
-def _layout_contiguity_enabled(settings: Mapping[str, Any]) -> bool:
-    value = settings.get("layout.contiguity")
-
-    if value is None or value == "preserve_existing_strides":
-        return False
-
-    if value == "contiguous":
-        return True
-
-    message = f"layout.contiguity is unsupported: {value}"
-    raise MaterializationError(message)
-
-
-def _parameter_dtype(settings: Mapping[str, Any]) -> torch.dtype | None:
-    autodiff_dtype = _dtype_setting(settings, "dtype.autodiff_compute")
-
-    if autodiff_dtype is not None:
-        return autodiff_dtype
-
-    return _dtype_setting(settings, "dtype.parameter_storage")
-
-
-def _batch_dtype(settings: Mapping[str, Any]) -> torch.dtype | None:
-    autodiff_dtype = _dtype_setting(settings, "dtype.autodiff_compute")
-
-    if autodiff_dtype is not None:
-        return autodiff_dtype
-
-    return _dtype_setting(settings, "dtype.intermediate")
-
-
-def _dtype_setting(settings: Mapping[str, Any], key: str) -> torch.dtype | None:
-    dtype_name = settings.get(key)
-
-    if dtype_name is None:
-        return None
-
-    if not isinstance(dtype_name, str):
-        message = f"{key} must be a string"
-        raise MaterializationError(message)
-
-    if dtype_name == "bf16":
-        return torch.bfloat16
-
-    if dtype_name == "fp16":
-        return torch.float16
-
-    if dtype_name == "fp32":
-        return torch.float32
-
-    if dtype_name == "fp8_when_supported":
-        return _fp8_dtype()
-
-    message = f"{key} is unsupported by standard runtime: {dtype_name}"
-    raise MaterializationError(message)
-
-
-def _fp8_dtype() -> torch.dtype:
-    if hasattr(torch, "float8_e4m3fn"):
-        return torch.float8_e4m3fn
-
-    message = "fp8_when_supported requires PyTorch FP8 dtype support"
-    raise MaterializationError(message)
 
 
 def run_with_backend_settings(
@@ -4398,7 +3944,7 @@ def run_with_backend_settings(
     if not runtime_values.BACKEND_SETTINGS_ENABLED[0]:
         return callback()
 
-    matmul_precision = _matmul_precision_setting(settings)
+    matmul_precision = layout.matmul_precision_setting(settings)
     autocast_setting = runtime_values.autocast_setting(settings)
     allow_bf16_reduction = runtime_values.bool_string_setting(
         settings,
@@ -4500,24 +4046,6 @@ def _run_with_declared_state_restore(
     finally:
         runtime_values.restore_declared_tensors(execution.params, parameter_snapshot)
         runtime_values.restore_declared_tensors(execution.buffers, buffer_snapshot)
-
-
-def _matmul_precision_setting(settings: Mapping[str, Any]) -> str | None:
-    key = "numeric.float32_matmul_precision"
-    value = settings.get(key)
-
-    if value is None:
-        return None
-
-    if not isinstance(value, str):
-        message = f"{key} must be a string"
-        raise MaterializationError(message)
-
-    if value not in {"highest", "high", "medium"}:
-        message = f"{key} is unsupported by standard runtime: {value}"
-        raise MaterializationError(message)
-
-    return value
 
 
 def _anchor_candidate(operator: OperatorSpec, candidate: Candidate) -> Candidate:

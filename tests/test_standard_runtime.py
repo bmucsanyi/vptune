@@ -13,6 +13,7 @@ import vptune.derivatives as derivatives_module
 import vptune.ext as vpx
 import vptune.fisher as fisher_module
 import vptune.ggn as ggn_module
+import vptune.layout as layout_module
 import vptune.metrics as metrics_module
 import vptune.runtime as runtime_module
 import vptune.runtime_values as runtime_values_module
@@ -1261,7 +1262,7 @@ def patch_matmul_call_recorder(
     setting_value: object,
 ) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
     calls = []
-    original_matmul = runtime_module.matmul_runtime
+    original_matmul = layout_module.matmul_runtime
 
     def recording_matmul(
         settings: Mapping[str, Any],
@@ -1273,7 +1274,7 @@ def patch_matmul_call_recorder(
 
         return original_matmul(settings, left, right)
 
-    monkeypatch.setattr(runtime_module, "matmul_runtime", recording_matmul)
+    monkeypatch.setattr(layout_module, "matmul_runtime", recording_matmul)
 
     return calls
 
@@ -15096,10 +15097,10 @@ def test_standard_runtime_applies_fp8_storage_before_model_compute() -> None:
         vector,
     )()
     expected_param = (
-        params["w"].to(dtype=runtime_module._fp8_dtype()).to(dtype=torch.float32)
+        params["w"].to(dtype=layout_module._fp8_dtype()).to(dtype=torch.float32)
     )
     expected_buffer = (
-        buffers["b"].to(dtype=runtime_module._fp8_dtype()).to(dtype=torch.float32)
+        buffers["b"].to(dtype=layout_module._fp8_dtype()).to(dtype=torch.float32)
     )
 
     assert observed["param_dtype"] == torch.float32
@@ -15150,8 +15151,8 @@ def test_standard_runtime_executes_fp8_model_compute_boundary() -> None:
     )()
 
     assert observed == {
-        "param_dtype": runtime_module._fp8_dtype(),
-        "batch_dtype": runtime_module._fp8_dtype(),
+        "param_dtype": layout_module._fp8_dtype(),
+        "batch_dtype": layout_module._fp8_dtype(),
     }
     assert tree_leaves(result)[0].dtype == torch.float32
 
@@ -15813,7 +15814,7 @@ def test_standard_runtime_moves_inputs_at_declared_call_boundary(
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     calls = []
-    original = runtime_module._runtime_batch_input_residency
+    original = runtime_module.runtime_batch_input_residency
 
     def recording_input_residency(
         batch: vpx.Batch,
@@ -15838,7 +15839,7 @@ def test_standard_runtime_moves_inputs_at_declared_call_boundary(
 
     monkeypatch.setattr(
         runtime_module,
-        "_runtime_batch_input_residency",
+        "runtime_batch_input_residency",
         recording_input_residency,
     )
     factory = vpx.standard_operation_factory(

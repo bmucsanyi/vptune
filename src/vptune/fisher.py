@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from vptune import derivatives, runtime, runtime_values, vectorization
+from vptune import derivatives, layout, runtime, runtime_values, vectorization
 from vptune.data import (
     Batch,
     Candidate,
@@ -551,7 +551,7 @@ def _blockwise_score_matrix_product(
 ) -> torch.Tensor:
     first_block = blocks[0]
     offset = first_block.shape[1]
-    score_dot = runtime.matmul_runtime(settings, first_block, vector[:offset])
+    score_dot = layout.matmul_runtime(settings, first_block, vector[:offset])
 
     for block in blocks[1:]:
         width = block.shape[1]
@@ -561,7 +561,7 @@ def _blockwise_score_matrix_product(
             message = f"{label} block columns exceed vector length"
             raise MaterializationError(message)
 
-        score_dot = score_dot + runtime.matmul_runtime(
+        score_dot = score_dot + layout.matmul_runtime(
             settings, block, vector[offset:stop]
         )
         offset = stop
@@ -571,7 +571,7 @@ def _blockwise_score_matrix_product(
         raise MaterializationError(message)
 
     pieces = tuple(
-        runtime.matmul_runtime(settings, block.T, score_dot) for block in blocks
+        layout.matmul_runtime(settings, block.T, score_dot) for block in blocks
     )
     result = torch.cat(pieces) / normalization
     runtime_values.require_finite_tensor(result, f"{label} blockwise result")
@@ -631,11 +631,9 @@ def _score_matrix_product(
             ranges,
         )
 
-    score_dot = runtime.matmul_runtime(settings, score_gradients, vector)
+    score_dot = layout.matmul_runtime(settings, score_gradients, vector)
 
-    return (
-        runtime.matmul_runtime(settings, score_gradients.T, score_dot) / normalization
-    )
+    return layout.matmul_runtime(settings, score_gradients.T, score_dot) / normalization
 
 
 def _parameter_blocked_score_matrix_product(
@@ -657,7 +655,7 @@ def _parameter_blocked_score_matrix_product(
 
     for start, stop in ranges:
         score_block = score_gradients[:, start:stop]
-        result_chunks.append(runtime.matmul_runtime(settings, score_block.T, score_dot))
+        result_chunks.append(layout.matmul_runtime(settings, score_block.T, score_dot))
 
     result = torch.cat(tuple(result_chunks)) / normalization
     runtime_values.require_finite_tensor(result, "score matrix parameter-block result")
@@ -960,18 +958,18 @@ def _blockwise_score_matrix_product_unchecked(
 ) -> torch.Tensor:
     first_block = blocks[0]
     offset = first_block.shape[1]
-    score_dot = runtime.matmul_runtime(settings, first_block, vector[:offset])
+    score_dot = layout.matmul_runtime(settings, first_block, vector[:offset])
 
     for block in blocks[1:]:
         width = block.shape[1]
         stop = offset + width
-        score_dot = score_dot + runtime.matmul_runtime(
+        score_dot = score_dot + layout.matmul_runtime(
             settings, block, vector[offset:stop]
         )
         offset = stop
 
     pieces = tuple(
-        runtime.matmul_runtime(settings, block.T, score_dot) for block in blocks
+        layout.matmul_runtime(settings, block.T, score_dot) for block in blocks
     )
 
     return torch.cat(pieces) / normalization
@@ -1555,7 +1553,7 @@ def _sampled_fisher_contributions(
     score_matrix = _sampled_fisher_score_matrix_for_bound(execution)
     vector = runtime.parameter_order_vector(execution)
     normalization = _sampled_fisher_normalization(execution)
-    score_dot = runtime.matmul_runtime(
+    score_dot = layout.matmul_runtime(
         execution.candidate.settings, score_matrix, vector
     )
     contributions = score_matrix * score_dot.unsqueeze(1) / normalization
