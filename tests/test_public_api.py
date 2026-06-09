@@ -6,6 +6,7 @@ from typing import Any, TypeGuard
 
 import pytest
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import vptune as vp
 import vptune.engine.runtime as runtime_module
@@ -3395,3 +3396,238 @@ def test_replay_identity_fields_distinguish_declared_variants() -> None:
         ).spec.semantics
         == tol_a.spec.semantics
     )
+
+
+class RealTransformerClassifier(torch.nn.Module):
+    """Two-layer batch-first transformer encoder with a class head."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        torch.manual_seed(7)
+        self.embed = torch.nn.Embedding(11, 16, dtype=torch.float64)
+        layer = torch.nn.TransformerEncoderLayer(
+            d_model=16,
+            nhead=2,
+            dim_feedforward=32,
+            dropout=0.0,
+            batch_first=True,
+            dtype=torch.float64,
+        )
+        self.encoder = torch.nn.TransformerEncoder(layer, num_layers=2)
+        self.head = torch.nn.Linear(16, 5, dtype=torch.float64)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> Mapping[str, torch.Tensor]:
+        hidden = self.embed(tokens)
+        encoded = self.encoder(hidden, src_key_padding_mask=padding_mask)
+
+        return {"logits": self.head(encoded[:, 0, :])}
+
+
+class RealConvClassifier(torch.nn.Module):
+    """Two-convolution image classifier with a linear head."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        torch.manual_seed(11)
+        self.conv1 = torch.nn.Conv2d(1, 4, 3, padding=1, dtype=torch.float64)
+        self.conv2 = torch.nn.Conv2d(4, 8, 3, padding=1, dtype=torch.float64)
+        self.head = torch.nn.Linear(128, 5, dtype=torch.float64)
+
+    def forward(self, images: torch.Tensor) -> Mapping[str, torch.Tensor]:
+        hidden = torch.relu(self.conv1(images))
+        hidden = torch.nn.functional.max_pool2d(torch.relu(self.conv2(hidden)), 2)
+
+        return {"logits": self.head(hidden.reshape(images.shape[0], -1))}
+
+
+def real_transformer_setup() -> tuple[
+    torch.nn.Module, vp.Model, Mapping[str, torch.Tensor]
+]:
+    module = RealTransformerClassifier()
+    model = vp.torch_model(
+        module,
+        parameters=vp.parameters(module),
+        call=vp.module_call(
+            args=("tokens", "padding_mask"), kwargs={}, output="logits"
+        ),
+    )
+    generator = torch.Generator().manual_seed(3)
+    tokens = torch.randint(0, 11, (4, 8), generator=generator)
+    padding_mask = torch.zeros(4, 8, dtype=torch.bool)
+    padding_mask[1, 6:] = True
+    padding_mask[3, 4:] = True
+    labels = torch.randint(0, 5, (4,), generator=generator)
+    batch = {"tokens": tokens, "padding_mask": padding_mask, "labels": labels}
+
+    return module, model, batch
+
+
+def real_conv_setup() -> tuple[torch.nn.Module, vp.Model, Mapping[str, torch.Tensor]]:
+    module = RealConvClassifier()
+    model = vp.torch_model(
+        module,
+        parameters=vp.parameters(module),
+        call=vp.module_call(args=("images",), kwargs={}, output="logits"),
+    )
+    generator = torch.Generator().manual_seed(5)
+    images = torch.randn(4, 1, 8, 8, dtype=torch.float64, generator=generator)
+    labels = torch.randint(0, 5, (4,), generator=generator)
+    batch = {"images": images, "labels": labels}
+
+    return module, model, batch
+
+
+def real_parameter_vector(
+    module: torch.nn.Module, seed: int
+) -> dict[str, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+
+    return {
+        name: torch.randn(parameter.shape, dtype=parameter.dtype, generator=generator)
+        for name, parameter in module.named_parameters()
+    }
+
+
+def real_flat(
+    module: torch.nn.Module, tree: Mapping[str, torch.Tensor]
+) -> torch.Tensor:
+    return torch.cat([tree[name].reshape(-1) for name, _ in module.named_parameters()])
+
+
+def real_autograd_gradient(
+    module: torch.nn.Module,
+    batch: Mapping[str, torch.Tensor],
+    call_args: tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    output = module(*(batch[name] for name in call_args))
+    loss = torch.nn.functional.cross_entropy(output["logits"], batch["labels"])
+    names = [name for name, _ in module.named_parameters()]
+    grads = torch.autograd.grad(loss, [p for _, p in module.named_parameters()])
+
+    return dict(zip(names, grads, strict=True))
+
+
+@pytest.mark.parametrize(
+    ("setup", "call_args"),
+    [
+        (real_transformer_setup, ("tokens", "padding_mask")),
+        (real_conv_setup, ("images",)),
+    ],
+)
+def test_real_model_gradient_matches_autograd(
+    setup: Callable[[], tuple[torch.nn.Module, vp.Model, Mapping[str, torch.Tensor]]],
+    call_args: tuple[str, ...],
+) -> None:
+    module, model, batch = setup()
+    loss = vp.loss.softmax_cross_entropy(output="logits", labels="labels")
+    output = vp.gradient(model, loss)(batch)
+    expected = real_autograd_gradient(module, batch, call_args)
+
+    for name, _ in module.named_parameters():
+        torch.testing.assert_close(output[name], expected[name])
+
+
+@pytest.mark.parametrize(
+    ("setup", "call_args"),
+    [
+        (real_transformer_setup, ("tokens", "padding_mask")),
+        (real_conv_setup, ("images",)),
+    ],
+)
+def test_real_model_hvp_matches_autograd(
+    setup: Callable[[], tuple[torch.nn.Module, vp.Model, Mapping[str, torch.Tensor]]],
+    call_args: tuple[str, ...],
+) -> None:
+    module, model, batch = setup()
+    loss = vp.loss.softmax_cross_entropy(output="logits", labels="labels")
+    vector = real_parameter_vector(module, seed=13)
+
+    # CPU flash SDPA has no double-backward; pin the math kernel for HVP.
+    with sdpa_kernel([SDPBackend.MATH]):
+        output = vp.hvp(model, loss)(batch, vector)
+
+    parameters = [p for _, p in module.named_parameters()]
+    names = [name for name, _ in module.named_parameters()]
+
+    with sdpa_kernel([SDPBackend.MATH]):
+        model_output = module(*(batch[name] for name in call_args))
+
+    ce = torch.nn.functional.cross_entropy(model_output["logits"], batch["labels"])
+
+    with sdpa_kernel([SDPBackend.MATH]):
+        grads = torch.autograd.grad(ce, parameters, create_graph=True)
+    dot = torch.stack([
+        (grad * vector[name]).sum() for name, grad in zip(names, grads, strict=True)
+    ]).sum()
+    expected = torch.autograd.grad(dot, parameters)
+
+    for name, value in zip(names, expected, strict=True):
+        torch.testing.assert_close(output[name], value)
+
+
+def test_real_transformer_ggnvp_is_symmetric_psd_and_matches_fisher() -> None:
+    module, model, batch = real_transformer_setup()
+    loss = vp.loss.softmax_cross_entropy(output="logits", labels="labels")
+    ggn = vp.ggnvp(model, loss)
+    likelihood = vp.likelihood.categorical(output="logits", labels="labels")
+
+    with pytest.raises(
+        vp.MaterializationError,
+        match="exact categorical Fisher is represented by GGNVP",
+    ):
+        vp.fisher_vp(model, likelihood)
+
+    u = real_parameter_vector(module, seed=17)
+    v = real_parameter_vector(module, seed=19)
+
+    # CPU flash SDPA lacks forward AD; pin the math kernel for the GGN JVP.
+    with sdpa_kernel([SDPBackend.MATH]):
+        ggn_v = ggn(batch, v)
+        ggn_u = ggn(batch, u)
+
+    flat_v = real_flat(module, v)
+    flat_u = real_flat(module, u)
+    flat_ggn_v = real_flat(module, ggn_v)
+    flat_ggn_u = real_flat(module, ggn_u)
+
+    assert torch.isfinite(flat_ggn_v).all()
+    assert flat_v @ flat_ggn_v >= -1e-10
+    torch.testing.assert_close(flat_u @ flat_ggn_v, flat_v @ flat_ggn_u)
+
+
+def test_real_transformer_per_example_rows_compose_empirical_fisher() -> None:
+    module, model, batch = real_transformer_setup()
+    loss = vp.loss.softmax_cross_entropy(output="logits", labels="labels")
+    rows_tree = vp.per_example_gradient(model, loss)(batch)
+    vector = real_parameter_vector(module, seed=23)
+    empirical = vp.empirical_fisher_vp(model, loss)(batch, vector)
+
+    names = [name for name, _ in module.named_parameters()]
+    examples = batch["labels"].shape[0]
+    rows = torch.cat([rows_tree[name].reshape(examples, -1) for name in names], dim=1)
+    flat_vector = real_flat(module, vector)
+    expected = rows.T @ (rows @ flat_vector) / float(examples)
+
+    torch.testing.assert_close(real_flat(module, empirical), expected)
+
+
+def test_real_transformer_sampled_fisher_repeats_for_fixed_seed() -> None:
+    module, model, batch = real_transformer_setup()
+    likelihood = vp.likelihood.categorical(output="logits", labels="labels")
+    operator = vp.sampled_fisher_vp(
+        model,
+        likelihood,
+        samples=vp.samples.fixed_seed(seed=29, count=3),
+    )
+    vector = real_parameter_vector(module, seed=31)
+
+    first = operator(batch, vector)
+    second = operator(batch, vector)
+
+    for name, _ in module.named_parameters():
+        assert torch.isfinite(first[name]).all()
+        torch.testing.assert_close(first[name], second[name])
