@@ -793,25 +793,65 @@ def source_text_for_tests() -> str:
 
 
 def behavior_source_text_for_tests() -> str:
-    source = source_text_for_tests()
-    value_map_pattern = (
-        r"MANIFEST_SYMBOLIC_VALUE_TEST_COVERAGE = \{.*?\n\}\n"
-        r"MANIFEST_CHECK_TEST_COVERAGE = "
-    )
-    source = re.sub(
-        value_map_pattern,
-        "MANIFEST_CHECK_TEST_COVERAGE = ",
-        source,
-        flags=re.DOTALL,
-    )
-    source = re.sub(
-        r"MANIFEST_CHECK_TEST_COVERAGE = \{.*?\n\}\n\n\ndef repo_root",
-        "def repo_root",
-        source,
-        flags=re.DOTALL,
-    )
+    """Return the joined source of test function bodies only.
 
-    return source
+    Module-level text such as the coverage mapping dicts is excluded, so a
+    manifest value literal counts as covered only when it appears inside an
+    executable test function.
+    """
+    segments = []
+
+    for path in sorted((repo_root() / "tests").glob("test_*.py")):
+        source = path.read_text(encoding="utf-8")
+        lines = source.splitlines(keepends=True)
+        tree = ast.parse(source)
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                start = node.lineno
+
+                if node.decorator_list:
+                    start = min(d.lineno for d in node.decorator_list)
+
+                segments.append("".join(lines[start - 1 : node.end_lineno]))
+
+    return "".join(segments)
+
+
+def collected_test_function_nodes() -> Mapping[str, ast.FunctionDef]:
+    nodes = {}
+
+    for path in sorted((repo_root() / "tests").glob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+                nodes[node.name] = node
+
+    return nodes
+
+
+def has_behavioral_assertion(node: ast.FunctionDef) -> bool:
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Assert):
+            return True
+
+        if isinstance(sub, ast.Call):
+            func = sub.func
+
+            if isinstance(func, ast.Name) and func.id.startswith("assert"):
+                return True
+
+            if isinstance(func, ast.Attribute):
+                if func.attr.startswith("assert"):
+                    return True
+
+                if func.attr == "raises" and any(
+                    keyword.arg == "match" for keyword in sub.keywords
+                ):
+                    return True
+
+    return False
 
 
 def suite_test_names() -> set[str]:
@@ -5074,7 +5114,7 @@ def test_selection_rejects_invalid_rows() -> None:
     stale = vpx.Candidate("family", "stale", {})
     failed = vpx.Candidate("family", "failed", {})
 
-    with pytest.raises(vp.NoPassedCandidateError):
+    with pytest.raises(vp.NoPassedCandidateError, match="accepted rows"):
         select_family(
             (
                 (
@@ -8864,7 +8904,7 @@ def test_plan_replay_recomputes_family_selection() -> None:
         **_identity_kwargs(),
     )
 
-    with pytest.raises(vp.StaleRecordError):
+    with pytest.raises(vp.StaleRecordError, match=r"selection|selected"):
         vpx.plan_from_json(
             vpx.plan_to_json(plan),
             replay_context=replay_context_for_plan(plan),
@@ -8921,7 +8961,7 @@ def test_plan_replay_recomputes_family_selection() -> None:
         **_identity_kwargs(),
     )
 
-    with pytest.raises(vp.StaleRecordError):
+    with pytest.raises(vp.StaleRecordError, match=r"selection|selected"):
         vpx.plan_from_json(
             vpx.plan_to_json(memory_plan),
             replay_context=replay_context_for_plan(memory_plan),
@@ -10501,3 +10541,15 @@ def test_tune_exhaustive_strategy_measures_every_admitted_row(
         "gradient-graph",
         "hvp-path",
     ]
+
+
+def test_acceptance_mapped_tests_contain_behavioral_assertions() -> None:
+    nodes = collected_test_function_nodes()
+    weak = {
+        name
+        for names in ACCEPTANCE_TEST_COVERAGE.values()
+        for name in names
+        if not has_behavioral_assertion(nodes[name])
+    }
+
+    assert sorted(weak) == []

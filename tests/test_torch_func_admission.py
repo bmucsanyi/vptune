@@ -30,8 +30,11 @@ def torch_func_settings(**overrides: object) -> dict[str, object]:
 def test_torch_func_admission_accepts_declared_vmap_randomness(
     randomness: str,
 ) -> None:
-    vpx.admit_torch_func(
-        torch_func_settings(**{"vectorization.randomness": randomness})
+    assert (
+        vpx.admit_torch_func(
+            torch_func_settings(**{"vectorization.randomness": randomness})
+        )
+        is None
     )
 
 

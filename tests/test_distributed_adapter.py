@@ -930,7 +930,7 @@ def test_build_dtensor_placement_rejects_contradictory_fields(
     def partial(_: str) -> object:
         return object()
 
-    with pytest.raises(AdmissionError):
+    with pytest.raises(AdmissionError, match=r"placement"):
         build_dtensor_placement(
             replicate,
             shard,

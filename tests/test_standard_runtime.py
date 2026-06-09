@@ -4164,7 +4164,7 @@ def test_metric_reference_check_rejects_nonsymmetric_metric() -> None:
         },
     )
 
-    with pytest.raises(vp.ReferenceFailedError):
+    with pytest.raises(vp.ReferenceFailedError, match="symmetry"):
         check(
             vpx.Candidate(
                 "metric",
@@ -4200,7 +4200,7 @@ def test_metric_reference_check_rejects_indefinite_metric() -> None:
         },
     )
 
-    with pytest.raises(vp.ReferenceFailedError):
+    with pytest.raises(vp.ReferenceFailedError, match="psd_violation"):
         check(
             vpx.Candidate(
                 "metric",
@@ -11647,7 +11647,7 @@ def test_inverse_metric_reference_check_rejects_indefinite_metric() -> None:
         },
     )
 
-    with pytest.raises(vp.ReferenceFailedError):
+    with pytest.raises(vp.ReferenceFailedError, match="psd_violation"):
         check(
             vpx.Candidate(
                 "inverse",
