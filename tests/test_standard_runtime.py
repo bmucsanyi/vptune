@@ -10,6 +10,7 @@ from torch._dynamo import config as torch_dynamo_config
 
 import vptune as vp
 import vptune.ext as vpx
+import vptune.fisher as fisher_module
 import vptune.ggn as ggn_module
 import vptune.metrics as metrics_module
 import vptune.runtime as runtime_module
@@ -1246,7 +1247,7 @@ def patch_score_matrix_product_recorder(
 ) -> None:
     patch_runtime_call_recorder(
         monkeypatch,
-        runtime_module,
+        fisher_module,
         "_score_matrix_product",
         recorder,
         "score_matrix_product",
@@ -5308,7 +5309,7 @@ def test_streaming_fisher_family_accumulates_without_score_matrix(
         raise AssertionError(message)
 
     monkeypatch.setattr(
-        runtime_module,
+        fisher_module,
         "_score_matrix_product",
         blocked_score_matrix_product,
     )
