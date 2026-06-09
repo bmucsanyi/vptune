@@ -63,6 +63,11 @@ from vptune.candidates import (
     standard_axis_registry,
 )
 from vptune.checks import STANDARD_THRESHOLDS
+from vptune.composition import (
+    composition_operation_factory,
+    composition_reference_check,
+    composition_runtime_config,
+)
 from vptune.data import (
     AutobatchDomain,
     Batch,
@@ -125,9 +130,6 @@ from vptune.metrics import KFACMetricOperator, StandardMetricOperator
 from vptune.reference import constant_operation, tree_reference_check
 from vptune.runtime import (
     checkpoint_operation,
-    composition_operation_factory,
-    composition_reference_check,
-    composition_runtime_config,
     standard_operation_factory,
     standard_reference_check,
     standard_runtime_config,

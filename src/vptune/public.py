@@ -20,6 +20,7 @@ from vptune.candidates import (
     standard_axis_registry,
 )
 from vptune.checks import STANDARD_THRESHOLDS
+from vptune.composition import composition_runtime_config
 from vptune.data import (
     PACKAGE_VERSION,
     Batch,
@@ -66,7 +67,6 @@ from vptune.run import load_plan as _load_plan
 from vptune.run import tune as _tune_problem
 from vptune.run import tune_run as _tune_run
 from vptune.runtime import (
-    composition_runtime_config,
     standard_operation_factory,
     standard_runtime_config,
 )

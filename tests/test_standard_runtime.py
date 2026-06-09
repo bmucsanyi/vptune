@@ -1182,7 +1182,7 @@ def patch_runtime_output_recorder(
     patch_runtime_call_recorder(
         monkeypatch,
         runtime_module,
-        "_runtime_output",
+        "runtime_output",
         recorder,
         "runtime_output",
     )

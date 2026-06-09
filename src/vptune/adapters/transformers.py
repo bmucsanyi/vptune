@@ -55,9 +55,9 @@ from vptune.runtime import (
     _compile_optional_bool,
     _compile_options,
     _compiled_autograd_patch,
-    _validate_compile_cache_state,
     standard_operation_factory,
     standard_reference_check,
+    validate_compile_cache_state,
 )
 from vptune.tensor_tree import tree_signature
 
@@ -1126,7 +1126,7 @@ def _transformers_compile_paths(
         message = f"compile.boundary={boundary} module paths must be unique"
         raise MaterializationError(message)
 
-    _validate_compile_cache_state(settings)
+    validate_compile_cache_state(settings)
 
     return result
 

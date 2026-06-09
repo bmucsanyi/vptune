@@ -11,6 +11,7 @@ from vptune.admission import admit_call_core_settings
 from vptune.autobatch_bridge import find_autobatch_value
 from vptune.candidates import AxisTable, axis_table, topological_families
 from vptune.cohorts import candidate_matches_assignment, cohort_assignments
+from vptune.composition import composition_runtime_config
 from vptune.data import (
     AutobatchDomain,
     Batch,
@@ -53,10 +54,7 @@ from vptune.measure import (
     measure_once,
     run_candidate,
 )
-from vptune.runtime import (
-    composition_runtime_config,
-    standard_runtime_with_matrix_free_bindings,
-)
+from vptune.runtime import standard_runtime_with_matrix_free_bindings
 from vptune.runtime_values import CompositionChild, deferred_runtime_finite_checks
 from vptune.schemas import (
     candidate_from_signature,
