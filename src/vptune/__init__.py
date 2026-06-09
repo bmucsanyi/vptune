@@ -11,6 +11,7 @@ from vptune.errors import (
     RecordFormatError,
     RecordValidationError,
     ReferenceFailedError,
+    RuntimeValueError,
     StaleRecordError,
     VPTuneError,
 )
@@ -121,6 +122,7 @@ __all__ = [
     "RecordValidationError",
     "ReferenceFailedError",
     "Run",
+    "RuntimeValueError",
     "SampleSource",
     "ScaledIdentity",
     "SearchSpace",

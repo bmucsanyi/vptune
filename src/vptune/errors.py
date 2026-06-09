@@ -39,3 +39,7 @@ class CompileSetupError(MaterializationError):
 
 class RecordValidationError(MaterializationError):
     """Raised when declared record or data content is invalid."""
+
+
+class RuntimeValueError(MaterializationError):
+    """Raised when a declared runtime value cannot be converted or validated."""

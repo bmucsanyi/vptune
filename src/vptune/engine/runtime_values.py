@@ -50,8 +50,8 @@ from vptune.engine.checks import (
 )
 from vptune.errors import (
     AdmissionError,
-    MaterializationError,
     ReferenceFailedError,
+    RuntimeValueError,
 )
 
 MATRIX_FREE_RUNTIME_BINDINGS = ContextVar[
@@ -897,11 +897,11 @@ def matrix_symmetry_error(matrix: torch.Tensor) -> float:
         The symmetry error.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if matrix.ndim != MATRIX_DIMS or matrix.shape[0] != matrix.shape[1]:
         message = "metric matrix must be square"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     require_finite_tensor(matrix, "metric matrix")
 
@@ -915,11 +915,11 @@ def matrix_psd_violation(matrix: torch.Tensor) -> float:
         The psd violation.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if matrix.ndim != MATRIX_DIMS or matrix.shape[0] != matrix.shape[1]:
         message = "metric matrix must be square"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     require_finite_tensor(matrix, "metric matrix")
 
@@ -1008,7 +1008,7 @@ def require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
     """Validate finite tensor.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if not FINITE_CHECKS_ENABLED[0]:
         return
@@ -1017,7 +1017,7 @@ def require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
 
     if not torch.isfinite(check_tensor).all().item():
         message = f"{name} contains nonfinite values"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def _finite_check_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -1135,7 +1135,7 @@ def scaled_loss_hessian_batch(batch: Batch, scale: float) -> Batch:
 def _scaled_tensor(value: Any, scale: float, name: str) -> torch.Tensor:
     if not isinstance(value, torch.Tensor):
         message = f"{name} must be a tensor"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return value * scale
 
@@ -1275,11 +1275,11 @@ def require_loss_hessian_shape(
     """Validate loss hessian shape.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if loss_hessian.shape != (output_numel, output_numel):
         message = "loss_hessian shape must match flattened function output"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def parameter_column_ranges(
@@ -1293,14 +1293,14 @@ def parameter_column_ranges(
         The column ranges.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     block_size = _parameter_block_size(settings)
     layer_block_size = _layer_block_size(settings)
 
     if block_size is not None and layer_block_size is not None:
         message = "parameter and layer chunk sizes cannot both be set"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if block_size is not None:
         return tuple(_parameter_block_ranges(width, block_size))
@@ -1318,7 +1318,7 @@ def _layer_block_ranges(
 ) -> tuple[tuple[int, int], ...]:
     if parameter_surface is None or not parameter_surface.layer_groups:
         message = "chunk.layer_block_size requires declared layer_groups"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     group_ranges = _parameter_surface_group_ranges(
         parameter_surface,
@@ -1335,13 +1335,13 @@ def _layer_block_ranges(
 
         if chunk_stop - chunk_start != chunk_width:
             message = "chunk.layer_block_size requires contiguous layer groups"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         ranges.append((chunk_start, chunk_stop))
 
     if ranges[0][0] != 0 or ranges[-1][1] != width:
         message = "chunk.layer_block_size ranges must cover parameter width"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return tuple(ranges)
 
@@ -1373,7 +1373,7 @@ def _parameter_surface_group_ranges(
 
         if stop - start != width:
             message = f"{key} requires contiguous parameter groups"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         ranges.append((start, stop))
 
@@ -1434,11 +1434,11 @@ def require_nonempty_per_example_terms(terms: torch.Tensor, label: str) -> None:
     """Validate nonempty per example terms.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if terms.numel() == 0:
         message = f"{label} requires at least one objective term"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def per_example_batch_size(
@@ -1452,7 +1452,7 @@ def per_example_batch_size(
         The example batch size.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     for key, value in batch.items():
         dim = in_dims[key]
@@ -1464,7 +1464,7 @@ def per_example_batch_size(
             return value.shape[dim]
 
     message = f"{label} requires a nonempty mapped batch"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def per_example_batch_slice(
@@ -1517,7 +1517,7 @@ def optional_positive_int_setting(
         The positive int setting.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = settings.get(key)
 
@@ -1525,7 +1525,7 @@ def optional_positive_int_setting(
         return None
 
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise MaterializationError(invalid_message)
+        raise RuntimeValueError(invalid_message)
 
     return value
 
@@ -1543,12 +1543,12 @@ def required_positive_int_setting(
         The positive int setting.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = optional_positive_int_setting(settings, key, invalid_message)
 
     if value is None:
-        raise MaterializationError(
+        raise RuntimeValueError(
             invalid_message if missing_message is None else missing_message
         )
 
@@ -1565,14 +1565,14 @@ def validate_vector_tensor_in_dim(
         The vector tensor in dim.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if raw_in_dim is None:
         return None
 
     if not isinstance(raw_in_dim, int) or isinstance(raw_in_dim, bool):
         message = "vectorization.in_dims values must be integers or None"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     dim = raw_in_dim
 
@@ -1581,11 +1581,11 @@ def validate_vector_tensor_in_dim(
 
     if dim < 0 or dim >= vector.ndim:
         message = "vectorization.in_dims axis is out of range"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if vector.shape[dim] == 0:
         message = "vectorized vector inputs require a nonempty mapped dimension"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return raw_in_dim
 
@@ -1597,21 +1597,21 @@ def vector_tree_batch_size(vector: TensorTree, in_dims: Any) -> int:
         The tree batch size.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     sizes = []
     _collect_vector_tree_batch_sizes(vector, in_dims, sizes)
 
     if not sizes:
         message = "vectorized vector inputs require at least one mapped leaf"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     first_size = sizes[0]
 
     for size in sizes[1:]:
         if size != first_size:
             message = "vectorized vector mapped dimensions differ"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
     return first_size
 
@@ -1642,7 +1642,7 @@ def _collect_vector_tree_batch_sizes(
         return
 
     message = f"unsupported vector tree node: {type(vector).__name__}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def vector_tree_select(vector: TensorTree, in_dims: Any, index: int) -> TensorTree:
@@ -1652,7 +1652,7 @@ def vector_tree_select(vector: TensorTree, in_dims: Any, index: int) -> TensorTr
         The tree select.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if isinstance(vector, torch.Tensor):
         if in_dims is None:
@@ -1674,7 +1674,7 @@ def vector_tree_select(vector: TensorTree, in_dims: Any, index: int) -> TensorTr
         )
 
     message = f"unsupported vector tree node: {type(vector).__name__}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def vector_tree_slice(
@@ -1689,7 +1689,7 @@ def vector_tree_slice(
         The tree slice.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if isinstance(vector, torch.Tensor):
         if in_dims is None:
@@ -1712,7 +1712,7 @@ def vector_tree_slice(
         )
 
     message = f"unsupported vector tree node: {type(vector).__name__}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def normalized_vector_dim(vector: torch.Tensor, in_dim: int) -> int:
@@ -1722,7 +1722,7 @@ def normalized_vector_dim(vector: torch.Tensor, in_dim: int) -> int:
         The vector dim.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     dim = in_dim
 
@@ -1731,7 +1731,7 @@ def normalized_vector_dim(vector: torch.Tensor, in_dim: int) -> int:
 
     if dim < 0 or dim >= vector.ndim:
         message = "vectorization.in_dims axis is out of range"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return dim
 
@@ -1743,11 +1743,11 @@ def stack_tensor_trees(outputs: Sequence[TensorTree], dim: int) -> TensorTree:
         The tensor trees.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if not outputs:
         message = "cannot stack an empty tensor-tree sequence"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     first = outputs[0]
 
@@ -1757,7 +1757,7 @@ def stack_tensor_trees(outputs: Sequence[TensorTree], dim: int) -> TensorTree:
         for output in outputs:
             if not isinstance(output, torch.Tensor):
                 message = "tensor tree structures differ"
-                raise MaterializationError(message)
+                raise RuntimeValueError(message)
 
             leaves.append(output)
 
@@ -1770,7 +1770,7 @@ def stack_tensor_trees(outputs: Sequence[TensorTree], dim: int) -> TensorTree:
         return _stack_tensor_tree_tuples(outputs, first, dim)
 
     message = f"unsupported tensor tree node: {type(first).__name__}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def cat_tensor_trees(outputs: Sequence[TensorTree], dim: int) -> TensorTree:
@@ -1780,11 +1780,11 @@ def cat_tensor_trees(outputs: Sequence[TensorTree], dim: int) -> TensorTree:
         The tensor trees.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if not outputs:
         message = "cannot concatenate an empty tensor-tree sequence"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     first = outputs[0]
 
@@ -1794,7 +1794,7 @@ def cat_tensor_trees(outputs: Sequence[TensorTree], dim: int) -> TensorTree:
         for output in outputs:
             if not isinstance(output, torch.Tensor):
                 message = "tensor tree structures differ"
-                raise MaterializationError(message)
+                raise RuntimeValueError(message)
 
             leaves.append(output)
 
@@ -1817,7 +1817,7 @@ def cat_tensor_trees(outputs: Sequence[TensorTree], dim: int) -> TensorTree:
         )
 
     message = f"unsupported tensor tree node: {type(first).__name__}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def _stack_tensor_tree_dicts(
@@ -1844,7 +1844,7 @@ def _require_tensor_tree_dict_outputs(
     for output in outputs:
         if not is_tensor_tree_dict(output) or set(output) != set(first):
             message = "tensor tree mapping keys differ"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         result.append(output)
 
@@ -1875,7 +1875,7 @@ def _require_tensor_tree_tuple_outputs(
     for output in outputs:
         if not is_tensor_tree_tuple(output) or len(output) != len(first):
             message = "tensor tree sequence lengths differ"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         result.append(output)
 
@@ -1893,19 +1893,19 @@ def runtime_path_from_settings(
         The path from settings.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = settings.get(setting_key)
 
     if not isinstance(value, str):
         message = f"{setting_key} is required"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     path = SPEC_PATH_TO_RUNTIME[operator_kind].get(value)
 
     if path is None:
         message = f"{setting_key} value is not lowered: {value}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return path
 
@@ -1914,13 +1914,13 @@ def require_positive_definite_matrix(matrix: torch.Tensor, label: str) -> None:
     """Validate positive definite matrix.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     _, info = torch.linalg.cholesky_ex(matrix)
 
     if torch.any(info != 0):
         message = f"{label} requires positive definite matrix"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 MetricMultiplyRunner = Callable[
@@ -2043,13 +2043,13 @@ def require_transform_admission_settings(
     """Validate transform admission settings.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if _requires_torch_func_admission(operator, path, settings):
         try:
             admit_torch_func(settings)
         except AdmissionError as error:
-            raise MaterializationError(str(error)) from error
+            raise RuntimeValueError(str(error)) from error
 
     if path in {
         JVP_PATH,
@@ -2060,7 +2060,7 @@ def require_transform_admission_settings(
         try:
             admit_forward_ad(settings)
         except AdmissionError as error:
-            raise MaterializationError(str(error)) from error
+            raise RuntimeValueError(str(error)) from error
 
 
 def _requires_torch_func_admission(
@@ -2108,13 +2108,13 @@ def require_call_runtime_settings(settings: Mapping[str, Any]) -> None:
     """Validate call runtime settings.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if any(key in settings for key in FUNCTIONAL_CALL_FIELDS):
         try:
             admit_functional_call(settings)
         except AdmissionError as error:
-            raise MaterializationError(str(error)) from error
+            raise RuntimeValueError(str(error)) from error
 
     path = _require_call_path_settings(settings)
     _require_call_state_settings(settings, path)
@@ -2125,7 +2125,7 @@ def _require_call_path_settings(settings: Mapping[str, Any]) -> Any:
     try:
         return admit_call_core_settings(settings)
     except AdmissionError as error:
-        raise MaterializationError(str(error)) from error
+        raise RuntimeValueError(str(error)) from error
 
 
 def _require_call_state_settings(
@@ -2136,13 +2136,13 @@ def _require_call_state_settings(
 
     if tied_weights not in {None, "preserve_alias_groups"}:
         message = f"call.tied_weights is unsupported: {tied_weights}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     parametrizations = settings.get("call.parametrizations")
 
     if parametrizations not in {None, "preserve_parametrizations"}:
         message = f"call.parametrizations is unsupported: {parametrizations}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     buffer_mutation = settings.get("call.buffer_mutation")
 
@@ -2153,7 +2153,7 @@ def _require_call_state_settings(
             _require_declared_state_restore_settings(settings)
     elif buffer_mutation not in {None, "forbidden"}:
         message = f"call.buffer_mutation is unsupported: {buffer_mutation}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def _require_call_return_settings(
@@ -2169,7 +2169,7 @@ def _require_call_return_settings(
             return
 
         message = f"call.return_type is unsupported: {return_type}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def _require_declared_state_restore_settings(settings: Mapping[str, Any]) -> None:
@@ -2179,27 +2179,27 @@ def _require_declared_state_restore_settings(settings: Mapping[str, Any]) -> Non
         or settings.get("call.buffers") != "explicit_buffers"
     ):
         message = "declared state restoration requires explicit functional-call inputs"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     try:
         admit_functional_call(settings)
     except AdmissionError as error:
-        raise MaterializationError(str(error)) from error
+        raise RuntimeValueError(str(error)) from error
 
     if settings["mutates_state"] is not True:
         message = "declared state restoration requires mutates_state=True"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def _require_stateful_declared_restore_settings(settings: Mapping[str, Any]) -> None:
     try:
         admit_functional_call(settings)
     except AdmissionError as error:
-        raise MaterializationError(str(error)) from error
+        raise RuntimeValueError(str(error)) from error
 
     if settings["mutates_state"] is not True:
         message = "declared state restoration requires mutates_state=True"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def require_stateful_module_path_settings(
@@ -2210,7 +2210,7 @@ def require_stateful_module_path_settings(
     """Validate stateful module path settings.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if settings.get("call.path") != "stateful_module":
         return
@@ -2226,7 +2226,7 @@ def require_stateful_module_path_settings(
         return
 
     message = "call.path=stateful_module requires a package-owned eager autograd path"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def require_module_state_names(
@@ -2237,18 +2237,18 @@ def require_module_state_names(
     """Validate module state names.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     module_params = dict(module.named_parameters())
     module_buffers = dict(module.named_buffers())
 
     if set(params) != set(module_params):
         message = "module parameter names must match runtime params"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if set(buffers) != set(module_buffers):
         message = "module buffer names must match runtime buffers"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -2290,7 +2290,7 @@ def restore_module_state(slots: tuple[_ModuleStateSlot, ...]) -> None:
     """Restore module state.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     for slot in reversed(slots):
         if slot.kind == "parameter":
@@ -2299,7 +2299,7 @@ def restore_module_state(slots: tuple[_ModuleStateSlot, ...]) -> None:
             slot.parent.__dict__["_buffers"][slot.name] = slot.value
         else:
             message = f"module state slot kind is unsupported: {slot.kind}"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
 
 def _module_state_parent(
@@ -2336,7 +2336,7 @@ def _batch_value(batch: Batch, key: str) -> Any:
         return batch[key]
 
     message = f"module call batch field is missing: {key}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def select_stateful_module_output(
@@ -2350,24 +2350,24 @@ def select_stateful_module_output(
         The stateful module output.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     return_type = settings.get("call.return_type")
 
     if return_type in {None, "raw_tensor_tree"}:
         if call.output_fields:
             message = "raw_tensor_tree module calls must not declare output fields"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         return output
 
     if return_type != "model_output_object_with_declared_fields":
         message = f"call.return_type is unsupported: {return_type}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if not call.output_fields:
         message = "model output object rows require declared output fields"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return {
         key: _select_stateful_module_output_path(output, path)
@@ -2400,7 +2400,7 @@ def _select_named_output_field(value: object, key: str) -> object:
         return getattr(value, key)
 
     message = f"model output field is missing: {key}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def _select_indexed_output_field(value: object, index: int) -> object:
@@ -2409,23 +2409,23 @@ def _select_indexed_output_field(value: object, index: int) -> object:
             return value[index]
         except IndexError as error:
             message = f"model output index is missing: {index}"
-            raise MaterializationError(message) from error
+            raise RuntimeValueError(message) from error
 
     message = f"model output is not indexable at: {index}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def require_batch_data_axis(operator: OperatorSpec, label: str) -> None:
     """Validate batch data axis.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if operator.data_axis == "batch":
         return
 
     message = f"{label} requires operator data_axis=batch"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def require_per_token_schedule(
@@ -2436,7 +2436,7 @@ def require_per_token_schedule(
     """Validate per token schedule.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     block_size = token_block_size(settings)
     schedule_value = settings.get("schedule.per_token")
@@ -2444,7 +2444,7 @@ def require_per_token_schedule(
     if schedule_value is None:
         if block_size is not None:
             message = "chunk.token_block_size requires schedule.per_token=loop"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         return
 
@@ -2460,16 +2460,16 @@ def require_per_token_schedule(
             "variable_length",
         }:
             message = "schedule.per_token=packed requires packed input binding"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         if batch_layout_callback is None:
             message = "schedule.per_token=packed requires packed input binding"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         return
 
     message = f"schedule.per_token is unsupported: {schedule_value}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def token_block_size(settings: Mapping[str, Any]) -> int | None:
@@ -2497,7 +2497,7 @@ def _require_token_block_runtime(
         return
 
     message = "chunk.token_block_size requires closed-form CE/KL GGN"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def require_lm_head_chunking_settings(
@@ -2507,7 +2507,7 @@ def require_lm_head_chunking_settings(
     """Validate lm head chunking settings.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     key = "chunk.lm_head_weight_chunk_bytes"
     value = optional_positive_int_setting(
@@ -2521,38 +2521,38 @@ def require_lm_head_chunking_settings(
 
     if lm_head_chunker is None:
         message = f"{key} requires LM-head weight binding"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def require_per_example_schedule(path: str | None, value: Any) -> None:
     """Validate per example schedule.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if value == "loop":
         if path in FISHER_MANUAL_PER_EXAMPLE_PATHS:
             return
 
         message = f"schedule.per_example=loop is incompatible with path: {path}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if value == "vmap":
         if path in VMAP_RUNTIME_PATHS:
             return
 
         message = f"schedule.per_example=vmap is incompatible with path: {path}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if value == "manual_batch":
         if path in FISHER_MANUAL_PER_EXAMPLE_PATHS:
             return
 
         message = f"schedule.per_example=manual_batch is incompatible with path: {path}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     message = f"schedule.per_example is unsupported: {value}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def require_per_example_batch_size_setting(
@@ -2565,14 +2565,14 @@ def require_per_example_batch_size_setting(
     """Validate per example batch size setting.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     schedule = settings.get("schedule.per_example")
 
     if key not in settings:
         if schedule == "manual_batch" and path in manual_paths:
             message = f"{key} is required for schedule.per_example=manual_batch"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         return
 
@@ -2584,7 +2584,7 @@ def require_per_example_batch_size_setting(
             f"{key} requires schedule.per_example=vmap or manual_batch on a "
             "matching path"
         )
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     required_positive_int_setting(
         settings,
@@ -2597,7 +2597,7 @@ def require_output_buffer_settings(settings: Mapping[str, Any]) -> None:
     """Validate output buffer settings.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = settings.get("memory.output_buffers")
 
@@ -2608,7 +2608,7 @@ def require_output_buffer_settings(settings: Mapping[str, Any]) -> None:
         return
 
     message = f"memory.output_buffers is unsupported: {value}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def require_fusion_settings(
@@ -2619,7 +2619,7 @@ def require_fusion_settings(
     """Validate fusion settings.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     for key, fused_values in _fusion_value_domains().items():
         value = settings.get(key)
@@ -2633,12 +2633,12 @@ def require_fusion_settings(
 
             if fusion_rewriter is None:
                 message = f"{key}={value} requires a registered fused implementation"
-                raise MaterializationError(message)
+                raise RuntimeValueError(message)
 
             continue
 
         message = f"{key} is unsupported: {value}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def _fusion_value_domains() -> Mapping[str, set[str]]:
@@ -2670,27 +2670,27 @@ def _require_fused_loss_identity(
             f"fusion.loss={fused_loss} requires typed "
             f"{expected_loss_kind} loss identity"
         )
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if loss.get("kind") != expected_loss_kind:
         message = (
             f"fusion.loss={fused_loss} requires typed "
             f"{expected_loss_kind} loss identity"
         )
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     identity = loss.get("identity")
 
     if not isinstance(identity, Mapping):
         message = f"fusion.loss={fused_loss} requires exact global normalization fields"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     reduction = identity.get("reduction")
     denominator = identity.get("denominator")
 
     if not isinstance(reduction, str) or not isinstance(denominator, str):
         message = f"fusion.loss={fused_loss} requires exact global normalization fields"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def runtime_fusion_module(
@@ -2704,18 +2704,18 @@ def runtime_fusion_module(
         The fusion module.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if not _has_fused_setting(candidate.settings):
         return module
 
     if module is None:
         message = "fused rows require a module"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if fusion_rewriter is None:
         message = "fused rows require a registered fused implementation"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return fusion_rewriter(module, candidate)
 
@@ -2743,7 +2743,7 @@ def require_path_coupled_reuse_setting(
     """Validate path coupled reuse setting.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if operator.kind != operator_kind:
         return
@@ -2755,10 +2755,10 @@ def require_path_coupled_reuse_setting(
 
     if value != required_value:
         message = f"{setting_key} is unsupported: {value}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if path != required_path:
-        raise MaterializationError(path_message)
+        raise RuntimeValueError(path_message)
 
 
 def require_output_cotangent_block_settings(
@@ -2769,7 +2769,7 @@ def require_output_cotangent_block_settings(
     """Validate output cotangent block settings.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     block_size = output_cotangent_block_size(settings)
 
@@ -2778,11 +2778,11 @@ def require_output_cotangent_block_settings(
 
     if operator.kind != "ggnvp":
         message = "chunk.output_cotangent_block_size applies only to GGNVP rows"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if path == GGN_DENSE_PATH:
         message = "chunk.output_cotangent_block_size requires a GGN VJP path"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def output_cotangent_block_size(settings: Mapping[str, Any]) -> int | None:
@@ -2826,7 +2826,7 @@ def require_parameter_block_size_settings(
     """Validate parameter block size settings.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     block_size = _parameter_block_size(settings)
     layer_block_size = _layer_block_size(settings)
@@ -2836,7 +2836,7 @@ def require_parameter_block_size_settings(
 
     if block_size is not None and layer_block_size is not None:
         message = "parameter and layer chunk sizes cannot both be set"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if layer_block_size is not None:
         _layer_block_ranges(
@@ -2858,7 +2858,7 @@ def require_parameter_block_size_settings(
         return
 
     message = "chunk.parameter_block_size requires a dense parameter-column matrix path"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def _parameter_surface_width(
@@ -2867,7 +2867,7 @@ def _parameter_surface_width(
 ) -> int:
     if parameter_surface is None:
         message = f"{key} requires declared layer_groups"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return sum(math.prod(shape) for shape in parameter_surface.shapes)
 
@@ -2883,11 +2883,11 @@ def declared_parameter_groups(
         The parameter groups.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if parameter_surface is None:
         message = f"{key} requires declared {group_field}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     groups = (
         parameter_surface.layer_groups
@@ -2897,7 +2897,7 @@ def declared_parameter_groups(
 
     if not groups:
         message = f"{key} requires declared {group_field}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return groups
 
@@ -2937,7 +2937,7 @@ def _require_group_names(
 
     if missing:
         message = f"{key} declared groups contain missing parameters: {missing}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def parameter_tree_from_tensor_tree(
@@ -2950,22 +2950,22 @@ def parameter_tree_from_tensor_tree(
         The tree from tensor tree.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if not isinstance(tree, dict):
         message = f"{label} requires a parameter-tree tensor mapping"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     result = dict[str, torch.Tensor]()
 
     for key, value in tree.items():
         if not isinstance(key, str):
             message = f"{label} requires string keys"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         if not isinstance(value, torch.Tensor):
             message = f"{label} requires tensor leaves"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         result[key] = value
 
@@ -2979,16 +2979,16 @@ def pin_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
         The cpu tensor.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if tensor.device.type != "cpu":
         message = "teacher output pinning requires CPU tensors"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     try:
         return tensor.pin_memory()
     except RuntimeError as error:
-        raise MaterializationError(str(error)) from error
+        raise RuntimeValueError(str(error)) from error
 
 
 def runtime_named_tensor_map_preserve_alias(
@@ -3021,7 +3021,7 @@ def require_parameter_surface_runtime_settings(
     """Validate parameter surface runtime settings.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if parameter_surface is None:
         return
@@ -3031,7 +3031,7 @@ def require_parameter_surface_runtime_settings(
         and parameter_surface.tied_weights_policy != "preserve"
     ):
         message = "tied-weight preservation requires preserved parameter surface"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def preserves_parameter_aliases(settings: Mapping[str, Any]) -> bool:
@@ -3067,7 +3067,7 @@ def runtime_output_to_buffer(
         The output to buffer.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if buffer is None:
         return output
@@ -3076,7 +3076,7 @@ def runtime_output_to_buffer(
         return tree_map2(_copy_output_tensor, buffer, output)
     except (RuntimeError, TypeError) as error:
         message = "memory.output_buffers=preallocated output tree mismatch"
-        raise MaterializationError(message) from error
+        raise RuntimeValueError(message) from error
 
 
 def _copy_output_tensor(buffer: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
@@ -3121,7 +3121,7 @@ def runtime_nested_tensor_value(
         The nested tensor value.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if isinstance(value, torch.Tensor):
         return map_tensor(value)
@@ -3147,7 +3147,7 @@ def runtime_nested_tensor_value(
         )
 
     if error_message is not None:
-        raise MaterializationError(error_message)
+        raise RuntimeValueError(error_message)
 
     return value
 
@@ -3162,7 +3162,7 @@ def run_with_call_grad_mode(
         The with call grad mode.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = settings.get("call.grad_mode")
 
@@ -3174,7 +3174,7 @@ def run_with_call_grad_mode(
             return callback()
 
     message = f"call.grad_mode is unsupported: {value}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def declared_tensor_snapshot(
@@ -3188,14 +3188,14 @@ def declared_tensor_snapshot(
         The tensor snapshot.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     snapshot = {}
 
     for key in keys:
         if key not in values:
             message = f"declared mutated {label} is missing: {key}"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         snapshot[key] = values[key].detach().clone()
 
@@ -3225,30 +3225,30 @@ def require_buffers_unchanged(before: BufferTree, after: BufferTree) -> None:
     """Validate buffers unchanged.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if set(before) != set(after):
         message = "call.buffer_mutation=forbidden detected changed buffer keys"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     for key, before_tensor in before.items():
         after_tensor = after[key]
 
         if before_tensor.shape != after_tensor.shape:
             message = f"call.buffer_mutation=forbidden changed buffer shape: {key}"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         if before_tensor.dtype != after_tensor.dtype:
             message = f"call.buffer_mutation=forbidden changed buffer dtype: {key}"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         if before_tensor.device != after_tensor.device:
             message = f"call.buffer_mutation=forbidden changed buffer device: {key}"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         if not torch.equal(before_tensor, after_tensor):
             message = f"call.buffer_mutation=forbidden changed buffer value: {key}"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
 
 def autocast_setting(settings: Mapping[str, Any]) -> tuple[str, torch.dtype] | None:
@@ -3258,7 +3258,7 @@ def autocast_setting(settings: Mapping[str, Any]) -> tuple[str, torch.dtype] | N
         The setting.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = settings.get("autocast")
 
@@ -3272,13 +3272,13 @@ def autocast_setting(settings: Mapping[str, Any]) -> tuple[str, torch.dtype] | N
         return _cuda_autocast(torch.bfloat16)
 
     message = f"autocast is unsupported by standard runtime: {value}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def _cuda_autocast(dtype: torch.dtype) -> tuple[str, torch.dtype]:
     if not torch.cuda.is_available():
         message = "CUDA autocast requires CUDA"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return "cuda", dtype
 
@@ -3290,7 +3290,7 @@ def bool_string_setting(settings: Mapping[str, Any], key: str) -> bool | None:
         The string setting.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = settings.get(key)
 
@@ -3304,7 +3304,7 @@ def bool_string_setting(settings: Mapping[str, Any], key: str) -> bool | None:
         return False
 
     message = f"{key} must be true or false"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def spec_path_value_for_runtime_path(operator_kind: str, path: str) -> str | None:
@@ -3326,14 +3326,14 @@ def require_candidate_family(operator: OperatorSpec, candidate: Candidate) -> No
     """Validate candidate family.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if candidate.family != operator.family:
         message = (
             f"candidate family does not match operator family: "
             f"{candidate.family} != {operator.family}"
         )
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
 
 def require_path(
@@ -3344,13 +3344,13 @@ def require_path(
     """Validate path.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if path in allowed_paths:
         return
 
     message = f"operator path {path} does not support {operator_kind}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def scalar_objective(
@@ -3363,13 +3363,13 @@ def scalar_objective(
         The objective.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     objective = scalar_objectives.get(operator.objective_id)
 
     if objective is None:
         message = f"scalar objective is missing: {operator.objective_id}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return objective
 
@@ -3384,13 +3384,13 @@ def function_objective(
         The objective.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     objective = function_objectives.get(operator.objective_id)
 
     if objective is None:
         message = f"function objective is missing: {operator.objective_id}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return objective
 
@@ -3406,18 +3406,18 @@ def checked_function_output(
         The function output.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if settings.get("call.return_type") != "raw_tensor_tree":
         if not _is_raw_tensor_tree(output):
             message = f"{name} must be a tensor tree"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         return output
 
     if not _is_raw_tensor_tree(output):
         message = f"{name} must be a raw tensor tree"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return output
 
@@ -3471,13 +3471,13 @@ def flatten_vector(vector: TensorTree) -> torch.Tensor:
         The vector.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     leaves = tree_leaves(vector)
 
     if not leaves:
         message = "dense standard operator requires at least one tensor leaf"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return torch.cat(tuple(leaf.reshape(-1) for leaf in leaves))
 
@@ -3489,14 +3489,14 @@ def flatten_vector_like(template: TensorTree, vector: TensorTree) -> torch.Tenso
         The vector like.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if isinstance(vector, torch.Tensor):
         return vector.reshape(-1)
 
     if isinstance(template, torch.Tensor):
         message = "flat tensor template requires a flat tensor vector"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     leaves = matching_vector_leaves(template, vector)
 
@@ -3528,7 +3528,7 @@ def wrap_flat_parameter_tree(
         The flat parameter tree.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     leaves = []
     offset = 0
@@ -3540,7 +3540,7 @@ def wrap_flat_parameter_tree(
 
     if offset != result.numel():
         message = "flat parameter layout length differs from parameter tree"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return dict(zip(template, leaves, strict=True))
 
@@ -3583,11 +3583,11 @@ def _collect_flat_vector_batch_pieces(
     if is_tensor_tree_dict(template) and is_tensor_tree_dict(vector):
         if not isinstance(in_dims, Mapping) or set(in_dims) != set(template):
             message = "vectorization.in_dims must match the vector tree"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         if set(vector) != set(template):
             message = "vector tree mapping keys differ from parameters"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         for key in template:
             _collect_flat_vector_batch_pieces(
@@ -3603,11 +3603,11 @@ def _collect_flat_vector_batch_pieces(
     if is_tensor_tree_tuple(template) and is_tensor_tree_tuple(vector):
         if not isinstance(in_dims, tuple) or len(in_dims) != len(template):
             message = "vectorization.in_dims must match the vector tree"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         if len(vector) != len(template):
             message = "vector tree sequence length differs from parameters"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         for param_leaf, vector_leaf, in_dim in zip(
             template,
@@ -3626,7 +3626,7 @@ def _collect_flat_vector_batch_pieces(
         return
 
     message = "vector tree structure differs from parameters"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def _flat_vector_batch_piece(
@@ -3638,24 +3638,24 @@ def _flat_vector_batch_piece(
     if in_dim is None:
         if vector.shape != template.shape:
             message = "unmapped vector leaf shape differs from parameter leaf"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         return vector.reshape(1, -1).expand(batch_size, -1)
 
     if not isinstance(in_dim, int) or isinstance(in_dim, bool):
         message = "vectorization.in_dims values must be integers or None"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     dim = normalized_vector_dim(vector, in_dim)
     unbatched_shape = vector.shape[:dim] + vector.shape[dim + 1 :]
 
     if unbatched_shape != template.shape:
         message = "mapped vector leaf shape differs from parameter leaf"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if vector.shape[dim] != batch_size:
         message = "vectorized vector mapped dimensions differ"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return vector.movedim(dim, 0).reshape(batch_size, -1)
 
@@ -3667,7 +3667,7 @@ def wrap_flat_vector(template: TensorTree, result: torch.Tensor) -> TensorTree:
         The flat vector.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     leaves = []
     offset = 0
@@ -3679,7 +3679,7 @@ def wrap_flat_vector(template: TensorTree, result: torch.Tensor) -> TensorTree:
 
     if offset != result.numel():
         message = "dense standard operator output length differs from vector tree"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return tree_from_leaves(template, tuple(leaves))
 
@@ -3691,11 +3691,11 @@ def wrap_flat_vector_batch(template: TensorTree, result: torch.Tensor) -> Tensor
         The flat vector batch.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     if result.ndim != MATRIX_DIMS:
         message = "batched flat vector result must be a matrix"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     leaves = []
     offset = 0
@@ -3709,7 +3709,7 @@ def wrap_flat_vector_batch(template: TensorTree, result: torch.Tensor) -> Tensor
 
     if offset != result.shape[1]:
         message = "batched dense output width differs from parameter tree"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return tree_from_leaves(template, tuple(leaves))
 
@@ -3721,13 +3721,13 @@ def batch_tensor(batch: Batch, key: str) -> torch.Tensor:
         The tensor.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = batch.get(key)
 
     if not isinstance(value, torch.Tensor):
         message = f"batch tensor is missing: {key}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return value
 
@@ -3739,28 +3739,28 @@ def batch_tensor_blocks(batch: Batch, key: str) -> tuple[torch.Tensor, ...]:
         The tensor blocks.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = batch.get(key)
 
     if not isinstance(value, tuple) or not value:
         message = f"batch tensor blocks are missing: {key}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     row_count = None
 
     for block in value:
         if not isinstance(block, torch.Tensor):
             message = f"batch tensor block must be a tensor: {key}"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         if block.ndim != MATRIX_DIMS:
             message = f"batch tensor block must be two-dimensional: {key}"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         if block.shape[0] == 0:
             message = f"batch tensor blocks must have at least one row: {key}"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
         require_finite_tensor(block, key)
 
@@ -3768,7 +3768,7 @@ def batch_tensor_blocks(batch: Batch, key: str) -> tuple[torch.Tensor, ...]:
             row_count = block.shape[0]
         elif block.shape[0] != row_count:
             message = f"batch tensor blocks must share row count: {key}"
-            raise MaterializationError(message)
+            raise RuntimeValueError(message)
 
     return value
 
@@ -3780,7 +3780,7 @@ def batch_tree(batch: Batch, key: str) -> TensorTree:
         The tree.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = batch.get(key)
 
@@ -3798,7 +3798,7 @@ def batch_tree(batch: Batch, key: str) -> TensorTree:
         return value
 
     message = f"batch tensor tree is missing: {key}"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def normalization(batch: Batch, operator: OperatorSpec) -> float:
@@ -3808,19 +3808,19 @@ def normalization(batch: Batch, operator: OperatorSpec) -> float:
         The normalization.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = batch.get("normalization")
 
     if not isinstance(value, int | float):
         message = "batch normalization is missing"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     normalization = float(value)
 
     if normalization <= 0.0:
         message = "batch normalization must be positive"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     if operator.aggregation == "sum" and not math.isclose(
         normalization,
@@ -3829,7 +3829,7 @@ def normalization(batch: Batch, operator: OperatorSpec) -> float:
         abs_tol=0.0,
     ):
         message = "sum aggregation requires normalization=1.0"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return normalization
 
@@ -3841,19 +3841,19 @@ def sampling_bound_float(bound: Mapping[str, Any], key: str) -> float:
         The bound float.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = bound.get(key)
 
     if not isinstance(value, int | float) or isinstance(value, bool):
         message = f"sampled Fisher sampling_bound.{key} must be numeric"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     result = float(value)
 
     if not math.isfinite(result) or result < 0.0:
         message = f"sampled Fisher sampling_bound.{key} must be finite and nonnegative"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return result
 
@@ -3865,7 +3865,7 @@ def sampling_bound_probability(bound: Mapping[str, Any], key: str) -> float:
         The bound probability.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     result = sampling_bound_float(bound, key)
 
@@ -3873,7 +3873,7 @@ def sampling_bound_probability(bound: Mapping[str, Any], key: str) -> float:
         return result
 
     message = f"sampled Fisher sampling_bound.{key} must be in (0, 1)"
-    raise MaterializationError(message)
+    raise RuntimeValueError(message)
 
 
 def operator_semantic(operator: OperatorSpec, key: str) -> str:
@@ -3883,13 +3883,13 @@ def operator_semantic(operator: OperatorSpec, key: str) -> str:
         The semantic.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = operator.semantics.get(key)
 
     if not isinstance(value, str):
         message = f"operator semantic field is missing: {key}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return value
 
@@ -3899,7 +3899,7 @@ def _operator_semantic_int(operator: OperatorSpec, key: str) -> int:
 
     if not isinstance(value, int) or isinstance(value, bool):
         message = f"operator semantic field is missing: {key}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return value
 
@@ -3911,13 +3911,13 @@ def operator_semantic_positive_int(operator: OperatorSpec, key: str) -> int:
         The semantic positive int.
 
     Raises:
-        MaterializationError: If the declared inputs are invalid.
+        RuntimeValueError: If the declared inputs are invalid.
     """
     value = _operator_semantic_int(operator, key)
 
     if value < 1:
         message = f"operator semantic field must be positive: {key}"
-        raise MaterializationError(message)
+        raise RuntimeValueError(message)
 
     return value
 
