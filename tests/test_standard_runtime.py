@@ -6475,13 +6475,21 @@ def test_sqrt_metric_eigenbasis_paths_match_reference() -> None:
         inverse_vector=vector,
     )
     eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
-    expected_sqrt = eigenvectors @ torch.diag(torch.sqrt(eigenvalues)) @ vector["w"]
+    expected_sqrt = (
+        eigenvectors
+        @ torch.diag(torch.sqrt(eigenvalues))
+        @ eigenvectors.T
+        @ vector["w"]
+    )
     inverse_matrix = torch.linalg.inv(
         matrix + damping * torch.eye(2, dtype=torch.float64)
     )
     inverse_eigenvalues, inverse_eigenvectors = torch.linalg.eigh(inverse_matrix)
     expected_inverse_sqrt = (
-        inverse_eigenvectors @ torch.diag(torch.sqrt(inverse_eigenvalues)) @ vector["w"]
+        inverse_eigenvectors
+        @ torch.diag(torch.sqrt(inverse_eigenvalues))
+        @ inverse_eigenvectors.T
+        @ vector["w"]
     )
 
     torch.testing.assert_close(tensor_mapping(sqrt_result)["w"], expected_sqrt)
@@ -18637,3 +18645,100 @@ def test_standard_runtime_tunes_hvp_and_materializes_selected_operator(
         tree_leaves(result)[0],
         torch.tensor([12.0], dtype=torch.float64),
     )
+
+
+def test_sqrt_metric_cholesky_factor_round_trip_matches_metric() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[4.0, 1.0], [1.0, 3.0]], dtype=torch.float64)
+    operator = ops.sqrt_metric(
+        "sqrt_metric",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+    )
+    settings = {"sqrt_metric.factor_path": "cholesky_factor"}
+    basis = torch.eye(2, dtype=torch.float64)
+    columns = [
+        flatten_tree(
+            standard_operation_result(
+                operator,
+                params,
+                {"metric_matrix": matrix},
+                {"w": basis[index].clone()},
+                settings,
+                f"sqrt-basis-{index}",
+            )
+        )
+        for index in range(2)
+    ]
+    factor = torch.stack(columns, dim=1)
+
+    torch.testing.assert_close(factor @ factor.T, matrix)
+
+
+def test_sqrt_metric_eigenbasis_double_apply_matches_metric_product() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[5.0, 2.0], [2.0, 4.0]], dtype=torch.float64)
+    vector = {"w": torch.tensor([0.5, -1.5], dtype=torch.float64)}
+    operator = ops.sqrt_metric(
+        "sqrt_metric",
+        "dense",
+        aggregation="sum",
+        representation=dense_metric_representation(),
+    )
+    settings = {"sqrt_metric.factor_path": "eigenbasis_factor"}
+    once = standard_operation_result(
+        operator,
+        params,
+        {"metric_matrix": matrix},
+        vector,
+        settings,
+        "sqrt-once",
+    )
+    twice = standard_operation_result(
+        operator,
+        params,
+        {"metric_matrix": matrix},
+        {"w": tensor_mapping(once)["w"]},
+        settings,
+        "sqrt-twice",
+    )
+
+    torch.testing.assert_close(flatten_tree(twice), matrix @ vector["w"])
+
+
+def test_block_metric_square_root_factor_round_trip_matches_metric() -> None:
+    params = {
+        "a": torch.tensor([1.0], dtype=torch.float64),
+        "b": torch.tensor([2.0, 3.0], dtype=torch.float64),
+    }
+    blocks = (
+        torch.tensor([[4.0]], dtype=torch.float64),
+        torch.tensor([[3.0, 1.0], [1.0, 2.0]], dtype=torch.float64),
+    )
+    dense = torch.block_diag(*blocks)
+    operator = ops.sqrt_metric(
+        "sqrt_metric",
+        "blocks",
+        aggregation="sum",
+        representation={"kind": "block_diagonal", "block_schedule": "custom_blocks"},
+    )
+    settings = {"sqrt_metric.factor_path": "cholesky_factor"}
+    basis = torch.eye(3, dtype=torch.float64)
+    columns = []
+
+    for index in range(3):
+        vector = {"a": basis[index][:1].clone(), "b": basis[index][1:].clone()}
+        result = standard_operation_result(
+            operator,
+            params,
+            {"metric_blocks": blocks},
+            vector,
+            settings,
+            f"sqrt-block-basis-{index}",
+        )
+        columns.append(flatten_tree(result))
+
+    factor = torch.stack(columns, dim=1)
+
+    torch.testing.assert_close(factor @ factor.T, dense)

@@ -2628,15 +2628,25 @@ def metric_square_root_apply(
         return runtime_values.wrap_flat_vector(vector, flat_result)
 
     matrix = metric_dense_matrix(execution.operator, execution.batch, vector)
-
-    factor = _metric_square_root_factor_matrix(
-        execution,
-        matrix,
-        inverse=inverse,
-        path=path,
-    )
     flat_vector = runtime_values.flatten_vector(vector)
-    flat_result = factor.T @ flat_vector if adjoint else factor @ flat_vector
+
+    if path == runtime_values.SQRT_METRIC_EIGENBASIS_PATH:
+        # The symmetric root is applied in factored form; the adjoint of a
+        # symmetric factor is the factor itself.
+        flat_result = _eigenbasis_metric_square_root_product(
+            execution,
+            matrix,
+            flat_vector,
+            inverse=inverse,
+        )
+    else:
+        factor = _metric_square_root_factor_matrix(
+            execution,
+            matrix,
+            inverse=inverse,
+            path=path,
+        )
+        flat_result = factor.T @ flat_vector if adjoint else factor @ flat_vector
 
     runtime_values.require_finite_tensor(flat_result, "metric square-root result")
 
@@ -2905,14 +2915,33 @@ def _metric_square_root_factor_matrix(
 
         return torch.linalg.cholesky(factor_matrix)
 
-    if path == runtime_values.SQRT_METRIC_EIGENBASIS_PATH:
-        eigenvalues, eigenvectors = torch.linalg.eigh(factor_matrix)
-        _require_positive_spectrum(eigenvalues, "eigenbasis square root")
-
-        return eigenvectors @ torch.diag(torch.sqrt(eigenvalues))
-
     message = f"metric square-root path is not lowered: {path}"
     raise MaterializationError(message)
+
+
+def _eigenbasis_metric_square_root_product(
+    execution: runtime_values.StandardExecution,
+    matrix: torch.Tensor,
+    flat_vector: torch.Tensor,
+    *,
+    inverse: bool,
+) -> torch.Tensor:
+    if inverse:
+        damped = inverse_metric_matrix(
+            execution.operator,
+            matrix,
+            execution.batch,
+            execution.vector,
+        )
+        eigenvalues, eigenvectors = torch.linalg.eigh(damped)
+        _require_positive_spectrum(eigenvalues, "eigenbasis square root")
+        scales = torch.rsqrt(eigenvalues)
+    else:
+        eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+        _require_positive_spectrum(eigenvalues, "eigenbasis square root")
+        scales = torch.sqrt(eigenvalues)
+
+    return eigenvectors @ (scales * (eigenvectors.T @ flat_vector))
 
 
 def _lanczos_metric_square_root_product(

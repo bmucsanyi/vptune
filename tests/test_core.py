@@ -338,6 +338,8 @@ ACCEPTANCE_TEST_COVERAGE = {
     ),
     "Standard runtime builder runs dense GGNVP": (
         "test_standard_operation_factory_runs_dense_metric_and_fisher_families",
+        "test_metric_inner_dense_paths_match_reference",
+        "test_inverse_metric_inner_reference_check_records_inverse_residual",
     ),
     "Standard runtime applies declared `dtype.parameter_storage`": (
         "test_standard_runtime_executes_dtype_and_backend_axes",
@@ -374,6 +376,10 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_standard_runtime_executes_layout_contiguity_axis",
         "test_standard_runtime_preserves_tied_parameter_aliases_during_dtype_cast",
         "test_distributed_operation_factory_delegates_dtensor_layout_to_strategy",
+        "test_standard_runtime_executes_layout_output_flat_contiguous",
+        "test_standard_runtime_executes_layout_params_flat_contiguous",
+        "test_standard_runtime_executes_layout_vector_flat_contiguous",
+        "test_standard_runtime_executes_layout_output_alias_groups",
     ),
     "Standard runtime rejects registered axes whose execution belongs": (
         "test_distributed_layout_values_require_distributed_adapter",
@@ -427,6 +433,9 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_inverse_metric_dense_direct_solve_paths_match_dense_solve",
         "test_inverse_metric_cg_dense_preconditioners_match_reference",
         "test_inverse_metric_direct_solve_rejects_iteration_budget",
+        "test_inverse_metric_cg_factor_reuse_does_not_filter_zero_rows",
+        "test_block_metric_schedule_must_match_representation",
+        "test_block_inverse_metric_schedule_must_match_representation",
     ),
     "Composition reference checks run child operator anchors": (
         "test_composition_reference_check_runs_child_anchor",
@@ -455,6 +464,10 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_sqrt_metric_cholesky_paths_match_reference",
         "test_ekfac_closed_form_square_root_paths_match_reference",
         "test_public_matrix_free_metric_square_roots_tune_selected_curvature_product",
+        "test_sqrt_metric_cholesky_factor_round_trip_matches_metric",
+        "test_sqrt_metric_eigenbasis_double_apply_matches_metric_product",
+        "test_block_metric_square_root_factor_round_trip_matches_metric",
+        "test_typed_kfac_metric_products_execute_against_reference",
     ),
     "Metric inner-product tests cover": (
         "test_metric_inner_dense_paths_match_reference",
@@ -471,6 +484,7 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_typed_block_metric_per_group_damping_executes_by_block",
         "test_typed_kfac_metric_per_group_damping_executes_by_parameter",
         "test_typed_kfac_pi_damping_uses_factored_shift",
+        "test_typed_kfac_rejects_invalid_factor_declarations",
     ),
     "Solver-tolerance tests cover": (
         "test_inverse_metric_cg_stops_at_declared_tol",
@@ -513,24 +527,31 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_standard_runtime_enables_compiled_autograd_for_backward_operator",
         "test_standard_runtime_warms_compile_cache",
         "test_run_candidate_records_measured_recompile_count",
+        "test_standard_runtime_compiles_whole_operator",
+        "test_tune_thorough_strategy_records_compile_horizon_scores",
     ),
     "Attention tests cover every frontend listed": (
         "test_transformers_attention_axis_uses_core_and_adapter_admission_fields",
         "test_sdpa_kernel_values_enter_declared_context",
         "test_sdpa_priority_list_enters_priority_context",
         "test_transformers_registered_attention_row_selects_runtime_backend",
+        "test_transformers_operation_factory_sets_attention_and_runs_module",
     ),
     "Attention executor tests cover a non-Transformers module": (
         "test_mapping_attention_location_executes_non_transformers_attention",
         "test_pytorch_sdpa_direct_matches_exact_attention",
         "test_packed_exact_attention_restores_token_order",
         "test_blockwise_exact_attention_matches_full_attention",
+        "test_packed_exact_attention_restores_padded_positions",
     ),
     "Distributed tests cover every distributed axis": (
         "test_distributed_adapter_registry_admits_owned_axes_and_strategy_fields",
         "test_distributed_operation_factory_applies_strategy_and_runs_module",
         "test_distributed_reference_check_uses_single_device_anchor",
         "test_reduce_rank_statuses_records_global_failure",
+        "test_gloo_process_group_all_gather_matches_logical_rank_output",
+        "test_nccl_process_group_single_rank_all_gather_matches_logical_rank_output",
+        "test_nccl_process_group_all_gather_matches_logical_rank_output",
     ),
     "Search tests cover": (
         "test_tune_admission_strategy_returns_candidate_table_only",
@@ -572,6 +593,7 @@ ACCEPTANCE_TEST_COVERAGE = {
     "Selection tests cover cohort comparison": (
         "test_cohort_selection_sums_compiled_row_scores",
         "test_selection_scores_compiled_distributed_rows_by_global_compile_fields",
+        "test_selection_tie_breaks_with_declared_rank_memory_reduction",
     ),
     "Dtype coherence is expressed through a": (
         "test_tune_run_selects_complete_dtype_cohort",
@@ -582,6 +604,7 @@ ACCEPTANCE_TEST_COVERAGE = {
     ),
     "Blocked descendants write": (
         "test_tune_run_propagates_candidate_validation_errors_inside_cohort",
+        "test_tune_run_cohort_subset_handles_cross_boundary_dependencies",
     ),
     "Failed rows from non-selected cohort assignments": (
         "test_tune_run_cohort_subset_handles_cross_boundary_dependencies",
@@ -598,11 +621,17 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_standard_runtime_executes_explicit_functional_call_settings",
         "test_standard_runtime_preserves_tied_parameter_aliases_during_dtype_cast",
         "test_standard_runtime_rejects_forbidden_functional_buffer_mutation",
+        "test_module_functional_call_preserves_active_parametrization",
+        "test_module_functional_call_handles_buffers_and_restores_mode",
+        "test_module_functional_call_respects_tied_weight_policy",
     ),
     "`torch.func` tests cover": (
         "test_standard_axis_registry_validates_core_axes",
         "test_torch_func_admission_rejects_transform_limitations",
         "test_torch_func_admission_rejects_forward_ad_coverage_failure",
+        "test_standard_operation_factory_runs_core_derivative_products",
+        "test_torch_func_admission_accepts_declared_vmap_randomness",
+        "test_torch_func_admission_rejects_invalid_vmap_randomness",
     ),
     "Checkpoint tests cover": (
         "test_checkpoint_operation_preserves_rng_state",
@@ -613,12 +642,18 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_transformers_sdpa_rows_enter_declared_kernel_context",
         "test_transformers_registered_attention_row_selects_runtime_backend",
         "test_transformers_model_identity_changes_with_replay_inputs",
+        "test_transformers_runtime_rejects_unlowered_row_settings",
+        "test_transformers_attention_location_executes_core_attention",
+        "test_transformers_runtime_config_runs_full_size_check_and_materializer",
     ),
     "Distributed adapter tests cover": (
         "test_distributed_selected_settings_must_match_across_ranks",
         "test_distributed_record_contains_memory_surface_and_settings",
         "test_fsdp2_admission_requires_hook_entry_and_rejects_bypass",
         "test_layout_admission_uses_mode_specific_fields",
+        "test_distributed_adapter_registry_admits_owned_axes_and_strategy_fields",
+        "test_reduce_rank_statuses_records_global_failure",
+        "test_distributed_operation_factory_delegates_dtensor_layout_to_strategy",
     ),
     "Selected-plan validation follows stored family order": (
         "test_validate_plan_materializes_in_validation_order",
