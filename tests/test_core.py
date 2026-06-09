@@ -533,6 +533,7 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_run_candidate_records_measured_recompile_count",
         "test_standard_runtime_compiles_whole_operator",
         "test_tune_thorough_strategy_records_compile_horizon_scores",
+        "test_standard_runtime_fullgraph_rejects_graph_breaks",
     ),
     "Attention tests cover every frontend listed": (
         "test_transformers_attention_axis_uses_core_and_adapter_admission_fields",

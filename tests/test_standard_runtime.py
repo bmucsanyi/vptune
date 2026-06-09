@@ -18742,3 +18742,53 @@ def test_block_metric_square_root_factor_round_trip_matches_metric() -> None:
     factor = torch.stack(columns, dim=1)
 
     torch.testing.assert_close(factor @ factor.T, dense)
+
+
+def graph_breaking_scalar(
+    params: vpx.ParameterTree,
+    buffers: vpx.BufferTree,
+    batch: vpx.Batch,
+    context: vpx.ObjectiveContext,
+) -> torch.Tensor:
+    del buffers, context
+    total = (params["w"] * batch["scale"]).square().sum()
+    torch._dynamo.graph_break()
+
+    return 0.5 * total
+
+
+@pytest.mark.parametrize("fullgraph", ["false", "true"])
+def test_standard_runtime_fullgraph_rejects_graph_breaks(fullgraph: str) -> None:
+    torch._dynamo.reset()
+    build = lambda: compiled_boundary_operation(  # noqa: E731
+        ops.gradient("gradient", "loss", aggregation="sum"),
+        params={"w": torch.tensor([2.0], dtype=torch.float64)},
+        settings={
+            **gradient_settings(),
+            **compile_settings(boundary="whole_operator"),
+            "compile.fullgraph": fullgraph,
+        },
+        batch={"scale": 3.0},
+        vector={"w": torch.tensor([1.0], dtype=torch.float64)},
+        scalar_objectives={"loss": graph_breaking_scalar},
+    )
+
+    if fullgraph == "true":
+        with pytest.raises(
+            Exception, match=r"data-dependent|graph break|Unsupported|fullgraph"
+        ):
+            build()()
+
+        return
+
+    result = build()()
+    reference_weight = torch.tensor([2.0], dtype=torch.float64, requires_grad=True)
+    reference_loss = graph_breaking_scalar(
+        {"w": reference_weight},
+        {},
+        {"scale": 3.0},
+        None,
+    )
+    (expected,) = torch.autograd.grad(reference_loss, reference_weight)
+
+    torch.testing.assert_close(tree_leaves(result)[0], expected)
