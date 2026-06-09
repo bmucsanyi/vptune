@@ -9,28 +9,8 @@ from typing import Any, Protocol
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from vptune.attention import (
-    AttentionSemantics,
-    MappingAttentionLocation,
-)
-from vptune.attention import (
-    check_patched_attention_output_reference as _check_patched_attention_output,
-)
-from vptune.attention import (
-    check_patched_attention_vjp_reference as _check_patched_attention_vjp,
-)
-from vptune.candidates import AxisDescriptor
-from vptune.checks import tree_error_measurements, validate_thresholds
-from vptune.compile import (
-    compile_backend,
-    compile_bool,
-    compile_mode,
-    compile_optional_bool,
-    compile_options,
-    compiled_autograd_patch,
-    validate_compile_cache_state,
-)
-from vptune.data import (
+from vptune.axes.candidates import AxisDescriptor
+from vptune.core.data import (
     PACKAGE_VERSION,
     Batch,
     BufferTree,
@@ -55,13 +35,33 @@ from vptune.data import (
     ScalarObjective,
     TensorTree,
 )
-from vptune.errors import AdmissionError, MaterializationError
-from vptune.identities import module_identity
-from vptune.runtime import (
+from vptune.core.identities import module_identity
+from vptune.core.tensor_tree import tree_signature
+from vptune.engine.attention import (
+    AttentionSemantics,
+    MappingAttentionLocation,
+)
+from vptune.engine.attention import (
+    check_patched_attention_output_reference as _check_patched_attention_output,
+)
+from vptune.engine.attention import (
+    check_patched_attention_vjp_reference as _check_patched_attention_vjp,
+)
+from vptune.engine.checks import tree_error_measurements, validate_thresholds
+from vptune.engine.compile import (
+    compile_backend,
+    compile_bool,
+    compile_mode,
+    compile_optional_bool,
+    compile_options,
+    compiled_autograd_patch,
+    validate_compile_cache_state,
+)
+from vptune.engine.runtime import (
     standard_operation_factory,
     standard_reference_check,
 )
-from vptune.tensor_tree import tree_signature
+from vptune.errors import AdmissionError, MaterializationError
 
 SDPA_KERNEL_BACKENDS = {
     "math": SDPBackend.MATH,

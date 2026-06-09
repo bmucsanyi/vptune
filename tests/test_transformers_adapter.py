@@ -8,9 +8,9 @@ import torch
 import vptune as vp
 import vptune.adapters as vpa
 import vptune.adapters.transformers as transformers_module
+import vptune.engine.runtime as runtime_module
 import vptune.ext as vpx
-import vptune.runtime as runtime_module
-from vptune import operators as ops
+from vptune.core import operators as ops
 from vptune.errors import AdmissionError
 
 

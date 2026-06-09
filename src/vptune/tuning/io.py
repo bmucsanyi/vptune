@@ -6,8 +6,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from vptune.identities import to_json_value
-from vptune.schemas import validate_json_record
+from vptune.core.identities import to_json_value
+from vptune.tuning.schemas import validate_json_record
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:

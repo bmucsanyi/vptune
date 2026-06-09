@@ -9,21 +9,21 @@ import torch
 from torch._dynamo import config as torch_dynamo_config
 
 import vptune as vp
-import vptune.compile as compile_module
-import vptune.derivatives as derivatives_module
+import vptune.engine.compile as compile_module
+import vptune.engine.derivatives as derivatives_module
+import vptune.engine.fisher as fisher_module
+import vptune.engine.ggn as ggn_module
+import vptune.engine.layout as layout_module
+import vptune.engine.memory as memory_module
+import vptune.engine.metrics as metrics_module
+import vptune.engine.runtime as runtime_module
+import vptune.engine.runtime_values as runtime_values_module
 import vptune.ext as vpx
-import vptune.fisher as fisher_module
-import vptune.ggn as ggn_module
-import vptune.layout as layout_module
-import vptune.memory as memory_module
-import vptune.metrics as metrics_module
-import vptune.runtime as runtime_module
-import vptune.runtime_values as runtime_values_module
-from vptune import operators as ops
-from vptune.io import read_record
-from vptune.measure import CPUMemoryBackend
-from vptune.run import tune as tune_problem
-from vptune.tensor_tree import tree_leaves, tree_map
+from vptune.core import operators as ops
+from vptune.core.tensor_tree import tree_leaves, tree_map
+from vptune.tuning.io import read_record
+from vptune.tuning.measure import CPUMemoryBackend
+from vptune.tuning.run import tune as tune_problem
 
 
 class OneParameterModule(torch.nn.Module):

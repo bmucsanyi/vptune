@@ -7,15 +7,15 @@ from typing import Any, Protocol
 
 import torch
 
-from vptune.data import (
+from vptune.core.data import (
     PACKAGE_VERSION,
     Candidate,
     FullSizeRecord,
     Measurement,
     TimingPolicy,
 )
+from vptune.core.tensor_tree import TensorTree, tree_detach, tree_leaves, tree_signature
 from vptune.errors import MeasurementError
-from vptune.tensor_tree import TensorTree, tree_detach, tree_leaves, tree_signature
 
 
 class MemoryBackend(Protocol):

@@ -8,30 +8,11 @@ from typing import Any
 
 import torch
 
-from vptune import (
-    compile,
-    derivatives,
-    fisher,
-    ggn,
-    layout,
-    memory,
-    metrics,
-    runtime_values,
-    vectorization,
-)
-from vptune.admission import (
+from vptune.axes.admission import (
     FUNCTIONAL_CALL_FIELDS,
     TORCH_FUNC_FIELDS,
 )
-from vptune.anchors import (
-    finite_difference_jvp,
-    vjp_dot_identity_error,
-)
-from vptune.checks import (
-    tree_error_measurements,
-    validate_thresholds,
-)
-from vptune.data import (
+from vptune.core.data import (
     PACKAGE_VERSION,
     Batch,
     BufferTree,
@@ -57,12 +38,8 @@ from vptune.data import (
     RuntimeReferenceCheck,
     ScalarObjective,
 )
-from vptune.errors import (
-    MaterializationError,
-    ReferenceFailedError,
-)
-from vptune.identities import stable_hash, to_json_value
-from vptune.tensor_tree import (
+from vptune.core.identities import stable_hash, to_json_value
+from vptune.core.tensor_tree import (
     TensorTree,
     tree_add_foreach,
     tree_dot,
@@ -71,6 +48,29 @@ from vptune.tensor_tree import (
     tree_map2,
     tree_mul_foreach,
     tree_signature,
+)
+from vptune.engine import (
+    compile,
+    derivatives,
+    fisher,
+    ggn,
+    layout,
+    memory,
+    metrics,
+    runtime_values,
+    vectorization,
+)
+from vptune.engine.anchors import (
+    finite_difference_jvp,
+    vjp_dot_identity_error,
+)
+from vptune.engine.checks import (
+    tree_error_measurements,
+    validate_thresholds,
+)
+from vptune.errors import (
+    MaterializationError,
+    ReferenceFailedError,
 )
 
 
@@ -1093,14 +1093,14 @@ def standard_runtime_config(
         "vptune.standard_operation_factory",
         PACKAGE_VERSION,
         runtime_signature,
-        {"callback": "vptune.runtime.standard_operation_factory"},
+        {"callback": "vptune.engine.runtime.standard_operation_factory"},
         operation_factory,
     )
     reference_check = CallableReferenceCheck(
         "vptune.standard_reference_check",
         PACKAGE_VERSION,
         runtime_signature,
-        {"callback": "vptune.runtime.standard_reference_check"},
+        {"callback": "vptune.engine.runtime.standard_reference_check"},
         reference_check,
     )
     materializer = standard_materializer(

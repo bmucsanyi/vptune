@@ -1,57 +1,12 @@
 """Extension API for custom runtimes, adapters, and replay tooling."""
 
-from vptune.admission import (
+from vptune.axes.admission import (
     admit_checkpoint,
     admit_forward_ad,
     admit_functional_call,
     admit_torch_func,
 )
-from vptune.anchors import (
-    AnchorRegistry,
-    dense_jacobian_anchor,
-    dense_metric_inner,
-    dense_metric_inverse_multiply,
-    dense_metric_inverse_residual,
-    dense_metric_multiply,
-    empirical_fisher_vp_dense_anchor,
-    finite_difference_hvp,
-    finite_difference_jvp,
-    fisher_vp_dense_anchor,
-    forward_ad_jvp_anchor,
-    ggnvp_dense_anchor,
-    gradient_anchor,
-    hvp_anchor,
-    hvp_jvp_grad_anchor,
-    hvp_reverse_over_reverse_anchor,
-    jvp_anchor,
-    module_functional_call,
-    sampled_fisher_vp_dense_anchor,
-    vhp_anchor,
-    vjp_anchor,
-    vjp_dot_identity_error,
-)
-from vptune.attention import (
-    AttentionInputs,
-    AttentionLocation,
-    AttentionSemantics,
-    AttentionSettings,
-    MappingAttentionLocation,
-    admit_core_attention,
-    apply_final_logit_softcap,
-    apply_softcap,
-    attention_operation_factory,
-    attention_reference_check,
-    attention_settings_from_candidate,
-    core_attention_axis,
-    exact_attention,
-    execute_attention,
-    run_attention,
-)
-from vptune.autobatch_bridge import (
-    AutobatchFind,
-    select_fastest_candidate_with_autobatch,
-)
-from vptune.candidates import (
+from vptune.axes.candidates import (
     AxisDescriptor,
     AxisManifest,
     AxisRegistry,
@@ -62,13 +17,7 @@ from vptune.candidates import (
     standard_axis_descriptors,
     standard_axis_registry,
 )
-from vptune.checks import STANDARD_THRESHOLDS
-from vptune.composition import (
-    composition_operation_factory,
-    composition_reference_check,
-    composition_runtime_config,
-)
-from vptune.data import (
+from vptune.core.data import (
     AutobatchDomain,
     Batch,
     BufferTree,
@@ -118,24 +67,80 @@ from vptune.data import (
     VectorProvider,
     parameter_surface,
 )
-from vptune.identities import device_signature, environment_signature, tensor_signature
-from vptune.measure import (
+from vptune.core.identities import (
+    device_signature,
+    environment_signature,
+    tensor_signature,
+)
+from vptune.core.tensor_tree import tree_add, tree_l2_norm, tree_zeros_like
+from vptune.engine.anchors import (
+    AnchorRegistry,
+    dense_jacobian_anchor,
+    dense_metric_inner,
+    dense_metric_inverse_multiply,
+    dense_metric_inverse_residual,
+    dense_metric_multiply,
+    empirical_fisher_vp_dense_anchor,
+    finite_difference_hvp,
+    finite_difference_jvp,
+    fisher_vp_dense_anchor,
+    forward_ad_jvp_anchor,
+    ggnvp_dense_anchor,
+    gradient_anchor,
+    hvp_anchor,
+    hvp_jvp_grad_anchor,
+    hvp_reverse_over_reverse_anchor,
+    jvp_anchor,
+    module_functional_call,
+    sampled_fisher_vp_dense_anchor,
+    vhp_anchor,
+    vjp_anchor,
+    vjp_dot_identity_error,
+)
+from vptune.engine.attention import (
+    AttentionInputs,
+    AttentionLocation,
+    AttentionSemantics,
+    AttentionSettings,
+    MappingAttentionLocation,
+    admit_core_attention,
+    apply_final_logit_softcap,
+    apply_softcap,
+    attention_operation_factory,
+    attention_reference_check,
+    attention_settings_from_candidate,
+    core_attention_axis,
+    exact_attention,
+    execute_attention,
+    run_attention,
+)
+from vptune.engine.checks import STANDARD_THRESHOLDS
+from vptune.engine.composition import (
+    composition_operation_factory,
+    composition_reference_check,
+    composition_runtime_config,
+)
+from vptune.engine.memory import checkpoint_operation
+from vptune.engine.metrics import KFACMetricOperator, StandardMetricOperator
+from vptune.engine.reference import constant_operation, tree_reference_check
+from vptune.engine.runtime import (
+    standard_operation_factory,
+    standard_reference_check,
+    standard_runtime_config,
+)
+from vptune.engine.runtime_values import CompositionChild, KFACMetricBlock
+from vptune.tuning.autobatch_bridge import (
+    AutobatchFind,
+    select_fastest_candidate_with_autobatch,
+)
+from vptune.tuning.measure import (
     CPUMemoryBackend,
     CUDAMemoryBackend,
     MemoryBackend,
     clear_parameter_gradients,
     default_memory_backend,
 )
-from vptune.memory import checkpoint_operation
-from vptune.metrics import KFACMetricOperator, StandardMetricOperator
-from vptune.reference import constant_operation, tree_reference_check
-from vptune.runtime import (
-    standard_operation_factory,
-    standard_reference_check,
-    standard_runtime_config,
-)
-from vptune.runtime_values import CompositionChild, KFACMetricBlock
-from vptune.schemas import (
+from vptune.tuning.schemas import (
     candidate_record_from_json,
     candidate_record_to_json,
     check_record_current,
@@ -150,7 +155,6 @@ from vptune.schemas import (
     selected_plan_validation_summary_current,
     selected_plan_validation_summary_record,
 )
-from vptune.tensor_tree import tree_add, tree_l2_norm, tree_zeros_like
 
 __all__ = [
     "STANDARD_THRESHOLDS",

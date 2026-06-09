@@ -10,7 +10,18 @@ from typing import Any
 
 import torch
 
-from vptune import (
+from vptune.core.data import (
+    Batch,
+    Candidate,
+    OperationFactory,
+    OperatorSpec,
+    ParameterSurface,
+    ParameterTree,
+)
+from vptune.core.tensor_tree import (
+    TensorTree,
+)
+from vptune.engine import (
     compile,
     derivatives,
     layout,
@@ -19,22 +30,11 @@ from vptune import (
     runtime_values,
     vectorization,
 )
-from vptune.anchors import (
+from vptune.engine.anchors import (
     jvp_anchor,
-)
-from vptune.data import (
-    Batch,
-    Candidate,
-    OperationFactory,
-    OperatorSpec,
-    ParameterSurface,
-    ParameterTree,
 )
 from vptune.errors import (
     MaterializationError,
-)
-from vptune.tensor_tree import (
-    TensorTree,
 )
 
 

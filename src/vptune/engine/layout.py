@@ -10,22 +10,26 @@ from typing import Any
 
 import torch
 
-from vptune import memory, runtime, runtime_values
-from vptune.checks import (
-    tree_error_measurements,
-)
-from vptune.data import (
+from vptune.core.data import (
     Batch,
     Candidate,
     ParameterSurface,
     ParameterTree,
 )
-from vptune.errors import (
-    MaterializationError,
-)
-from vptune.tensor_tree import (
+from vptune.core.tensor_tree import (
     TensorTree,
     tree_map,
+)
+from vptune.engine import (
+    memory,
+    runtime,
+    runtime_values,
+)
+from vptune.engine.checks import (
+    tree_error_measurements,
+)
+from vptune.errors import (
+    MaterializationError,
 )
 
 

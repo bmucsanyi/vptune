@@ -7,12 +7,9 @@ from collections.abc import Callable, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
-from vptune.admission import admit_call_core_settings
-from vptune.autobatch_bridge import find_autobatch_value
-from vptune.candidates import AxisTable, axis_table, topological_families
-from vptune.cohorts import candidate_matches_assignment, cohort_assignments
-from vptune.composition import composition_runtime_config
-from vptune.data import (
+from vptune.axes.admission import admit_call_core_settings
+from vptune.axes.candidates import AxisTable, axis_table, topological_families
+from vptune.core.data import (
     AutobatchDomain,
     Batch,
     Candidate,
@@ -38,15 +35,24 @@ from vptune.data import (
     TimingPolicy,
     TuningRun,
 )
+from vptune.core.identities import canonical_json, stable_hash
+from vptune.core.tensor_tree import TensorTree, tree_signature
+from vptune.engine.composition import composition_runtime_config
+from vptune.engine.runtime import standard_runtime_with_matrix_free_bindings
+from vptune.engine.runtime_values import (
+    CompositionChild,
+    deferred_runtime_finite_checks,
+)
 from vptune.errors import (
     AdmissionError,
     MaterializationError,
     NoPassedCandidateError,
     ReferenceFailedError,
 )
-from vptune.identities import canonical_json, stable_hash
-from vptune.io import read_record, write_record, write_record_exclusive
-from vptune.measure import (
+from vptune.tuning.autobatch_bridge import find_autobatch_value
+from vptune.tuning.cohorts import candidate_matches_assignment, cohort_assignments
+from vptune.tuning.io import read_record, write_record, write_record_exclusive
+from vptune.tuning.measure import (
     MemoryBackend,
     OperationMeasurementError,
     default_memory_backend,
@@ -54,9 +60,7 @@ from vptune.measure import (
     measure_once,
     run_candidate,
 )
-from vptune.runtime import standard_runtime_with_matrix_free_bindings
-from vptune.runtime_values import CompositionChild, deferred_runtime_finite_checks
-from vptune.schemas import (
+from vptune.tuning.schemas import (
     candidate_from_signature,
     candidate_record_from_json,
     candidate_record_to_json,
@@ -69,14 +73,13 @@ from vptune.schemas import (
     selected_plan_validation_input_signature,
     selected_plan_validation_summary_record,
 )
-from vptune.select import (
+from vptune.tuning.select import (
     record_accepted,
     record_matches_candidate,
     select_cohort,
     select_family,
 )
-from vptune.selection_core import selection_memory_mib, selection_score_seconds
-from vptune.tensor_tree import TensorTree, tree_signature
+from vptune.tuning.selection_core import selection_memory_mib, selection_score_seconds
 
 DTYPE_SETTING_KEYS = (
     "dtype.parameter_storage",

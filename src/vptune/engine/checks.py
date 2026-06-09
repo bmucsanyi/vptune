@@ -6,8 +6,8 @@ from typing import Any
 
 import torch
 
+from vptune.core.tensor_tree import TensorTree, tree_l2_norm, tree_max_abs, tree_sub
 from vptune.errors import ReferenceFailedError
-from vptune.tensor_tree import TensorTree, tree_l2_norm, tree_max_abs, tree_sub
 
 STANDARD_THRESHOLDS = {
     "max_abs_diff": 1e-4,

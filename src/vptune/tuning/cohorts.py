@@ -2,9 +2,9 @@
 
 import itertools
 
-from vptune.data import Candidate, CohortAssignment, CohortConstraint
+from vptune.core.data import Candidate, CohortAssignment, CohortConstraint
+from vptune.core.identities import stable_hash, to_json_value
 from vptune.errors import MaterializationError
-from vptune.identities import stable_hash, to_json_value
 
 
 def constraint_families(

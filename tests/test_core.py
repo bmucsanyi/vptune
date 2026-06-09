@@ -1,3 +1,4 @@
+import ast
 import contextlib
 import dataclasses
 import math
@@ -19,40 +20,22 @@ from vptune_test_helpers import (
 
 import vptune as vp
 import vptune.adapters as vpa
-import vptune.attention as attention_module
-import vptune.candidates as candidates_module
+import vptune.axes.candidates as candidates_module
+import vptune.engine.attention as attention_module
+import vptune.engine.runtime as runtime_module
 import vptune.ext as vpx
-import vptune.measure as measure_module
-import vptune.run as run_module
-import vptune.runtime as runtime_module
-from vptune import autobatch_bridge
-from vptune import operators as ops
-from vptune.checks import (
-    numeric_error_bound_measurements,
-    uses_reduction_degrading_setting,
-    validate_numeric_error_bound,
-    validate_thresholds,
-)
-from vptune.data import PACKAGE_VERSION, FullSizeRecord, Measurement
-from vptune.errors import ReferenceFailedError
-from vptune.identities import (
+import vptune.tuning.measure as measure_module
+import vptune.tuning.run as run_module
+from vptune.core import operators as ops
+from vptune.core.data import PACKAGE_VERSION, FullSizeRecord, Measurement
+from vptune.core.identities import (
     canonical_json,
     cuda_driver_version,
     module_identity,
     stable_hash,
     to_json_value,
 )
-from vptune.io import read_record, write_record, write_record_exclusive
-from vptune.measure import (
-    CPUMemoryBackend,
-    measure_once,
-    measure_operation,
-    run_candidate,
-)
-from vptune.run import tune as tune_problem
-from vptune.schemas import record_current
-from vptune.select import memory_stable, select_cohort, select_family
-from vptune.tensor_tree import (
+from vptune.core.tensor_tree import (
     tree_add_foreach,
     tree_dot_foreach,
     tree_elementwise_div_foreach,
@@ -63,6 +46,24 @@ from vptune.tensor_tree import (
     tree_mul_foreach,
     tree_signature,
 )
+from vptune.engine.checks import (
+    numeric_error_bound_measurements,
+    uses_reduction_degrading_setting,
+    validate_numeric_error_bound,
+    validate_thresholds,
+)
+from vptune.errors import ReferenceFailedError
+from vptune.tuning import autobatch_bridge
+from vptune.tuning.io import read_record, write_record, write_record_exclusive
+from vptune.tuning.measure import (
+    CPUMemoryBackend,
+    measure_once,
+    measure_operation,
+    run_candidate,
+)
+from vptune.tuning.run import tune as tune_problem
+from vptune.tuning.schemas import record_current
+from vptune.tuning.select import memory_stable, select_cohort, select_family
 
 MANIFEST_AXIS_BULLET = re.compile(r"^- `([^`]+)`(?:: (.*))?$")
 MANIFEST_AXIS_KEY_ALLOWLIST = {"autocast", "teacher_outputs"}
@@ -10185,3 +10186,47 @@ def test_tune_run_propagates_candidate_validation_errors_inside_cohort(
             memory_backend=CPUMemoryBackend(),
             clock=SequenceClock((0.0, 1.0)),
         )
+
+
+PACKAGE_LAYER_BY_OWNER = {
+    "errors": 0,
+    "core": 1,
+    "axes": 2,
+    "engine": 3,
+    "tuning": 4,
+    "adapters": 4,
+    "public": 5,
+    "ext": 5,
+    "__init__": 5,
+}
+
+
+def test_package_layers_have_one_directional_imports() -> None:
+    src_root = repo_root() / "src" / "vptune"
+
+    for path in sorted(src_root.rglob("*.py")):
+        owner = path.relative_to(src_root).parts[0].removesuffix(".py")
+        source_layer = PACKAGE_LAYER_BY_OWNER[owner]
+        tree = ast.parse(path.read_text())
+
+        for node in ast.walk(tree):
+            targets = []
+
+            if isinstance(node, ast.ImportFrom) and node.module is not None:
+                if node.module == "vptune":
+                    targets = [alias.name for alias in node.names]
+                elif node.module.startswith("vptune."):
+                    targets = [node.module.split(".")[1]]
+            elif isinstance(node, ast.Import):
+                targets = [
+                    alias.name.split(".")[1]
+                    for alias in node.names
+                    if alias.name.startswith("vptune.")
+                ]
+
+            for target in targets:
+                target_layer = PACKAGE_LAYER_BY_OWNER[target]
+                assert target_layer <= source_layer, (
+                    f"{owner} (layer {source_layer}) imports "
+                    f"{target} (layer {target_layer}) in {path}"
+                )

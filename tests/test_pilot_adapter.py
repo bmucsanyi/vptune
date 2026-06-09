@@ -7,13 +7,13 @@ import torch
 
 import vptune as vp
 import vptune.ext as vpx
-from vptune import operators as ops
 from vptune.adapters.pilot import (
     PilotReadiness,
     lower,
     readiness,
     selected_settings,
 )
+from vptune.core import operators as ops
 
 
 class OneBatchData:

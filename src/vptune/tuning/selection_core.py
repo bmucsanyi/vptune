@@ -2,8 +2,8 @@
 
 from collections.abc import Mapping, Sequence
 
-from vptune.candidates import attention_frontend_requires_full_size_agreement
-from vptune.data import Candidate, FullSizeRecord, Measurement, SelectionPolicy
+from vptune.axes.candidates import attention_frontend_requires_full_size_agreement
+from vptune.core.data import Candidate, FullSizeRecord, Measurement, SelectionPolicy
 from vptune.errors import NoPassedCandidateError
 
 FULL_SIZE_AGREEMENT_KEY = "full_size_agreement_passed"

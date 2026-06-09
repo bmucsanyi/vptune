@@ -12,28 +12,28 @@ from typing import Any
 import torch
 from torch.utils.checkpoint import checkpoint, noop_context_fn
 
-from vptune import (
-    derivatives,
-    runtime,
-    runtime_values,
-)
-from vptune.admission import (
+from vptune.axes.admission import (
     admit_checkpoint,
 )
-from vptune.data import (
+from vptune.core.data import (
     Batch,
     Candidate,
     CandidateOperation,
     FunctionObjective,
     OperatorSpec,
 )
+from vptune.core.tensor_tree import (
+    TensorTree,
+    tree_map,
+)
+from vptune.engine import (
+    derivatives,
+    runtime,
+    runtime_values,
+)
 from vptune.errors import (
     AdmissionError,
     MaterializationError,
-)
-from vptune.tensor_tree import (
-    TensorTree,
-    tree_map,
 )
 
 MMapResidency = Callable[[torch.Tensor, str], torch.Tensor]

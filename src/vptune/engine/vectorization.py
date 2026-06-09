@@ -9,24 +9,28 @@ from typing import Any
 
 import torch
 
-from vptune import derivatives, runtime, runtime_values
-from vptune.admission import (
+from vptune.axes.admission import (
     admit_torch_func,
 )
-from vptune.anchors import (
-    jvp_anchor,
-)
-from vptune.data import (
+from vptune.core.data import (
     Batch,
     ParameterTree,
+)
+from vptune.core.tensor_tree import (
+    TensorTree,
+    tree_from_leaves,
+)
+from vptune.engine import (
+    derivatives,
+    runtime,
+    runtime_values,
+)
+from vptune.engine.anchors import (
+    jvp_anchor,
 )
 from vptune.errors import (
     AdmissionError,
     MaterializationError,
-)
-from vptune.tensor_tree import (
-    TensorTree,
-    tree_from_leaves,
 )
 
 

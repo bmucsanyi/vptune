@@ -8,9 +8,9 @@ import pytest
 import torch
 
 import vptune as vp
-import vptune.attention as vpat
+import vptune.engine.attention as vpat
+import vptune.engine.runtime as runtime_module
 import vptune.ext as vpx
-import vptune.runtime as runtime_module
 from vptune.errors import AdmissionError, ReferenceFailedError
 
 

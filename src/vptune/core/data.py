@@ -9,13 +9,13 @@ from typing import Any, Protocol
 
 import torch
 
-from vptune.errors import MaterializationError, RecordValidationError
-from vptune.identities import (
+from vptune.core.identities import (
     device_signature,
     module_identity,
     to_json_value,
 )
-from vptune.tensor_tree import TensorTree
+from vptune.core.tensor_tree import TensorTree
+from vptune.errors import MaterializationError, RecordValidationError
 
 SCHEMA_VERSION = 1
 PACKAGE_VERSION = "1.0.0"

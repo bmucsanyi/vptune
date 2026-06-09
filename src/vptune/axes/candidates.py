@@ -7,13 +7,13 @@ from typing import Any
 
 import torch
 
-from vptune.admission import (
+from vptune.axes.admission import (
     FORWARD_AD_FIELDS,
     TORCH_FUNC_FIELDS,
     admit_forward_ad,
     admit_torch_func,
 )
-from vptune.data import PACKAGE_VERSION, Candidate, Family
+from vptune.core.data import PACKAGE_VERSION, Candidate, Family
 from vptune.errors import AdmissionError
 
 AdmissionRule = Callable[[Candidate], tuple[bool, str | None]]
@@ -574,7 +574,7 @@ def _axis_table_descriptor_domain(axis: "AxisDescriptor") -> tuple[Any, ...]:
 
 
 def _axis_table_adapter_axis_descriptors() -> tuple["AxisDescriptor", ...]:
-    attention_module = importlib.import_module("vptune.attention")
+    attention_module = importlib.import_module("vptune.engine.attention")
     distributed_module = importlib.import_module("vptune.adapters.distributed")
 
     core_attention_axes = tuple(
@@ -593,7 +593,7 @@ def _axis_table_adapter_axis_descriptors() -> tuple["AxisDescriptor", ...]:
 
 
 def _axis_table_attention_frontend_descriptor() -> "AxisDescriptor":
-    attention_module = importlib.import_module("vptune.attention")
+    attention_module = importlib.import_module("vptune.engine.attention")
     transformers_module = importlib.import_module("vptune.adapters.transformers")
 
     core_axis = attention_module.core_attention_axis()
@@ -706,7 +706,7 @@ def _attention_frontend_values() -> tuple[str, ...]:
 
 
 def _core_attention_frontend_values() -> tuple[str, ...]:
-    attention_module = importlib.import_module("vptune.attention")
+    attention_module = importlib.import_module("vptune.engine.attention")
 
     return attention_module.CORE_ATTENTION_FRONTENDS
 

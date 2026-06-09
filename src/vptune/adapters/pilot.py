@@ -4,8 +4,8 @@ import dataclasses
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from vptune.candidates import topological_families
-from vptune.data import (
+from vptune.axes.candidates import topological_families
+from vptune.core.data import (
     Candidate,
     CheckRecord,
     CohortConstraint,
@@ -16,9 +16,9 @@ from vptune.data import (
     Target,
     TuningRun,
 )
+from vptune.core.identities import to_json_value
 from vptune.errors import MaterializationError
-from vptune.identities import to_json_value
-from vptune.schemas import selected_plan_validation_input_signature
+from vptune.tuning.schemas import selected_plan_validation_input_signature
 
 PILOT_ACCEPTANCE_FAMILIES = (
     "capability_gradient",

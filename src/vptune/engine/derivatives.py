@@ -11,17 +11,7 @@ from typing import Any
 
 import torch
 
-from vptune import fisher, layout, runtime, runtime_values, vectorization
-from vptune.anchors import (
-    finite_difference_hvp,
-    forward_ad_jvp_anchor,
-    gradient_anchor,
-    hvp_anchor,
-    hvp_jvp_grad_anchor,
-    hvp_reverse_over_reverse_anchor,
-    jvp_anchor,
-)
-from vptune.data import (
+from vptune.core.data import (
     Batch,
     BufferTree,
     Candidate,
@@ -34,16 +24,32 @@ from vptune.data import (
     ParameterTree,
     ScalarObjective,
 )
-from vptune.errors import (
-    MaterializationError,
-    ReferenceFailedError,
-)
-from vptune.tensor_tree import (
+from vptune.core.tensor_tree import (
     TensorTree,
     tree_from_leaves,
     tree_leaves,
     tree_map,
     tree_map2,
+)
+from vptune.engine import (
+    fisher,
+    layout,
+    runtime,
+    runtime_values,
+    vectorization,
+)
+from vptune.engine.anchors import (
+    finite_difference_hvp,
+    forward_ad_jvp_anchor,
+    gradient_anchor,
+    hvp_anchor,
+    hvp_jvp_grad_anchor,
+    hvp_reverse_over_reverse_anchor,
+    jvp_anchor,
+)
+from vptune.errors import (
+    MaterializationError,
+    ReferenceFailedError,
 )
 
 

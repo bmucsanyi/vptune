@@ -5,8 +5,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from vptune.cohorts import candidate_matches_assignment, cohort_assignments
-from vptune.data import (
+from vptune.core.data import (
     PACKAGE_VERSION,
     SCHEMA_VERSION,
     Candidate,
@@ -20,12 +19,13 @@ from vptune.data import (
     ReplayContext,
     SelectionPolicy,
 )
-from vptune.errors import RecordFormatError, StaleRecordError
-from vptune.identities import (
+from vptune.core.identities import (
     canonical_json,
     to_json_value,
 )
-from vptune.selection_core import (
+from vptune.errors import RecordFormatError, StaleRecordError
+from vptune.tuning.cohorts import candidate_matches_assignment, cohort_assignments
+from vptune.tuning.selection_core import (
     ACCEPTED_STATUS,
     COMPILED_SPEED_STATISTIC,
     full_size_agreement_satisfied,

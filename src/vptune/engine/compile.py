@@ -12,7 +12,17 @@ from typing import Any
 
 import torch
 
-from vptune import (
+from vptune.core.data import (
+    Batch,
+    Candidate,
+    CandidateOperation,
+    OperatorSpec,
+    ParameterTree,
+)
+from vptune.core.tensor_tree import (
+    TensorTree,
+)
+from vptune.engine import (
     derivatives,
     fisher,
     ggn,
@@ -20,18 +30,8 @@ from vptune import (
     runtime,
     runtime_values,
 )
-from vptune.data import (
-    Batch,
-    Candidate,
-    CandidateOperation,
-    OperatorSpec,
-    ParameterTree,
-)
 from vptune.errors import (
     CompileSetupError,
-)
-from vptune.tensor_tree import (
-    TensorTree,
 )
 
 

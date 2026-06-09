@@ -2,10 +2,10 @@
 
 from collections.abc import Mapping, Sequence
 
-from vptune.data import Candidate, FullSizeRecord, SelectionPolicy
+from vptune.core.data import Candidate, FullSizeRecord, SelectionPolicy
+from vptune.core.identities import to_json_value
 from vptune.errors import NoPassedCandidateError
-from vptune.identities import to_json_value
-from vptune.selection_core import (
+from vptune.tuning.selection_core import (
     full_size_agreement_satisfied,
     memory_stable,
     select_accepted_family,

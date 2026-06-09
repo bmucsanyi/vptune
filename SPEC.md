@@ -2308,28 +2308,46 @@ vptune/
     vptune/
       __init__.py
       py.typed
-      admission.py
-      anchors.py
-      autobatch_bridge.py
-      candidates.py
-      checks.py
-      data.py
       errors.py
-      ext.py
-      identities.py
-      attention.py
-      io.py
-      measure.py
-      operators.py
       public.py
-      reference.py
-      runtime.py
-      select.py
-      selection_core.py
-      cohorts.py
-      run.py
-      schemas.py
-      tensor_tree.py
+      ext.py
+      core/
+        __init__.py
+        data.py
+        identities.py
+        operators.py
+        tensor_tree.py
+      axes/
+        __init__.py
+        admission.py
+        candidates.py
+      engine/
+        __init__.py
+        runtime.py
+        runtime_values.py
+        derivatives.py
+        ggn.py
+        fisher.py
+        metrics.py
+        vectorization.py
+        composition.py
+        layout.py
+        memory.py
+        compile.py
+        attention.py
+        anchors.py
+        checks.py
+        reference.py
+      tuning/
+        __init__.py
+        run.py
+        measure.py
+        select.py
+        selection_core.py
+        cohorts.py
+        autobatch_bridge.py
+        schemas.py
+        io.py
       adapters/
         transformers.py
         distributed.py
@@ -2346,6 +2364,16 @@ vptune/
     test_pilot_adapter.py
     vptune_test_helpers.py
 ```
+
+Package layers and their import rule, enforced by an acceptance test: `errors`
+is importable everywhere; `core` (data model, identities, tensor trees,
+operator specs) imports only `errors`; `axes` (manifest, candidate generation,
+admission) imports `core` and below; `engine` (runtime orchestration and the
+operator, metric, vectorization, composition, layout, memory, compile, and
+attention lowerings) imports `axes` and below; `tuning` (search, measurement,
+selection, cohorts, persistence) imports `engine` and below; `adapters` import
+`tuning` and below; the root surface (`public.py`, `ext.py`, `__init__.py`)
+imports anything. No module imports a higher layer.
 
 ## Implementation Order
 

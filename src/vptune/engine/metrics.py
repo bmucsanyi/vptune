@@ -14,12 +14,7 @@ from typing import Any
 
 import torch
 
-from vptune import layout, memory, runtime, runtime_values, vectorization
-from vptune.anchors import (
-    dense_metric_inverse_multiply,
-    dense_metric_multiply,
-)
-from vptune.data import (
+from vptune.core.data import (
     Batch,
     Candidate,
     FullSizeRecord,
@@ -27,10 +22,7 @@ from vptune.data import (
     OperatorSpec,
     ParameterTree,
 )
-from vptune.errors import (
-    MaterializationError,
-)
-from vptune.tensor_tree import (
+from vptune.core.tensor_tree import (
     TensorTree,
     tree_add_foreach,
     tree_add_scalar_foreach,
@@ -38,6 +30,20 @@ from vptune.tensor_tree import (
     tree_elementwise_mul_foreach,
     tree_map,
     tree_map2,
+)
+from vptune.engine import (
+    layout,
+    memory,
+    runtime,
+    runtime_values,
+    vectorization,
+)
+from vptune.engine.anchors import (
+    dense_metric_inverse_multiply,
+    dense_metric_multiply,
+)
+from vptune.errors import (
+    MaterializationError,
 )
 
 

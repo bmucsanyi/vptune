@@ -12,18 +12,25 @@ from typing import Any
 
 import torch
 
-from vptune import compile, derivatives, layout, runtime, runtime_values, vectorization
-from vptune.data import (
+from vptune.core.data import (
     Batch,
     Candidate,
     OperatorSpec,
     ParameterSurface,
 )
+from vptune.core.tensor_tree import (
+    TensorTree,
+)
+from vptune.engine import (
+    compile,
+    derivatives,
+    layout,
+    runtime,
+    runtime_values,
+    vectorization,
+)
 from vptune.errors import (
     MaterializationError,
-)
-from vptune.tensor_tree import (
-    TensorTree,
 )
 
 FISHER_PER_EXAMPLE_MANUAL_BATCH_PATHS = (

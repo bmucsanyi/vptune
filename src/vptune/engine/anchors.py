@@ -7,8 +7,8 @@ from typing import Any, Protocol
 import torch
 from torch.func import functional_call, grad, jvp, vjp
 
-from vptune.admission import admit_functional_call
-from vptune.tensor_tree import (
+from vptune.axes.admission import admit_functional_call
+from vptune.core.tensor_tree import (
     TensorTree,
     tree_dot,
     tree_from_leaves,

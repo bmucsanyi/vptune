@@ -11,17 +11,15 @@ from typing import Any, TypeGuard
 
 import torch
 
-from vptune import operators as _operator_builders
-from vptune.candidates import (
+from vptune.axes.candidates import (
     AxisDescriptor,
     axis_manifest,
     settings_product,
     standard_axis_descriptors,
     standard_axis_registry,
 )
-from vptune.checks import STANDARD_THRESHOLDS
-from vptune.composition import composition_runtime_config
-from vptune.data import (
+from vptune.core import operators as _operator_builders
+from vptune.core.data import (
     PACKAGE_VERSION,
     Batch,
     BufferTree,
@@ -41,36 +39,38 @@ from vptune.data import (
     operator_dependencies,
     parameter_surface,
 )
-from vptune.data import CohortConstraint as _LowerCohortConstraint
-from vptune.data import (
+from vptune.core.data import CohortConstraint as _LowerCohortConstraint
+from vptune.core.data import (
     Problem as _LowerProblem,
 )
-from vptune.data import (
+from vptune.core.data import (
     SearchPolicy as _SearchPolicy,
 )
-from vptune.data import (
+from vptune.core.data import (
     Target as _LowerTarget,
 )
-from vptune.data import (
+from vptune.core.data import (
     TuningRun as _LowerTuningRun,
 )
-from vptune.errors import AdmissionError, MaterializationError
-from vptune.identities import (
+from vptune.core.identities import (
     module_identity,
     stable_hash,
     tensor_signature,
     to_json_value,
 )
-from vptune.io import read_record
-from vptune.measure import MemoryBackend
-from vptune.run import load_plan as _load_plan
-from vptune.run import tune as _tune_problem
-from vptune.run import tune_run as _tune_run
-from vptune.runtime import (
+from vptune.core.tensor_tree import tree_leaves
+from vptune.engine.checks import STANDARD_THRESHOLDS
+from vptune.engine.composition import composition_runtime_config
+from vptune.engine.runtime import (
     standard_operation_factory,
     standard_runtime_config,
 )
-from vptune.tensor_tree import tree_leaves
+from vptune.errors import AdmissionError, MaterializationError
+from vptune.tuning.io import read_record
+from vptune.tuning.measure import MemoryBackend
+from vptune.tuning.run import load_plan as _load_plan
+from vptune.tuning.run import tune as _tune_problem
+from vptune.tuning.run import tune_run as _tune_run
 
 MIN_CLASS_LOGIT_DIMS = 2
 SQUARE_MATRIX_DIMS = 2

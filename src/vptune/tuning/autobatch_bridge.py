@@ -5,7 +5,7 @@ from typing import Protocol
 
 import autobatch
 
-from vptune.data import Candidate
+from vptune.core.data import Candidate
 from vptune.errors import MaterializationError
 
 

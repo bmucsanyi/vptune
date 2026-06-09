@@ -8,11 +8,11 @@ import pytest
 import torch
 
 import vptune as vp
+import vptune.engine.runtime as runtime_module
 import vptune.ext as vpx
 import vptune.public as public_module
-import vptune.run as run_module
-import vptune.runtime as runtime_module
-from vptune.tensor_tree import tree_leaves
+import vptune.tuning.run as run_module
+from vptune.core.tensor_tree import tree_leaves
 
 
 def unchecked_public_value(value: Any) -> Any:

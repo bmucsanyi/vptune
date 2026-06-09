@@ -3,8 +3,7 @@
 import dataclasses
 from collections.abc import Mapping
 
-from vptune.checks import tree_error_measurements, validate_thresholds
-from vptune.data import (
+from vptune.core.data import (
     Batch,
     Candidate,
     CandidateOperation,
@@ -12,8 +11,9 @@ from vptune.data import (
     ReferenceCheck,
     ReferenceResult,
 )
+from vptune.core.tensor_tree import TensorTree
+from vptune.engine.checks import tree_error_measurements, validate_thresholds
 from vptune.errors import MaterializationError
-from vptune.tensor_tree import TensorTree
 
 
 def tree_reference_check(

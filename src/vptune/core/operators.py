@@ -4,7 +4,7 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from vptune.data import OperatorSpec
+from vptune.core.data import OperatorSpec
 from vptune.errors import MaterializationError
 
 AGGREGATIONS = ("sum", "mean", "mean_per_example", "none")

@@ -1,7 +1,7 @@
 """Typed public API for derivative-product tuning."""
 
 from vptune import adapters as adapters
-from vptune.data import Plan, TuningRun
+from vptune.core.data import Plan, TuningRun
 from vptune.errors import (
     AdmissionError,
     CompileSetupError,
@@ -82,7 +82,7 @@ from vptune.public import (
     tune,
     vjp,
 )
-from vptune.run import (
+from vptune.tuning.run import (
     load_plan,
     load_tuned_plan,
     load_tuned_run,

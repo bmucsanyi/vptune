@@ -11,12 +11,7 @@ from typing import Any
 
 import torch
 
-from vptune import compile, memory, metrics, runtime, runtime_values, vectorization
-from vptune.checks import (
-    tree_error_measurements,
-    validate_thresholds,
-)
-from vptune.data import (
+from vptune.core.data import (
     PACKAGE_VERSION,
     Batch,
     CallableOperationFactory,
@@ -31,15 +26,27 @@ from vptune.data import (
     ReferenceResult,
     RuntimeConfig,
 )
+from vptune.core.tensor_tree import (
+    TensorTree,
+    tree_map,
+    tree_signature,
+)
+from vptune.engine import (
+    compile,
+    memory,
+    metrics,
+    runtime,
+    runtime_values,
+    vectorization,
+)
+from vptune.engine.checks import (
+    tree_error_measurements,
+    validate_thresholds,
+)
 from vptune.errors import (
     CompileSetupError,
     MaterializationError,
     ReferenceFailedError,
-)
-from vptune.tensor_tree import (
-    TensorTree,
-    tree_map,
-    tree_signature,
 )
 
 
@@ -1106,14 +1113,14 @@ def composition_runtime_config(
         "vptune.composition_operation_factory",
         PACKAGE_VERSION,
         runtime_signature,
-        {"callback": "vptune.runtime.composition_operation_factory"},
+        {"callback": "vptune.engine.runtime.composition_operation_factory"},
         operation_factory,
     )
     reference_check = CallableReferenceCheck(
         "vptune.composition_reference_check",
         PACKAGE_VERSION,
         runtime_signature,
-        {"callback": "vptune.runtime.composition_reference_check"},
+        {"callback": "vptune.engine.runtime.composition_reference_check"},
         reference_check,
     )
 

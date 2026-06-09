@@ -6,14 +6,13 @@ from typing import Any, Protocol, TypeGuard
 
 import torch
 
-from vptune.candidates import (
+from vptune.axes.candidates import (
     FSDP_RESHARD_AFTER_FORWARD_DOMAIN,
     INTEGER_DOMAIN,
     AxisDescriptor,
     AxisRegistry,
 )
-from vptune.checks import tree_error_measurements, validate_thresholds
-from vptune.data import (
+from vptune.core.data import (
     PACKAGE_VERSION,
     Batch,
     BufferTree,
@@ -38,10 +37,11 @@ from vptune.data import (
     RuntimeOperationFactory,
     ScalarObjective,
 )
+from vptune.core.identities import module_identity, to_json_value
+from vptune.core.tensor_tree import TensorTree, tree_signature
+from vptune.engine.checks import tree_error_measurements, validate_thresholds
+from vptune.engine.runtime import standard_operation_factory, standard_reference_check
 from vptune.errors import AdmissionError, MaterializationError
-from vptune.identities import module_identity, to_json_value
-from vptune.runtime import standard_operation_factory, standard_reference_check
-from vptune.tensor_tree import TensorTree, tree_signature
 
 DISTRIBUTED_STRATEGIES = (
     "single_gpu",

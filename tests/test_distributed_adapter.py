@@ -9,7 +9,6 @@ import torch
 import torch.multiprocessing as mp
 
 from vptune import AdmissionError, MaterializationError
-from vptune import operators as ops
 from vptune.adapters import distributed as distributed_module
 from vptune.adapters.distributed import (
     DistributedAdmissionPolicy,
@@ -45,7 +44,8 @@ from vptune.adapters.distributed import (
     run_with_loss_parallel,
     wait_collective,
 )
-from vptune.candidates import INTEGER_DOMAIN
+from vptune.axes.candidates import INTEGER_DOMAIN
+from vptune.core import operators as ops
 from vptune.ext import (
     Batch,
     BufferTree,

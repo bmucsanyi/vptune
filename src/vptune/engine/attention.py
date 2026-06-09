@@ -10,10 +10,8 @@ import torch
 from torch.nn import functional
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from vptune.candidates import AxisDescriptor, AxisRegistry
-from vptune.checks import tree_error_measurements, validate_thresholds
-from vptune.compile import compiled_operation
-from vptune.data import (
+from vptune.axes.candidates import AxisDescriptor, AxisRegistry
+from vptune.core.data import (
     PACKAGE_VERSION,
     Batch,
     Candidate,
@@ -22,8 +20,10 @@ from vptune.data import (
     ReferenceCheck,
     ReferenceResult,
 )
+from vptune.core.tensor_tree import TensorTree
+from vptune.engine.checks import tree_error_measurements, validate_thresholds
+from vptune.engine.compile import compiled_operation
 from vptune.errors import AdmissionError, CompileSetupError, MaterializationError
-from vptune.tensor_tree import TensorTree
 
 SDPA_BACKENDS = {
     "math": SDPBackend.MATH,

@@ -3,13 +3,13 @@
 from collections.abc import Mapping
 from typing import Any
 
-from vptune.checks import (
+from vptune.core.tensor_tree import TensorTree
+from vptune.engine.checks import (
     STANDARD_THRESHOLDS,
     tree_error_measurements,
     validate_thresholds,
 )
 from vptune.errors import ReferenceFailedError
-from vptune.tensor_tree import TensorTree
 
 
 def thresholds_for_measurements(

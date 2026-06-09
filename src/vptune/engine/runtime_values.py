@@ -14,7 +14,7 @@ from typing import Any, TypeGuard
 
 import torch
 
-from vptune.admission import (
+from vptune.axes.admission import (
     FUNCTIONAL_CALL_FIELDS,
     TORCH_FUNC_FIELDS,
     admit_call_core_settings,
@@ -22,12 +22,7 @@ from vptune.admission import (
     admit_functional_call,
     admit_torch_func,
 )
-from vptune.checks import (
-    STANDARD_THRESHOLDS,
-    numeric_error_bound_measurements,
-    validate_numeric_error_bound,
-)
-from vptune.data import (
+from vptune.core.data import (
     Batch,
     BufferTree,
     Candidate,
@@ -41,17 +36,22 @@ from vptune.data import (
     ReferenceCheck,
     ScalarObjective,
 )
-from vptune.errors import (
-    AdmissionError,
-    MaterializationError,
-    ReferenceFailedError,
-)
-from vptune.identities import tensor_signature, to_json_value
-from vptune.tensor_tree import (
+from vptune.core.identities import tensor_signature, to_json_value
+from vptune.core.tensor_tree import (
     TensorTree,
     tree_from_leaves,
     tree_leaves,
     tree_map2,
+)
+from vptune.engine.checks import (
+    STANDARD_THRESHOLDS,
+    numeric_error_bound_measurements,
+    validate_numeric_error_bound,
+)
+from vptune.errors import (
+    AdmissionError,
+    MaterializationError,
+    ReferenceFailedError,
 )
 
 MATRIX_FREE_RUNTIME_BINDINGS = ContextVar[
