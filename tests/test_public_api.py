@@ -3345,14 +3345,11 @@ def test_replay_identity_fields_distinguish_declared_variants() -> None:
 
     assert from_scalar_v1.spec.semantics != from_scalar_v2.spec.semantics
 
-    curvature = vp.ggnvp(model, loss, name="curvature")
-    gradient = vp.gradient(model, loss, name="gradient")
-
     def weighted_composition(coefficient: float) -> vp.Operator:
         return vp.composition(
             model,
             name="weighted",
-            children={"curvature": curvature, "gradient": gradient},
+            children=("curvature", "gradient"),
             combine=vp.linear_combination(
                 (coefficient, "curvature"),
                 (1.0, "gradient"),
