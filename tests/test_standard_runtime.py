@@ -14,6 +14,7 @@ import vptune.ext as vpx
 import vptune.fisher as fisher_module
 import vptune.ggn as ggn_module
 import vptune.layout as layout_module
+import vptune.memory as memory_module
 import vptune.metrics as metrics_module
 import vptune.runtime as runtime_module
 import vptune.runtime_values as runtime_values_module
@@ -4859,7 +4860,7 @@ def test_ggnvp_executes_intermediate_residency_at_jvp_and_cotangent_boundaries(
 
         return moved
 
-    monkeypatch.setattr(runtime_module, "_residency_tensor", recording_residency)
+    monkeypatch.setattr(memory_module, "_residency_tensor", recording_residency)
     factory = vpx.standard_operation_factory(
         ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
@@ -7608,7 +7609,7 @@ def test_standard_runtime_executes_pinned_vector_residency() -> None:
         pytest.skip(str(error))
 
     calls = []
-    original = runtime_module._residency_tensor
+    original = memory_module._residency_tensor
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([3.0], dtype=torch.float64)}
 
@@ -7624,7 +7625,7 @@ def test_standard_runtime_executes_pinned_vector_residency() -> None:
     factory = quadratic_hvp_factory(params)
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(runtime_module, "_residency_tensor", recording_residency)
+        monkeypatch.setattr(memory_module, "_residency_tensor", recording_residency)
         result = run_passed_candidate(
             factory,
             "hvp",
@@ -7667,7 +7668,7 @@ def test_standard_runtime_executes_gpu_vector_residency() -> None:
 
 def test_standard_runtime_executes_metric_factor_residency_axis() -> None:
     calls = []
-    original = runtime_module._residency_tensor
+    original = memory_module._residency_tensor
     params = {"w": torch.tensor([1.0, 2.0], dtype=torch.float64)}
     factors = LowRankMetricData.factors()
     vector = {"w": torch.tensor([0.25, -0.75], dtype=torch.float64)}
@@ -7694,7 +7695,7 @@ def test_standard_runtime_executes_metric_factor_residency_axis() -> None:
     )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(runtime_module, "_residency_tensor", recording_residency)
+        monkeypatch.setattr(memory_module, "_residency_tensor", recording_residency)
         result = run_passed_candidate(
             factory,
             "metric",
@@ -15226,7 +15227,7 @@ def test_standard_runtime_executes_non_reentrant_layer_checkpoint(
     params = {"w": torch.tensor([2.0], dtype=torch.float64, requires_grad=True)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     calls = []
-    original_checkpoint_operation = runtime_module.checkpoint_operation
+    original_checkpoint_operation = memory_module.checkpoint_operation
 
     def recording_checkpoint_operation(
         candidate: vpx.Candidate,
@@ -15261,7 +15262,7 @@ def test_standard_runtime_executes_non_reentrant_layer_checkpoint(
         )
 
     monkeypatch.setattr(
-        runtime_module,
+        memory_module,
         "checkpoint_operation",
         recording_checkpoint_operation,
     )
@@ -15360,7 +15361,7 @@ def test_standard_runtime_executes_selective_checkpoint_with_context_pair(
         return operation
 
     monkeypatch.setattr(
-        runtime_module,
+        memory_module,
         "checkpoint_operation",
         recording_checkpoint_operation,
     )
@@ -15594,8 +15595,8 @@ def test_standard_runtime_executes_cpu_saved_tensor_hooks(
     params = {"w": torch.tensor([2.0], dtype=torch.float64, requires_grad=True)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     events = []
-    original_pack = runtime_module._cpu_pack_hook
-    original_unpack = runtime_module._cpu_unpack_hook
+    original_pack = memory_module._cpu_pack_hook
+    original_unpack = memory_module._cpu_unpack_hook
 
     def scalar(
         params: vpx.ParameterTree,
@@ -15620,8 +15621,8 @@ def test_standard_runtime_executes_cpu_saved_tensor_hooks(
 
         return original_unpack(packed)
 
-    monkeypatch.setattr(runtime_module, "_cpu_pack_hook", recording_pack)
-    monkeypatch.setattr(runtime_module, "_cpu_unpack_hook", recording_unpack)
+    monkeypatch.setattr(memory_module, "_cpu_pack_hook", recording_pack)
+    monkeypatch.setattr(memory_module, "_cpu_unpack_hook", recording_unpack)
     factory = vpx.standard_operation_factory(
         ops.gradient("gradient", "loss", aggregation="sum"),
         params=params,
@@ -15814,7 +15815,7 @@ def test_standard_runtime_moves_inputs_at_declared_call_boundary(
     params = {"w": torch.tensor([2.0], dtype=torch.float64)}
     vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
     calls = []
-    original = runtime_module.runtime_batch_input_residency
+    original = memory_module.runtime_batch_input_residency
 
     def recording_input_residency(
         batch: vpx.Batch,
@@ -15838,7 +15839,7 @@ def test_standard_runtime_moves_inputs_at_declared_call_boundary(
         return params["w"].pow(2).sum() * scale.sum()
 
     monkeypatch.setattr(
-        runtime_module,
+        memory_module,
         "runtime_batch_input_residency",
         recording_input_residency,
     )
@@ -18069,7 +18070,7 @@ def test_composition_executes_intermediate_residency_between_children(
 
         return moved
 
-    monkeypatch.setattr(runtime_module, "_residency_tensor", recording_residency)
+    monkeypatch.setattr(memory_module, "_residency_tensor", recording_residency)
     factory = vpx.composition_operation_factory(
         ops.composition(
             "compose",

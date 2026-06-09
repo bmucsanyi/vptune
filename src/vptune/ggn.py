@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from vptune import derivatives, layout, runtime, runtime_values, vectorization
+from vptune import derivatives, layout, memory, runtime, runtime_values, vectorization
 from vptune.anchors import (
     jvp_anchor,
 )
@@ -1223,9 +1223,7 @@ def _runtime_intermediate_residency_tree(
     result = tree
 
     if residency is not None:
-        result = runtime.tree_residency(
-            tree, residency, "memory.intermediate_residency"
-        )
+        result = memory.tree_residency(tree, residency, "memory.intermediate_residency")
 
     if intermediate_transform is None:
         return result

@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from vptune import metrics, runtime, runtime_values, vectorization
+from vptune import memory, metrics, runtime, runtime_values, vectorization
 from vptune.checks import (
     tree_error_measurements,
     validate_thresholds,
@@ -856,7 +856,7 @@ def _composition_intermediate_residency(
     if residency is None:
         return result
 
-    return runtime.tree_residency(result, residency, "memory.intermediate_residency")
+    return memory.tree_residency(result, residency, "memory.intermediate_residency")
 
 
 def _compile_composition_child_components(

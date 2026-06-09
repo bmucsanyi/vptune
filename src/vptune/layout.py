@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from vptune import runtime, runtime_values
+from vptune import memory, runtime, runtime_values
 from vptune.checks import (
     tree_error_measurements,
 )
@@ -304,7 +304,7 @@ def runtime_batch_after_contiguity(
     result = _runtime_batch_contiguity(batch, settings)
 
     if move_input_residency:
-        result = runtime.runtime_batch_input_residency(result, settings)
+        result = memory.runtime_batch_input_residency(result, settings)
 
     return _runtime_batch_teacher_outputs(result, settings)
 

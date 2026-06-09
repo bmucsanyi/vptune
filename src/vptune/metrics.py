@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-from vptune import layout, runtime, runtime_values, vectorization
+from vptune import layout, memory, runtime, runtime_values, vectorization
 from vptune.anchors import (
     dense_metric_inverse_multiply,
     dense_metric_multiply,
@@ -5159,7 +5159,7 @@ def runtime_metric_factor_residency_value(
 
     return runtime_values.runtime_nested_tensor_value(
         value,
-        lambda tensor: runtime.runtime_residency_tensor(
+        lambda tensor: memory.runtime_residency_tensor(
             tensor,
             residency,
             "memory.factor_residency",

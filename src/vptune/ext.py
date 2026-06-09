@@ -126,10 +126,10 @@ from vptune.measure import (
     clear_parameter_gradients,
     default_memory_backend,
 )
+from vptune.memory import checkpoint_operation
 from vptune.metrics import KFACMetricOperator, StandardMetricOperator
 from vptune.reference import constant_operation, tree_reference_check
 from vptune.runtime import (
-    checkpoint_operation,
     standard_operation_factory,
     standard_reference_check,
     standard_runtime_config,
