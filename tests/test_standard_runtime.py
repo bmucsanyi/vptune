@@ -10,6 +10,7 @@ from torch._dynamo import config as torch_dynamo_config
 
 import vptune as vp
 import vptune.ext as vpx
+import vptune.ggn as ggn_module
 import vptune.metrics as metrics_module
 import vptune.runtime as runtime_module
 import vptune.runtime_values as runtime_values_module
@@ -1219,7 +1220,7 @@ def patch_ggn_loss_product_recorder(
 ) -> None:
     patch_runtime_call_recorder(
         monkeypatch,
-        runtime_module,
+        ggn_module,
         "_ggn_loss_hessian_product",
         recorder,
         "loss_hessian",
@@ -1232,7 +1233,7 @@ def patch_ggn_vjp_recorder(
 ) -> None:
     patch_runtime_call_recorder(
         monkeypatch,
-        runtime_module,
+        ggn_module,
         "_run_ggnvp_vjp",
         recorder,
         "vjp",
@@ -4955,7 +4956,7 @@ def test_ggnvp_chunks_output_cotangent_vjp(
     vector = {"w": torch.tensor([1.5, -2.0], dtype=torch.float64)}
     loss_hessian = torch.diag(torch.tensor([3.0, 5.0, 7.0], dtype=torch.float64))
     chunk_nonzeros = []
-    original_vjp = runtime_module._run_ggnvp_vjp_by_path
+    original_vjp = ggn_module._run_ggnvp_vjp_by_path
 
     def function(
         params: vpx.ParameterTree,
@@ -4988,7 +4989,7 @@ def test_ggnvp_chunks_output_cotangent_vjp(
 
         return original_vjp(execution, tensor_function, output_cotangent)
 
-    monkeypatch.setattr(runtime_module, "_run_ggnvp_vjp_by_path", recording_vjp)
+    monkeypatch.setattr(ggn_module, "_run_ggnvp_vjp_by_path", recording_vjp)
     factory = vpx.standard_operation_factory(
         ops.ggnvp("ggn", "model_output", aggregation="sum"),
         params=params,
@@ -7986,7 +7987,7 @@ def test_standard_runtime_recomputes_ggn_memory_outputs(
     vector = {"w": torch.tensor([1.5, -2.0], dtype=torch.float64)}
     loss_hessian = torch.diag(torch.tensor([3.0, 5.0], dtype=torch.float64))
     calls = {"function": 0, "cotangent": 0}
-    original_loss_product = runtime_module._ggn_loss_hessian_product
+    original_loss_product = ggn_module._ggn_loss_hessian_product
 
     def function(
         params: vpx.ParameterTree,
@@ -8014,7 +8015,7 @@ def test_standard_runtime_recomputes_ggn_memory_outputs(
         return original_loss_product(execution, output, output_jvp)
 
     monkeypatch.setattr(
-        runtime_module,
+        ggn_module,
         "_ggn_loss_hessian_product",
         recording_loss_product,
     )
