@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-from vptune import runtime, runtime_values
+from vptune import runtime, runtime_values, vectorization
 from vptune.anchors import (
     dense_metric_inverse_multiply,
     dense_metric_multiply,
@@ -900,7 +900,7 @@ def _kfac_inverse_metric_multiply_batch(
 ) -> TensorTree:
     batch = _kfac_factor_batch(execution.batch)
     vector_map = _kfac_vector_map(execution.vector)
-    vector_in_dims = runtime.vector_tree_in_dims(
+    vector_in_dims = vectorization.vector_tree_in_dims(
         execution.vector,
         execution.candidate.settings,
     )
@@ -2333,7 +2333,7 @@ def _metric_inner_block_mode(
         return mode
 
     if mode == "vmap":
-        runtime.vmap_chunk_size(execution.candidate.settings)
+        vectorization.vmap_chunk_size(execution.candidate.settings)
 
         return mode
 
@@ -2355,14 +2355,14 @@ def _metric_inner_vmap_block_reduce(
         right,
         side,
     )
-    chunk_size = runtime.vmap_chunk_size(execution.candidate.settings)
+    chunk_size = vectorization.vmap_chunk_size(execution.candidate.settings)
 
     def flat_right_product(right_vector: TensorTree) -> torch.Tensor:
         return runtime_values.flatten_vector(
             runtime_values.call_with_deferred_finite_checks(right_product, right_vector)
         )
 
-    product_matrix = runtime.torch_func_vmap(
+    product_matrix = vectorization.torch_func_vmap(
         flat_right_product,
         in_dims=(right_in_dims,),
         randomness=execution.candidate.settings["vectorization.randomness"],
@@ -2509,7 +2509,7 @@ def _metric_inner_vector_in_dims(
 
         raw_in_dims = raw_in_dims[side]
 
-    return runtime.validate_vector_tree_in_dims(vector, raw_in_dims)
+    return vectorization.validate_vector_tree_in_dims(vector, raw_in_dims)
 
 
 def _metric_inner_reduce_matrices(
@@ -3475,7 +3475,7 @@ def run_inverse_metric_by_mode(
     Returns:
         The inverse metric by mode result.
     """
-    return runtime.run_by_vectorization_mode(
+    return vectorization.run_by_vectorization_mode(
         execution,
         single_vector=_inverse_metric_solve_by_path,
         single_loop=_run_inverse_metric_vector_single_loop,
@@ -3487,7 +3487,7 @@ def run_inverse_metric_by_mode(
 def _run_inverse_metric_vector_manual_batch(
     execution: runtime_values.StandardExecution,
 ) -> TensorTree:
-    return runtime.run_vector_manual_batches(
+    return vectorization.run_vector_manual_batches(
         execution,
         _run_inverse_metric_vector_single_loop,
     )
@@ -3512,7 +3512,9 @@ def _run_inverse_metric_vector_single_loop(
     ):
         return _run_inverse_metric_rhs_batch(execution)
 
-    return runtime.run_vector_single_loop(execution, _inverse_metric_solve_by_path)
+    return vectorization.run_vector_single_loop(
+        execution, _inverse_metric_solve_by_path
+    )
 
 
 def _run_inverse_metric_rhs_batch(
@@ -3571,7 +3573,7 @@ def _factorized_inverse_metric_multiply_batch(
 def _flat_inverse_metric_vector_batch(
     execution: runtime_values.StandardExecution,
 ) -> torch.Tensor:
-    vector_in_dims = runtime.vector_tree_in_dims(
+    vector_in_dims = vectorization.vector_tree_in_dims(
         execution.vector,
         execution.candidate.settings,
     )

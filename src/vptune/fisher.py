@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from vptune import runtime, runtime_values
+from vptune import runtime, runtime_values, vectorization
 from vptune.data import (
     Batch,
     Candidate,
@@ -253,7 +253,7 @@ def _run_fisher_family_vp(
 
         return _run_fisher_family_vp_vector_vmap(row_execution, row)
 
-    return runtime.run_single_vectorized_by_path(
+    return vectorization.run_single_vectorized_by_path(
         execution,
         row["paths"],
         single_vector,
@@ -732,7 +732,7 @@ def _run_streaming_score_gradient_product_vmap(
     label: str,
 ) -> TensorTree:
     vector_batch = _flat_vector_batch(execution)
-    chunk_size = runtime.vmap_chunk_size(execution.candidate.settings)
+    chunk_size = vectorization.vmap_chunk_size(execution.candidate.settings)
     result = torch.zeros_like(vector_batch)
 
     for row in _streaming_gradient_rows(execution):
@@ -861,7 +861,7 @@ def _accumulate_streaming_gradient_row_batch(
     def product(flat_vector: torch.Tensor) -> torch.Tensor:
         return row * runtime.dot_runtime(execution.candidate.settings, row, flat_vector)
 
-    return result + runtime.torch_func_vmap(
+    return result + vectorization.torch_func_vmap(
         product,
         in_dims=0,
         randomness=execution.candidate.settings["vectorization.randomness"],
@@ -897,7 +897,7 @@ def _score_matrix_product_batch_vmap(
         vector_batch,
         f"{label} score_gradients",
     )
-    chunk_size = runtime.vmap_chunk_size(execution.candidate.settings)
+    chunk_size = vectorization.vmap_chunk_size(execution.candidate.settings)
 
     def product(flat_vector: torch.Tensor) -> torch.Tensor:
         return _score_matrix_product(
@@ -908,7 +908,7 @@ def _score_matrix_product_batch_vmap(
             execution.parameter_surface,
         )
 
-    result = runtime.torch_func_vmap(
+    result = vectorization.torch_func_vmap(
         product,
         in_dims=0,
         randomness=execution.candidate.settings["vectorization.randomness"],
@@ -931,7 +931,7 @@ def _blockwise_score_matrix_product_batch_vmap(
     )
     vector_batch = _flat_vector_batch(execution)
     _require_blockwise_score_matrix_product_inputs(blocks, vector_batch, label)
-    chunk_size = runtime.vmap_chunk_size(execution.candidate.settings)
+    chunk_size = vectorization.vmap_chunk_size(execution.candidate.settings)
 
     def product(flat_vector: torch.Tensor) -> torch.Tensor:
         return _blockwise_score_matrix_product_unchecked(
@@ -941,7 +941,7 @@ def _blockwise_score_matrix_product_batch_vmap(
             execution.candidate.settings,
         )
 
-    result = runtime.torch_func_vmap(
+    result = vectorization.torch_func_vmap(
         product,
         in_dims=0,
         randomness=execution.candidate.settings["vectorization.randomness"],
@@ -981,7 +981,7 @@ def _flat_vector_batch(execution: runtime_values.StandardExecution) -> torch.Ten
     if execution.flat_parameter_vector_batch is not None:
         return execution.flat_parameter_vector_batch
 
-    return runtime.build_flat_vector_batch(execution)
+    return vectorization.build_flat_vector_batch(execution)
 
 
 def _require_score_matrix_product_inputs(
@@ -1349,7 +1349,7 @@ def _empirical_fisher_normalization(
 def _empirical_fisher_streaming_normalization(
     execution: runtime_values.StandardExecution,
 ) -> float:
-    batch, batch_in_dims = runtime.per_example_batch_in_dims(
+    batch, batch_in_dims = vectorization.per_example_batch_in_dims(
         execution.batch,
         "empirical Fisher streaming",
     )

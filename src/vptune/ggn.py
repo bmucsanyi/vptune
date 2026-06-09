@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from vptune import runtime, runtime_values
+from vptune import runtime, runtime_values, vectorization
 from vptune.anchors import (
     jvp_anchor,
 )
@@ -363,7 +363,7 @@ def run_ggnvp_by_path(execution: runtime_values.StandardExecution) -> TensorTree
     Returns:
         The ggnvp by path result.
     """
-    return runtime.run_single_vectorized_by_path(
+    return vectorization.run_single_vectorized_by_path(
         execution,
         (
             runtime_values.GGN_DENSE_PATH,
@@ -576,7 +576,7 @@ def _run_ggnvp_vector_vmap(execution: runtime_values.StandardExecution) -> Tenso
 
         return result
 
-    result = runtime.run_vector_vmap(execution, ggn_function)
+    result = vectorization.run_vector_vmap(execution, ggn_function)
     runtime_values.require_finite_tree(result, "GGN result")
 
     return result
