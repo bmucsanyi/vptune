@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from vptune import derivatives, layout, runtime, runtime_values, vectorization
+from vptune import compile, derivatives, layout, runtime, runtime_values, vectorization
 from vptune.data import (
     Batch,
     Candidate,
@@ -67,7 +67,7 @@ def prepare_score_matrix_compile_boundary(
     Returns:
         The score matrix compile boundary result.
     """
-    runtime.require_compiled_execution(execution, settings)
+    compile.require_compiled_execution(execution, settings)
     compiled_score_matrix = _compiled_tensor_operation(settings, builder)
 
     return dataclasses.replace(
@@ -113,12 +113,12 @@ def _compiled_tensor_operation(
     settings: Mapping[str, Any],
     operation: Callable[[], torch.Tensor],
 ) -> Callable[[], torch.Tensor]:
-    compiled = runtime.compiled_callable(
+    compiled = compile.compiled_callable(
         settings,
         operation,
         use_backend_settings=False,
     )
-    runtime.warm_compiled_cache(settings, compiled)
+    compile.warm_compiled_cache(settings, compiled)
 
     return compiled
 

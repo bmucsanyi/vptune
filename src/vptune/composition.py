@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from vptune import memory, metrics, runtime, runtime_values, vectorization
+from vptune import compile, memory, metrics, runtime, runtime_values, vectorization
 from vptune.checks import (
     tree_error_measurements,
     validate_thresholds,
@@ -153,7 +153,7 @@ def composition_operation_factory(
                 ),
             )
 
-        return runtime.compile_operation(operator, candidate.settings, operation)
+        return compile.compile_operation(operator, candidate.settings, operation)
 
     return factory
 
@@ -873,7 +873,7 @@ def _compile_composition_child_components(
         message = "compile.boundary=composition_child requires child calls"
         raise CompileSetupError(message)
 
-    runtime.validate_compile_cache_state(settings)
+    compile.validate_compile_cache_state(settings)
     compiled_components = {}
     warm_result = _composition_child_warm_vector(settings, vector)
     warm_batch = _composition_child_warm_batch(settings, batch)
@@ -937,7 +937,7 @@ def _compiled_composition_component(
     settings: Mapping[str, Any],
     component: Callable[[Batch, TensorTree], TensorTree],
 ) -> Callable[[Batch, TensorTree], TensorTree]:
-    return runtime.compiled_callable(settings, component, use_backend_settings=False)
+    return compile.compiled_callable(settings, component, use_backend_settings=False)
 
 
 def _composition_reference_components(

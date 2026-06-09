@@ -12,6 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from vptune.candidates import AxisDescriptor, AxisRegistry
 from vptune.checks import tree_error_measurements, validate_thresholds
+from vptune.compile import compiled_operation
 from vptune.data import (
     PACKAGE_VERSION,
     Batch,
@@ -22,7 +23,6 @@ from vptune.data import (
     ReferenceResult,
 )
 from vptune.errors import AdmissionError, CompileSetupError, MaterializationError
-from vptune.runtime import compiled_operation
 from vptune.tensor_tree import TensorTree
 
 SDPA_BACKENDS = {

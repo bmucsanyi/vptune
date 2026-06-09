@@ -9,6 +9,7 @@ import torch
 from torch._dynamo import config as torch_dynamo_config
 
 import vptune as vp
+import vptune.compile as compile_module
 import vptune.derivatives as derivatives_module
 import vptune.ext as vpx
 import vptune.fisher as fisher_module
@@ -1561,7 +1562,7 @@ def test_compile_backend_accepts_concrete_registered_backend(
     )
 
     assert (
-        runtime_module._compile_backend({"compile.backend": "custom_backend"})
+        compile_module.compile_backend({"compile.backend": "custom_backend"})
         == "custom_backend"
     )
 
@@ -1572,7 +1573,7 @@ def test_compile_backend_requires_backend_registry(
     monkeypatch.delattr(runtime_module.torch.compiler, "list_backends")
 
     with pytest.raises(vp.MaterializationError, match="list_backends"):
-        runtime_module._compile_backend({"compile.backend": "custom_backend"})
+        compile_module.compile_backend({"compile.backend": "custom_backend"})
 
 
 @pytest.mark.parametrize(
@@ -1587,7 +1588,7 @@ def test_compile_backend_rejects_non_concrete_or_unregistered_backend(
     message: str,
 ) -> None:
     with pytest.raises(vp.CompileSetupError, match=message):
-        runtime_module._compile_backend({"compile.backend": backend})
+        compile_module.compile_backend({"compile.backend": backend})
 
 
 def loss_scaling_settings(*, degree: int, scale: float = 8.0) -> dict[str, object]:

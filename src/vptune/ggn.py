@@ -10,7 +10,15 @@ from typing import Any
 
 import torch
 
-from vptune import derivatives, layout, memory, runtime, runtime_values, vectorization
+from vptune import (
+    compile,
+    derivatives,
+    layout,
+    memory,
+    runtime,
+    runtime_values,
+    vectorization,
+)
 from vptune.anchors import (
     jvp_anchor,
 )
@@ -133,7 +141,7 @@ def _prepare_ggn_loss_product_compile_boundary(
     settings: Mapping[str, Any],
     builder: Callable[[TensorTree, TensorTree], TensorTree],
 ) -> runtime_values.StandardExecution:
-    runtime.require_compiled_execution(execution, settings)
+    compile.require_compiled_execution(execution, settings)
     warm_inputs = (
         _ggn_loss_product_warm_inputs(execution)
         if settings.get("compile.cache_state") == "warm_cache"
@@ -157,7 +165,7 @@ def _prepare_ggn_jvp_compile_boundary(
     settings: Mapping[str, Any],
     builder: Callable[[], tuple[TensorTree, TensorTree]],
 ) -> runtime_values.StandardExecution:
-    runtime.require_compiled_execution(execution, settings)
+    compile.require_compiled_execution(execution, settings)
     compiled_ggn_jvp = _compiled_ggn_jvp_operation(settings, builder)
 
     return dataclasses.replace(
@@ -171,7 +179,7 @@ def _prepare_ggn_vjp_compile_boundary(
     settings: Mapping[str, Any],
     builder: Callable[[TensorTree], TensorTree],
 ) -> runtime_values.StandardExecution:
-    runtime.require_compiled_execution(execution, settings)
+    compile.require_compiled_execution(execution, settings)
     warm_output_cotangent = (
         _ggn_vjp_warm_input(execution)
         if settings.get("compile.cache_state") == "warm_cache"
@@ -195,12 +203,12 @@ def _compiled_ggn_loss_product_operation(
     warm_output: TensorTree | None,
     warm_output_jvp: TensorTree | None,
 ) -> Callable[[TensorTree, TensorTree], TensorTree]:
-    compiled = runtime.compiled_callable(
+    compiled = compile.compiled_callable(
         settings,
         operation,
         use_backend_settings=False,
     )
-    runtime.warm_compiled_cache(
+    compile.warm_compiled_cache(
         settings,
         compiled,
         warm_output,
@@ -215,12 +223,12 @@ def _compiled_ggn_jvp_operation(
     settings: Mapping[str, Any],
     operation: Callable[[], tuple[TensorTree, TensorTree]],
 ) -> Callable[[], tuple[TensorTree, TensorTree]]:
-    compiled = runtime.compiled_callable(
+    compiled = compile.compiled_callable(
         settings,
         operation,
         use_backend_settings=True,
     )
-    runtime.warm_compiled_cache(settings, compiled)
+    compile.warm_compiled_cache(settings, compiled)
 
     return compiled
 
@@ -230,12 +238,12 @@ def _compiled_ggn_vjp_operation(
     operation: Callable[[TensorTree], TensorTree],
     warm_output_cotangent: TensorTree | None,
 ) -> Callable[[TensorTree], TensorTree]:
-    compiled = runtime.compiled_callable(
+    compiled = compile.compiled_callable(
         settings,
         operation,
         use_backend_settings=False,
     )
-    runtime.warm_compiled_cache(
+    compile.warm_compiled_cache(
         settings,
         compiled,
         warm_output_cotangent,

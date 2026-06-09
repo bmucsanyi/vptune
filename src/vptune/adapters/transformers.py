@@ -21,6 +21,15 @@ from vptune.attention import (
 )
 from vptune.candidates import AxisDescriptor
 from vptune.checks import tree_error_measurements, validate_thresholds
+from vptune.compile import (
+    compile_backend,
+    compile_bool,
+    compile_mode,
+    compile_optional_bool,
+    compile_options,
+    compiled_autograd_patch,
+    validate_compile_cache_state,
+)
 from vptune.data import (
     PACKAGE_VERSION,
     Batch,
@@ -49,15 +58,8 @@ from vptune.data import (
 from vptune.errors import AdmissionError, MaterializationError
 from vptune.identities import module_identity
 from vptune.runtime import (
-    _compile_backend,
-    _compile_bool,
-    _compile_mode,
-    _compile_optional_bool,
-    _compile_options,
-    _compiled_autograd_patch,
     standard_operation_factory,
     standard_reference_check,
-    validate_compile_cache_state,
 )
 from vptune.tensor_tree import tree_signature
 
@@ -1189,27 +1191,27 @@ def _compile_transformers_forward(
     settings: Mapping[str, Any],
     forward: Callable[..., Any],
 ) -> Callable[..., Any]:
-    compiled_autograd = _compile_bool(settings, "compile.compiled_autograd")
+    compiled_autograd = compile_bool(settings, "compile.compiled_autograd")
 
     def build_compiled() -> Callable[..., Any]:
         return torch.compile(
             forward,
-            backend=_compile_backend(settings),
-            mode=_compile_mode(settings),
-            fullgraph=_compile_bool(settings, "compile.fullgraph"),
-            dynamic=_compile_optional_bool(settings, "compile.dynamic"),
-            options=_compile_options(settings),
+            backend=compile_backend(settings),
+            mode=compile_mode(settings),
+            fullgraph=compile_bool(settings, "compile.fullgraph"),
+            dynamic=compile_optional_bool(settings, "compile.dynamic"),
+            options=compile_options(settings),
         )
 
     if compiled_autograd:
-        with _compiled_autograd_patch():
+        with compiled_autograd_patch():
             compiled = build_compiled()
     else:
         compiled = build_compiled()
 
     def compiled_forward(*args: Any, **kwargs: Any) -> Any:
         if compiled_autograd:
-            with _compiled_autograd_patch():
+            with compiled_autograd_patch():
                 return compiled(*args, **kwargs)
 
         return compiled(*args, **kwargs)
