@@ -34,6 +34,7 @@ from vptune.data import (
     CandidateOperation,
     FunctionObjective,
     ModuleCallSpec,
+    ObjectiveContext,
     OperatorSpec,
     ParameterSurface,
     ParameterTree,
@@ -3919,3 +3920,61 @@ def operator_semantic_positive_int(operator: OperatorSpec, key: str) -> int:
         raise MaterializationError(message)
 
     return value
+
+
+ActivationUnpackHooks = Mapping[str, Callable[[Any], torch.Tensor]]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class StandardExecution:
+    """Inputs for one standard operator execution."""
+
+    operator: OperatorSpec
+    candidate: Candidate
+    path: str
+    batch: Batch
+    vector: TensorTree
+    params: ParameterTree
+    buffers: BufferTree
+    parameter_surface: ParameterSurface | None
+    context: ObjectiveContext
+    scalar_objectives: Mapping[str, ScalarObjective]
+    function_objectives: Mapping[str, FunctionObjective]
+    module: torch.nn.Module | None = None
+    module_call: ModuleCallSpec | None = None
+    teacher_objective: FunctionObjective | None = None
+    batch_layout: Callable[[Candidate, Batch], Batch] | None = None
+    lm_head_chunker: Callable[[Candidate, Batch], Batch] | None = None
+    fusion_rewriter: Callable[[torch.nn.Module, Candidate], torch.nn.Module] | None = (
+        None
+    )
+    mmap_residency: Callable[[torch.Tensor, str], torch.Tensor] | None = None
+    manual_recompute: (
+        Callable[
+            [Candidate, CandidateOperation, tuple[torch.Tensor, ...]],
+            CandidateOperation,
+        ]
+        | None
+    ) = None
+    activation_pack_hooks: ActivationPackHooks = dataclasses.field(default_factory=dict)
+    activation_unpack_hooks: ActivationUnpackHooks = dataclasses.field(
+        default_factory=dict
+    )
+    checkpoint_contexts: CheckpointContextFns = dataclasses.field(default_factory=dict)
+    intermediate_transform: IntermediateTransform | None = None
+    flat_parameter_vector: torch.Tensor | None = None
+    flat_parameter_vector_batch: torch.Tensor | None = None
+    compiled_inner: CandidateOperation | None = None
+    compiled_vector_step: Callable[[TensorTree], TensorTree] | None = None
+    compiled_model_forward: Callable[[Batch], object] | None = None
+    compiled_scalar_function: Callable[[ParameterTree], torch.Tensor] | None = None
+    compiled_score_matrix: Callable[[], torch.Tensor] | None = None
+    compiled_ggn_jvp: Callable[[], tuple[TensorTree, TensorTree]] | None = None
+    compiled_ggn_loss_product: Callable[[TensorTree, TensorTree], TensorTree] | None = (
+        None
+    )
+    compiled_ggn_vjp: Callable[[TensorTree], TensorTree] | None = None
+    prepared_gradient: CandidateOperation | None = None
+    linearized_jvp: Callable[[TensorTree], TensorTree] | None = None
+    linearized_hvp: Callable[[TensorTree], TensorTree] | None = None
+    vjp_closure: Callable[[TensorTree], TensorTree] | None = None

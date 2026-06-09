@@ -121,10 +121,9 @@ from vptune.measure import (
     clear_parameter_gradients,
     default_memory_backend,
 )
+from vptune.metrics import KFACMetricOperator, StandardMetricOperator
 from vptune.reference import constant_operation, tree_reference_check
 from vptune.runtime import (
-    KFACMetricOperator,
-    StandardMetricOperator,
     checkpoint_operation,
     composition_operation_factory,
     composition_reference_check,

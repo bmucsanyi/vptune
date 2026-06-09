@@ -10,6 +10,7 @@ from torch._dynamo import config as torch_dynamo_config
 
 import vptune as vp
 import vptune.ext as vpx
+import vptune.metrics as metrics_module
 import vptune.runtime as runtime_module
 import vptune.runtime_values as runtime_values_module
 from vptune import operators as ops
@@ -1257,7 +1258,7 @@ def patch_matmul_call_recorder(
     setting_value: object,
 ) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
     calls = []
-    original_matmul = runtime_module._matmul_runtime
+    original_matmul = runtime_module.matmul_runtime
 
     def recording_matmul(
         settings: Mapping[str, Any],
@@ -1269,7 +1270,7 @@ def patch_matmul_call_recorder(
 
         return original_matmul(settings, left, right)
 
-    monkeypatch.setattr(runtime_module, "_matmul_runtime", recording_matmul)
+    monkeypatch.setattr(runtime_module, "matmul_runtime", recording_matmul)
 
     return calls
 
@@ -2859,7 +2860,9 @@ def test_parameter_order_vector_is_prepared_before_operation(
     calls = []
     original = runtime_module._build_parameter_order_vector
 
-    def counted_build(execution: runtime_module.StandardExecution) -> torch.Tensor:
+    def counted_build(
+        execution: runtime_values_module.StandardExecution,
+    ) -> torch.Tensor:
         calls.append(execution.candidate.candidate_id)
 
         return original(execution)
@@ -4971,7 +4974,7 @@ def test_ggnvp_chunks_output_cotangent_vjp(
         ))
 
     def recording_vjp(
-        execution: runtime_module.StandardExecution,
+        execution: runtime_values_module.StandardExecution,
         tensor_function: Callable[[vpx.ParameterTree], vpx.TensorTree],
         output_cotangent: vpx.TensorTree,
     ) -> vpx.TensorTree:
@@ -5297,7 +5300,9 @@ def test_streaming_fisher_family_accumulates_without_score_matrix(
         message = "streaming row used full score matrix product"
         raise AssertionError(message)
 
-    def blocked_gradient_matrix(_: runtime_module.StandardExecution) -> torch.Tensor:
+    def blocked_gradient_matrix(
+        _: runtime_values_module.StandardExecution,
+    ) -> torch.Tensor:
         message = "streaming row built a stacked gradient matrix"
         raise AssertionError(message)
 
@@ -7393,7 +7398,7 @@ def test_dtype_accumulation_reaches_metric_multiply_reductions(
         params=params,
         buffers={},
     )
-    original = runtime_module._accumulation_tensor
+    original = runtime_module.accumulation_tensor
     calls = []
 
     def recording_accumulation_tensor(
@@ -7409,7 +7414,7 @@ def test_dtype_accumulation_reaches_metric_multiply_reductions(
 
     monkeypatch.setattr(
         runtime_module,
-        "_accumulation_tensor",
+        "accumulation_tensor",
         recording_accumulation_tensor,
     )
     candidate = passed_candidate(
@@ -10435,7 +10440,7 @@ def test_low_rank_streaming_metric_uses_streaming_accumulation(
         raise AssertionError(message)
 
     monkeypatch.setattr(
-        runtime_module,
+        metrics_module,
         "_low_rank_metric_multiply",
         forbidden_low_rank_metric_multiply,
     )
@@ -10591,7 +10596,7 @@ def test_kfac_streaming_metric_uses_streaming_blocks(
         raise AssertionError(message)
 
     monkeypatch.setattr(
-        runtime_module,
+        metrics_module,
         "_kfac_metric_multiply",
         forbidden_kfac_metric_multiply,
     )
@@ -10978,7 +10983,7 @@ def test_ggn_streaming_metric_uses_streaming_accumulation(
         raise AssertionError(message)
 
     monkeypatch.setattr(
-        runtime_module,
+        metrics_module,
         "_ggn_metric_multiply",
         forbidden_ggn_metric_multiply,
     )
