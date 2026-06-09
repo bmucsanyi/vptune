@@ -22,7 +22,7 @@ from vptune.data import (
     ReferenceResult,
 )
 from vptune.errors import AdmissionError, MaterializationError
-from vptune.runtime import _compiled_operation as _compile_candidate_operation
+from vptune.runtime import compiled_operation
 from vptune.tensor_tree import TensorTree
 
 SDPA_BACKENDS = {
@@ -398,7 +398,7 @@ def _attention_compile_operation(
         message = f"compile.boundary={boundary} is not lowered for attention"
         raise MaterializationError(message)
 
-    return _compile_candidate_operation(settings, operation)
+    return compiled_operation(settings, operation)
 
 
 def attention_reference_check(

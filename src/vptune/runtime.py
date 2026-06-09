@@ -4702,7 +4702,7 @@ def _prepare_inner_compile_boundary(
     builder: CandidateOperation,
 ) -> StandardExecution:
     _require_compiled_execution(execution, settings)
-    compiled_inner = _compiled_operation(settings, builder)
+    compiled_inner = compiled_operation(settings, builder)
 
     return dataclasses.replace(
         execution,
@@ -5116,7 +5116,7 @@ def _compile_operation(
     if _compile_boundary_runs_inside_operator(operator.kind, settings):
         return operation
 
-    return _compiled_operation(settings, operation)
+    return compiled_operation(settings, operation)
 
 
 def _compile_boundary_runs_inside_operator(
@@ -5157,18 +5157,26 @@ def _compile_boundary_runs_inside_operator(
     }
 
 
-def _compiled_operation(
+def compiled_operation(
     settings: Mapping[str, Any],
     operation: CandidateOperation,
 ) -> CandidateOperation:
-    compiled_operation = _compiled_callable(
+    """Compile a candidate operation per its declared compile settings.
+
+    Applies the declared backend settings and warms the compile cache
+    according to the declared cache state.
+
+    Returns:
+        The compiled candidate operation.
+    """
+    compiled = _compiled_callable(
         settings,
         operation,
         use_backend_settings=True,
     )
-    _warm_compiled_cache(settings, compiled_operation)
+    _warm_compiled_cache(settings, compiled)
 
-    return compiled_operation
+    return compiled
 
 
 def _compiled_bound_vector_step(
