@@ -9,6 +9,7 @@ import torch
 from torch._dynamo import config as torch_dynamo_config
 
 import vptune as vp
+import vptune.derivatives as derivatives_module
 import vptune.ext as vpx
 import vptune.fisher as fisher_module
 import vptune.ggn as ggn_module
@@ -5314,7 +5315,7 @@ def test_streaming_fisher_family_accumulates_without_score_matrix(
         blocked_score_matrix_product,
     )
     monkeypatch.setattr(
-        runtime_module,
+        derivatives_module,
         "_per_example_gradient_matrix",
         blocked_gradient_matrix,
     )

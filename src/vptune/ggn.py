@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from vptune import runtime, runtime_values, vectorization
+from vptune import derivatives, runtime, runtime_values, vectorization
 from vptune.anchors import (
     jvp_anchor,
 )
@@ -553,7 +553,7 @@ def _run_ggnvp_vector_vmap(execution: runtime_values.StandardExecution) -> Tenso
 
     runtime_values.require_finite_tree(output, "GGN output")
     _require_ggn_loss_hessian_vector_vmap_inputs(execution, output)
-    pullback = runtime.vjp_pullback(tensor_function, execution.params)
+    pullback = derivatives.vjp_pullback(tensor_function, execution.params)
 
     def ggn_function(vector: TensorTree) -> TensorTree:
         output_jvp = jvp_function(vector)
@@ -1131,13 +1131,13 @@ def _run_ggnvp_vjp_by_path(
     path = execution.candidate.settings.get("ggn.vjp_path")
 
     if path == "torch_func_vjp":
-        pullback = runtime.vjp_pullback(tensor_function, execution.params)
+        pullback = derivatives.vjp_pullback(tensor_function, execution.params)
         (result,) = pullback(output_cotangent)
 
         return result
 
     if path == "autograd_grad_outputs":
-        return runtime.autograd_grad_outputs_vjp(
+        return derivatives.autograd_grad_outputs_vjp(
             tensor_function,
             execution.params,
             output_cotangent,

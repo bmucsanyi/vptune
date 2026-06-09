@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from vptune import runtime, runtime_values
+from vptune import derivatives, runtime, runtime_values
 from vptune.admission import (
     admit_torch_func,
 )
@@ -113,13 +113,13 @@ def run_jvp_vector_vmap(execution: runtime_values.StandardExecution) -> TensorTr
             jvp_function = execution.linearized_jvp
         else:
             _, jvp_function = torch.func.linearize(
-                runtime.jvp_tensor_function(execution),
+                derivatives.jvp_tensor_function(execution),
                 execution.params,
             )
 
         return run_vector_vmap(execution, jvp_function)
 
-    tensor_function = runtime.jvp_tensor_function(execution)
+    tensor_function = derivatives.jvp_tensor_function(execution)
 
     def jvp_function(vector: TensorTree) -> TensorTree:
         return jvp_anchor(
@@ -152,8 +152,8 @@ def run_vjp_vector_vmap(execution: runtime_values.StandardExecution) -> TensorTr
             return closure(vector)
 
     else:
-        pullback = runtime.vjp_pullback(
-            runtime.vjp_tensor_function(execution),
+        pullback = derivatives.vjp_pullback(
+            derivatives.vjp_tensor_function(execution),
             execution.params,
         )
 
@@ -176,7 +176,7 @@ def run_hvp_vector_single_loop(
     if _hvp_uses_reverse_reuse(execution.candidate.settings):
         return _run_hvp_reused_reverse_vectors(execution)
 
-    return run_vector_single_loop(execution, runtime.run_hvp_single_vector)
+    return run_vector_single_loop(execution, derivatives.run_hvp_single_vector)
 
 
 def run_hvp_vector_manual_batch(
@@ -357,7 +357,7 @@ def _hvp_uses_reverse_reuse(settings: Mapping[str, Any]) -> bool:
 def _run_hvp_reused_reverse_vectors(
     execution: runtime_values.StandardExecution,
 ) -> TensorTree:
-    scalar_function = runtime.hvp_scalar_function(execution)
+    scalar_function = derivatives.hvp_scalar_function(execution)
     active_params = runtime_values.grad_enabled_params(execution.params)
     value = scalar_function(active_params)
     retain_gradient_graph = (
@@ -499,7 +499,7 @@ def run_hvp_vector_vmap(execution: runtime_values.StandardExecution) -> TensorTr
     if execution.linearized_hvp is not None:
         hvp_function = execution.linearized_hvp
     else:
-        gradient_function = torch.func.grad(runtime.hvp_scalar_function(execution))
+        gradient_function = torch.func.grad(derivatives.hvp_scalar_function(execution))
         _, hvp_function = torch.func.linearize(
             gradient_function,
             execution.params,
@@ -553,9 +553,9 @@ def per_example_gradient_matrix_without_manual_batch(
     Returns:
         The per example gradient matrix without manual batch.
     """
-    return runtime.per_example_gradient_matrix_from_builders(
+    return derivatives.per_example_gradient_matrix_from_builders(
         execution,
-        runtime.PER_EXAMPLE_GRADIENT_WITHOUT_MANUAL_BUILDERS,
+        derivatives.PER_EXAMPLE_GRADIENT_WITHOUT_MANUAL_BUILDERS,
         (
             "schedule.per_example=manual_batch is incompatible with path: "
             f"{execution.path}"

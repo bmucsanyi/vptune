@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from vptune import runtime, runtime_values, vectorization
+from vptune import derivatives, runtime, runtime_values, vectorization
 from vptune.data import (
     Batch,
     Candidate,
@@ -452,9 +452,9 @@ def _score_gradient_matrix_from_builders(
     if execution.path not in paths:
         raise MaterializationError(error_message)
 
-    return runtime.per_example_gradient_matrix_from_builders(
+    return derivatives.per_example_gradient_matrix_from_builders(
         execution,
-        runtime.PER_EXAMPLE_GRADIENT_WITHOUT_MANUAL_BUILDERS,
+        derivatives.PER_EXAMPLE_GRADIENT_WITHOUT_MANUAL_BUILDERS,
         error_message,
     )
 
@@ -756,7 +756,7 @@ def _streaming_score_gradient_product_manual_batches(
 ) -> torch.Tensor:
     result = torch.zeros_like(vector_tensor)
 
-    for subexecution in runtime.per_example_sliced_executions(
+    for subexecution in derivatives.per_example_sliced_executions(
         execution,
         "per-example manual batching",
         _per_example_manual_batch_size(execution),
@@ -790,7 +790,7 @@ def _streaming_gradient_rows(
     execution: runtime_values.StandardExecution,
 ) -> Iterator[torch.Tensor]:
     if _uses_manual_per_example_schedule(execution):
-        for subexecution in runtime.per_example_sliced_executions(
+        for subexecution in derivatives.per_example_sliced_executions(
             execution,
             "per-example manual batching",
             _per_example_manual_batch_size(execution),
@@ -812,7 +812,7 @@ def _streaming_gradient_rows_without_manual_batch(
 
         return
 
-    builder = runtime.STREAMING_GRADIENT_ROW_BUILDERS.get(execution.path)
+    builder = derivatives.STREAMING_GRADIENT_ROW_BUILDERS.get(execution.path)
 
     if builder is not None:
         yield from builder(execution)
@@ -1043,7 +1043,7 @@ def _uses_manual_per_example_schedule(
 def _per_example_gradient_matrix_manual_batches(
     execution: runtime_values.StandardExecution,
 ) -> torch.Tensor:
-    return runtime.per_example_gradient_matrix_batched(
+    return derivatives.per_example_gradient_matrix_batched(
         execution,
         "per-example manual batching",
         _per_example_manual_batch_size(execution),
