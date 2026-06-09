@@ -18787,7 +18787,7 @@ def test_standard_runtime_fullgraph_rejects_graph_breaks(fullgraph: str) -> None
         {"w": reference_weight},
         {},
         {"scale": 3.0},
-        None,
+        vpx.ObjectiveContext(family="gradient", candidate_id="reference", settings={}),
     )
     (expected,) = torch.autograd.grad(reference_loss, reference_weight)
 
