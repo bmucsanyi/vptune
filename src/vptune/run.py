@@ -54,11 +54,10 @@ from vptune.measure import (
     run_candidate,
 )
 from vptune.runtime import (
-    CompositionChild,
     composition_runtime_config,
-    deferred_runtime_finite_checks,
     standard_runtime_with_matrix_free_bindings,
 )
+from vptune.runtime_values import CompositionChild, deferred_runtime_finite_checks
 from vptune.schemas import (
     candidate_from_signature,
     candidate_record_from_json,

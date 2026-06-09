@@ -123,8 +123,6 @@ from vptune.measure import (
 )
 from vptune.reference import constant_operation, tree_reference_check
 from vptune.runtime import (
-    CompositionChild,
-    KFACMetricBlock,
     KFACMetricOperator,
     StandardMetricOperator,
     checkpoint_operation,
@@ -135,6 +133,7 @@ from vptune.runtime import (
     standard_reference_check,
     standard_runtime_config,
 )
+from vptune.runtime_values import CompositionChild, KFACMetricBlock
 from vptune.schemas import (
     candidate_record_from_json,
     candidate_record_to_json,

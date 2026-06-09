@@ -11,6 +11,7 @@ from torch._dynamo import config as torch_dynamo_config
 import vptune as vp
 import vptune.ext as vpx
 import vptune.runtime as runtime_module
+import vptune.runtime_values as runtime_values_module
 from vptune import operators as ops
 from vptune.io import read_record
 from vptune.measure import CPUMemoryBackend
@@ -1190,8 +1191,8 @@ def patch_require_finite_tree_recorder(
 ) -> None:
     patch_runtime_call_recorder(
         monkeypatch,
-        runtime_module,
-        "_require_finite_tree",
+        runtime_values_module,
+        "require_finite_tree",
         recorder,
         "finite_tree",
         lambda args, _: ("finite_tree", args[1], recorder.active()),
@@ -4669,13 +4670,13 @@ def test_ggnvp_jvp_hessian_vjp_does_not_call_dense_jacobian_helpers(
         ))
 
     monkeypatch.setattr(
-        runtime_module,
-        "_dense_jacobian_tree",
+        runtime_values_module,
+        "dense_jacobian_tree",
         forbidden_dense_jacobian,
     )
     monkeypatch.setattr(
-        runtime_module,
-        "_dense_jacobian_row_block",
+        runtime_values_module,
+        "dense_jacobian_row_block",
         forbidden_dense_jacobian,
     )
     factory = vpx.standard_operation_factory(
@@ -4977,7 +4978,7 @@ def test_ggnvp_chunks_output_cotangent_vjp(
         chunk_nonzeros.append(
             int(
                 torch.count_nonzero(
-                    runtime_module._flatten_vector(output_cotangent)
+                    runtime_values_module.flatten_vector(output_cotangent)
                 ).item()
             )
         )
@@ -5022,7 +5023,7 @@ def test_dense_ggnvp_executes_declared_row_batches(
     vector = {"w": torch.tensor([1.5, -2.0], dtype=torch.float64)}
     loss_hessian = torch.diag(torch.tensor([3.0, 5.0, 7.0], dtype=torch.float64))
     row_blocks = []
-    original_row_block = runtime_module._dense_jacobian_row_block
+    original_row_block = runtime_values_module.dense_jacobian_row_block
 
     def function(
         params: vpx.ParameterTree,
@@ -5058,7 +5059,7 @@ def test_dense_ggnvp_executes_declared_row_batches(
         )
 
     monkeypatch.setattr(
-        runtime_module, "_dense_jacobian_row_block", recording_row_block
+        runtime_values_module, "dense_jacobian_row_block", recording_row_block
     )
     factory = vpx.standard_operation_factory(
         ops.ggnvp("ggn", "model_output", aggregation="sum"),
