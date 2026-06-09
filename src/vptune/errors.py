@@ -31,3 +31,11 @@ class MeasurementError(VPTuneError):
 
 class MaterializationError(VPTuneError):
     """Raised when a selected plan cannot be materialized."""
+
+
+class CompileSetupError(MaterializationError):
+    """Raised when declared compile settings cannot be set up."""
+
+
+class RecordValidationError(MaterializationError):
+    """Raised when declared record or data content is invalid."""

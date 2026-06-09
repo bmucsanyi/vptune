@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 import torch
 
-from vptune.errors import MaterializationError
+from vptune.errors import MaterializationError, RecordValidationError
 from vptune.identities import (
     device_signature,
     module_identity,
@@ -86,7 +86,7 @@ def _require_string_tuple(value: Any, label: str) -> None:
         return
 
     message = f"{label} must be a tuple of strings"
-    raise MaterializationError(message)
+    raise RecordValidationError(message)
 
 
 def _require_string_mapping(value: Any, label: str) -> None:
@@ -96,7 +96,7 @@ def _require_string_mapping(value: Any, label: str) -> None:
         return
 
     message = f"{label} must map strings to strings"
-    raise MaterializationError(message)
+    raise RecordValidationError(message)
 
 
 def _selected_name(family: str | None, name: str | None) -> str | None:
@@ -116,15 +116,15 @@ def _require_output_field_paths(
     for key, path in value.items():
         if not isinstance(key, str):
             message = "output field names must be strings"
-            raise MaterializationError(message)
+            raise RecordValidationError(message)
 
         if not isinstance(path, tuple) or not path:
             message = f"output field path must be a nonempty tuple: {key}"
-            raise MaterializationError(message)
+            raise RecordValidationError(message)
 
         if not all(isinstance(item, (str, int)) for item in path):
             message = f"output field path items must be strings or integers: {key}"
-            raise MaterializationError(message)
+            raise RecordValidationError(message)
 
 
 class DataProvider(Protocol):
@@ -670,7 +670,7 @@ def _require_identity_method(value: Any, name: str) -> None:
 
     if not callable(identity):
         message = f"RuntimeConfig {name} must expose identity()"
-        raise MaterializationError(message)
+        raise RecordValidationError(message)
 
     _identity_payload(identity(), f"{name}.identity")
 
@@ -680,7 +680,7 @@ def _identity_payload(value: Mapping[str, Any], name: str) -> Any:
         return to_json_value(value)
     except TypeError as error:
         message = f"{name} must be JSON-compatible"
-        raise MaterializationError(message) from error
+        raise RecordValidationError(message) from error
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1109,7 +1109,7 @@ class Family:
         """Derive dependencies from operator semantics.
 
         Raises:
-            MaterializationError: If operator dependencies are invalid.
+            RecordValidationError: If operator dependencies are invalid.
         """
         dependencies = operator_dependencies(self.operator)
 
@@ -1118,7 +1118,7 @@ class Family:
 
         if self.dependencies:
             message = "family dependencies are derived from operator semantics"
-            raise MaterializationError(message)
+            raise RecordValidationError(message)
 
         object.__setattr__(self, "dependencies", dependencies)
 
@@ -1141,18 +1141,18 @@ def _composition_dependencies(operator: OperatorSpec) -> tuple[str, ...]:
 
     if not isinstance(children, Sequence) or isinstance(children, str):
         message = "composition operator must declare ordered children"
-        raise MaterializationError(message)
+        raise RecordValidationError(message)
 
     child_order = tuple(children)
 
     if not child_order:
         message = "composition operator must declare ordered children"
-        raise MaterializationError(message)
+        raise RecordValidationError(message)
 
     for child in child_order:
         if not isinstance(child, str) or not child:
             message = "composition children must be non-empty strings"
-            raise MaterializationError(message)
+            raise RecordValidationError(message)
 
     return child_order
 
@@ -1180,7 +1180,7 @@ def _matrix_free_metric_dependency(operator: OperatorSpec) -> str | None:
 
     if not isinstance(product, str) or not product:
         message = "matrix_free metric requires a named sibling product"
-        raise MaterializationError(message)
+        raise RecordValidationError(message)
 
     return product
 

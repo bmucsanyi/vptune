@@ -337,7 +337,7 @@ def test_attention_operation_compiles_attention_module_boundary(
 def test_attention_operation_rejects_other_compile_boundaries() -> None:
     factory = vpat.attention_operation_factory(attention_location())
 
-    with pytest.raises(vp.MaterializationError, match="model_forward"):
+    with pytest.raises(vp.CompileSetupError, match="model_forward"):
         factory(
             vpx.Candidate(
                 "attention",

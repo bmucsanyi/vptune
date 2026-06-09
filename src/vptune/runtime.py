@@ -69,7 +69,12 @@ from vptune.data import (
     RuntimeReferenceCheck,
     ScalarObjective,
 )
-from vptune.errors import AdmissionError, MaterializationError, ReferenceFailedError
+from vptune.errors import (
+    AdmissionError,
+    CompileSetupError,
+    MaterializationError,
+    ReferenceFailedError,
+)
 from vptune.identities import stable_hash, tensor_signature, to_json_value
 from vptune.tensor_tree import (
     TensorTree,
@@ -1806,7 +1811,7 @@ def _compile_composition_child_components(
 
     if settings.get("composition.execution") == "fuse_adjacent_children":
         message = "compile.boundary=composition_child requires child calls"
-        raise MaterializationError(message)
+        raise CompileSetupError(message)
 
     _validate_compile_cache_state(settings)
     compiled_components = {}
@@ -4742,7 +4747,7 @@ def _prepare_model_forward_compile_boundary(
 
     if execution.module is None or execution.module_call is None:
         message = "compile.boundary=model_forward requires module_call"
-        raise MaterializationError(message)
+        raise CompileSetupError(message)
 
     module = execution.module
     module_call = execution.module_call
@@ -5105,7 +5110,7 @@ def _compile_operation(
 
     if enabled != "true":
         message = f"compile.enabled is unsupported: {enabled}"
-        raise MaterializationError(message)
+        raise CompileSetupError(message)
 
     _require_compile_boundary(operator, settings)
 
@@ -5199,7 +5204,7 @@ def _validate_compile_cache_state(settings: Mapping[str, Any]) -> None:
         return
 
     message = "compile.cache_state must be cold_compile or warm_cache"
-    raise MaterializationError(message)
+    raise CompileSetupError(message)
 
 
 def _compiled_tensor_operation(
@@ -5387,7 +5392,7 @@ def _warm_compiled_cache(
         return
 
     if error_message is not None and any(arg is None for arg in warm_args):
-        raise MaterializationError(error_message)
+        raise CompileSetupError(error_message)
 
     compiled(*warm_args)
 
@@ -5400,13 +5405,13 @@ def _require_compile_boundary(
 
     if not isinstance(boundary, str):
         message = "compile.boundary is required"
-        raise MaterializationError(message)
+        raise CompileSetupError(message)
 
     if _compile_boundary_supported(operator.kind, boundary, settings):
         return
 
     message = f"compile.boundary={boundary} is not lowered for {operator.kind}"
-    raise MaterializationError(message)
+    raise CompileSetupError(message)
 
 
 def _compile_boundary_supported(
@@ -5562,7 +5567,7 @@ def _require_compiled_autograd_operator(operator: OperatorSpec) -> None:
         "compile.compiled_autograd=true requires a backward or higher-order "
         f"operator, got {operator.kind}"
     )
-    raise MaterializationError(message)
+    raise CompileSetupError(message)
 
 
 def _compile_backend(settings: Mapping[str, Any]) -> str:
@@ -5570,20 +5575,20 @@ def _compile_backend(settings: Mapping[str, Any]) -> str:
 
     if not isinstance(value, str):
         message = "compile.backend is required"
-        raise MaterializationError(message)
+        raise CompileSetupError(message)
 
     if value == "inductor":
         return value
 
     if value == "registered_backend":
         message = "compile.backend requires a concrete PyTorch compiler backend id"
-        raise MaterializationError(message)
+        raise CompileSetupError(message)
 
     if _is_registered_compile_backend(value):
         return value
 
     message = f"compile.backend is not registered with PyTorch: {value}"
-    raise MaterializationError(message)
+    raise CompileSetupError(message)
 
 
 def _is_registered_compile_backend(value: str) -> bool:
@@ -5591,7 +5596,7 @@ def _is_registered_compile_backend(value: str) -> bool:
         backends = torch.compiler.list_backends()
     except AttributeError as error:
         message = "torch.compiler.list_backends is required"
-        raise MaterializationError(message) from error
+        raise CompileSetupError(message) from error
 
     return value in set(backends)
 
@@ -5606,7 +5611,7 @@ def _compile_mode(settings: Mapping[str, Any]) -> str | None:
         return value
 
     message = f"compile.mode is unsupported: {value}"
-    raise MaterializationError(message)
+    raise CompileSetupError(message)
 
 
 def _compile_bool(settings: Mapping[str, Any], key: str) -> bool:
@@ -5619,7 +5624,7 @@ def _compile_bool(settings: Mapping[str, Any], key: str) -> bool:
         return False
 
     message = f"{key} must be true or false"
-    raise MaterializationError(message)
+    raise CompileSetupError(message)
 
 
 def _compile_optional_bool(settings: Mapping[str, Any], key: str) -> bool | None:
@@ -5635,7 +5640,7 @@ def _compile_optional_bool(settings: Mapping[str, Any], key: str) -> bool | None
         return False
 
     message = f"{key} must be None, true, or false"
-    raise MaterializationError(message)
+    raise CompileSetupError(message)
 
 
 def _compile_options(settings: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -14412,7 +14417,7 @@ def _call_compiled_model_forward(
 ) -> object:
     if execution.module is None:
         message = "compile.boundary=model_forward requires module"
-        raise MaterializationError(message)
+        raise CompileSetupError(message)
 
     settings = execution.candidate.settings
     model_params = _stateful_model_tree(active_params, settings)

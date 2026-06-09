@@ -21,7 +21,7 @@ from vptune.data import (
     ReferenceCheck,
     ReferenceResult,
 )
-from vptune.errors import AdmissionError, MaterializationError
+from vptune.errors import AdmissionError, CompileSetupError, MaterializationError
 from vptune.runtime import compiled_operation
 from vptune.tensor_tree import TensorTree
 
@@ -396,7 +396,7 @@ def _attention_compile_operation(
 
     if boundary not in {"attention_module", "whole_operator"}:
         message = f"compile.boundary={boundary} is not lowered for attention"
-        raise MaterializationError(message)
+        raise CompileSetupError(message)
 
     return compiled_operation(settings, operation)
 

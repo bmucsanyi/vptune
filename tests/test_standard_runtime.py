@@ -1579,7 +1579,7 @@ def test_compile_backend_rejects_non_concrete_or_unregistered_backend(
     backend: str,
     message: str,
 ) -> None:
-    with pytest.raises(vp.MaterializationError, match=message):
+    with pytest.raises(vp.CompileSetupError, match=message):
         runtime_module._compile_backend({"compile.backend": backend})
 
 
@@ -17268,7 +17268,7 @@ def test_standard_runtime_compiles_score_matrix_boundary_only(
 def test_standard_runtime_rejects_compile_boundary_without_matching_callable() -> None:
     factory = quadratic_hvp_factory({"w": torch.tensor([1.0], dtype=torch.float64)})
 
-    with pytest.raises(vp.MaterializationError, match="hvp_batched_vectors"):
+    with pytest.raises(vp.CompileSetupError, match="hvp_batched_vectors"):
         factory(
             passed_candidate(
                 "hvp",
@@ -17292,7 +17292,7 @@ def test_standard_runtime_rejects_loss_closure_boundary_without_scalar_loss() ->
         function_objectives={"function": square_function},
     )
 
-    with pytest.raises(vp.MaterializationError, match="loss_closure"):
+    with pytest.raises(vp.CompileSetupError, match="loss_closure"):
         factory(
             vpx.Candidate(
                 "jvp",
@@ -17349,7 +17349,7 @@ def test_standard_runtime_rejects_single_vector_compile_boundary_for_batched_hvp
 ):
     factory = quadratic_hvp_factory({"w": torch.tensor([1.0], dtype=torch.float64)})
 
-    with pytest.raises(vp.MaterializationError, match="hvp_single_vector"):
+    with pytest.raises(vp.CompileSetupError, match="hvp_single_vector"):
         factory(
             passed_candidate(
                 "hvp",
@@ -17426,7 +17426,7 @@ def test_standard_runtime_rejects_compiled_autograd_without_backward_graph() -> 
         buffers={},
     )
 
-    with pytest.raises(vp.MaterializationError, match="backward or higher-order"):
+    with pytest.raises(vp.CompileSetupError, match="backward or higher-order"):
         factory(
             vpx.Candidate(
                 "metric",
@@ -18207,7 +18207,7 @@ def test_composition_child_compile_boundary_rejects_fused_composition() -> None:
         fused_components={("multiply", "shift"): fused_multiply_shift_component},
     )
 
-    with pytest.raises(vp.MaterializationError, match="child calls"):
+    with pytest.raises(vp.CompileSetupError, match="child calls"):
         factory(
             vpx.Candidate(
                 "compose",

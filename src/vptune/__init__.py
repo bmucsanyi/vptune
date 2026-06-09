@@ -4,10 +4,12 @@ from vptune import adapters as adapters
 from vptune.data import Plan, TuningRun
 from vptune.errors import (
     AdmissionError,
+    CompileSetupError,
     MaterializationError,
     MeasurementError,
     NoPassedCandidateError,
     RecordFormatError,
+    RecordValidationError,
     ReferenceFailedError,
     StaleRecordError,
     VPTuneError,
@@ -96,6 +98,7 @@ __all__ = [
     "CohortConstraint",
     "Combine",
     "Compile",
+    "CompileSetupError",
     "Compose",
     "Damping",
     "DeterminismPolicy",
@@ -115,6 +118,7 @@ __all__ = [
     "Plan",
     "Precision",
     "RecordFormatError",
+    "RecordValidationError",
     "ReferenceFailedError",
     "Run",
     "SampleSource",
