@@ -3303,3 +3303,98 @@ def test_typed_output_jvp_and_vjp_execute_reference() -> None:
         vjp_output["weight"],
         cotangent.T @ batch["x"],
     )
+
+
+def test_replay_identity_fields_distinguish_declared_variants() -> None:
+    model = typed_metric_model()
+    loss = vp.loss.softmax_cross_entropy(output="logits", labels="labels")
+
+    matrix_free_a = vp.metric.matrix_free(
+        operator=vp.ggnvp(model, loss, name="curvature_a")
+    )
+    matrix_free_b = vp.metric.matrix_free(
+        operator=vp.ggnvp(model, loss, name="curvature_b")
+    )
+    inverse_a = vp.inverse_metric_vp(
+        model, matrix_free_a, damping=vp.damping.scalar(0.5)
+    )
+    inverse_b = vp.inverse_metric_vp(
+        model, matrix_free_b, damping=vp.damping.scalar(0.5)
+    )
+
+    assert inverse_a.spec.semantics != inverse_b.spec.semantics
+
+    def scalar_objective(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: Mapping[str, object],
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        del buffers, batch, context
+
+        return params["weight"].square().sum()
+
+    from_scalar_v1 = vp.gradient(
+        model,
+        vp.loss.from_scalar(scalar_objective, output="logits", version="v1"),
+    )
+    from_scalar_v2 = vp.gradient(
+        model,
+        vp.loss.from_scalar(scalar_objective, output="logits", version="v2"),
+    )
+
+    assert from_scalar_v1.spec.semantics != from_scalar_v2.spec.semantics
+
+    curvature = vp.ggnvp(model, loss, name="curvature")
+    gradient = vp.gradient(model, loss, name="gradient")
+
+    def weighted_composition(coefficient: float) -> vp.Operator:
+        return vp.composition(
+            model,
+            name="weighted",
+            children={"curvature": curvature, "gradient": gradient},
+            combine=vp.linear_combination(
+                (coefficient, "curvature"),
+                (1.0, "gradient"),
+            ),
+        )
+
+    assert (
+        weighted_composition(1.5).spec.semantics
+        != weighted_composition(2.5).spec.semantics
+    )
+
+    likelihood = vp.likelihood.gaussian(output="logits", target="target", noise=1.0)
+    sampled_a = vp.sampled_fisher_vp(
+        model, likelihood, samples=vp.samples.fixed_seed(seed=1, count=4)
+    )
+    sampled_b = vp.sampled_fisher_vp(
+        model, likelihood, samples=vp.samples.fixed_seed(seed=2, count=4)
+    )
+
+    assert sampled_a.spec.semantics != sampled_b.spec.semantics
+
+    ekfac = typed_ekfac_metric()
+    inner_norm = vp.inverse_metric_inner_vp(
+        model, ekfac, damping=vp.damping.scalar(0.5), as_norm=True
+    )
+    inner_gram = vp.inverse_metric_inner_vp(
+        model, ekfac, damping=vp.damping.scalar(0.5), as_norm=False
+    )
+
+    assert inner_norm.spec.semantics != inner_gram.spec.semantics
+
+    tol_a = vp.inverse_metric_vp(
+        model, matrix_free_a, damping=vp.damping.scalar(0.5), tol=1e-4
+    )
+    tol_b = vp.inverse_metric_vp(
+        model, matrix_free_a, damping=vp.damping.scalar(0.5), tol=2e-4
+    )
+
+    assert tol_a.spec.semantics != tol_b.spec.semantics
+    assert (
+        vp.inverse_metric_vp(
+            model, matrix_free_a, damping=vp.damping.scalar(0.5), tol=1e-4
+        ).spec.semantics
+        == tol_a.spec.semantics
+    )

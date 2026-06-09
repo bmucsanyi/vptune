@@ -455,6 +455,8 @@ ACCEPTANCE_TEST_COVERAGE = {
     "Positive-definiteness tests reject": (
         "test_inverse_metric_rejects_ill_conditioned_undamped_solve",
         "test_typed_inverse_metric_tol_lowers_to_matrix_free_cg",
+        "test_matrix_free_inverse_metric_rows_admit_only_conjugate_gradient",
+        "test_public_matrix_free_metric_tunes_selected_curvature_product",
     ),
     "EKFAC metric tests cover": (
         "test_typed_ekfac_metric_products_execute_against_reference",
@@ -493,6 +495,7 @@ ACCEPTANCE_TEST_COVERAGE = {
     "Cohort-input tests pin": (
         "test_public_tune_multi_product_cohort_without_run_dir",
         "test_tune_run_selects_complete_dtype_cohort",
+        "test_cohort_constraint_pins_vector_axes_and_rejects_disagreement",
     ),
     "Multi-RHS tests cover": (
         "test_inverse_metric_multi_rhs_controls_cholesky_rhs_batching",
@@ -507,6 +510,7 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_public_problem_autotune_and_operator_load_replay",
         "test_public_operator_load_rejects_stale_model_identity",
         "test_typed_inverse_metric_tol_lowers_to_matrix_free_cg",
+        "test_replay_identity_fields_distinguish_declared_variants",
     ),
     "KFAC metric multiply, inverse, and inner product": (
         "test_typed_kfac_metric_products_execute_against_reference",
@@ -559,6 +563,7 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_tune_fast_strategy_compiles_near_fastest_eager_rows",
         "test_tune_balanced_strategy_crosses_retained_group_winners",
         "test_tune_thorough_strategy_uses_declared_repeat_count",
+        "test_tune_exhaustive_strategy_measures_every_admitted_row",
     ),
     "Autobatch tests cover": (
         "test_autobatch_bridge_selects_candidate_by_positive_index_domain",
@@ -10265,3 +10270,233 @@ def test_package_layers_have_one_directional_imports() -> None:
                     f"{owner} (layer {source_layer}) imports "
                     f"{target} (layer {target_layer}) in {path}"
                 )
+
+
+def test_matrix_free_inverse_metric_rows_admit_only_conjugate_gradient() -> None:
+    runtime = runtime_config(
+        passed_candidates(
+            "inverse_metric",
+            (
+                (
+                    "cg",
+                    {"inverse_metric.solve_path": "conjugate_gradient"},
+                ),
+                (
+                    "cholesky",
+                    {"inverse_metric.solve_path": "cholesky_solve"},
+                ),
+                (
+                    "eigh",
+                    {"inverse_metric.solve_path": "eigh_solve"},
+                ),
+                (
+                    "svd",
+                    {"inverse_metric.solve_path": "svd_solve"},
+                ),
+            ),
+        ),
+        constant_operation_factory,
+        passing_reference_check,
+        materialize_candidate,
+        None,
+        {
+            "runtime": "standard",
+            "operator": {
+                "kind": "inverse_metric",
+                "semantics": {
+                    "representation": {"kind": "matrix_free"},
+                },
+            },
+        },
+    )
+    rows = {
+        candidate.candidate_id: candidate
+        for candidate in run_module._candidate_rows(runtime)
+    }
+
+    assert rows["cg"].admission_status == "passed"
+
+    for candidate_id in ("cholesky", "eigh", "svd"):
+        assert rows[candidate_id].admission_status == "failed"
+        assert rows[candidate_id].admission_error == (
+            "metric representation kind is not supported by path: matrix_free"
+        )
+
+
+def test_cohort_constraint_pins_vector_axes_and_rejects_disagreement(
+    tmp_path: Path,
+) -> None:
+    target = one_call_cpu_target()
+    model = torch.nn.Linear(1, 1)
+    operator_a = ops.gradient("a", "loss", aggregation="sum")
+    operator_b = ops.gradient("b", "loss", aggregation="sum")
+    constraint = vpx.CohortConstraint(
+        name="vector_axes",
+        settings_keys=("layout.vector", "dtype.vector"),
+        assignments=(
+            {"layout.vector": "flat_contiguous", "dtype.vector": "fp32"},
+            {"layout.vector": "per_layer_flat", "dtype.vector": "bf16"},
+        ),
+    )
+
+    def problem_for(
+        name: str,
+        operator: vpx.OperatorSpec,
+        rows: tuple[tuple[str, Mapping[str, Any]], ...],
+        calls: list[str],
+    ) -> vpx.Problem:
+        return recorded_tuning_problem(
+            model=model,
+            target=target,
+            name=name,
+            operator=operator,
+            candidates=passed_candidates(name, rows),
+            calls=calls,
+        )
+
+    matching_rows = (
+        ("flat", {"layout.vector": "flat_contiguous", "dtype.vector": "fp32"}),
+        ("layer", {"layout.vector": "per_layer_flat", "dtype.vector": "bf16"}),
+    )
+    calls = []
+    plan = vp.tune_run(
+        vpx.TuningRun(
+            target=target,
+            families=(vpx.Family("a", operator_a), vpx.Family("b", operator_b)),
+            problems=(
+                problem_for("a", operator_a, matching_rows, calls),
+                problem_for("b", operator_b, matching_rows, calls),
+            ),
+            cohort_constraints=(constraint,),
+            run_id="vector-cohort",
+        ),
+        run_dir=tmp_path / "agree",
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0, 1.0, 101.0, 101.0, 111.0, 111.0, 121.0)),
+    )
+
+    assert plan.cohort_assignment is not None
+    pinned = plan.cohort_assignment.values
+
+    for family in ("a", "b"):
+        selected = plan.selected[family]
+
+        for key in ("layout.vector", "dtype.vector"):
+            assert selected.settings[key] == pinned[key]
+
+    with pytest.raises(vp.NoPassedCandidateError):
+        vp.tune_run(
+            vpx.TuningRun(
+                target=target,
+                families=(vpx.Family("a", operator_a), vpx.Family("b", operator_b)),
+                problems=(
+                    problem_for("a", operator_a, matching_rows, []),
+                    problem_for(
+                        "b",
+                        operator_b,
+                        (
+                            (
+                                "mixed",
+                                {
+                                    "layout.vector": "flat_contiguous",
+                                    "dtype.vector": "bf16",
+                                },
+                            ),
+                        ),
+                        [],
+                    ),
+                ),
+                cohort_constraints=(constraint,),
+                run_id="vector-cohort-disagree",
+            ),
+            run_dir=tmp_path / "disagree",
+            memory_backend=CPUMemoryBackend(),
+            clock=SequenceClock((0.0, 1.0, 1.0, 101.0, 101.0, 111.0, 111.0, 121.0)),
+        )
+
+
+def test_tune_exhaustive_strategy_measures_every_admitted_row(
+    tmp_path: Path,
+) -> None:
+    calls = []
+    model = torch.nn.Linear(1, 1)
+    candidates = passed_changed_candidates(
+        "family",
+        (
+            ("base", {}, ()),
+            (
+                "hvp-path",
+                {"hvp.path": "reverse_over_reverse"},
+                ("hvp.path",),
+            ),
+            (
+                "gradient-graph",
+                {"gradient.graph_schedule": "build_once"},
+                ("gradient.graph_schedule",),
+            ),
+            ("dtype", {"dtype.model_compute": "fp32"}, ("dtype.model_compute",)),
+        ),
+    )
+    target = dataclasses.replace(
+        cpu_target(
+            vpx.TimingPolicy(
+                short_seconds=0.0,
+                medium_seconds=0.0,
+                long_measured_calls=1,
+            )
+        ),
+        search_policy=vpx.SearchPolicy(strategy="exhaustive"),
+    )
+
+    def operation_factory(
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.CandidateOperation:
+        del batch, vector
+        calls.append(("operation", candidate.candidate_id))
+
+        return vpx.constant_operation(torch.tensor([1.0]))
+
+    def reference_check(
+        candidate: vpx.Candidate,
+        batch: vpx.Batch,
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
+        del batch, vector
+        calls.append(("reference", candidate.candidate_id))
+
+        return reference_passed()
+
+    problem = vpx.Problem(
+        model=model,
+        params=vpx.parameter_surface(model),
+        data=TwoProbeData(),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
+        vectors=TwoVectorProvider(),
+        target=target,
+        runtime=runtime_config(
+            candidates,
+            operation_factory,
+            reference_check,
+            materialize_candidate,
+            None,
+            {"runtime": "test.search-exhaustive"},
+        ),
+    )
+    plan = tune_problem(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)),
+    )
+
+    measured = tuple(record.candidate_id for record in plan.full_size_records)
+
+    assert sorted(measured) == ["base", "dtype", "gradient-graph", "hvp-path"]
+    assert sorted({call[1] for call in calls}) == [
+        "base",
+        "dtype",
+        "gradient-graph",
+        "hvp-path",
+    ]
