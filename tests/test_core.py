@@ -381,6 +381,7 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_standard_runtime_executes_cpu_saved_tensor_hooks",
         "test_standard_runtime_executes_custom_saved_tensor_hooks",
         "test_activation_offload_preserves_higher_order_hvp",
+        "test_offload_hooks_that_restore_wrong_tensors_fail_reference",
     ),
     "Layout tests cover `layout.vector_ops=foreach`": (
         "test_standard_runtime_executes_foreach_vector_ops_for_diagonal_metric",

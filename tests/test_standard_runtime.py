@@ -18973,3 +18973,48 @@ def test_ggnvp_reference_check_rejects_nonfinite_loss_hessian() -> None:
             },
             {"w": torch.tensor([1.0], dtype=torch.float64)},
         )
+
+
+def test_offload_hooks_that_restore_wrong_tensors_fail_reference() -> None:
+    params = {"w": torch.tensor([2.0], dtype=torch.float64, requires_grad=True)}
+    vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+
+    def pack_hook(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.detach().clone()
+
+    def corrupting_unpack_hook(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor * 3.0
+
+    check = vpx.standard_reference_check(
+        ops.gradient("gradient", "loss", aggregation="sum"),
+        params=params,
+        buffers={},
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "directional_abs_diff": 1e-6,
+            "directional_rel_diff": 1e-6,
+        },
+        scalar_objectives={"loss": quadratic_scalar},
+        activation_pack_hooks={"corrupting": pack_hook},
+        activation_unpack_hooks={"corrupting": corrupting_unpack_hook},
+    )
+    settings = {
+        **gradient_settings(),
+        "activation.recompute": "none",
+        "activation.offload": "custom_saved_tensor_hooks",
+        "activation.pack_hook": "corrupting",
+        "activation.unpack_hook": "corrupting",
+    }
+
+    with pytest.raises(vp.ReferenceFailedError, match="diff"):
+        check(
+            vpx.Candidate(
+                "gradient",
+                "corrupting-offload",
+                settings,
+                admission_status="passed",
+            ),
+            {"scale": 1.0},
+            vector,
+        )
