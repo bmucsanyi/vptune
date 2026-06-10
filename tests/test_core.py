@@ -405,6 +405,8 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_ggnvp_reference_check_rejects_nonsymmetric_loss_hessian",
         "test_ggnvp_reference_check_rejects_indefinite_loss_hessian",
         "test_typed_declared_psd_matrix_free_rejects_indefinite_matvec",
+        "test_ggnvp_reference_check_rejects_mismatched_loss_hessian_shape",
+        "test_ggnvp_reference_check_rejects_nonfinite_loss_hessian",
     ),
     "FisherVP anchor computes exact score-gradient outer products": (
         "test_fisher_references_use_declared_per_example_objectives",

@@ -18902,3 +18902,74 @@ def test_sampled_fisher_exact_comparison_runs_only_with_declared_bound() -> None
             {**base_batch, "exact_fisher_vp": exact + 1000.0},
             vector,
         )
+
+
+def _ggn_reference_check_for_loss_hessian() -> Any:
+    params = {"w": torch.tensor([1.0], dtype=torch.float64)}
+
+    def function(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        del buffers, batch, context
+
+        return torch.stack((params["w"][0], 2.0 * params["w"][0]))
+
+    return vpx.standard_reference_check(
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
+        params=params,
+        buffers={},
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "symmetry_max_abs_diff": 1e-12,
+            "psd_violation": 1e-12,
+        },
+        function_objectives={"model_output": function},
+    )
+
+
+def test_ggnvp_reference_check_rejects_mismatched_loss_hessian_shape() -> None:
+    check = _ggn_reference_check_for_loss_hessian()
+
+    with pytest.raises(
+        vp.ReferenceFailedError,
+        match="loss_hessian shape must match flattened function output",
+    ):
+        check(
+            vpx.Candidate(
+                "ggn",
+                "row",
+                ggn_dense_kernel_settings(),
+                admission_status="passed",
+            ),
+            {
+                "loss_hessian": torch.eye(3, dtype=torch.float64),
+                "symmetry_vector": {"w": torch.tensor([2.0], dtype=torch.float64)},
+            },
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+        )
+
+
+def test_ggnvp_reference_check_rejects_nonfinite_loss_hessian() -> None:
+    check = _ggn_reference_check_for_loss_hessian()
+
+    with pytest.raises(vp.ReferenceFailedError, match="finite"):
+        check(
+            vpx.Candidate(
+                "ggn",
+                "row",
+                ggn_dense_kernel_settings(),
+                admission_status="passed",
+            ),
+            {
+                "loss_hessian": torch.tensor(
+                    [[float("nan"), 0.0], [0.0, 1.0]],
+                    dtype=torch.float64,
+                ),
+                "symmetry_vector": {"w": torch.tensor([2.0], dtype=torch.float64)},
+            },
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+        )
