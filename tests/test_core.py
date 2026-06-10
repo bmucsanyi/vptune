@@ -356,6 +356,7 @@ ACCEPTANCE_TEST_COVERAGE = {
     "Grad-materialization tests cover tensor-tree returns": (
         "test_standard_operation_factory_runs_core_derivative_products",
         "test_standard_runtime_executes_stateful_module_gradient",
+        "test_gradient_rows_reject_materialization_override_keys",
     ),
     "Teacher-output tests cover CPU": (
         "test_standard_runtime_executes_precomputed_cpu_teacher_outputs",
@@ -373,6 +374,8 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_standard_runtime_executes_fused_row_with_registered_rewriter",
         "test_standard_runtime_executes_fused_rows_for_higher_order_families",
         "test_composition_fuse_adjacent_children_reference_validates_fused_output",
+        "test_standard_runtime_rejects_fused_loss_without_loss_identity",
+        "test_standard_runtime_accepts_fused_loss_with_normalization_identity",
     ),
     "Activation-offload tests cover CPU saved-tensor hooks": (
         "test_standard_runtime_executes_cpu_saved_tensor_hooks",
@@ -488,6 +491,14 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_typed_ekfac_metric_inner_products_execute_against_reference",
         "test_metric_inner_norm_requires_sqrt_apply_reduce",
         "test_metric_inner_block_rhs_matches_single_column_gram",
+        "test_metric_inner_low_rank_sqrt_reduce_paths_match_reference",
+        "test_metric_inner_ggn_sqrt_reduce_paths_match_reference",
+        "test_metric_inner_eigenbasis_sqrt_reduce_paths_match_reference",
+        "test_metric_inner_diagonal_factored_gram_paths_match_reference",
+        "test_metric_inner_low_rank_factored_gram_matches_reference",
+        "test_inverse_metric_inner_low_rank_factored_gram_matches_reference",
+        "test_metric_inner_kfac_factored_gram_matches_reference",
+        "test_inverse_metric_inner_kfac_factored_gram_matches_reference",
     ),
     "Per-example gradient tests cover": (
         "test_typed_softmax_cross_entropy_per_example_gradient_matches_reference",
@@ -503,6 +514,7 @@ ACCEPTANCE_TEST_COVERAGE = {
     "Solver-tolerance tests cover": (
         "test_inverse_metric_cg_stops_at_declared_tol",
         "test_inverse_metric_reference_check_uses_declared_tol_threshold",
+        "test_inverse_sqrt_metric_matrix_free_lanczos_tol_checks_residual",
     ),
     "Cohort-input tests pin": (
         "test_public_tune_multi_product_cohort_without_run_dir",
@@ -10612,3 +10624,22 @@ def test_manifest_rejects_declared_contradictory_rows() -> None:
 
     assert not admitted
     assert error == "attention.sdpa_kernel applies only to pytorch_sdpa_direct"
+
+
+def test_gradient_rows_reject_materialization_override_keys() -> None:
+    registry = vpx.standard_axis_registry()
+
+    with pytest.raises(
+        vp.AdmissionError,
+        match=r"no axis owner: gradient\.grad_materialization",
+    ):
+        registry.admit(
+            vpx.Candidate(
+                "gradient",
+                "materialization-override",
+                {
+                    "gradient.path": "backward_materialized_grad",
+                    "gradient.grad_materialization": "tensor_tree",
+                },
+            )
+        )
