@@ -18,6 +18,7 @@ import vptune.engine.memory as memory_module
 import vptune.engine.metrics as metrics_module
 import vptune.engine.runtime as runtime_module
 import vptune.engine.runtime_values as runtime_values_module
+import vptune.engine.vectorization as vectorization_module
 import vptune.ext as vpx
 from vptune.core import operators as ops
 from vptune.core.tensor_tree import tree_leaves, tree_map
@@ -18792,3 +18793,112 @@ def test_standard_runtime_fullgraph_rejects_graph_breaks(fullgraph: str) -> None
     (expected,) = torch.autograd.grad(reference_loss, reference_weight)
 
     torch.testing.assert_close(tree_leaves(result)[0], expected)
+
+
+def test_vector_vmap_chunk_size_reaches_torch_func_vmap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded = []
+    real_vmap = vectorization_module.torch_func_vmap
+
+    def recording_vmap(function: Any, **kwargs: Any) -> Any:
+        recorded.append(kwargs.get("chunk_size"))
+
+        return real_vmap(function, **kwargs)
+
+    monkeypatch.setattr(vectorization_module, "torch_func_vmap", recording_vmap)
+    result = _run_function_vectorization_case(
+        ops.jvp("jvp", "function", aggregation="none"),
+        {
+            **jvp_settings("torch_func_jvp"),
+            **torch_func_settings(requires_forward_ad=True),
+            **vmap_settings({"w": 0}, chunk_size=2),
+        },
+        {"scale": 1.0},
+        _vector_rows("w", THREE_VECTOR_ROWS),
+        {"function": square_function},
+    )
+
+    assert 2 in recorded
+    torch.testing.assert_close(
+        tree_leaves(result)[0],
+        _float_rows(_jvp_vjp_expected(THREE_VECTOR_ROWS)),
+    )
+
+
+def test_sampled_fisher_exact_comparison_runs_only_with_declared_bound() -> None:
+    params = {
+        "a": torch.zeros(2, dtype=torch.float64),
+        "b": torch.zeros((2, 1), dtype=torch.float64),
+    }
+    vector = {
+        "a": torch.tensor([1.0, 2.0], dtype=torch.float64),
+        "b": torch.tensor([[3.0], [4.0]], dtype=torch.float64),
+    }
+    base_batch = {
+        "sampled_score_gradients": torch.eye(4, dtype=torch.float64),
+        "num_examples": 2,
+    }
+
+    def sampled_scores(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        del buffers, context
+        assert batch["num_examples"] == 2
+
+        return torch.stack((
+            params["a"][0],
+            params["a"][1],
+            params["b"][0, 0],
+            params["b"][1, 0],
+        ))
+
+    operator = score_terms_sampled_fisher("sampled", "sampled_scores")
+    factory = vpx.standard_operation_factory(
+        operator,
+        params=params,
+        buffers={},
+        function_objectives={"sampled_scores": sampled_scores},
+    )
+    bogus_exact = torch.full((4,), 123.0, dtype=torch.float64)
+    skipped = run_passed_candidate(
+        factory,
+        "sampled",
+        "check-disabled",
+        sampled_fisher_settings("materialize_score_gradients"),
+        {**base_batch, "exact_fisher_vp": bogus_exact},
+        vector,
+    )
+    exact = torch.cat([
+        tensor_mapping(skipped)["a"].reshape(-1),
+        tensor_mapping(skipped)["b"].reshape(-1),
+    ])
+    enabled = sampled_fisher_settings(
+        "materialize_score_gradients",
+        exact_check="enabled_with_sampling_bound",
+    )
+    within = run_passed_candidate(
+        factory,
+        "sampled",
+        "check-within-bound",
+        enabled,
+        {**base_batch, "exact_fisher_vp": exact},
+        vector,
+    )
+
+    torch.testing.assert_close(
+        tensor_mapping(within)["a"], tensor_mapping(skipped)["a"]
+    )
+
+    with pytest.raises(vp.MaterializationError, match="exceeded bound"):
+        run_passed_candidate(
+            factory,
+            "sampled",
+            "check-out-of-bound",
+            enabled,
+            {**base_batch, "exact_fisher_vp": exact + 1000.0},
+            vector,
+        )

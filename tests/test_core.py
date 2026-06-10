@@ -417,6 +417,7 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_typed_sampled_fisher_fixed_seed_repeats",
         "test_sampled_fisher_vp_rejects_inconsistent_rows",
         "test_sampled_fisher_vp_dense_loop_and_anchor_use_parameter_order",
+        "test_sampled_fisher_exact_comparison_runs_only_with_declared_bound",
     ),
     "EmpiricalFisherVP anchor computes per-example-gradient": (
         "test_per_example_gradient_reference_check_and_empirical_outer_product",
@@ -424,6 +425,7 @@ ACCEPTANCE_TEST_COVERAGE = {
     "EmpiricalFisherVP standard runtime has both loop": (
         "test_empirical_fisher_vmap_path_matches_loop_path",
         "test_empirical_fisher_vmap_path_rejects_invalid_batch_shape",
+        "test_vector_vmap_chunk_size_reaches_torch_func_vmap",
     ),
     "Standard dense metric materialization returns one object": (
         "test_standard_metric_materializer_returns_metric_object",
