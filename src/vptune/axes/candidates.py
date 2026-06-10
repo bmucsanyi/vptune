@@ -2700,6 +2700,27 @@ def _manual_batch_size_error(settings: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _per_token_schedule_axis() -> AdmissionRule:
+    def admit(candidate: Candidate) -> tuple[bool, str | None]:
+        schedule = candidate.settings["schedule.per_token"]
+
+        if schedule != "packed":
+            return True, None
+
+        if candidate.settings.get("input.batch_layout") in {
+            "packed_with_inverse_permutation",
+            "variable_length",
+        }:
+            return True, None
+
+        return False, (
+            "schedule.per_token=packed requires input.batch_layout "
+            "packed_with_inverse_permutation or variable_length"
+        )
+
+    return admit
+
+
 def _gradient_accumulation_axis() -> AdmissionRule:
     def admit(candidate: Candidate) -> tuple[bool, str | None]:
         error = _gradient_accumulation_error(candidate.settings)
@@ -3191,7 +3212,11 @@ STANDARD_AXIS_ROWS = (
         ("single_step", "microbatch_accumulate"),
         _fixed_axis_rule(_gradient_accumulation_axis),
     ),
-    _single_axis_row("schedule.per_token", ("loop", "packed")),
+    _single_axis_row(
+        "schedule.per_token",
+        ("loop", "packed"),
+        _fixed_axis_rule(_per_token_schedule_axis),
+    ),
     *_single_axis_rows(
         ("chunk.token_block_size", "chunk.sequence_position_block_size"),
         (),

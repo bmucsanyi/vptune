@@ -301,6 +301,14 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_standard_axis_registry_validates_core_axes",
         "test_core_attention_axis_rejects_invalid_rows",
         "test_build_dtensor_placement_rejects_contradictory_fields",
+        "test_manifest_rejects_declared_contradictory_rows",
+        "test_memory_output_recompute_rejects_unmatched_settings",
+        "test_checkpoint_operation_rejects_missing_activation_offload",
+        "test_checkpoint_operation_rejects_custom_offload_without_hooks",
+        "test_standard_runtime_rejects_input_schedule_rows_without_binding",
+        "test_candidate_rows_reject_sampled_fisher_exact_check_without_bound",
+        "test_sampled_fisher_vp_rejects_inconsistent_rows",
+        "test_typed_categorical_fisher_routes_to_ggn",
     ),
     "Axis manifest rejects `compile.options.*=true`": (
         "test_standard_axis_registry_validates_core_axes",
@@ -10553,3 +10561,50 @@ def test_acceptance_mapped_tests_contain_behavioral_assertions() -> None:
     }
 
     assert sorted(weak) == []
+
+
+def test_manifest_rejects_declared_contradictory_rows() -> None:
+    registry = vpx.standard_axis_registry()
+
+    packed = registry.admit(
+        vpx.Candidate(
+            "gradient",
+            "packed-dense",
+            {
+                "schedule.per_token": "packed",
+                "input.batch_layout": "dense_padded",
+            },
+        )
+    )
+
+    assert packed.admission_status == "failed"
+    assert packed.admission_error == (
+        "schedule.per_token=packed requires input.batch_layout "
+        "packed_with_inverse_permutation or variable_length"
+    )
+
+    for alias in ("reduce-overhead", "max-autotune-no-cudagraphs"):
+        aliased = registry.admit(
+            vpx.Candidate("gradient", f"alias-{alias}", {"compile.mode": alias})
+        )
+
+        assert aliased.admission_status == "failed"
+        assert aliased.admission_error == (
+            "candidate axis value is not allowed: compile.mode"
+        )
+
+    admitted, error = vpx.admit_core_attention(
+        vpx.Candidate(
+            "attention",
+            "kernel-on-eager",
+            {
+                "attention.frontend": "patched_eager",
+                "attention.sdpa_kernel": "math",
+                "attention.partition": "full",
+                "attention.padding": "dense_padded",
+            },
+        )
+    )
+
+    assert not admitted
+    assert error == "attention.sdpa_kernel applies only to pytorch_sdpa_direct"
