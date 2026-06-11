@@ -148,6 +148,53 @@ def test_transformers_operation_factory_sets_attention_and_runs_module() -> None
     )
 
 
+@pytest.mark.parametrize(
+    ("frontend", "extra_settings", "expected_implementation"),
+    [
+        ("transformers_flash_attention_2", {}, "flash_attention_2"),
+        ("transformers_flash_attention_3", {}, "flash_attention_3"),
+        ("transformers_flash_attention_4", {}, "flash_attention_4"),
+        ("transformers_flex_attention", {}, "flex_attention"),
+        ("paged|eager", {}, "paged|eager"),
+        ("paged|sdpa", {"attention.sdpa_kernel": "math"}, "paged|sdpa"),
+        ("paged|flash_attention_2", {}, "paged|flash_attention_2"),
+    ],
+)
+def test_transformers_flash_flex_and_paged_rows_select_implementation(
+    frontend: str,
+    extra_settings: dict[str, object],
+    expected_implementation: str,
+) -> None:
+    model = TinyTransformersScalarModule()
+    factory = vpa.transformers_operation_factory(
+        ops.gradient("gradient", "loss", aggregation="sum"),
+        model=model,
+        params=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
+    )
+    output = factory(
+        vpx.Candidate(
+            "gradient",
+            f"row-{frontend}",
+            {
+                **stateful_transformers_settings(),
+                "attention.frontend": frontend,
+                **extra_settings,
+            },
+            admission_status="passed",
+        ),
+        {"scale": torch.tensor([4.0], dtype=torch.float64)},
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )()
+
+    assert model.attention_values == [expected_implementation]
+    torch.testing.assert_close(
+        tensor_dict(output)["w"],
+        torch.tensor([4.0], dtype=torch.float64),
+    )
+
+
 def test_transformers_registered_attention_row_selects_runtime_backend() -> None:
     model = RowSelectedAttentionModule()
     factory = vpa.transformers_operation_factory(

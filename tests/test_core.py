@@ -62,7 +62,7 @@ from vptune.tuning.measure import (
     run_candidate,
 )
 from vptune.tuning.run import tune as tune_problem
-from vptune.tuning.schemas import record_current
+from vptune.tuning.schemas import record_current, validate_json_record
 from vptune.tuning.select import memory_stable, select_cohort, select_family
 
 MANIFEST_AXIS_BULLET = re.compile(r"^- `([^`]+)`(?:: (.*))?$")
@@ -240,6 +240,7 @@ MANIFEST_CHECK_TEST_COVERAGE = {
     "full_size_agreement": ("test_tune_measures_every_probe_input",),
     "fused_kernel_reference_agreement": (
         "test_composition_fuse_adjacent_children_reference_validates_fused_output",
+        "test_standard_runtime_real_rewriter_preserves_higher_order_agreement",
     ),
     "hvp_symmetry": ("test_hvp_reference_check_records_symmetry_error",),
     "input_representation_equality": (
@@ -296,6 +297,9 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_axis_manifest_matches_spec_key_and_value_domains",
         "test_axis_manifest_keys_match_features_and_spec",
         "test_axis_manifest_carries_lowering_and_check_identity_fields",
+        "test_axis_manifest_assigns_one_owner_and_one_group_per_key",
+        "test_axis_registry_rejects_duplicate_setting_owner",
+        "test_axis_manifest_applies_merge_rules_deterministically",
     ),
     "Axis manifest rejects contradictory rows for packing": (
         "test_standard_axis_registry_validates_core_axes",
@@ -313,6 +317,7 @@ ACCEPTANCE_TEST_COVERAGE = {
     "Axis manifest rejects `compile.options.*=true`": (
         "test_standard_axis_registry_validates_core_axes",
         "test_standard_runtime_executes_dtype_and_backend_axes",
+        "test_manifest_rejects_compile_option_mode_combinations",
     ),
     "Axis manifest rejects metric and inverse-metric rows": (
         "test_candidate_rows_reject_metric_representation_path_mismatches",
@@ -376,6 +381,7 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_composition_fuse_adjacent_children_reference_validates_fused_output",
         "test_standard_runtime_rejects_fused_loss_without_loss_identity",
         "test_standard_runtime_accepts_fused_loss_with_normalization_identity",
+        "test_standard_runtime_real_rewriter_preserves_higher_order_agreement",
     ),
     "Activation-offload tests cover CPU saved-tensor hooks": (
         "test_standard_runtime_executes_cpu_saved_tensor_hooks",
@@ -404,6 +410,8 @@ ACCEPTANCE_TEST_COVERAGE = {
     "GGNVP cross-checks dense": (
         "test_ggnvp_reference_check_uses_jvp_hessian_vjp_anchor",
         "test_ggnvp_reference_check_cross_checks_jvp_path_with_dense_anchor",
+        "test_ggnvp_dense_anchor_agrees_with_jvp_hessian_vjp_anchor",
+        "test_typed_ce_ggn_matches_independent_dense_jacobian_hessian_product",
     ),
     "GGNVP enforces PSD on the output-space loss Hessian": (
         "test_ggnvp_reference_check_rejects_nonsymmetric_loss_hessian",
@@ -500,6 +508,7 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_inverse_metric_inner_low_rank_factored_gram_matches_reference",
         "test_metric_inner_kfac_factored_gram_matches_reference",
         "test_inverse_metric_inner_kfac_factored_gram_matches_reference",
+        "test_metric_inner_matrix_free_paths_match_dense_reference",
     ),
     "Per-example gradient tests cover": (
         "test_typed_softmax_cross_entropy_per_example_gradient_matches_reference",
@@ -530,6 +539,7 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_typed_softmax_cross_entropy_rejects_invalid_fields",
         "test_typed_sample_source_validation",
         "test_typed_declared_psd_matrix_free_rejects_indefinite_matvec",
+        "test_typed_metric_likelihood_and_damping_reject_kind_typos",
     ),
     "Replay tests cover the new identity fields": (
         "test_public_problem_autotune_and_operator_load_replay",
@@ -566,6 +576,12 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_sdpa_priority_list_enters_priority_context",
         "test_transformers_registered_attention_row_selects_runtime_backend",
         "test_transformers_operation_factory_sets_attention_and_runs_module",
+        "test_transformers_registered_attention_requires_mask_formatter_runtime",
+        "test_packed_exact_attention_restores_token_order",
+        "test_blockwise_exact_attention_matches_full_attention",
+        "test_transformers_runtime_config_runs_full_size_check_and_materializer",
+        "test_transformers_sdpa_rows_enter_declared_kernel_context",
+        "test_cuda_sdpa_backend_matches_math_backend",
     ),
     "Attention executor tests cover a non-Transformers module": (
         "test_mapping_attention_location_executes_non_transformers_attention",
@@ -573,6 +589,9 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_packed_exact_attention_restores_token_order",
         "test_blockwise_exact_attention_matches_full_attention",
         "test_packed_exact_attention_restores_padded_positions",
+        "test_segmented_forward_ad_attention_matches_full_attention_tangent",
+        "test_attention_executor_rejects_invalid_rows",
+        "test_cuda_sdpa_backend_matches_math_backend",
     ),
     "Distributed tests cover every distributed axis": (
         "test_distributed_adapter_registry_admits_owned_axes_and_strategy_fields",
@@ -582,6 +601,19 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_gloo_process_group_all_gather_matches_logical_rank_output",
         "test_nccl_process_group_single_rank_all_gather_matches_logical_rank_output",
         "test_nccl_process_group_all_gather_matches_logical_rank_output",
+        "test_resolve_process_group_backend_uses_declared_backend",
+        "test_build_dtensor_placement_constructs_declared_placement",
+        "test_distributed_strategy_applier_lowers_fsdp2_row_settings",
+        "test_distributed_admission_accepts_single_gpu_and_hybrid",
+        "test_distributed_strategy_applier_rejects_undeclared_tp_layout_key",
+        "test_distributed_strategy_applier_lowers_sequence_parallel_modules",
+        "test_distributed_strategy_applier_lowers_context_parallel_row_settings",
+        "test_distributed_redistribution_runs_before_output_schedule",
+        "test_distributed_strategy_applier_lowers_reduce_scatter_overlap",
+        "test_wait_collective_waits_on_work_handle",
+        "test_distributed_identity_records_mesh_and_communication",
+        "test_distributed_record_contains_memory_surface_and_settings",
+        "test_distributed_selected_settings_must_match_across_ranks",
     ),
     "Search tests cover": (
         "test_tune_admission_strategy_returns_candidate_table_only",
@@ -601,10 +633,12 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_record_current_rejects_stale_candidate_and_full_size_status",
         "test_check_record_current_rejects_stale_status_and_thresholds",
         "test_plan_replay_rejects_stale_context_and_materializer",
+        "test_record_current_rejects_stale_signature_generator_and_dependencies",
     ),
     "Saved reference and full-size rows carry schema-valid": (
         "test_tune_writes_admission_failure_rows_without_measurement",
         "test_plan_replay_recomputes_family_selection",
+        "test_saved_rows_carry_schema_valid_fields_and_replay_compares_loaded_rows",
     ),
     "Saved-run replay materializes the selected plan": (
         "test_plan_replay_recomputes_family_selection",
@@ -616,6 +650,8 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_tune_writes_admission_failure_rows_without_measurement",
         "test_measurement_cleans_memory_backend_after_runtime_failure",
         "test_measurement_reuses_long_probe_as_measured_sample",
+        "test_measurement_records_oom_rows_with_captured_samples",
+        "test_tune_writes_reference_runtime_failure_rows",
     ),
     "Selection chooses lower memory within": (
         "test_within_family_selection",
@@ -625,6 +661,7 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_cohort_selection_sums_compiled_row_scores",
         "test_selection_scores_compiled_distributed_rows_by_global_compile_fields",
         "test_selection_tie_breaks_with_declared_rank_memory_reduction",
+        "test_cohort_selection_sums_distributed_and_compiled_distributed_scores",
     ),
     "Dtype coherence is expressed through a": (
         "test_tune_run_selects_complete_dtype_cohort",
@@ -632,6 +669,7 @@ ACCEPTANCE_TEST_COVERAGE = {
     "Cohort selection supports generic single-key": (
         "test_tune_run_uses_generic_multi_key_cohort_constraint",
         "test_tune_run_cohort_subset_handles_cross_boundary_dependencies",
+        "test_tune_run_selects_complete_dtype_cohort",
     ),
     "Blocked descendants write": (
         "test_tune_run_propagates_candidate_validation_errors_inside_cohort",
@@ -643,10 +681,13 @@ ACCEPTANCE_TEST_COVERAGE = {
     "Plan replay rejects stale target": (
         "test_plan_replay_rejects_stale_context_and_materializer",
         "test_plan_replay_rejects_changed_memory_backend_identity",
+        "test_plan_replay_rejects_stale_dependency_identity",
+        "test_tune_run_uses_generic_multi_key_cohort_constraint",
     ),
     "Selection rejects stale signatures": (
         "test_selection_rejects_invalid_rows",
         "test_selection_requires_full_size_agreement",
+        "test_selection_rejects_all_failed_family",
     ),
     "`functional_call` tests cover": (
         "test_standard_runtime_executes_explicit_functional_call_settings",
@@ -663,6 +704,12 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_standard_operation_factory_runs_core_derivative_products",
         "test_torch_func_admission_accepts_declared_vmap_randomness",
         "test_torch_func_admission_rejects_invalid_vmap_randomness",
+        "test_ggnvp_dense_anchor_agrees_with_jvp_hessian_vjp_anchor",
+        "test_ggnvp_reference_check_uses_jvp_hessian_vjp_anchor",
+        "test_ggnvp_reference_check_cross_checks_jvp_path_with_dense_anchor",
+        "test_fisher_score_grad_paths_match_loop_result",
+        "test_sampled_fisher_vp_score_grad_paths_match_loop_path",
+        "test_empirical_fisher_vmap_path_matches_loop_path",
     ),
     "Checkpoint tests cover": (
         "test_checkpoint_operation_preserves_rng_state",
@@ -676,6 +723,10 @@ ACCEPTANCE_TEST_COVERAGE = {
         "test_transformers_runtime_rejects_unlowered_row_settings",
         "test_transformers_attention_location_executes_core_attention",
         "test_transformers_runtime_config_runs_full_size_check_and_materializer",
+        "test_transformers_flash_flex_and_paged_rows_select_implementation",
+        "test_transformers_attention_admission_axis",
+        "test_cuda_sdpa_backend_matches_math_backend",
+        "test_attention_reference_check_rejects_dropout_without_reproducible_policy",
     ),
     "Distributed adapter tests cover": (
         "test_distributed_selected_settings_must_match_across_ranks",
@@ -2352,6 +2403,96 @@ def test_axis_manifest_keys_match_features_and_spec() -> None:
     )
 
     assert set(spec_keys) == set(feature_keys)
+
+
+def test_axis_manifest_assigns_one_owner_and_one_group_per_key() -> None:
+    manifest = vpx.axis_manifest()
+    by_key = manifest.by_key()
+
+    assert len(by_key) == len(manifest.axes)
+
+    setting_owners = {}
+
+    for axis in manifest.axes:
+        assert axis.owner_id
+        assert axis.class_c_group
+
+        for key in axis.settings_keys:
+            assert key not in setting_owners
+            setting_owners[key] = axis.axis_key
+
+    group_members = {}
+
+    for group, keys in manifest.class_c_groups.items():
+        for key in keys:
+            assert key not in group_members
+            group_members[key] = group
+
+    assert set(group_members) == set(by_key)
+
+    for key, group in group_members.items():
+        assert by_key[key].class_c_group == group
+
+
+def test_axis_registry_rejects_duplicate_setting_owner() -> None:
+    registry = vpx.standard_axis_registry()
+    owned_key = "hvp.path"
+
+    assert owned_key in registry.owners
+
+    duplicate = vpx.AxisDescriptor(
+        name="duplicate-owner-axis",
+        settings_keys=(owned_key,),
+        allowed_values=("reverse_over_reverse",),
+    )
+
+    with pytest.raises(vp.AdmissionError, match=r"multiple axis owners: hvp\.path"):
+        registry.register(duplicate)
+
+    existing = registry.axes[registry.owners[owned_key]]
+
+    with pytest.raises(vp.AdmissionError, match="already registered"):
+        registry.register(existing)
+
+
+def test_axis_manifest_applies_merge_rules_deterministically() -> None:
+    manifest = vpx.axis_manifest()
+
+    assert manifest.signature() == vpx.axis_manifest().signature()
+    assert manifest.merge_rules == candidates_module.AXIS_TABLE_MERGE_RULES
+
+    settings = {
+        "attention.partition": "packed_tokens",
+        "compile.boundary": "attention_module",
+        "fusion.norm": "fused_rmsnorm",
+        "inverse_metric.solve_path": "factorized_solve",
+    }
+    changed_axes = tuple(settings)
+    forward = vpx.Candidate(
+        "family",
+        "merge-row",
+        settings,
+        changed_axes=changed_axes,
+    )
+    reversed_row = vpx.Candidate(
+        "family",
+        "merge-row",
+        dict(reversed(list(settings.items()))),
+        changed_axes=tuple(reversed(changed_axes)),
+    )
+    own_groups = {manifest.by_key()[key].class_c_group for key in changed_axes}
+    merged_groups = {
+        "input_schedule",
+        "attention_dispatch",
+        "ad_lowering",
+        "metric_storage",
+    }
+    expected = tuple(sorted(own_groups | merged_groups))
+    forward_groups = run_module._candidate_class_c_groups(forward, manifest)
+
+    assert forward_groups == expected
+    assert run_module._candidate_class_c_groups(forward, manifest) == forward_groups
+    assert run_module._candidate_class_c_groups(reversed_row, manifest) == expected
 
 
 def test_axis_manifest_values_and_checks_have_test_coverage() -> None:
@@ -4341,6 +4482,90 @@ def test_measurement_cleans_memory_backend_after_runtime_failure() -> None:
     assert backend.cleanup_calls == 2
 
 
+def test_measurement_records_oom_rows_with_captured_samples() -> None:
+    def oom_operation() -> torch.Tensor:
+        message = "CUDA out of memory"
+        raise torch.cuda.OutOfMemoryError(message)
+
+    with pytest.raises(vp.MeasurementError) as error_info:
+        measure_once(oom_operation, memory_backend=CPUMemoryBackend())
+
+    error = error_info.value
+
+    assert isinstance(error, measure_module.OperationMeasurementError)
+    assert error.error_type == "OutOfMemoryError"
+    assert error.samples
+
+    candidate = vpx.Candidate("family", "oom-row", {}, admission_status="passed")
+    record = run_candidate(
+        candidate,
+        _input_signature("oom-row"),
+        oom_operation,
+        timing_policy=vpx.TimingPolicy(),
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0)),
+    )
+
+    assert record.status == "failed"
+    assert record.error_type == "OutOfMemoryError"
+    assert record.reference_passed is True
+    assert record.memory_samples
+    assert record.memory_samples[0].peak_reserved_mib >= 0.0
+
+
+def test_tune_writes_reference_runtime_failure_rows(tmp_path: Path) -> None:
+    model = torch.nn.Linear(1, 1)
+    candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
+
+    def failing_reference_check(
+        candidate: vpx.Candidate,
+        batch: Mapping[str, object],
+        vector: vpx.TensorTree,
+    ) -> vpx.ReferenceResult:
+        _ = candidate, batch, vector
+        message = "reference backend exploded"
+        raise RuntimeError(message)
+
+    problem = vpx.Problem(
+        model=model,
+        params=vpx.parameter_surface(model),
+        data=OneBatchData(),
+        operator=ops.gradient("family", "loss", aggregation="sum"),
+        vectors=OneVectorProvider(),
+        target=cpu_target(),
+        runtime=runtime_config(
+            (candidate,),
+            operation_factory_never_runs,
+            failing_reference_check,
+            materialize_candidate,
+            None,
+            {"generator": "reference-runtime-failure"},
+        ),
+    )
+
+    with pytest.raises(vp.NoPassedCandidateError):
+        tune_problem(
+            problem,
+            run_dir=tmp_path,
+            memory_backend=CPUMemoryBackend(),
+            clock=SequenceClock(()),
+        )
+
+    check_row = read_record(
+        tmp_path / "references" / "family" / "row" / "tree_close.json"
+    )
+    full_size_row = read_record(
+        tmp_path / "full_size" / "family" / "row" / "result.json"
+    )
+
+    assert check_row["status"] == "failed"
+    assert check_row["error_type"] == "RuntimeError"
+    assert check_row["error"] == "reference backend exploded"
+    assert full_size_row["status"] == "failed"
+    assert full_size_row["error_type"] == "RuntimeError"
+    assert full_size_row["reference_passed"] is False
+
+
 def _record(
     candidate: vpx.Candidate,
     *,
@@ -5072,6 +5297,76 @@ def test_cohort_selection_sums_compiled_row_scores() -> None:
     assert cohort["b"][0] == compiled_b
 
 
+def test_cohort_selection_sums_distributed_and_compiled_distributed_scores() -> None:
+    signature = {"case": "distributed-cohort"}
+    distributed_a = vpx.Candidate("a", "dist-a", {"distributed.strategy": "fsdp2"})
+    distributed_b = vpx.Candidate("b", "dist-b", {"distributed.strategy": "fsdp2"})
+    compiled_a = vpx.Candidate(
+        "a",
+        "compiled-dist-a",
+        {"compile.enabled": "true", "distributed.strategy": "fsdp2"},
+    )
+    compiled_b = vpx.Candidate(
+        "b",
+        "compiled-dist-b",
+        {"compile.enabled": "true", "distributed.strategy": "fsdp2"},
+    )
+
+    def distributed_record(candidate: vpx.Candidate) -> FullSizeRecord:
+        return _with_rank_memory_samples(
+            _record(
+                candidate,
+                elapsed=(4.0,),
+                reserved=(1.0,),
+                input_signature=signature,
+                selection_metadata={"global_elapsed_seconds": 4.0},
+            ),
+            (1.0, 1.0),
+        )
+
+    def compiled_distributed_record(candidate: vpx.Candidate) -> FullSizeRecord:
+        return _with_rank_memory_samples(
+            _record(
+                candidate,
+                elapsed=(1.0,),
+                reserved=(1.0,),
+                input_signature=signature,
+                selection_metadata={
+                    "global_steady_elapsed_seconds": 1.0,
+                    "global_compile_time_seconds": 90.0,
+                    "recompile_count": 0,
+                },
+            ),
+            (1.0, 1.0),
+        )
+
+    assignments = (
+        {
+            "a": (distributed_a, distributed_record(distributed_a)),
+            "b": (distributed_b, distributed_record(distributed_b)),
+        },
+        {
+            "a": (compiled_a, compiled_distributed_record(compiled_a)),
+            "b": (compiled_b, compiled_distributed_record(compiled_b)),
+        },
+    )
+    short_horizon = select_cohort(
+        assignments,
+        families=("a", "b"),
+        policy=vpx.SelectionPolicy(compile_call_horizon=10),
+    )
+    long_horizon = select_cohort(
+        assignments,
+        families=("a", "b"),
+        policy=vpx.SelectionPolicy(compile_call_horizon=90),
+    )
+
+    assert short_horizon["a"][0] == distributed_a
+    assert short_horizon["b"][0] == distributed_b
+    assert long_horizon["a"][0] == compiled_a
+    assert long_horizon["b"][0] == compiled_b
+
+
 @pytest.mark.parametrize("value", [0.0, 0.99, float("nan"), True])
 def test_selection_policy_rejects_invalid_near_fastest_multiplier(
     value: float | bool,
@@ -5161,6 +5456,31 @@ def test_selection_rejects_invalid_rows() -> None:
                         status="failed",
                     ),
                 ),
+            ),
+            input_signature=signature,
+            policy=vpx.SelectionPolicy(),
+        )
+
+
+def test_selection_rejects_all_failed_family() -> None:
+    signature = {"case": "all-failed"}
+    first = vpx.Candidate("family", "first", {})
+    second = vpx.Candidate("family", "second", {})
+
+    def failed_record_for(candidate: vpx.Candidate) -> FullSizeRecord:
+        return _record(
+            candidate,
+            elapsed=(),
+            reserved=(),
+            input_signature=signature,
+            status="failed",
+        )
+
+    with pytest.raises(vp.NoPassedCandidateError, match="no accepted rows"):
+        select_family(
+            (
+                (first, failed_record_for(first)),
+                (second, failed_record_for(second)),
             ),
             input_signature=signature,
             policy=vpx.SelectionPolicy(),
@@ -5441,6 +5761,77 @@ def test_record_current_rejects_stale_candidate_and_full_size_status() -> None:
         dependency_identities=candidate.dependency_identities,
         generator_id=candidate.generator_id,
         generator_version=candidate.generator_version,
+    )
+
+
+def test_record_current_rejects_stale_signature_generator_and_dependencies() -> None:
+    input_signature = {
+        **_input_signature("identity-current"),
+        "metric_representation": {"kind": "kfac_factors"},
+    }
+    candidate = vpx.Candidate(
+        "family",
+        "row",
+        {"metric.multiply_path": "factorized_multiply"},
+        dependency_identities={"curvature": {"selected_row": "row-a"}},
+        admission_status="passed",
+    )
+    row = vpx.full_size_record_to_json(
+        _record(
+            candidate,
+            elapsed=(1.0,),
+            reserved=(1.0,),
+            input_signature=input_signature,
+        )
+    )
+
+    def row_current(
+        signature: Mapping[str, Any],
+        dependency_identities: Mapping[str, Mapping[str, Any]],
+        generator_version: str,
+    ) -> bool:
+        return record_current(
+            row,
+            record_type="full_size",
+            family=candidate.family,
+            candidate_id=candidate.candidate_id,
+            status="passed",
+            input_signature=signature,
+            candidate_settings=candidate.settings,
+            dependency_identities=dependency_identities,
+            generator_id=candidate.generator_id,
+            generator_version=generator_version,
+        )
+
+    current_dependencies = candidate.dependency_identities
+
+    assert row_current(
+        input_signature,
+        current_dependencies,
+        candidate.generator_version,
+    )
+    assert not row_current(
+        _input_signature("identity-stale"),
+        current_dependencies,
+        candidate.generator_version,
+    )
+    assert not row_current(
+        input_signature,
+        current_dependencies,
+        "stale-generator-version",
+    )
+    assert not row_current(
+        input_signature,
+        {"curvature": {"selected_row": "row-b"}},
+        candidate.generator_version,
+    )
+    assert not row_current(
+        {
+            **input_signature,
+            "metric_representation": {"kind": "low_rank_factors"},
+        },
+        current_dependencies,
+        candidate.generator_version,
     )
 
 
@@ -8133,6 +8524,74 @@ def test_tune_writes_admission_failure_rows_without_measurement(tmp_path: Path) 
     assert full_size_row["reference_passed"] is False
 
 
+def test_saved_rows_carry_schema_valid_fields_and_replay_compares_loaded_rows(
+    tmp_path: Path,
+) -> None:
+    model = torch.nn.Linear(1, 1)
+    candidate = vpx.Candidate(
+        "family",
+        "row",
+        {"scale": 1.0},
+        admission_status="passed",
+    )
+    calls = {"reference": 0, "operation": 0}
+    problem = single_row_tuning_problem(
+        model=model,
+        operator=ops.gradient("family", "loss", aggregation="sum"),
+        target=one_call_cpu_target(),
+        row=candidate,
+        calls=calls,
+        generator="saved-row-schema",
+    )
+    plan = tune_problem(
+        problem,
+        run_dir=tmp_path,
+        memory_backend=CPUMemoryBackend(),
+        clock=SequenceClock((0.0, 1.0)),
+    )
+    saved_rows = tuple(
+        read_record(path)
+        for directory in ("candidates", "references", "full_size")
+        for path in sorted((tmp_path / directory).rglob("*.json"))
+    )
+
+    assert saved_rows
+
+    for row in saved_rows:
+        validate_json_record(row)
+
+    full_size_row = read_record(
+        tmp_path / "full_size" / "family" / "row" / "result.json"
+    )
+    reference_row = read_record(
+        tmp_path / "references" / "family" / "row" / "tree_close.json"
+    )
+
+    assert full_size_row["status"] == "passed"
+    assert full_size_row["reference_passed"] is True
+    assert full_size_row["candidate_settings"] == {"scale": 1.0}
+    assert full_size_row["timing_samples"][0]["elapsed_seconds"] == pytest.approx(1.0)
+    assert full_size_row["memory_samples"][0]["peak_reserved_mib"] >= 0.0
+    assert reference_row["status"] == "passed"
+    assert reference_row["thresholds"] == {"max_abs_diff": 1e-6}
+    assert reference_row["measurements"] == {"max_abs_diff": 0.0}
+
+    saved_full_size, saved_checks = saved_plan_rows(tmp_path, plan)
+    replayed = vpx.plan_from_json(
+        read_record(tmp_path / "summaries" / "tuning.json"),
+        replay_context=replay_context_for_plan(plan),
+        full_size_records=saved_full_size,
+        check_records=saved_checks,
+        candidate_records=saved_candidate_rows(tmp_path, plan),
+        materializers={"family": materialize_candidate},
+    )
+
+    assert replayed.selected["family"].candidate_id == "row"
+    assert canonical_json(replayed.records["family"].row_key()) == canonical_json(
+        plan.records["family"].row_key()
+    )
+
+
 def test_reference_failed_rows_are_rechecked_on_next_tune(tmp_path: Path) -> None:
     model = torch.nn.Linear(1, 1)
     candidate = vpx.Candidate("family", "row", {}, admission_status="passed")
@@ -8882,6 +9341,98 @@ def test_plan_replay_rejects_stale_context_and_materializer() -> None:
             check_records=(check,),
             candidate_records=(stale_candidate_row,),
             materializers={"family": materialize_candidate},
+        )
+
+
+def test_plan_replay_rejects_stale_dependency_identity() -> None:
+    input_signature = _input_signature("dependency-replay")
+    upstream = vpx.Candidate("a", "a-row", {"scale": 1.0}, admission_status="passed")
+    upstream_record = _current_record(
+        _record(
+            upstream,
+            elapsed=(1.0,),
+            reserved=(1.0,),
+            input_signature=input_signature,
+        )
+    )
+    dependency_identity = {
+        "family": "a",
+        "candidate_id": upstream.candidate_id,
+        "candidate_settings": dict(upstream.settings),
+        "full_size_row": upstream_record.row_key(),
+        "materializer_identity": dict(materialize_candidate.identity()),
+    }
+    downstream = vpx.Candidate(
+        "b",
+        "b-row",
+        {"scale": 2.0},
+        dependency_identities={"a": dependency_identity},
+        admission_status="passed",
+    )
+    downstream_record = _current_record(
+        _record(
+            downstream,
+            elapsed=(1.0,),
+            reserved=(1.0,),
+            input_signature=input_signature,
+        )
+    )
+    upstream_check = _check_record(upstream, input_signature=input_signature)
+    downstream_check = _check_record(downstream, input_signature=input_signature)
+    materializers = {"a": materialize_candidate, "b": materialize_candidate}
+    plan = vpx.Plan(
+        selected={"a": upstream, "b": downstream},
+        records={"a": upstream_record, "b": downstream_record},
+        input_signature=input_signature,
+        policy=vpx.SelectionPolicy(),
+        full_size_records=(upstream_record, downstream_record),
+        check_records=(upstream_check, downstream_check),
+        materializers=materializers,
+        dependencies_by_family={"a": (), "b": ("a",)},
+        **_identity_kwargs(families=("a", "b")),
+    )
+    replayed = vpx.plan_from_json(
+        vpx.plan_to_json(plan),
+        replay_context=replay_context_for_plan(plan),
+        full_size_records=(upstream_record, downstream_record),
+        check_records=(upstream_check, downstream_check),
+        candidate_records=candidate_records_for_plan(plan),
+        materializers=materializers,
+    )
+
+    assert replayed.selected["b"].dependency_identities["a"]["candidate_id"] == "a-row"
+
+    stale_downstream = dataclasses.replace(
+        downstream,
+        dependency_identities={
+            "a": {**dependency_identity, "candidate_id": "a-other"},
+        },
+    )
+    stale_record = _current_record(
+        _record(
+            stale_downstream,
+            elapsed=(1.0,),
+            reserved=(1.0,),
+            input_signature=input_signature,
+        )
+    )
+    stale_check = _check_record(stale_downstream, input_signature=input_signature)
+    stale_plan = dataclasses.replace(
+        plan,
+        selected={"a": upstream, "b": stale_downstream},
+        records={"a": upstream_record, "b": stale_record},
+        full_size_records=(upstream_record, stale_record),
+        check_records=(upstream_check, stale_check),
+    )
+
+    with pytest.raises(vp.StaleRecordError, match="dependency identity is stale"):
+        vpx.plan_from_json(
+            vpx.plan_to_json(stale_plan),
+            replay_context=replay_context_for_plan(stale_plan),
+            full_size_records=(upstream_record, stale_record),
+            check_records=(upstream_check, stale_check),
+            candidate_records=candidate_records_for_plan(stale_plan),
+            materializers=materializers,
         )
 
 
@@ -10625,6 +11176,62 @@ def test_manifest_rejects_declared_contradictory_rows() -> None:
 
     assert not admitted
     assert error == "attention.sdpa_kernel applies only to pytorch_sdpa_direct"
+
+
+def test_manifest_rejects_compile_option_mode_combinations() -> None:
+    registry = vpx.standard_axis_registry()
+    base = {
+        "metric.multiply_path": "dense_matmul",
+        "compile.enabled": "true",
+        "compile.boundary": "whole_operator",
+        "compile.backend": "inductor",
+        "compile.mode": "default",
+        "compile.fullgraph": "false",
+        "compile.dynamic": None,
+        "compile.compiled_autograd": "false",
+        "compile.options.epilogue_fusion": "false",
+        "compile.options.shape_padding": "false",
+        "compile.cuda_graphs": "false",
+        "compile.cache_state": "cold_compile",
+    }
+
+    def admitted(candidate_id: str, settings: Mapping[str, object]) -> vpx.Candidate:
+        return registry.admit(vpx.Candidate("family", candidate_id, settings))
+
+    option_with_mode = admitted(
+        "option-with-mode",
+        {**base, "compile.options.epilogue_fusion": "true"},
+    )
+
+    assert option_with_mode.admission_status == "failed"
+    assert option_with_mode.admission_error == (
+        "compile backend options require compile.mode=None"
+    )
+
+    mode_none_disabled = admitted("mode-none-disabled", {**base, "compile.mode": None})
+
+    assert mode_none_disabled.admission_status == "failed"
+    assert mode_none_disabled.admission_error == (
+        "disabled compile options forbid compile.mode=None"
+    )
+
+    option_with_mode_none = admitted(
+        "option-with-mode-none",
+        {**base, "compile.mode": None, "compile.options.epilogue_fusion": "true"},
+    )
+
+    assert option_with_mode_none.admission_status == "passed"
+    assert admitted("mode-with-disabled-options", dict(base)).admission_status == (
+        "passed"
+    )
+
+    tf32_keys = tuple(
+        key
+        for key in vpx.axis_manifest().by_key()
+        if "tf32" in key.lower() or "matmul" in key.lower()
+    )
+
+    assert tf32_keys == ("numeric.float32_matmul_precision",)
 
 
 def test_gradient_rows_reject_materialization_override_keys() -> None:

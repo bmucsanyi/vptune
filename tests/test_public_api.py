@@ -1563,6 +1563,12 @@ def test_public_bound_operator_compiles_vector_step_once(
     torch.testing.assert_close(first["weight"], 2.0 * vector["weight"])
     torch.testing.assert_close(second["weight"], 2.0 * other_vector["weight"])
 
+    events.clear()
+    third = tuned(vector)
+
+    assert events == [("call", 1)]
+    torch.testing.assert_close(third["weight"], 2.0 * vector["weight"])
+
     loaded = product.bind(batch=batch).load(tmp_path)
     events.clear()
     loaded_output = loaded(vector)
@@ -1786,6 +1792,55 @@ def test_typed_mse_loss_gradient_hvp_and_ggn_match_reference() -> None:
     torch.testing.assert_close(gradient_output["weight"], output_error.T @ batch["x"])
     torch.testing.assert_close(hvp_output["weight"], hessian_tangent.T @ batch["x"])
     torch.testing.assert_close(ggn_output["weight"], hessian_tangent.T @ batch["x"])
+
+
+def test_typed_ce_ggn_matches_independent_dense_jacobian_hessian_product() -> None:
+    model = typed_metric_model()
+    batch = {
+        "x": torch.tensor(
+            [[1.0, -0.5], [0.25, 2.0], [-1.5, 0.75]],
+            dtype=torch.float64,
+        ),
+        "labels": torch.tensor([0, 1, 0], dtype=torch.long),
+    }
+    vector = typed_vector()
+    loss = vp.loss.softmax_cross_entropy(
+        output="logits",
+        labels="labels",
+        reduction="sum",
+    )
+    ggn = vp.ggnvp(model, loss)
+
+    output = ggn(batch, vector)
+
+    weight = model.parameter_values["weight"]
+
+    def flat_logits(flat_weight: torch.Tensor) -> torch.Tensor:
+        return (batch["x"] @ flat_weight.reshape(weight.shape).T).reshape(-1)
+
+    def summed_cross_entropy(logits: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.cross_entropy(
+            logits.reshape(batch["x"].shape[0], -1),
+            batch["labels"],
+            reduction="sum",
+        )
+
+    flat_weight = weight.reshape(-1)
+    jacobian = torch.autograd.functional.jacobian(flat_logits, flat_weight)
+    loss_hessian = torch.autograd.functional.hessian(
+        summed_cross_entropy,
+        flat_logits(flat_weight),
+    )
+    dense_product = jacobian.T @ (
+        loss_hessian @ (jacobian @ vector["weight"].reshape(-1))
+    )
+
+    torch.testing.assert_close(
+        output["weight"],
+        dense_product.reshape(weight.shape),
+        rtol=1e-12,
+        atol=1e-12,
+    )
 
 
 def test_typed_declared_psd_loss_ggn_matches_dense_factor_reference() -> None:
@@ -2476,6 +2531,43 @@ def test_typed_softmax_cross_entropy_rejects_invalid_fields() -> None:
             matvec=declared_psd_matrix_free_output_matvec,
             version="",
         )
+
+
+def test_typed_metric_likelihood_and_damping_reject_kind_typos() -> None:
+    model = typed_metric_model()
+    dense = vp.metric.dense(matrix=torch.eye(2, dtype=torch.float64))
+    typo_metric = dataclasses.replace(dense, kind="dense_matrxi")
+
+    with pytest.raises(vp.MaterializationError, match="metric kind is not lowered"):
+        vp.metric_vp(model, typo_metric)
+
+    with pytest.raises(vp.MaterializationError, match="metric kind is not lowered"):
+        vp.inverse_metric_vp(model, typo_metric, damping=vp.damping.scalar(0.1))
+
+    likelihood = vp.likelihood.gaussian(output="logits", target="labels", noise=1.0)
+    typo_likelihood = dataclasses.replace(likelihood, kind="gausian")
+
+    with pytest.raises(
+        vp.MaterializationError,
+        match="likelihood kind is not lowered: gausian",
+    ):
+        vp.fisher_vp(model, typo_likelihood)
+
+    with pytest.raises(vp.MaterializationError, match="gaussian sample_space"):
+        vp.likelihood.gaussian(
+            output="logits",
+            target="labels",
+            noise=1.0,
+            sample_space="trems",
+        )
+
+    typo_damping = dataclasses.replace(vp.damping.scalar(0.1), kind="scaler")
+
+    with pytest.raises(
+        vp.MaterializationError,
+        match="damping kind is not lowered: scaler",
+    ):
+        vp.inverse_metric_vp(model, dense, damping=typo_damping)
 
 
 def test_typed_case_copies_batch_and_validates_vector() -> None:

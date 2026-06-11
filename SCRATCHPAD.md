@@ -1,22 +1,42 @@
 # Scratchpad
-Branch: codex-implement-spec-v2 local @ 8b13435 = origin
-
-<!-- writing-rules: justified -->
-writing-rules justification: filler-adjectives - the word appears only inside the verbatim title of git commit 68a7c05, quoted to identify that commit; rewording would misname the commit.
+Branch: codex-implement-spec-v2 local @ 8cbedf3 + enumeration-tail batch (uncommitted)
 
 ## TODO
 - [x] All prior milestones (narrow plan, conversion, five layers, real models, meta-tests, error domains) per earlier records.
-- [x] This batch: 2214 closed (packed-schedule admission rule in axes/candidates.py + consolidated contradiction test + per-area remaps); 2227 override-key rejection; 2230 fused-loss identity remaps; 2231 corrupting-unpack reference rejection; 2236 shape+nonfinite rejections; 2239 exact-bound gating; 2241 chunk plumbing; 2251 + 2254 remaps. Bullets now: genuine 65, partial 14, name-only 0 (VERIFICATION.md).
-- [x] Local at 8b13435: 914 passed, 11 skipped, lint+ty green.
-- [ ] Poll GPU job 399387 at 8b13435 (production delta since certified 399385: packed-admission rule only).
-- [ ] Continuation (enumeration-tail partials): 2213 owner-uniqueness/merge-determinism/duplicate-owner tests; 2215 compile.options-mode combination rejections; 2230 real-rewriter higher-order agreement; 2235 independent dense GGNVP cross-check; 2251 matrix-free inner execution; 2256 bind reuse assertion; 2257 Metric/Likelihood/Damping typo rejections; 2263-2265 attention/distributed enumeration items (several GPU rows); 2268-2269 staleness enumerations; 2272 OOM/reference-failure rows; 2274/2276 cohort row types and capabilities; 2279-2280 stale identity enumerations; 2282 remaining torch.func items; 2284 Flash/Flex/paged (GPU). OperatorExecutionError placement judgment.
+- [x] GPU job 399387 at 8b13435: COMPLETED 0:0, 924 passed / 1 skipped in 82s.
+- [x] Enumeration-tail batch, all bullets:
+  - 2213 owner/group uniqueness + duplicate-owner rejection + deterministic merges (3 new tests).
+  - 2215 compile option/mode combination rejections + only-TF32-key (1 new test).
+  - 2257 metric-kind production gate in public.py _typed_metric_operator + typo rejections test (Metric/Likelihood/Damping).
+  - 2235 dense GGNVP cross-check: engine dense_anchor_errors == 0 + public independent jacobian/hessian product (2 new tests).
+  - 2251 matrix-free inner execution: single + block k x k Gram vs dense reference (1 new test).
+  - 2256 bind reuse: isolated post-tune call asserts one call event, no compile (strengthened existing test).
+  - 2230 real-rewriter higher-order agreement: HVP fused-module pass/broken-fail + GGN/Fisher trio fused rows through reference check (1 new test).
+  - 2268 staleness kinds isolated (signature, generator version, dependency selection, metric-representation field) (1 new test).
+  - 2269 saved-row schema validity + replay-from-disk agreement (1 new test).
+  - 2272 OOM rows with captured samples + reference runtime failure rows (2 new tests).
+  - 2274 distributed + compiled-distributed cohort sums with horizon flip (1 new test).
+  - 2276 single-key constraint remap (dtype test, same generic machinery).
+  - 2279 dependency-identity replay staleness (1 new test) + cohort-assignment remap.
+  - 2280 all-failed family rejection with pinned message (1 new test).
+  - 2282 every torch.func path: remapped traced execution tests (core paths, GGN variants, fisher trio score paths).
+  - 2263/2264 attention remaps (mask formatter, packed/blockwise, segmented partition, executor rejections, CUDA kernel agreement, full-size check).
+  - 2265 distributed remaps (13 traced per-item tests; NCCL rows on GPU gate).
+  - 2284 flash/flex/paged implementation-selection parametrized test (7 rows) + admission/dropout remaps.
+- [x] OperatorExecutionError judgment: no new class; spec error list closed; OperationMeasurementError under MeasurementError is the placement (measure.py:164).
+- [x] Local: 937 passed, 11 skipped; make lint-fix green.
+- [x] VERIFICATION.md: genuine 78, partial 1 (2219 meta-test proxy), name-only 0; prior count line (65/14) was stale vs its own table (had 20 partial rows).
+- [ ] Commit + push, run hw_gate.sbatch on Ferranti, record job id + counts. BLOCKED: the permission system rejected git commit; the standing no-git rule needs the user's explicit lift in this session (the prior-session authorization in CODEX_SESSION_ANALYSIS.md does not carry).
 
 ## Open questions for the user
-- None pending.
+- Authorize git commit+push of this batch (or commit yourself), then I run the Ferranti hw gate on the new commit.
+- 2219 is the lone partial bullet: is the strengthened meta-test proxy acceptable, or do you want a value-by-value behavioral audit of all ~180 axes?
 
 ## Notes to self
-- GPU jobs: 399306/399380/399381/399385 all COMPLETED 0:0 (full suite, 2x h100); 399387 pending at 8b13435.
-- Per-area mapping inserter pattern + scoped AST match-adder are in the transcript; ACCEPTANCE_TEST_COVERAGE at tests/test_core.py:294.
-- Production changes this batch: axes/candidates.py packed-schedule admission rule only; everything else tests/mappings.
-- Reference checks are the enforcement layer for semantic preservation (offload hook corruption lands as ReferenceFailedError; shape errors re-wrap into ReferenceFailedError through the reference path).
-- Commit style: regular messages, no co-author; make lint-fix before commit.
+- Stateful module path restricted to gradient/vjp/hvp (runtime_values.py:2218); GGN/Fisher fused-row agreement runs against declared-objective anchors; anchors strip fusion.*/call.* (anchor_settings, runtime.py:2587).
+- select_cohort requires passed rows per assignment; a failed row crashes in median_elapsed_seconds. The tune flow filters failed rows before assignments are built, so this is the callers' precondition, no production gap.
+- Metric-kind gate: vp.metric_vp previously accepted typo'd kinds into factorized defaults. _METRIC_KINDS in public.py before _typed_metric_operator.
+- Matrix-free engine idiom: standard_runtime_with_matrix_free_bindings(standard_runtime_config(...), bindings={name: callable}, ...).operation_factory.
+- 2219 is the lone partial: per-value behavioral trace vs strengthened meta-test proxy. Raising it would need a value-by-value audit (~180 axes); judgment for the user whether the proxy suffices.
+- GPU jobs: 399306/399380/399381/399385/399387 all COMPLETED 0:0; hw_gate.sbatch at ~/repos/vptune-verify (owl569), conda env unlearning.
+- Commit style: regular messages, no co-author; make lint-fix before commit. Git+Ferranti authorized for this branch per CODEX_SESSION_ANALYSIS.md binding override.

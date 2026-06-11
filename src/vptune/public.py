@@ -5187,6 +5187,18 @@ def _inverse_metric_product_spec(
     )
 
 
+_METRIC_KINDS = {
+    "dense_matrix",
+    "diagonal_tree",
+    "block_diagonal",
+    "kfac_factors",
+    "ekfac_factors",
+    "low_rank_factors",
+    "ggn_derived_factors",
+    "matrix_free",
+}
+
+
 def _typed_metric_operator(
     model: Model,
     metric: Metric,
@@ -5195,6 +5207,10 @@ def _typed_metric_operator(
     call_inputs: tuple[str, ...],
     default_settings: Mapping[str, Any],
 ) -> Operator:
+    if metric.kind not in _METRIC_KINDS:
+        message = f"metric kind is not lowered: {metric.kind}"
+        raise MaterializationError(message)
+
     return Operator(
         model=model,
         spec=spec,

@@ -7120,6 +7120,145 @@ def test_metric_inner_block_rhs_matches_single_column_gram() -> None:
     torch.testing.assert_close(result, expected)
 
 
+def test_metric_inner_matrix_free_paths_match_dense_reference() -> None:
+    params = {"w": torch.zeros(2, dtype=torch.float64)}
+    matrix = torch.tensor([[5.0, 2.0], [2.0, 4.0]], dtype=torch.float64)
+    damping = 0.25
+    streaming_settings = {
+        "metric.multiply_path": "streaming_multiply",
+        "metric.accumulation": "streaming",
+    }
+    calls = []
+
+    def curvature(
+        batch: vpx.Batch,
+        input_vector: vpx.TensorTree,
+    ) -> vpx.TensorTree:
+        assert batch == {}
+        calls.append(tree_leaves(input_vector)[0].clone())
+
+        return {"w": matrix @ tensor_mapping(input_vector)["w"]}
+
+    def bound_result(
+        operator: Any,
+        settings: Mapping[str, object],
+        candidate_id: str,
+        vector: Any,
+    ) -> Any:
+        runtime = runtime_module.standard_runtime_with_matrix_free_bindings(
+            vpx.standard_runtime_config(
+                operator,
+                params=params,
+                buffers={},
+                candidates=(),
+                thresholds={"max_abs_diff": 1e-12, "max_rel_diff": 1e-12},
+                objective_signature={"metric_inner": "matrix-free-inner"},
+                axis_registry=None,
+            ),
+            bindings={"curvature": curvature},
+            binding_signature={"curvature": {"kind": "matrix_free_metric"}},
+        )
+
+        return runtime.operation_factory(
+            passed_candidate(operator.family, candidate_id, settings),
+            {},
+            vector,
+        )()
+
+    matrix_free_representation = {"kind": "matrix_free", "operator": "curvature"}
+    inner_operator = ops.metric_inner(
+        "metric_inner",
+        "metric",
+        aggregation="sum",
+        representation=matrix_free_representation,
+    )
+    inverse_operator = ops.inverse_metric_inner(
+        "inverse_metric_inner",
+        "metric",
+        aggregation="sum",
+        representation=matrix_free_representation,
+        damping=damping,
+    )
+    inverse_solve_settings = {
+        "inverse_metric.solve_path": "conjugate_gradient",
+        "inverse_metric.iteration_budget": 2,
+        "inverse_metric.preconditioner": "none",
+    }
+    left = {"w": torch.tensor([1.5, -0.5], dtype=torch.float64)}
+    right = {"w": torch.tensor([0.25, 2.0], dtype=torch.float64)}
+    inner_single = bound_result(
+        inner_operator,
+        {
+            "metric_inner.reduction_path": "multiply_then_reduce",
+            "metric_inner.multi_rhs": "single_column",
+            **streaming_settings,
+        },
+        "single-column",
+        (left, right),
+    )
+    inverse_single = bound_result(
+        inverse_operator,
+        {
+            "inverse_metric_inner.reduction_path": "solve_then_reduce",
+            "inverse_metric_inner.multi_rhs": "single_column",
+            **inverse_solve_settings,
+            **streaming_settings,
+        },
+        "inverse-single-column",
+        (left, right),
+    )
+    damped = matrix + damping * torch.eye(2, dtype=torch.float64)
+
+    assert calls
+    torch.testing.assert_close(inner_single, left["w"] @ (matrix @ right["w"]))
+    torch.testing.assert_close(
+        inverse_single,
+        left["w"] @ torch.linalg.solve(damped, right["w"]),
+    )
+
+    left_block = {"w": torch.tensor([[1.5, -0.5], [1.0, 2.0]], dtype=torch.float64)}
+    right_block = {"w": torch.tensor([[0.25, 3.0], [2.0, -1.0]], dtype=torch.float64)}
+    block_settings = {
+        "vectorization.mode": "manual_batch",
+        "vectorization.batch_size": 2,
+        "vectorization.in_dims": ({"w": 0}, {"w": 1}),
+    }
+    inner_block = bound_result(
+        inner_operator,
+        {
+            "metric_inner.reduction_path": "multiply_then_reduce",
+            "metric_inner.multi_rhs": "block",
+            **block_settings,
+            **streaming_settings,
+        },
+        "block",
+        (left_block, right_block),
+    )
+    inverse_block = bound_result(
+        inverse_operator,
+        {
+            "inverse_metric_inner.reduction_path": "solve_then_reduce",
+            "inverse_metric_inner.multi_rhs": "block",
+            **inverse_solve_settings,
+            **block_settings,
+            **streaming_settings,
+        },
+        "inverse-block",
+        (left_block, right_block),
+    )
+
+    torch.testing.assert_close(
+        inner_block,
+        left_block["w"] @ (matrix @ right_block["w"]),
+    )
+    torch.testing.assert_close(
+        inverse_block,
+        left_block["w"] @ torch.linalg.solve(damped, right_block["w"]),
+    )
+    torch.testing.assert_close(inner_block[0, 0], inner_single)
+    torch.testing.assert_close(inverse_block[0, 0], inverse_single)
+
+
 @pytest.mark.parametrize(
     ("mode_settings", "candidate_id"),
     [
@@ -8374,6 +8513,254 @@ def test_standard_runtime_executes_fused_rows_for_higher_order_families(
 
     assert events == [(family, "fused_logits_projection")]
     torch.testing.assert_close(tree_leaves(result)[0], expected)
+
+
+def test_standard_runtime_real_rewriter_preserves_higher_order_agreement() -> None:
+    events = []
+
+    class CubicModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.tensor([1.5], dtype=torch.float64))
+            self.fused = False
+
+        def forward(self, scale: torch.Tensor) -> torch.Tensor:
+            events.append("fused" if self.fused else "default")
+
+            if self.fused:
+                return (self.w.pow(3) * scale).sum()
+
+            return (self.w * self.w * self.w * scale).sum()
+
+    class BrokenCubicModule(CubicModule):
+        def forward(self, scale: torch.Tensor) -> torch.Tensor:
+            events.append("broken")
+
+            return (self.w.pow(3) * scale * 1.001).sum()
+
+    def cubic_loss(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        _ = buffers, context
+
+        return (params["w"] ** 3 * batch["scale"]).sum()
+
+    def fused_rewriter(
+        module: torch.nn.Module,
+        candidate: vpx.Candidate,
+    ) -> torch.nn.Module:
+        _ = module
+        events.append(("rewrite", candidate.settings["fusion.mlp"]))
+        fused = CubicModule()
+        fused.fused = True
+
+        return fused
+
+    def broken_rewriter(
+        module: torch.nn.Module,
+        candidate: vpx.Candidate,
+    ) -> torch.nn.Module:
+        _ = module, candidate
+
+        return BrokenCubicModule()
+
+    def hvp_check(
+        rewriter: Callable[[torch.nn.Module, vpx.Candidate], torch.nn.Module],
+    ) -> Any:
+        module = CubicModule()
+
+        return vpx.standard_reference_check(
+            ops.hvp("hvp", "loss", aggregation="sum"),
+            params=dict(module.named_parameters()),
+            buffers={},
+            thresholds={
+                "max_abs_diff": 1e-12,
+                "max_rel_diff": 1e-12,
+                "directional_abs_diff": 1e-6,
+                "directional_rel_diff": 1e-6,
+                "symmetry_max_abs_diff": 1e-12,
+            },
+            scalar_objectives={"loss": cubic_loss},
+            module=module,
+            module_call=vpx.ModuleCallSpec(positional_batch_keys=("scale",)),
+            fusion_rewriter=rewriter,
+        )
+
+    fused_hvp_candidate = passed_candidate(
+        "hvp",
+        "fused-row",
+        {
+            **hvp_settings("reverse_over_reverse"),
+            **stateful_module_call_settings(),
+            "fusion.mlp": "fused_mlp",
+        },
+    )
+    hvp_batch = {
+        "scale": torch.tensor([2.0], dtype=torch.float64),
+        "symmetry_vector": {"w": torch.tensor([0.5], dtype=torch.float64)},
+    }
+    hvp_vector = {"w": torch.tensor([1.0], dtype=torch.float64)}
+    hvp_result = hvp_check(fused_rewriter)(
+        fused_hvp_candidate,
+        hvp_batch,
+        hvp_vector,
+    )
+
+    assert events == [("rewrite", "fused_mlp"), "fused"]
+    assert hvp_result.measurements["max_abs_diff"] == pytest.approx(0.0, abs=1e-15)
+
+    events.clear()
+
+    with pytest.raises(vp.ReferenceFailedError, match="max_abs_diff"):
+        hvp_check(broken_rewriter)(fused_hvp_candidate, hvp_batch, hvp_vector)
+
+    assert "broken" in events
+
+    def per_example_scores(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        _ = buffers, batch, context
+
+        return torch.stack((
+            params["w"][0],
+            2.0 * params["w"][0] - params["w"][1],
+            0.5 * params["w"][0] + 3.0 * params["w"][1],
+        ))
+
+    def model_output(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        _ = buffers, batch, context
+
+        return torch.stack((params["w"][0], 3.0 * params["w"][0]))
+
+    score_gradients = torch.tensor(
+        [[1.0, 0.0], [2.0, -1.0], [0.5, 3.0]],
+        dtype=torch.float64,
+    )
+    rewrites = []
+
+    def family_rewriter(
+        module: torch.nn.Module,
+        candidate: vpx.Candidate,
+    ) -> torch.nn.Module:
+        _ = module
+        rewrites.append((candidate.family, candidate.settings["fusion.logits"]))
+
+        return OneParameterModule()
+
+    pair_params = {"w": torch.tensor([0.3, -0.2], dtype=torch.float64)}
+    pair_vector = {"w": torch.tensor([0.4, -0.7], dtype=torch.float64)}
+    family_cases = (
+        (
+            ops.ggnvp("ggn", "model_output", aggregation="sum"),
+            {
+                **ggn_dense_kernel_settings(),
+                "fusion.logits": "fused_logits_projection",
+            },
+            {"w": torch.tensor([1.0], dtype=torch.float64)},
+            {"model_output": model_output},
+            {
+                "loss_hessian": torch.tensor(
+                    [[2.0, 0.5], [0.5, 1.0]],
+                    dtype=torch.float64,
+                ),
+                "symmetry_vector": {"w": torch.tensor([2.0], dtype=torch.float64)},
+            },
+            {
+                "max_abs_diff": 1e-12,
+                "max_rel_diff": 1e-12,
+                "symmetry_max_abs_diff": 1e-12,
+                "psd_violation": 1e-12,
+                "inner_abs_diff": 1e-12,
+            },
+            {"w": torch.tensor([2.0], dtype=torch.float64)},
+        ),
+        (
+            score_terms_fisher("fisher", "scores"),
+            {
+                **fisher_settings("materialize_score_gradients"),
+                "fusion.logits": "fused_logits_projection",
+            },
+            pair_params,
+            {"scores": per_example_scores},
+            {"score_gradients": score_gradients, "normalization": 3.0},
+            {"max_abs_diff": 1e-12, "max_rel_diff": 1e-12},
+            pair_vector,
+        ),
+        (
+            score_terms_sampled_fisher("sampled", "scores"),
+            {
+                **sampled_fisher_settings("materialize_score_gradients"),
+                "fusion.logits": "fused_logits_projection",
+            },
+            pair_params,
+            {"scores": per_example_scores},
+            {"sampled_score_gradients": score_gradients, "num_examples": 3},
+            {"max_abs_diff": 1e-12, "max_rel_diff": 1e-12},
+            pair_vector,
+        ),
+        (
+            ops.empirical_fisher_vp(
+                "empirical",
+                "scores",
+                aggregation="mean_per_example",
+                example_loss_reduction="per_example",
+                denominator="batch_normalization",
+            ),
+            {
+                **empirical_dense_settings(),
+                "fusion.logits": "fused_logits_projection",
+            },
+            pair_params,
+            {"scores": per_example_scores},
+            {"per_example_gradients": score_gradients, "normalization": 3.0},
+            {"max_abs_diff": 1e-12, "max_rel_diff": 1e-12},
+            pair_vector,
+        ),
+    )
+
+    for (
+        operator,
+        settings,
+        params,
+        objectives,
+        batch,
+        thresholds,
+        vector,
+    ) in family_cases:
+        check = vpx.standard_reference_check(
+            operator,
+            params=params,
+            buffers={},
+            thresholds=thresholds,
+            function_objectives=objectives,
+            module=OneParameterModule(),
+            fusion_rewriter=family_rewriter,
+        )
+        result = check(
+            passed_candidate(operator.family, "fused-agreement", settings),
+            batch,
+            vector,
+        )
+
+        assert result.measurements["max_abs_diff"] == pytest.approx(0.0, abs=1e-15)
+
+    assert rewrites == [
+        ("ggn", "fused_logits_projection"),
+        ("fisher", "fused_logits_projection"),
+        ("sampled", "fused_logits_projection"),
+        ("empirical", "fused_logits_projection"),
+    ]
 
 
 def test_standard_runtime_rejects_fused_loss_without_loss_identity() -> None:
@@ -11864,6 +12251,63 @@ def test_ggnvp_reference_check_cross_checks_jvp_path_with_dense_anchor() -> None
             },
             {"w": torch.tensor([1.0], dtype=torch.float64)},
         )
+
+
+def test_ggnvp_dense_anchor_agrees_with_jvp_hessian_vjp_anchor() -> None:
+    params = {"w": torch.tensor([1.0], dtype=torch.float64)}
+
+    def function(
+        params: vpx.ParameterTree,
+        buffers: vpx.BufferTree,
+        batch: vpx.Batch,
+        context: vpx.ObjectiveContext,
+    ) -> torch.Tensor:
+        assert buffers == {}
+        assert batch["loss_hessian"] is not None
+        assert context.family == "ggn"
+
+        return torch.stack((params["w"][0], 3.0 * params["w"][0]))
+
+    check = vpx.standard_reference_check(
+        ops.ggnvp("ggn", "model_output", aggregation="sum"),
+        params=params,
+        buffers={},
+        thresholds={
+            "max_abs_diff": 1e-12,
+            "max_rel_diff": 1e-12,
+            "symmetry_max_abs_diff": 1e-12,
+            "psd_violation": 1e-12,
+            "inner_abs_diff": 1e-12,
+        },
+        function_objectives={"model_output": function},
+    )
+    result = check(
+        vpx.Candidate(
+            "ggn",
+            "row",
+            {
+                **ggn_settings("torch_func_jvp"),
+                **torch_func_settings(requires_forward_ad=True),
+                "ggn.loss_hessian_path": "autodiff_loss_hvp",
+                "ggn.loss_hessian_kernel": "dense_global",
+            },
+            admission_status="passed",
+        ),
+        {
+            "loss_hessian": torch.tensor(
+                [[2.0, 0.5], [0.5, 1.0]],
+                dtype=torch.float64,
+            ),
+            "symmetry_vector": {"w": torch.tensor([2.0], dtype=torch.float64)},
+        },
+        {"w": torch.tensor([1.0], dtype=torch.float64)},
+    )
+    dense_errors = result.measurements["dense_anchor_errors"]
+
+    assert result.measurements["max_abs_diff"] == pytest.approx(0.0, abs=1e-15)
+    assert result.measurements["psd_violation"] == pytest.approx(0.0, abs=1e-15)
+    assert dense_errors["max_abs_diff"] == pytest.approx(0.0, abs=1e-15)
+    assert dense_errors["max_rel_diff"] == pytest.approx(0.0, abs=1e-15)
 
 
 def test_ggnvp_reference_check_records_dense_anchor_errors() -> None:
